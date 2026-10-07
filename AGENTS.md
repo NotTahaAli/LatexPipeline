@@ -1,0 +1,21 @@
+# AGENTS.md
+
+`README.md` covers usage; `python scripts/build.py --help` lists flags.
+
+## Layout
+
+- `files/<name>/main.tex` is one document, built to `out/<name>.pdf`. Only directories under `files/` are searched.
+- A document's inputs are everything in its own directory. Keep `.cls`, `.bib`, and figures beside `main.tex`. Rebuild detection (local mtime and CI `--changed-since`) does not follow references outside that directory.
+- `out/` is generated and git-ignored. Every build writes `out/<name>.log`, which holds the result plus the latexmk, LaTeX and BibTeX logs. `build.py` also deletes PDFs and logs whose `main.tex` is gone.
+- CI publishes to the GitHub release tagged `pdfs` through `scripts/publish_release.py`. That tag is also the bookmark CI diffs against, so treat it as CI-owned. Moving or deleting it by hand changes what the next run rebuilds.
+
+## Build script
+
+- `scripts/build.py` uses only the Python standard library and must keep working on Windows, macOS, and Linux. Reach for stdlib before adding a dependency.
+- `scripts/publish_release.py` runs only in CI. It imports from `build.py` and calls the `gh` CLI. It uploads whatever is in `out/`, so in CI `out/` must hold only this run's output. A failed document then keeps its previous PDF next to the new `.log`. Release file names use reversible `_XX` hex escaping (`asset_name`), and deletion relies on that mapping. Change the naming rule and every existing file on the release gets deleted and re-uploaded under its new name on the next run.
+- If you rename the workflow file or add shared inputs outside `files/`, update `GLOBAL_INPUTS` in `build.py` and the `paths:` filters in `.github/workflows/build-pdf.yml` together.
+- Building needs only Python and a LaTeX distribution; Docker is never required. If this machine has no LaTeX, optionally verify in a throwaway `ubuntu:24.04` container with `apt-get install --no-install-recommends latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science python3 git`. These are the same packages CI installs. If a document adds a LaTeX package, update the package list in the workflow and `README.md`.
+
+## Python project
+
+- `requirements.txt` is generated from `uv.lock`, so change dependencies with `uv add` / `uv remove`. The pre-commit hook in `.githooks/` re-exports it. Outside the hook, run `uv export --no-hashes --no-emit-project -o requirements.txt`, with exactly these flags, because CI diffs against that output.

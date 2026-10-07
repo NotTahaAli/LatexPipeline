@@ -1,0 +1,36 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{lipsum} % Provides dummy placeholder text
+\usepackage{amsmath}
+
+\title{A Dummy LaTeX Document}
+\author{John Doe}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section*{Abstract}
+\noindent
+\lipsum[1] % Generates a sample dummy paragraph
+
+\section{Introduction}
+\noindent
+\lipsum[2]
+
+\section{Main Content}
+\noindent
+Here is some regular text followed by a centered mathematical equation:
+\begin{equation}
+    f(x) = \int_{0}^{\infty} e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+\end{equation}
+
+\noindent
+\lipsum[3]
+
+\section{Conclusion}
+\noindent
+\lipsum[4]
+
+\end{document}

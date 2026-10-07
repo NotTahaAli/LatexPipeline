@@ -1,0 +1,92 @@
+name: Build PDFs
+
+on:
+  push:
+    paths:
+      - "files/**"
+      - "scripts/**"
+      - ".github/workflows/build-pdf.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements.txt"
+  pull_request:
+    paths:
+      - "files/**"
+      - "scripts/**"
+      - ".github/workflows/build-pdf.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  requirements:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Check uv.lock and requirements.txt are up to date
+        run: |
+          uv lock --check
+          uv export --quiet --no-hashes --no-emit-project -o requirements.txt
+          git diff --exit-code requirements.txt
+
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Update the `pdfs` release.
+    # One run per branch at a time, so two never edit the release at once.
+    # A pending run may be superseded; the `pdfs` tag bookmark covers its changes.
+    concurrency: build-pdf-${{ github.ref }}
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # --changed-since needs history.
+
+      - name: Install LaTeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science
+
+      # Default branch: everything changed since the last fully successful
+      # publish (the `pdfs` tag), so skipped or failed runs are caught up.
+      # Other pushes: changed by the push. PR: changed since the base branch.
+      # Manual run, or no base (first publish, new branch): build everything.
+      - name: Build
+        id: build
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            BASE=
+            if git fetch --force origin refs/tags/pdfs:refs/tags/pdfs; then
+              BASE=pdfs
+            fi
+          fi
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] && [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            python3 scripts/build.py --changed-since "$BASE"
+          else
+            python3 scripts/build.py
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pdfs
+          path: out/
+          if-no-files-found: ignore
+
+      # Keep the `pdfs` release holding the latest PDF of every document.
+      # Runs even if some documents failed, so the rest still publish.
+      - name: Publish to release
+        if: ${{ !cancelled() && env.PUBLISH == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_OK: ${{ steps.build.outcome == 'success' }}
+        run: python3 scripts/publish_release.py

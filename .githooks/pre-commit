@@ -1,0 +1,12 @@
+#!/bin/sh
+# Keep uv.lock and requirements.txt in sync with pyproject.toml.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo "pre-commit: uv not found, skipping requirements.txt export" >&2
+    exit 0
+fi
+
+uv export --quiet --no-hashes --no-emit-project -o requirements.txt
+git add uv.lock requirements.txt

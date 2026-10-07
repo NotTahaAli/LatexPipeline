@@ -1,0 +1,9 @@
+[project]
+name = "latex-pipeline"
+version = "0.1.0"
+description = "Build tooling for the LaTeX documents."
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.uv]
+package = false

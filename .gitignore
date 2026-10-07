@@ -1,0 +1,11 @@
+.claude/*.local.json
+.env
+.vscode
+
+out/
+
+.DS_Store
+*.pem
+
+.venv/
+__pycache__/
