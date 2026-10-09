@@ -1,6 +1,9 @@
 .claude/*.local.json
 .env
-.vscode
+.vscode/*
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 
 out/
 .latex-cache/
