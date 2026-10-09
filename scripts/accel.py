@@ -34,6 +34,51 @@ INJECT = r"""\makeatletter
 \makeatother
 """
 
+# Full builds record, for every \input/\include after \begin{document}, its file name,
+# nesting depth and all counters, in <jobname>.focusmap. --focus uses that map.
+RECORD = r"""\makeatletter
+\newwrite\pgff@w \newcount\pgff@depth
+\def\pgff@elt#1{\string\pgff@c{#1}{\the\csname c@#1\endcsname}}
+\def\pgff@enter#1#2{\global\advance\pgff@depth\@ne
+\begingroup\let\@elt\pgff@elt\xdef\pgff@cnt{\cl@@ckpt}\endgroup
+\immediate\write\pgff@w{\string\pgff@e{#1}{\the\pgff@depth}{#2}{\pgff@cnt}}}
+\def\pgff@leave{\global\advance\pgff@depth\m@ne}
+\AddToHook{begindocument/end}{\immediate\openout\pgff@w=\jobname.focusmap
+\let\pgff@oldinput\input \let\pgff@oldinclude\include
+\def\input{\@ifnextchar\bgroup\pgff@input\pgff@oldinput}
+\def\pgff@input#1{\pgff@enter n{#1}\pgff@oldinput{#1}\pgff@leave}
+\def\include#1{\pgff@enter i{#1}\pgff@oldinclude{#1}\pgff@leave}}
+\makeatother
+"""
+
+# --focus: only the allowed files are read; every other \input does nothing
+# (\include uses \includeonly). Counters are restored when the first focused file starts.
+# %(allow)s, %(restore)s and %(only)s are filled in by focus_tex().
+FOCUS = r"""\makeatletter
+\def\pgff@c#1#2{\setcounter{#1}{#2}}
+%(allow)s
+\def\pgff@restore{%(restore)s}
+\def\pgff@first{%(first)s}
+\def\pgff@last{%(last)s}
+%(only)s
+\newbox\pgff@box
+%% Pages before the focused part are thrown away, then the real \shipout comes back.
+\def\pgff@go{\clearpage\global\let\shipout\pgff@shipout\global\let\pgff@first\relax}
+\def\pgff@stop{\clearpage\gdef\shipout{\setbox\pgff@box=}}
+\def\pgff@run#1{\ifx\pgff@n\pgff@first\pgff@go\pgff@restore\fi
+\pgff@oldinput{#1}\edef\pgff@n{#1}\ifx\pgff@n\pgff@last\pgff@stop\fi}
+\def\pgff@finput#1{\edef\pgff@n{#1}%%
+\ifcsname pgff@ok@\pgff@n\endcsname\expandafter\pgff@run\else\expandafter\@gobble\fi{#1}}
+\def\pgff@finclude#1{\edef\pgff@n{#1}\ifx\pgff@n\pgff@first\pgff@go\fi
+\pgff@oldinclude{#1}\edef\pgff@n{#1}\ifx\pgff@n\pgff@last\pgff@stop\fi}
+\AddToHook{begindocument/end}{\let\pgff@oldinput\input \let\pgff@oldinclude\include
+\global\let\pgff@shipout\shipout \gdef\shipout{\setbox\pgff@box=}
+\def\input{\@ifnextchar\bgroup\pgff@finput\pgff@oldinput}
+\let\include\pgff@finclude
+\let\maketitle\relax \let\tableofcontents\relax \let\listoffigures\relax \let\listoftables\relax}
+\makeatother
+"""
+
 # Draft flag per engine for the figure-listing run (no PDF written).
 DRAFT = {"pdflatex": "-draftmode", "lualatex": "--draftmode", "xelatex": "-no-pdf"}
 
@@ -82,6 +127,13 @@ def tex_path(target: Path, start: Path) -> str:
         return target.as_posix()
 
 
+def write_inject(build_dir: Path, doc_dir: Path, name: str, text: str) -> str:
+    """Write build_dir/name and return the TeX that inputs it from the document's directory."""
+    path = build_dir / name
+    path.write_text(text, encoding="utf-8")
+    return rf"\input{{{tex_path(path, doc_dir)}}}"
+
+
 class Figures:
     """The cached figures of one document."""
 
@@ -94,10 +146,10 @@ class Figures:
         self.stem = main_tex.stem
         self.cache = build_dir / "figcache"
         self.environment = environment_hash(main_tex, engine, shell_escape)
-        inject = build_dir / "_inject.tex"
-        inject.write_text(INJECT, encoding="utf-8")
         (build_dir / "tikz").mkdir(exist_ok=True)
-        self.pretex = rf"\input{{{tex_path(inject, main_tex.parent)}}}"
+        self.pretex = write_inject(build_dir, main_tex.parent, "_inject.tex", INJECT)
+        # The main run also records the \input tree (figure jobs must not).
+        self.main_pretex = self.pretex + write_inject(build_dir, main_tex.parent, "_record.tex", RECORD)
 
     def file(self, name: str, suffix: str) -> Path:
         # Not with_suffix(): a document called "v1.2" would lose its tail.
@@ -228,3 +280,96 @@ class Figures:
         shutil.rmtree(self.cache, ignore_errors=True)
         shutil.rmtree(self.build_dir / "tikz", ignore_errors=True)
         (self.build_dir / "tikz").mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# --focus
+# ---------------------------------------------------------------------------
+
+ENTRY = re.compile(r"\\pgff@e\{([in])\}\{(\d+)\}\{(.*?)\}\{(.*)\}$")
+COUNTER = re.compile(r"\\pgff@c\{([^}]*)\}\{(-?\d+)\}")
+
+
+def normalize(path: str) -> str:
+    """Chapters/./ch1.tex -> Chapters/ch1 (as an \\input argument is compared)."""
+    path = path.strip().replace("\\", "/")
+    path = re.sub(r"(^|/)\./", r"\1", path)
+    return path[:-4] if path.endswith(".tex") else path
+
+
+def read_focusmap(path: Path) -> list[dict]:
+    """The \\input tree a full build recorded: [{kind, depth, path, counters}, ...] in reading order."""
+    entries = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = ENTRY.match(line.strip())
+        if match:
+            entries.append({
+                "kind": match.group(1), "depth": int(match.group(2)), "path": normalize(match.group(3)),
+                "raw": match.group(3), "counters": COUNTER.findall(match.group(4)),
+            })
+    return entries
+
+
+def focus_selection(entries: list[dict], focus: str) -> tuple[set[int], int | None]:
+    """
+    Indexes of the entries to read for `focus`, and the index of the first one
+    that matches. Read: the matches, everything they read themselves, and the
+    files that read them (their ancestors).
+    """
+    focus = normalize(focus).rstrip("/")
+    matches = [
+        i for i, entry in enumerate(entries)
+        if entry["path"] == focus or entry["path"].startswith(focus + "/")
+    ]
+    keep: set[int] = set()
+
+    for i in matches:
+        keep.add(i)
+        depth = entries[i]["depth"]
+        for j in range(i + 1, len(entries)):  # Children.
+            if entries[j]["depth"] <= depth:
+                break
+            keep.add(j)
+        for j in range(i - 1, -1, -1):  # Ancestors.
+            if entries[j]["depth"] < depth:
+                keep.add(j)
+                depth = entries[j]["depth"]
+
+    return keep, (matches[0] if matches else None)
+
+
+def focus_tex(entries: list[dict], keep: set[int], first: int) -> str:
+    """The TeX file injected for a focus run."""
+    allow = "\n".join(
+        rf"\expandafter\def\csname pgff@ok@{entries[i]['raw']}\endcsname{{}}"
+        for i in sorted(keep) if entries[i]["kind"] == "n"
+    )
+    restore = "".join(
+        rf"\pgff@c{{{name}}}{{{value}}}" for name, value in entries[first]["counters"]
+    ) if entries[first]["kind"] == "n" else ""
+    included = [entries[i]["raw"] for i in sorted(keep) if entries[i]["kind"] == "i"]
+    # \includeonly lets LaTeX itself keep the counters and page numbers of skipped chapters.
+    only = rf"\AddToHook{{begindocument/before}}{{\includeonly{{{','.join(included)}}}}}" if any(
+        entry["kind"] == "i" for entry in entries
+    ) else ""
+    shallow = min(entries[i]["depth"] for i in keep)
+    last = max(i for i in keep if entries[i]["depth"] == shallow)
+    return FOCUS % {
+        "allow": allow, "restore": restore, "only": only,
+        "first": entries[first]["raw"], "last": entries[last]["raw"],
+    }
+
+
+def top_unit(entries: list[dict], changed: str) -> str | None:
+    """
+    The outermost recorded file (depth 1, read by main.tex) that holds the file
+    `changed` (a path relative to the document, with or without .tex). For --focus auto.
+    """
+    changed = normalize(changed)
+    for i, entry in enumerate(entries):
+        if entry["path"] != changed:
+            continue
+        for j in range(i, -1, -1):
+            if entries[j]["depth"] == 1:
+                return entries[j]["path"]
+    return None

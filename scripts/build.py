@@ -457,6 +457,7 @@ def error_text(name: str, found: dict) -> str:
 
 def build_document(
     main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
+    record: bool = False,
 ) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
@@ -581,7 +582,7 @@ def build_document(
                     return 1
                 if attempt and not changed:
                     return 0
-                extra = [f"-usepretex={figures.pretex}", f"-jobname={main_tex.stem}"]
+                extra = [f"-usepretex={figures.main_pretex}", f"-jobname={main_tex.stem}"]
                 code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
                 if code != 0:
                     return code
@@ -593,7 +594,13 @@ def build_document(
         if settings["externalize"] and accel.uses_tikz(main_tex.parent):
             mode = "externalized"
         previous = mode_file.read_text() if mode_file.exists() else mode
-        switched = force or previous != mode
+        # --focus needs the \input tree of a full build; (re)build once to get it.
+        no_map = record and not (build_dir / f"{main_tex.stem}.focusmap").exists()
+        switched = force or previous != mode or no_map
+        recording = (
+            [f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
+             f"-jobname={main_tex.stem}"] if record else []
+        )
 
         say(f"Engine:  {settings['engine']}")
         say()
@@ -615,7 +622,7 @@ def build_document(
 
             if used == "plain":
                 console = []
-                code = run(latexmk_command(*(["-g"] if switched else [])))
+                code = run(latexmk_command(*recording, *(["-g"] if switched else [])))
 
             if code == 0 or not cached or errors:
                 break
@@ -704,6 +711,95 @@ def build_document(
     return entry, "".join(shown)
 
 
+def focus_paths(main_tex: Path) -> tuple[Path, Path]:
+    """out/<name>.focus.pdf and out/<name>.focus.log for a document."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.focus.pdf"), pdf.with_name(f"{pdf.stem}.focus.log")
+
+
+def build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int = DEFAULT_JOBS) -> bool:
+    """
+    Typeset only the part of a document under `focus` (a path relative to the
+    document, e.g. "Chapters/chapter5") into out/<name>.focus.pdf, with one
+    LaTeX run that reads the last full build's .aux files, so references,
+    citations, counters and page numbers match the full document.
+    Returns True on success.
+    """
+    relative = main_tex.relative_to(ROOT_DIR)
+    build_dir = cache_dir_for(main_tex)
+    mapfile = build_dir / f"{main_tex.stem}.focusmap"
+
+    try:
+        settings = read_settings(main_tex)
+    except ConfigError as exc:
+        error(str(exc))
+        return False
+
+    if not mapfile.exists():
+        info("No full build with a recorded input tree yet; building the whole document first.")
+        entry, _ = build_document(main_tex, latexmk, True, False, fig_jobs, record=True)
+        info()
+        if not entry["ok"] or not mapfile.exists():
+            error("The full build did not produce an input tree; --focus cannot be used.")
+            return False
+
+    entries = accel.read_focusmap(mapfile)
+    keep, first = accel.focus_selection(entries, focus)
+    if first is None:
+        error(f"--focus {focus!r}: no \\input or \\include in {relative.as_posix()} reads that path.")
+        top = sorted({entry["path"] for entry in entries if entry["depth"] == 1})
+        info("Files read by main.tex: " + ", ".join(top))
+        return False
+
+    out_pdf, out_log = focus_paths(main_tex)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    focus_dir = build_dir / "focus"
+    focus_dir.mkdir(exist_ok=True)
+
+    # Fresh copies of the full build's cross-reference data; this run writes its own.
+    for path in build_dir.iterdir():
+        if path.suffix in {".aux", ".bbl", ".toc", ".lof", ".lot", ".out"}:
+            shutil.copy2(path, focus_dir / path.name)
+
+    pretex = accel.write_inject(focus_dir, main_tex.parent, "_focus.tex", accel.focus_tex(entries, keep, first))
+    command = [
+        settings["engine"], "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
+        f"-output-directory={focus_dir}", f"-jobname={main_tex.stem}",
+        *(["-shell-escape"] if settings["shell_escape"] else []),
+        f"{pretex}\\input{{{main_tex.name}}}",
+    ]
+    info(f"Focus:   {focus} ({len(keep)} of {len(entries)} files read)")
+    began = time.monotonic()
+    generated = focus_dir / f"{main_tex.stem}.pdf"
+    generated.unlink(missing_ok=True)
+    process = subprocess.run(
+        command, cwd=main_tex.parent, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+    )
+    log_file = focus_dir / f"{main_tex.stem}.log"
+    log_text = log_file.read_text(encoding="utf-8", errors="replace") if log_file.exists() else ""
+    ok = process.returncode == 0 and generated.exists()
+    found = parse_latex_errors(process.stdout)
+    pages = LATEX_PAGES.findall(log_text)
+
+    out_log.write_text(
+        f"Focus build of {relative.as_posix()} ({focus}): {'SUCCESS' if ok else 'FAILED'}\n"
+        + "".join(f"{error_text(doc_name(main_tex), item)}\n" for item in found)
+        + "\n===== LaTeX output =====\n" + process.stdout + "\n===== LaTeX log =====\n" + log_text,
+        encoding="utf-8",
+    )
+    seconds = time.monotonic() - began
+
+    if ok:
+        shutil.copy(generated, out_pdf)
+        count = f"{pages[-1]} pages, " if pages else ""
+        info(paint(f"SUCCESS: {out_pdf.relative_to(ROOT_DIR)}", GREEN) + f" ({count}{seconds:.1f}s, preview)")
+    else:
+        for item in found[:MAX_SUMMARY_ERRORS]:
+            info("  " + error_text(doc_name(main_tex), item))
+        info(paint(f"FAILED:  {relative.as_posix()} (focus {focus}); log: {out_log.relative_to(ROOT_DIR)}", RED))
+    return ok
+
+
 def build_safely(
     main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS,
 ) -> tuple[dict, str]:
@@ -786,7 +882,32 @@ def open_pdf(path: Path) -> None:
         error(f"Could not open {path}: {exc}")
 
 
-def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 0.5) -> int:
+def latest_tex(main_tex: Path) -> str | None:
+    """The most recently modified .tex file of a document, relative to its directory."""
+    files = [path for path in main_tex.parent.rglob("*.tex") if not path.name.startswith(".")]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime).relative_to(main_tex.parent).as_posix()
+
+
+def watch_target(document: Path, focus: str | None) -> str | None:
+    """
+    What to focus on after a change: the --focus path, or with "auto" the
+    top-level file that reads the file saved last. None means a full build.
+    """
+    if focus != "auto":
+        return focus
+
+    mapfile = cache_dir_for(document) / f"{document.stem}.focusmap"
+    changed = latest_tex(document)
+    if changed is None or changed == document.name or not mapfile.exists():
+        return None
+    return accel.top_unit(accel.read_focusmap(mapfile), changed)
+
+
+def watch(
+    latexmk: str, patterns: list[str], open_pdfs: bool, focus: str | None = None, interval: float = 0.5,
+) -> int:
     """
     Poll for changes and rebuild stale documents until interrupted.
     """
@@ -802,6 +923,7 @@ def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 
     # its inputs have stayed the same for a full interval, so a save that
     # writes several files triggers one build.
     seen: dict[Path, float] = {}
+    built: dict[Path, float] = {}
     opened: set[Path] = set()
 
     try:
@@ -810,11 +932,19 @@ def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 
             prune(everything)
 
             for document in select_documents(everything, patterns):
-                if not is_stale(document):
+                newest = newest_input(document)
+
+                # With --focus the full PDF stays old, so track the last build ourselves.
+                if focus and document not in built and focus == "auto" and not is_stale(document):
+                    built[document] = newest
+                if focus:
+                    stale = built.get(document, 0.0) < newest
+                else:
+                    stale = is_stale(document)
+
+                if not stale:
                     seen.pop(document, None)
                     continue
-
-                newest = newest_input(document)
 
                 if failed.get(document) == newest:
                     continue
@@ -824,9 +954,15 @@ def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 
                     continue
 
                 del seen[document]
-                entry, _ = build_document(document, latexmk)
+                target = watch_target(document, focus) if focus else None
+                if target:
+                    entry = {"ok": build_focus(document, latexmk, target), "pdf": focus_paths(document)[0]}
+                    entry["pdf"] = entry["pdf"].relative_to(OUT_DIR).as_posix()
+                else:
+                    entry, _ = build_document(document, latexmk)
 
                 if entry["ok"]:
+                    built[document] = newest
                     failed.pop(document, None)
 
                     if open_pdfs and document not in opened:
@@ -853,6 +989,7 @@ def prune(documents: list[Path]) -> None:
     """
     expected = {output_path_for(document) for document in documents}
     expected |= {log_path_for(document) for document in documents}
+    expected |= {path for document in documents for path in focus_paths(document)}
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]:
         if path not in expected:
@@ -1000,7 +1137,18 @@ def parse_args() -> argparse.Namespace:
         help="With --watch: open each PDF in its default viewer after its first successful build.",
     )
 
+    parser.add_argument(
+        "--focus",
+        metavar="PATH",
+        help="Preview only PATH (a file or directory relative to the document, e.g. Chapters/chapter5) in "
+             "out/<name>.focus.pdf, using the last full build's references and numbering. "
+             "With --watch, 'auto' focuses on the part holding the file saved last.",
+    )
+
     args = parser.parse_args()
+
+    if args.focus == "auto" and not args.watch:
+        parser.error("--focus auto needs --watch")
 
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
@@ -1107,8 +1255,14 @@ def main() -> int:
 
     latexmk = check_latex()
 
+    if args.focus and not args.watch:
+        if len(documents) != 1:
+            error("--focus needs exactly one document; name it, e.g. build.py sample-report --focus Chapters/ch1")
+            return 2
+        return 0 if build_focus(documents[0], latexmk, args.focus) else 1
+
     if args.watch:
-        return watch(latexmk, args.docs, args.open)
+        return watch(latexmk, args.docs, args.open, args.focus)
 
     if not args.force:
         documents = [document for document in documents if is_stale(document)]
