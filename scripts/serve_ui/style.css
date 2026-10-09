@@ -159,13 +159,26 @@ select#doc{max-width:200px;font-weight:600}
 .page canvas{width:100%;height:100%;display:block}
 .hit{position:absolute;background:rgba(255,230,0,.45);outline:2px solid #ffb000;animation:fade 3s forwards;pointer-events:none}
 @keyframes fade{70%{opacity:1}to{opacity:0}}
-#empty{padding:64px 24px;text-align:center;color:var(--mute)}
+#empty{padding:40px 24px;text-align:center;color:var(--fg);max-width:420px;margin:0 auto;display:flex;flex-direction:column;align-items:center;gap:6px}
+#empty h2{margin:14px 0 0;font-size:16px}#empty p{margin:0 0 6px;color:var(--mute)}
+.skeleton{width:200px;height:260px;background:#fff;border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.25),0 4px 14px rgba(0,0,0,.12);padding:28px 24px;display:flex;flex-direction:column;gap:9px}
+.skeleton i{display:block;height:6px;border-radius:3px;background:#e3e6ea;animation:shimmer 1.4s ease-in-out infinite alternate}
+.skeleton i:first-child{height:9px;background:#d4d8de;margin-bottom:8px}
+@keyframes shimmer{to{opacity:.45}}
+#progress{height:2px;background:transparent;flex:none;position:relative;margin-top:-2px;z-index:20}
+#progress i{display:block;height:100%;width:0;background:var(--warn);transition:width 1s linear}
+#progress.indeterminate i{width:35%;animation:slide 1.3s ease-in-out infinite}
+@keyframes slide{from{margin-left:-35%}to{margin-left:100%}}
+.pdf-note{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:6;display:flex;align-items:center;gap:10px;padding:5px 12px;border-radius:99px;background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad);font-size:12px;box-shadow:var(--shadow)}
+.pdf-note .link{color:inherit}
 
 /* Drawer */
-#drawer{flex:none;height:min(38vh,340px);background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#drawer{flex:none;max-height:min(38vh,340px);background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
 .drawer-bar{display:flex;align-items:center;padding-right:8px}
 .drawer-bar .side-tabs{border:0;flex:none}
-#dpanel-problems,#dpanel-lint,#dpanel-log{flex:1;min-height:0;overflow:auto}
+#dpanel-problems,#dpanel-lint,#dpanel-log{flex:0 1 auto;min-height:0;overflow:auto}
+#drawer[data-tab=log],#drawer[data-tab=lint]{height:min(38vh,340px)}
+#dpanel-log,#dpanel-lint{flex:1}
 .plist{list-style:none;margin:0;padding:6px 10px 10px}
 .plist li{border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:var(--panel2)}
 .plist .head{display:flex;gap:8px;align-items:flex-start;width:100%;padding:7px 10px;text-align:left;border-radius:8px}
@@ -176,7 +189,11 @@ select#doc{max-width:200px;font-weight:600}
 .plist .more{padding:0 12px 10px 34px}
 .plist .hint{background:var(--acc-bg);color:var(--acc-fg);padding:7px 10px;border-radius:6px;margin-bottom:8px}
 .plist pre{margin:0;padding:8px 10px;background:var(--ed-bg);border:1px solid var(--line2);border-radius:6px;overflow:auto;font-size:12px}
-.plist .none{border:0;background:none;color:var(--mute);padding:14px 4px}
+.plist .none{border:0;background:none;color:var(--mute);padding:10px 4px}
+.ok-mark{color:var(--ok);font-weight:600}
+.ok-mark::before{content:"\2713  "}
+button.link{display:inline;height:auto;padding:0;border:0;color:var(--acc);text-decoration:underline;text-underline-offset:2px;background:none}
+button.link:hover{filter:brightness(1.15)}
 .sev{width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none;background:var(--bad)}.sev.warning{background:var(--warn)}.sev.info{background:var(--acc)}
 #logText{margin:0;padding:10px 14px;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word}
 

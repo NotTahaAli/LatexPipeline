@@ -385,13 +385,32 @@ $("zLevel").textContent = (settings.zoom || 100) + "%";
 
 async function loadPdf() {
   const d = docs[cur];
-  if (!d || !d.version) { pdfView.clear(); showEmpty(d ? "Not built yet. " + (d.status === "failed" ? "The build failed." : "Building...") : "No such document."); return; }
+  if (!d || !d.version) { pdfView.clear(); showEmpty(d); return; }
   $("empty").hidden = true;
   window.__loadStart = performance.now();
   await pdfView.load(api.pdfUrl(cur, d.version), d.version);
   if (!settings.zoom) pdfView.fit();   // First visit: fit the page width.
 }
-function showEmpty(text) { $("empty").textContent = text; $("empty").hidden = false; }
+/** The PDF pane before there is a PDF: a page-shaped skeleton and what is going on, never a blank pane. */
+function showEmpty(d) {
+  const box = $("empty");
+  const page = el("div", { className: "skeleton" }, ...[60, 100, 92, 100, 70, 0, 100, 96, 84, 100, 40].map((w) => el("i", { style: `width:${w}%` })));
+  page.setAttribute("aria-hidden", "true");
+  let title, text, extra = [];
+  if (!d) { title = "No such document"; text = "Pick a document from the list at the top left."; }
+  else if (d.status === "failed") {
+    title = "The first build failed";
+    text = "Fix the errors listed below. The preview appears as soon as the document builds.";
+    extra = [el("button", { className: "btn", textContent: "Show problems", onclick: () => setDrawer(true, "problems") })];
+  } else if (d.status === "building") {
+    title = "Building your PDF";
+    text = "The first build is the slowest: LaTeX makes several passes and caches what it can. Later saves are much quicker.";
+    extra = [el("span", { className: "mute", textContent: "Elapsed " }, el("b", { id: "emptyTime", textContent: "0 s" }))];
+  } else { title = "Waiting for the first build"; text = "It starts by itself when you save."; }
+  box.replaceChildren(page, el("h2", { textContent: title }), el("p", { textContent: text }), ...extra);
+  box.hidden = false;
+  tickBuild();
+}
 
 async function forwardSearch(path, line) {
   if (!path) return;
@@ -428,6 +447,23 @@ function announce(d) {   // One short sentence per state change for screen reade
     : `Build finished${d.pages != null ? `, ${d.pages} ${d.pages === 1 ? "page" : "pages"}` : ""}${d.warnings ? `, ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"}` : ""}`;
 }
 
+let buildTimer;
+const fmtSecs = (n) => n >= 90 ? `${Math.floor(n / 60)} min ${String(Math.round(n % 60)).padStart(2, "0")} s` : `${Math.round(n)} s`;
+/** While a build runs: seconds so far in the pill, a bar that fills against the previous build's time, and the same in the empty PDF pane. */
+function tickBuild() {
+  const d = docs[cur];
+  const bar = $("progress");
+  if (!d || d.status !== "building") { clearInterval(buildTimer); buildTimer = null; bar.hidden = true; return; }
+  const elapsed = Math.max(0, Date.now() / 1000 - (d.started || buildSeen));
+  $("label").textContent = `Building ${fmtSecs(elapsed)}`;
+  $("info").textContent = d.seconds ? `· last took ${fmtSecs(d.seconds)}` : "";
+  bar.hidden = false;
+  bar.firstElementChild.style.width = d.seconds ? Math.min(95, (elapsed / d.seconds) * 100) + "%" : "";
+  bar.classList.toggle("indeterminate", !d.seconds);
+  const e = $("emptyTime"); if (e) e.textContent = fmtSecs(elapsed);
+}
+let buildSeen = Date.now() / 1000;
+
 function renderStatus() {
   const d = docs[cur]; if (!d) return;
   announce(d);
@@ -437,22 +473,29 @@ function renderStatus() {
   if (d.pages != null) bits.push(d.pages + (d.pages === 1 ? " page" : " pages"));
   if (d.seconds != null) bits.push(d.seconds + "s");
   $("info").textContent = bits.length ? "· " + bits.join(" · ") : "";
+  if (d.status === "building") { if (!buildTimer) { buildSeen = Date.now() / 1000; buildTimer = setInterval(tickBuild, 1000); } tickBuild(); } else tickBuild();
   $("status").title = [d.finished && "Finished " + new Date(d.finished * 1000).toLocaleTimeString(), d.status === "failed" && d.version && "Showing last good PDF", "Click for problems and log"].filter(Boolean).join(". ");
   const errs = d.errors.length || (d.status === "failed" ? 1 : 0);
   $("errBadge").hidden = !errs; $("errBadge").textContent = `${errs} error${errs === 1 ? "" : "s"}`;
   $("warnBadge").hidden = !d.warnings; $("warnBadge").textContent = `${d.warnings} warning${d.warnings === 1 ? "" : "s"}`;
+  $("warnBadge").title = "Show the build log, where LaTeX lists its warnings";
   $("problemCount").textContent = errs || "";
   const key = d.status === "failed" ? d.finished : null;
   if (key && key !== lastErrKey) { lastErrKey = key; setDrawer(true, "problems"); }   // New failure: show it once.
   if (!key) lastErrKey = null;
+  const note = $("pdfNote");   // The PDF on screen is older than the source: say so.
+  note.hidden = !(d.status === "failed" && d.version);
+  if (!note.hidden) note.replaceChildren(el("span", { textContent: "Build failed. This is the last good PDF." }), el("button", { className: "link", textContent: "Show errors", onclick: () => setDrawer(true, "problems") }));
+  if (!d.version) showEmpty(d);
   renderProblems();
 }
 
-function disclosure(head, more) {
+function disclosure(head, more, open = false) {
   const li = el("li");
   const btn = el("button", { className: "head", onclick: () => { const open = btn.getAttribute("aria-expanded") !== "true"; btn.setAttribute("aria-expanded", String(open)); body.hidden = !open; } }, icon("chev"), ...head);
-  btn.setAttribute("aria-expanded", "false");
-  const body = el("div", { className: "more", hidden: true }, ...more);
+  btn.firstChild.classList.add("chev");
+  btn.setAttribute("aria-expanded", String(open));
+  const body = el("div", { className: "more", hidden: !open }, ...more);
   li.append(btn, body);
   return li;
 }
@@ -461,18 +504,38 @@ function whereLink(file, line) {
   return el("a", { className: "where", href: "#", textContent: `${file}:${line}`, onclick: (e) => { e.preventDefault(); e.stopPropagation(); openFile(file, line); } });
 }
 
+let excerptKey = null, excerpt = null;
+/** A failed build with no parsed file:line (missing package, bad class...): TeX's own first complaint from the log. */
+async function loadExcerpt(d) {
+  if (excerptKey === d.finished) return;
+  excerptKey = d.finished; excerpt = null;
+  try {
+    const rows = (await (await fetch(api.logUrl(cur))).text()).split("\n");
+    const i = rows.findIndex((r) => r.startsWith("!"));
+    excerpt = i >= 0 ? rows.slice(i, i + 8).join("\n").trim() : "";
+  } catch { excerpt = ""; }
+  renderProblems();
+}
+
 function renderProblems() {
   const d = docs[cur]; if (!d) return;
   const list = [];
-  if (d.error && !d.errors.length) list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: d.error })], d.error_hint ? [el("div", { className: "hint", textContent: d.error_hint })] : [el("span", { className: "mute", textContent: "See the build log for details." })]));
-  for (const e of d.errors) {
+  const logLink = el("button", { className: "link", textContent: "Open the full log", onclick: () => setDrawer(true, "log") });
+  if (d.error && !d.errors.length) list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: d.error })], [...(d.error_hint ? [el("div", { className: "hint", textContent: d.error_hint })] : []), logLink], true));
+  d.errors.forEach((e, i) => {
     const more = [];
     if (e.hint) more.push(el("div", { className: "hint", textContent: e.hint }));
     if (e.excerpt) more.push(el("pre", { textContent: e.excerpt }));
-    if (!more.length) more.push(el("span", { className: "mute", textContent: "No further details. See the Log tab." }));
-    list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: e.message }), whereLink(e.file, e.line)], more));
+    if (!more.length) more.push(el("span", { className: "mute", textContent: "No further details." }), logLink.cloneNode(true));
+    list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: e.message }), whereLink(e.file, e.line)], more, i === 0));   // The first error opens by itself; the rest stay one line each.
+  });
+  if (!list.length && d.status === "failed") {
+    loadExcerpt(d);
+    list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: "The build failed, but LaTeX did not name a file and line." })],
+      [...(excerpt ? [el("pre", { textContent: excerpt })] : []), logLink.cloneNode(true)], true));
   }
-  if (!list.length) list.push(el("li", { className: "none", textContent: d.status === "failed" ? "The build failed without a parsed error. Check the Log tab." : "No errors." }));
+  if (!list.length) list.push(el("li", { className: "none" }, el("span", { className: "ok-mark", textContent: "No errors" }), el("span", { className: "mute", textContent: d.status === "building" ? " Building..." : " in the last build." }),
+    ...(d.warnings ? [" ", el("button", { className: "link", textContent: `See ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"} in the log`, onclick: () => setDrawer(true, "log") })] : [])));
   $("problems").replaceChildren(...list);
 }
 
@@ -493,7 +556,7 @@ async function loadLog() {
 
 function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
-  $("drawer").hidden = !open;
+  $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
   for (const b of ["status", "errBadge"]) $(b).setAttribute("aria-expanded", String(open));
   for (const n of ["problems", "lint", "log"]) {
     $("dtab-" + n).setAttribute("aria-selected", String(ui.drawerTab === n));

@@ -240,7 +240,8 @@ def snapshot() -> dict:
 def fresh_state(name: str, main_tex: Path) -> dict:
     return {
         "name": name, "status": "idle", "ok": None, "seconds": None, "pages": None, "warnings": 0,
-        "engine": None, "error": None, "errors": [], "finished": None, "version": pdf_version(main_tex),
+        "engine": None, "error": None, "errors": [], "finished": None, "started": None,
+        "version": pdf_version(main_tex),
     }
 
 
@@ -263,7 +264,7 @@ def log_excerpt(log_text: str, found: dict, lines: int = 8) -> str:
 
 def run_build(main_tex: Path, latexmk: str, force: bool) -> None:
     name = build.doc_name(main_tex)
-    publish(name, status="building")
+    publish(name, status="building", started=time.time())
     entry, _ = build.build_safely(main_tex, latexmk, False, force)
     try:
         log_text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
