@@ -29,6 +29,7 @@ from pathlib import Path
 from build import (
     OUT_DIR,
     SOURCE_DIR,
+    escape_name,
     find_documents,
     log_path_for,
     output_path_for,
@@ -49,16 +50,10 @@ def asset_name(pdf: Path) -> str:
     """
     out/reports/final_v2 report.pdf -> reports_2Ffinal_5Fv2_20report.pdf
 
-    GitHub mangles spaces and cannot hold "/" in asset names, so escape every
-    character outside [A-Za-z0-9.-] as "_" + its UTF-8 bytes in hex:
-    " " -> "_20", "_" -> "_5F", "/" -> "_2F". Reversible, unlike plain "-".
-    The original path is kept as the display label.
+    GitHub mangles spaces and cannot hold "/" in asset names, so the path is
+    escaped by build.escape_name. The original path is kept as the label.
     """
-    return re.sub(
-        r"[^A-Za-z0-9.-]",
-        lambda match: "".join(f"_{byte:02X}" for byte in match.group().encode()),
-        pdf.relative_to(OUT_DIR).as_posix(),
-    )
+    return escape_name(pdf.relative_to(OUT_DIR).as_posix())
 
 
 def read_state(body: str) -> dict:
@@ -96,13 +91,14 @@ def release_notes(previous: dict, built: list[dict], commit: str) -> str:
         else:
             new = {"pdf_commit": old.get("pdf_commit"), "pages": old.get("pages"),
                    "status": "failed", "commit": commit}
+        # Logs are uploaded for every document with one in out/, even a failed one.
+        # A log not in out/ this run stays on the release from an earlier run.
+        new["log"] = log_path_for(main_tex).exists() or old.get("log", old.get("pdf_commit") is not None)
         state[name] = new
 
-        if new.get("pdf_commit"):
-            pdf = f"[PDF]({download}{asset_name(output_path_for(main_tex))})"
-            log = f"[log]({download}{asset_name(log_path_for(main_tex))})"
-        else:
-            pdf = log = None
+        pdf = (f"[PDF]({download}{asset_name(output_path_for(main_tex))})"
+               if new.get("pdf_commit") else None)
+        log = f"[log]({download}{asset_name(log_path_for(main_tex))})" if new["log"] else None
         last_build = f"{new.get('status')} ({new['commit'][:7]})" if new.get("commit") else None
         cells = [name, pdf, new.get("pages"), (new.get("pdf_commit") or "")[:7] or None,
                  last_build, log]
@@ -131,18 +127,15 @@ def main() -> int:
         previous = gh("release", "view", TAG, "--json", "body", "--jq", ".body")
     except subprocess.CalledProcessError:
         previous = None
-    notes = release_notes(read_state(previous or ""), load_documents(), commit)
 
-    if previous is not None:
-        gh("release", "edit", TAG, "--notes", notes)
-    else:
+    if previous is None:
         # After a failed build, start the tag at the root commit so the next
-        # run rebuilds everything.
+        # run rebuilds everything. The notes are written after the uploads.
         target = commit if build_ok else subprocess.run(
             ["git", "rev-list", "--max-parents=0", "HEAD"],
             check=True, stdout=subprocess.PIPE, text=True,
         ).stdout.split()[0]
-        gh("release", "create", TAG, "--title", "Latest PDFs", "--notes", notes,
+        gh("release", "create", TAG, "--title", "Latest PDFs", "--notes", "",
            "--target", target)
 
     with tempfile.TemporaryDirectory() as staging:
@@ -163,6 +156,9 @@ def main() -> int:
         if name not in expected:
             print(f"Deleting: {name}", flush=True)
             gh("release", "delete-asset", TAG, name, "--yes")
+
+    notes = release_notes(read_state(previous or ""), load_documents(), commit)
+    gh("release", "edit", TAG, "--notes", notes)
 
     if build_ok:
         print(f"Moving tag {TAG} to {commit}", flush=True)

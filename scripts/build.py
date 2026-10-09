@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -58,12 +59,22 @@ DEFAULT_ENGINE = "pdflatex"
 # Output helpers
 # ---------------------------------------------------------------------------
 
+# Parallel builds write whole blocks under this lock, so lines never interleave.
+OUTPUT_LOCK = threading.Lock()
+
+
+def write(text: str) -> None:
+    with OUTPUT_LOCK:
+        sys.stdout.write(text)
+
+
 def info(message: str = "") -> None:
-    print(message)
+    write(message + "\n")
 
 
 def error(message: str) -> None:
-    print(f"ERROR: {message}", file=sys.stderr)
+    with OUTPUT_LOCK:
+        print(f"ERROR: {message}", file=sys.stderr)
 
 
 RULE = "=" * 72
@@ -90,6 +101,31 @@ def doc_name(main_tex: Path) -> str:
     files/reports/final/main.tex -> reports/final
     """
     return main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+
+
+def escape_name(text: str) -> str:
+    """
+    reports/final_v2 report.pdf -> reports_2Ffinal_5Fv2_20report.pdf
+
+    Every character outside [A-Za-z0-9.-] becomes "_" + its UTF-8 bytes in hex,
+    so the result holds no "/" or spaces and can be reversed. Used for release
+    asset names (publish_release.py) and for cache directory names.
+    """
+    return re.sub(
+        r"[^A-Za-z0-9.-]",
+        lambda match: "".join(f"_{byte:02X}" for byte in match.group().encode()),
+        text,
+    )
+
+
+def cache_dir_for(main_tex: Path) -> Path:
+    """
+    One flat directory per document, so no document's cache lies inside
+    another's (files/a and files/a/b). The root document gets "_root", which
+    escape_name never produces.
+    """
+    name = doc_name(main_tex)
+    return CACHE_DIR / ("_root" if name == "." else escape_name(name))
 
 
 def name_matches(name: str, pattern: str) -> bool:
@@ -303,7 +339,7 @@ CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
 LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
 LATEX_WARNING = re.compile(r"^(?:LaTeX|Package|Class)\b.*\bWarning", re.MULTILINE)
-LATEX_PAGES = re.compile(r"^Output written on .*?\((\d+) pages?", re.MULTILINE | re.DOTALL)
+LATEX_PAGES = re.compile(r"^Output written on .*?\((\d+)\s+pages?", re.MULTILINE | re.DOTALL)
 
 
 class ConfigError(Exception):
@@ -416,7 +452,7 @@ def error_text(name: str, found: dict) -> str:
 # Building
 # ---------------------------------------------------------------------------
 
-def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dict, str]:
+def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool = False) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
 
@@ -430,6 +466,8 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
     With live=True the output is streamed to the terminal. With live=False
     nothing is printed except a "Started" line; the caller prints the
     returned text once the document finishes, so parallel builds don't mix.
+
+    force passes latexmk -g, which rebuilds even when its cache says up to date.
     """
     began = time.monotonic()
     relative = main_tex.relative_to(ROOT_DIR)
@@ -442,7 +480,7 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
     def emit(text: str) -> None:
         shown.append(text)
         if live:
-            sys.stdout.write(text)
+            write(text)
 
     def say(text: str = "") -> None:
         emit(text + "\n")
@@ -472,7 +510,7 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
     # running still count as newer than the PDF.
     started = time.time()
 
-    build_dir = CACHE_DIR / main_tex.parent.relative_to(SOURCE_DIR)
+    build_dir = cache_dir_for(main_tex)
     cached = build_dir.exists()
     build_dir.mkdir(parents=True, exist_ok=True)
     generated_pdf = build_dir / f"{main_tex.stem}.pdf"
@@ -484,6 +522,7 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
             ENGINES[settings["engine"]],
             *(["-shell-escape"] if settings["shell_escape"] else []),
             *settings["latexmk_args"],
+            *(["-g"] if force else []),
             f"-outdir={build_dir}",
             main_tex.name,
         ]
@@ -593,9 +632,59 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
         "pages": pages,
         "errors": latex_errors,
         "warnings": warnings,
+        "error": None,
     }
 
     return entry, "".join(shown)
+
+
+def build_safely(main_tex: Path, latexmk: str, live: bool, force: bool) -> tuple[dict, str]:
+    """
+    build_document, but an exception (OSError and the like) fails only this
+    document: its report entry carries the message and the run goes on.
+    """
+    try:
+        return build_document(main_tex, latexmk, live, force)
+    except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
+        message = f"Build crashed: {exc}"
+        error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
+        name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+        entry = {
+            "name": name,
+            "pdf": output_path_for(main_tex).relative_to(OUT_DIR).as_posix(),
+            "log": log_path_for(main_tex).relative_to(OUT_DIR).as_posix(),
+            "ok": False,
+            "seconds": None,
+            "engine": None,
+            "pages": None,
+            "errors": [],
+            "warnings": 0,
+            "error": message,
+        }
+        return entry, ""
+
+
+def build_parallel(documents: list[Path], latexmk: str, jobs: int, force: bool) -> list[dict]:
+    """
+    Build in a thread pool. Ctrl+C cancels the queued documents and re-raises
+    KeyboardInterrupt; the running ones finish or die with the terminal's SIGINT.
+    """
+    pool = ThreadPoolExecutor(max_workers=jobs)
+    futures = [pool.submit(build_safely, document, latexmk, False, force) for document in documents]
+    results: list[dict] = []
+
+    try:
+        for future in as_completed(futures):
+            entry, text = future.result()
+            write(text)
+            results.append(entry)
+            info()
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+
+    pool.shutdown()
+    return results
 
 
 def write_report(entries: list[dict]) -> None:
@@ -872,7 +961,11 @@ def print_summary(results: list[dict]) -> None:
         if entry["warnings"]:
             details.append(f"{entry['warnings']} warning(s)")
 
-        info(f"  {status}  {entry['name']:<{width}}  {entry['seconds']:6.1f}s  {', '.join(details)}")
+        seconds = "" if entry["seconds"] is None else f"{entry['seconds']:6.1f}s"
+        info(f"  {status}  {entry['name']:<{width}}  {seconds:>7}  {', '.join(details)}")
+
+        if entry["error"]:
+            info(f"      ERROR: {entry['error']}")
 
         # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
         for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
@@ -961,24 +1054,19 @@ def main() -> int:
 
     # One document runs live; several run in a pool, printed as each finishes.
     jobs = min(args.jobs, len(documents))
-    results: list[dict] = []
 
-    if jobs == 1:
-        for document in documents:
-            results.append(build_document(document, latexmk)[0])
-            info()
-    else:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [
-                pool.submit(build_document, document, latexmk, False)
-                for document in documents
-            ]
-
-            for future in as_completed(futures):
-                entry, text = future.result()
-                sys.stdout.write(text)
-                results.append(entry)
+    try:
+        if jobs == 1:
+            results = []
+            for document in documents:
+                results.append(build_safely(document, latexmk, True, args.force)[0])
                 info()
+        else:
+            results = build_parallel(documents, latexmk, jobs, args.force)
+    except KeyboardInterrupt:
+        info()
+        error("Interrupted; queued documents were not built.")
+        return 130
 
     write_report(results)
     print_summary(results)

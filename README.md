@@ -34,7 +34,7 @@ From the repository root:
 
 ```bash
 python scripts/build.py                  # build documents whose PDF is missing or out of date
-python scripts/build.py --force          # rebuild everything
+python scripts/build.py --force          # rebuild everything (latexmk -g, even when its cache looks current)
 python scripts/build.py -j 2             # build two documents at a time (default: CPU count, up to 8)
 python scripts/build.py "FP-123 Report"  # build only that document (or a glob such as "reports/*")
 python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
@@ -46,21 +46,21 @@ python scripts/build.py --changed-since origin/main   # only documents changed s
 
 With uv you can use `uv run scripts/build.py ...` instead of `python`.
 
-Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once.
+Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once. Ctrl+C in a parallel build cancels the documents still in the queue and exits with status 130.
 
 A document counts as **out of date** when any file in its directory, or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored.
 
 For each document, the script:
 
-1. Runs `latexmk -pdf` in `.latex-cache/<name>/` (git-ignored). The `.aux`, `.bbl`, ... files stay there between builds, so a text edit needs one LaTeX pass instead of a full cold build (about 7 s instead of 19 s for the report). If a build fails with cached files, the cache is wiped and the build retried once from scratch. CI keeps the same cache with `actions/cache`.
+1. Runs `latexmk -pdf` in `.latex-cache/` (git-ignored), with one directory per document, so nested documents never share one. The `.aux`, `.bbl`, ... files stay there between builds, so a text edit needs one LaTeX pass instead of a full cold build (about 7 s instead of 19 s for the report). If a build fails with cached files, the cache is wiped and the build retried once from scratch. CI keeps the same cache with `actions/cache`.
 2. Copies only the final PDF into `out/`.
 3. Writes the full build log to `out/<name>.log` (for example `out/FP-123 Proposal.log`), whether the build succeeded or not. The log starts with the result and any errors. Then comes the latexmk console output from every pass, followed by LaTeX's own `.log` and BibTeX's `.blg`, so every info line, warning and error is in it.
-4. Carries on with the remaining documents if one fails, and prints a summary.
+4. Carries on with the remaining documents if one fails (an unexpected exception included, reported as `Build crashed: ...`), and prints a summary.
 5. Exits non-zero if any document failed.
 
 Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`.
 
-After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`) and `warnings` (a count of LaTeX warnings). CI reads this file, so keep its keys stable.
+After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings) and `error` (the message of a crashed build, otherwise `null`). CI reads this file, so keep its keys stable.
 
 Before building, it deletes any PDF or log in `out/` whose `main.tex` no longer exists. `--watch` does this too.
 
