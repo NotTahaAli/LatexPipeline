@@ -4,7 +4,7 @@
 
 ## Layout
 
-- `files/<name>/main.tex` is one document, built to `out/<name>.pdf`. Only directories under `files/` are searched.
+- `files/<name>/main.tex` is one document, built to `out/<name>.pdf`. Only directories under `files/` are searched by CI and by default. `bench/` holds local benchmark documents, built with `--source bench`; CI never builds them, and `build.py` keeps their outputs in `out/` when it prunes.
 - A document's inputs are everything in its own directory. Keep `.cls`, `.bib`, and figures beside `main.tex`. Files outside it (`\input{../shared/x}`) count for rebuild detection (local mtime and CI `--changed-since`) once a build has recorded them in the document's `.fls` (latexmk `-recorder`, in `.latex-cache/`). A document's first build sees only its own directory.
 - `out/` is generated and git-ignored. Every build writes `out/<name>.log`, which holds the result plus the latexmk, LaTeX and BibTeX logs. `build.py` also deletes PDFs and logs whose `main.tex` is gone.
 - CI publishes to the GitHub release tagged `pdfs` through `scripts/publish_release.py`. That tag is also the bookmark CI diffs against, so treat it as CI-owned. Moving or deleting it by hand changes what the next run rebuilds.

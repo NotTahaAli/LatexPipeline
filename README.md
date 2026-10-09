@@ -43,6 +43,7 @@ python scripts/build.py --list           # show discovered documents and whether
 python scripts/build.py --clean          # delete out/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
 python scripts/build.py --profile        # also print the figures and LaTeX time of each document
+python scripts/build.py --source bench sample-report   # build from bench/ instead of files/ (not built by CI)
 python scripts/build.py my-report --focus Chapters/chapter5   # preview one part in ~2 s, see "Large documents"
 ```
 
@@ -131,7 +132,7 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 * Macros defined in a skipped file are missing. The title page, table of contents and lists are skipped. Material typeset by `main.tex` itself between chapters is not in the preview.
 * `out/<name>.focus.pdf` and `.focus.log` are local previews and are never part of CI.
 
-**Measured on `files/sample-report`** (303 pages, 25 TikZ figures, 4 CPUs):
+**Measured on `bench/sample-report`** (303 pages, 25 TikZ figures, 4 CPUs):
 
 | Step | before | after |
 | --- | --- | --- |

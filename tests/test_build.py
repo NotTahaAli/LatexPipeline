@@ -1,5 +1,7 @@
 """Pure logic in scripts/build.py and the ci_report markdown helpers."""
 
+import contextlib
+import io
 import os
 import time
 import unittest
@@ -294,6 +296,42 @@ class MirrorDirsTests(unittest.TestCase):
 class PhaseTextTests(unittest.TestCase):
     def test_phase_text(self):
         self.assertEqual(build.phase_text({"figures": 1.25, "latex": 5.6}), "figures 1.2s, latex 5.6s")
+
+
+class SourceDirTests(unittest.TestCase):
+    """bench/ and --source: outputs named relative to their source, prune keeps every source's outputs."""
+
+    def setUp(self):
+        repo = fake_repo()
+        self.root = repo.__enter__()
+        self.addCleanup(repo.__exit__, None, None, None)
+        self.files_doc = write_doc(self.root, "shared", "x")
+        bench = self.root / "bench" / "shared"
+        bench.mkdir(parents=True)
+        self.bench_doc = bench / "main.tex"
+        self.bench_doc.write_text("x", encoding="utf-8")
+
+    def test_bench_document_is_named_relative_to_bench(self):
+        self.assertEqual(build.doc_name(self.bench_doc), "shared")
+        self.assertEqual(build.output_path_for(self.bench_doc), self.root / "out" / "shared.pdf")
+
+    def test_same_named_documents_keep_separate_caches(self):
+        self.assertNotEqual(build.cache_dir_for(self.files_doc), build.cache_dir_for(self.bench_doc))
+
+    def test_source_option_changes_the_documents_found(self):
+        with mock.patch.object(build, "SOURCE_DIR", self.root / "bench"):
+            self.assertEqual(build.find_documents(), [self.bench_doc])
+            self.assertEqual(build.doc_name(self.bench_doc), "shared")
+        self.assertEqual(build.find_documents(), [self.files_doc])
+
+    def test_prune_keeps_outputs_of_every_known_source(self):
+        out = self.root / "out"
+        out.mkdir()
+        for name in ("shared.pdf", "shared.log", "gone.pdf", "gone.log"):
+            (out / name).write_text("x")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build.prune(build.all_documents())
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["shared.log", "shared.pdf"])
 
 
 class CiReportCellTests(unittest.TestCase):

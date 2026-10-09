@@ -33,6 +33,8 @@ def fake_repo():
             "SOURCE_DIR": root / "files",
             "OUT_DIR": root / "out",
             "CACHE_DIR": root / ".latex-cache",
+            "FILES_DIR": root / "files",
+            "BENCH_DIR": root / "bench",
         }
         with contextlib.ExitStack() as stack:
             for module in (build, publish_release):

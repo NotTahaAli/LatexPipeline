@@ -26,7 +26,12 @@ import hints
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
-SOURCE_DIR = ROOT_DIR / "files"
+FILES_DIR = ROOT_DIR / "files"
+# Where documents are found. --source DIR changes it for one run.
+SOURCE_DIR = FILES_DIR
+# Local benchmark documents. CI never builds them, but they share out/ with
+# files/, so prune() keeps their outputs.
+BENCH_DIR = ROOT_DIR / "bench"
 OUT_DIR = ROOT_DIR / "out"
 # latexmk's working files (.aux, .bbl, ...) persist here between builds, so an
 # edit reruns only the passes it needs instead of a cold multi-pass build.
@@ -112,11 +117,32 @@ def separator() -> None:
     print(RULE)
 
 
+def source_root(main_tex: Path) -> Path:
+    """
+    The source directory a document belongs to: SOURCE_DIR (files/, or the
+    --source directory), else files/ or bench/. Output and cache names are
+    relative to it.
+    """
+    for root in (SOURCE_DIR, FILES_DIR, BENCH_DIR):
+        if root in main_tex.parents:
+            return root
+    return SOURCE_DIR
+
+
+def known_sources() -> list[Path]:
+    """Existing source directories: the selected one, then files/ and bench/."""
+    found: list[Path] = []
+    for root in (SOURCE_DIR, FILES_DIR, BENCH_DIR):
+        if root.is_dir() and root not in found:
+            found.append(root)
+    return found
+
+
 def doc_name(main_tex: Path) -> str:
     """
     files/reports/final/main.tex -> reports/final
     """
-    return main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+    return main_tex.parent.relative_to(source_root(main_tex)).as_posix()
 
 
 def escape_name(text: str) -> str:
@@ -138,9 +164,14 @@ def cache_dir_for(main_tex: Path) -> Path:
     """
     One flat directory per document, so no document's cache lies inside
     another's (files/a and files/a/b). The root document gets "_root", which
-    escape_name never produces.
+    escape_name never produces. Documents outside files/ are keyed with their
+    source's name, so bench/x and files/x keep separate caches.
     """
     name = doc_name(main_tex)
+    root = source_root(main_tex)
+    if root != FILES_DIR:
+        prefix = root.relative_to(ROOT_DIR).as_posix()
+        name = prefix if name == "." else f"{prefix}/{name}"
     return CACHE_DIR / ("_root" if name == "." else escape_name(name))
 
 
@@ -222,13 +253,19 @@ def check_latex() -> str:
 # Document discovery
 # ---------------------------------------------------------------------------
 
-def find_documents() -> list[Path]:
+def find_documents(root: Path | None = None) -> list[Path]:
     """
-    Find every main.tex under SOURCE_DIR.
+    Find every main.tex under root (default: SOURCE_DIR).
 
     Returns absolute paths.
     """
-    return sorted(path for path in SOURCE_DIR.rglob("main.tex") if path.is_file())
+    root = root or SOURCE_DIR
+    return sorted(path for path in root.rglob("main.tex") if path.is_file())
+
+
+def all_documents() -> list[Path]:
+    """Documents of every known source. prune() works from this list."""
+    return sorted({path for root in known_sources() for path in find_documents(root)})
 
 
 def changed_files(ref: str) -> list[str] | None:
@@ -418,7 +455,7 @@ def output_path_for(main_tex: Path) -> Path:
         files/main.tex
         -> out/main.pdf
     """
-    relative = main_tex.relative_to(SOURCE_DIR).parent
+    relative = main_tex.relative_to(source_root(main_tex)).parent
 
     if relative == Path("."):
         return OUT_DIR / "main.pdf"
@@ -589,7 +626,7 @@ def build_document(
     """
     began = time.monotonic()
     relative = main_tex.relative_to(ROOT_DIR)
-    name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+    name = doc_name(main_tex)
     output_pdf = output_path_for(main_tex)
     log_path = log_path_for(main_tex)
 
@@ -941,7 +978,7 @@ def build_safely(
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
         error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
-        name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+        name = doc_name(main_tex)
         entry = {
             "name": name,
             "pdf": output_path_for(main_tex).relative_to(OUT_DIR).as_posix(),
@@ -1059,7 +1096,7 @@ def watch(
     try:
         while True:
             everything = find_documents()
-            prune(everything)
+            prune(all_documents())
 
             for document in select_documents(everything, patterns):
                 newest = newest_input(document)
@@ -1115,7 +1152,9 @@ def watch(
 
 def prune(documents: list[Path]) -> None:
     """
-    Delete PDFs and logs in out/ whose main.tex no longer exists.
+    Delete PDFs and logs in out/ that no document in `documents` owns. Pass
+    all_documents(): then building files/ never deletes the outputs of bench/,
+    or the other way round.
     """
     expected = {output_path_for(document) for document in documents}
     expected |= {log_path_for(document) for document in documents}
@@ -1268,6 +1307,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--source",
+        metavar="DIR",
+        help="Build the documents under DIR (relative to the repository root, e.g. bench) "
+             "instead of files/. Outputs go to out/ as usual, named relative to DIR.",
+    )
+
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Show how long the figures and LaTeX phases of each document took, in the summary.",
@@ -1353,7 +1399,16 @@ def print_summary(results: list[dict], profile: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    global SOURCE_DIR
+
     args = parse_args()
+
+    if args.source:
+        source = Path(args.source) if Path(args.source).is_absolute() else ROOT_DIR / args.source
+        if not source.is_dir():
+            error(f"--source {args.source}: not a directory")
+            return 2
+        SOURCE_DIR = source.resolve()
 
     if args.clean:
         clean()
@@ -1373,7 +1428,7 @@ def main() -> int:
         return 2
 
     if not args.list:
-        prune(documents)
+        prune(all_documents())
 
     if not documents:
         info(f"No main.tex files found under {SOURCE_DIR.relative_to(ROOT_DIR)}/.")
