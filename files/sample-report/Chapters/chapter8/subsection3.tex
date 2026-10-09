@@ -1,0 +1,65 @@
+\section{Analysis and Validation (Results)}\label{sec:c8s3}
+\lipsum[140-140]
+
+This section builds on the material in \cref{sec:c8s2}, \cref{ch:9} and the prior work of \citet{main-4}; see also \citep{main-38,main-29}.
+
+\begin{equation}\label{eq:c8s3-a}
+  I = \int_{0}^{1}\!\!\int_{0}^{1} \frac{\sin(\pi x)\sin(\pi y)}{1+x^2+y^2}\,\mathrm{d}x\,\mathrm{d}y \approx \frac{1}{M}\sum_{m=1}^{M} h(\xi_m),
+\end{equation}
+with variance decreasing as
+\begin{equation}\label{eq:c8s3-b}
+  \operatorname{Var}\bigl[\hat I_M\bigr] = \frac{1}{M}\Bigl(\int h^2\,\mathrm{d}\mu - I^2\Bigr) = \mathcal{O}(M^{-1}).
+\end{equation}
+
+Equations~\eqref{eq:c8s3-a} and~\eqref{eq:c8s3-b} are used throughout the remainder of this section.
+
+\lipsum[59-60]
+
+\subsection{Quantitative behaviour}\label{sec:c8s3-q}
+Results are collected in \cref{tab:c8s3}. Similar trends were reported in~\citep{main-12,main-27}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c8s3}.}\label{tab:c8s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{11.4} & \SI{6.52}{\milli\second} & \num{3.897e-4} \\
+Beta & \num{92.2} & \SI{1.96}{\milli\second} & \num{1.257e-5} \\
+Gamma & \num{55.5} & \SI{4.62}{\milli\second} & \num{1.151e-1} \\
+Delta & \num{21.0} & \SI{3.70}{\milli\second} & \num{6.999e-5} \\
+Epsilon & \num{73.7} & \SI{9.18}{\milli\second} & \num{7.255e-4} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[93-94]
+
+\subsection{Implementation notes}\label{sec:c8s3-i}
+The core routine is shown in \cref{lst:c8s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{main-40}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c8s3.},label={lst:c8s3}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\lipsum[60-60]
+\begin{theorem}\label{thm:c8s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c8s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\kant[9-11]

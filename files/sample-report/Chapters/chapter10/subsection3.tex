@@ -1,0 +1,70 @@
+\section{Analysis and Validation (Conclusions and Future Work)}\label{sec:c10s3}
+\kant[3-12]
+
+This section builds on the material in \cref{sec:c10s2}, \cref{ch:1} and the prior work of \citet{main-34}; see also \citep{main-25,main-4}.
+
+\begin{equation}\label{eq:c10s3-a}
+  I = \int_{0}^{1}\!\!\int_{0}^{1} \frac{\sin(\pi x)\sin(\pi y)}{1+x^2+y^2}\,\mathrm{d}x\,\mathrm{d}y \approx \frac{1}{M}\sum_{m=1}^{M} h(\xi_m),
+\end{equation}
+with variance decreasing as
+\begin{equation}\label{eq:c10s3-b}
+  \operatorname{Var}\bigl[\hat I_M\bigr] = \frac{1}{M}\Bigl(\int h^2\,\mathrm{d}\mu - I^2\Bigr) = \mathcal{O}(M^{-1}).
+\end{equation}
+
+Equations~\eqref{eq:c10s3-a} and~\eqref{eq:c10s3-b} are used throughout the remainder of this section.
+
+\lipsum[32-33]
+
+\subsection{Quantitative behaviour}\label{sec:c10s3-q}
+Results are collected in \cref{tab:c10s3}. Similar trends were reported in~\citep{main-23,main-13}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c10s3}.}\label{tab:c10s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{91.6} & \SI{8.54}{\milli\second} & \num{6.564e-3} \\
+Beta & \num{36.9} & \SI{0.69}{\milli\second} & \num{7.008e-5} \\
+Gamma & \num{12.9} & \SI{4.29}{\milli\second} & \num{2.653e-1} \\
+Delta & \num{94.2} & \SI{5.07}{\milli\second} & \num{8.217e-1} \\
+Epsilon & \num{63.1} & \SI{2.56}{\milli\second} & \num{6.511e-5} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[33-34]
+
+\subsection{Implementation notes}\label{sec:c10s3-i}
+The core routine is shown in \cref{lst:c10s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{main-17}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for c10s3.},label={lst:c10s3}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\lipsum[134-134]
+\begin{theorem}\label{thm:c10s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c10s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[47-47]

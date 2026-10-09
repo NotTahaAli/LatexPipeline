@@ -1,0 +1,66 @@
+\section{Mathematical Framework}\label{sec:aCs2}
+\kant[5-12]
+
+This section builds on the material in \cref{app:C}, \cref{ch:8} and the prior work of \citet{appx-1}; see also \citep{appx-3,appx-10}.
+
+\begin{equation}\label{eq:aCs2-a}
+  I = \int_{0}^{1}\!\!\int_{0}^{1} \frac{\sin(\pi x)\sin(\pi y)}{1+x^2+y^2}\,\mathrm{d}x\,\mathrm{d}y \approx \frac{1}{M}\sum_{m=1}^{M} h(\xi_m),
+\end{equation}
+with variance decreasing as
+\begin{equation}\label{eq:aCs2-b}
+  \operatorname{Var}\bigl[\hat I_M\bigr] = \frac{1}{M}\Bigl(\int h^2\,\mathrm{d}\mu - I^2\Bigr) = \mathcal{O}(M^{-1}).
+\end{equation}
+
+Equations~\eqref{eq:aCs2-a} and~\eqref{eq:aCs2-b} are used throughout the remainder of this section.
+
+\lipsum[128-129]
+
+\subsection{Quantitative behaviour}\label{sec:aCs2-q}
+Results are collected in \cref{tab:aCs2}. Similar trends were reported in~\citep{appx-14,appx-13}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{aCs2}.}\label{tab:aCs2}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{20.4} & \SI{5.30}{\milli\second} & \num{1.173e-4} \\
+Beta & \num{31.6} & \SI{5.46}{\milli\second} & \num{6.586e-1} \\
+Gamma & \num{30.8} & \SI{9.52}{\milli\second} & \num{4.053e-2} \\
+Delta & \num{90.6} & \SI{0.18}{\milli\second} & \num{8.600e-5} \\
+Epsilon & \num{47.5} & \SI{8.47}{\milli\second} & \num{2.964e-1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\kant[5-12]
+
+\subsection{Implementation notes}\label{sec:aCs2-i}
+The core routine is shown in \cref{lst:aCs2}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{appx-4}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for aCs2.},label={lst:aCs2}]
+import numpy as np
+
+def step(u, dt, dx, D):
+    """Explicit finite-difference update."""
+    lap = (np.roll(u, 1) - 2 * u + np.roll(u, -1)) / dx**2
+    return u + dt * D * lap
+
+u = np.exp(-((np.linspace(0, 1, 200) - 0.5) ** 2) / 0.01)
+for _ in range(1000):
+    u = step(u, 1e-5, 1 / 200, 1.0)
+\end{lstlisting}
+
+\kant[9-12]
+\begin{theorem}\label{thm:aCs2}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:aCs2} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[93-93]

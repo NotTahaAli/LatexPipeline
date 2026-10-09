@@ -1,0 +1,138 @@
+\section{Overview and Motivation}\label{sec:aBs1}
+\lipsum[127-127]
+
+This section builds on the material in \cref{app:B}, \cref{ch:8} and the prior work of \citet{appx-4}; see also \citep{appx-13,appx-8}.
+
+\begin{equation}\label{eq:aBs1-a}
+  \frac{\partial u}{\partial t} = \nabla\cdot\bigl(D(\mathbf{x})\nabla u\bigr) + f(u),\qquad u(\mathbf{x},0)=u_0(\mathbf{x}).
+\end{equation}
+Discretising in space with $N$ degrees of freedom yields the semi-discrete system
+\begin{align}\label{eq:aBs1-b}
+  \mathbf{M}\dot{\mathbf{u}} &= -\mathbf{K}\mathbf{u} + \mathbf{F}(\mathbf{u}),\\
+  \mathbf{u}(0) &= \mathbf{u}_0 \in \mathbb{R}^{N}.
+\end{align}
+
+Equations~\eqref{eq:aBs1-a} and~\eqref{eq:aBs1-b} are used throughout the remainder of this section.
+
+\lipsum[134-135]
+
+\subsection{Quantitative behaviour}\label{sec:aBs1-q}
+Results are collected in \cref{tab:aBs1}. Similar trends were reported in~\citep{appx-5,appx-11}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{aBs1}.}\label{tab:aBs1}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{81.3} & \SI{7.12}{\milli\second} & \num{6.716e-2} \\
+Beta & \num{42.7} & \SI{7.24}{\milli\second} & \num{4.664e-5} \\
+Gamma & \num{4.1} & \SI{5.28}{\milli\second} & \num{7.743e-2} \\
+Delta & \num{38.9} & \SI{0.33}{\milli\second} & \num{1.076e-2} \\
+Epsilon & \num{72.3} & \SI{4.69}{\milli\second} & \num{5.921e-3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\kant[4-11]
+
+\subsection{Implementation notes}\label{sec:aBs1-i}
+The core routine is shown in \cref{lst:aBs1}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{appx-9}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for aBs1.},label={lst:aBs1}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\lipsum[18-18]
+\begin{theorem}\label{thm:aBs1}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:aBs1} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{longtable}{rrrl}
+\caption{Raw measurement log (\texttt{aBs1}).}\label{tab:aBs1-long}\\
+\toprule Run & Value & Ratio & Status \\ \midrule \endfirsthead
+\toprule Run & Value & Ratio & Status \\ \midrule \endhead
+\bottomrule \endfoot
+1 & \num{92.13} & \num{0.9703} & fail \\
+2 & \num{79.37} & \num{0.4062} & fail \\
+3 & \num{8.73} & \num{0.2733} & skip \\
+4 & \num{11.79} & \num{0.4737} & fail \\
+5 & \num{5.66} & \num{0.3981} & skip \\
+6 & \num{9.95} & \num{0.8483} & fail \\
+7 & \num{31.59} & \num{0.8224} & fail \\
+8 & \num{88.38} & \num{0.7190} & pass \\
+9 & \num{18.39} & \num{0.9178} & fail \\
+10 & \num{82.35} & \num{0.2828} & fail \\
+11 & \num{58.20} & \num{0.4584} & pass \\
+12 & \num{60.91} & \num{0.6327} & skip \\
+13 & \num{28.83} & \num{0.8659} & fail \\
+14 & \num{6.03} & \num{0.7748} & pass \\
+15 & \num{1.71} & \num{0.0235} & pass \\
+16 & \num{55.11} & \num{0.6606} & pass \\
+17 & \num{76.65} & \num{0.1012} & fail \\
+18 & \num{10.00} & \num{0.0994} & skip \\
+19 & \num{38.67} & \num{0.5678} & skip \\
+20 & \num{23.29} & \num{0.9555} & pass \\
+21 & \num{49.28} & \num{0.6707} & pass \\
+22 & \num{97.27} & \num{0.4811} & pass \\
+23 & \num{60.51} & \num{0.8336} & fail \\
+24 & \num{70.43} & \num{0.2690} & pass \\
+25 & \num{34.49} & \num{0.9180} & fail \\
+26 & \num{16.84} & \num{0.2119} & pass \\
+27 & \num{57.01} & \num{0.9527} & pass \\
+28 & \num{84.20} & \num{0.5874} & pass \\
+29 & \num{55.06} & \num{0.1631} & fail \\
+30 & \num{74.59} & \num{0.7970} & fail \\
+31 & \num{41.70} & \num{0.2281} & pass \\
+32 & \num{31.60} & \num{0.3103} & fail \\
+33 & \num{28.06} & \num{0.0209} & pass \\
+34 & \num{40.22} & \num{0.4850} & skip \\
+35 & \num{36.30} & \num{0.8422} & skip \\
+36 & \num{9.51} & \num{0.2026} & skip \\
+37 & \num{89.12} & \num{0.4065} & skip \\
+38 & \num{26.69} & \num{0.7679} & skip \\
+39 & \num{24.83} & \num{0.5348} & pass \\
+40 & \num{68.38} & \num{0.0752} & pass \\
+41 & \num{91.79} & \num{0.7106} & skip \\
+42 & \num{95.43} & \num{0.2253} & skip \\
+43 & \num{16.30} & \num{0.8174} & fail \\
+44 & \num{89.75} & \num{0.7091} & fail \\
+45 & \num{14.32} & \num{0.3042} & fail \\
+46 & \num{76.12} & \num{0.9623} & fail \\
+47 & \num{98.36} & \num{0.5449} & skip \\
+48 & \num{38.58} & \num{0.9812} & skip \\
+49 & \num{44.92} & \num{0.8193} & skip \\
+50 & \num{99.21} & \num{0.4183} & pass \\
+51 & \num{53.81} & \num{0.8943} & skip \\
+52 & \num{50.21} & \num{0.5809} & skip \\
+53 & \num{80.97} & \num{0.0339} & skip \\
+54 & \num{13.41} & \num{0.4013} & fail \\
+55 & \num{88.59} & \num{0.2568} & pass \\
+56 & \num{42.74} & \num{0.0808} & fail \\
+57 & \num{8.14} & \num{0.7572} & fail \\
+58 & \num{47.71} & \num{0.2696} & pass \\
+59 & \num{94.53} & \num{0.1088} & pass \\
+60 & \num{95.63} & \num{0.8606} & skip \\
+\end{longtable}
+
+\lipsum[127-127]
