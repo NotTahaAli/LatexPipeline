@@ -99,7 +99,7 @@ jobs:
             python3 scripts/build.py
           fi
 
-      # chktex warnings and word counts go into out/lint-report.json (in the artifact).
+      # Structural findings (annotations, never fail the job), chktex and word counts go into out/lint-report.json (in the artifact).
       - name: Lint and word counts
         if: ${{ !cancelled() }}
         continue-on-error: true
