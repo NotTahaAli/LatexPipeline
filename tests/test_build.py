@@ -291,6 +291,11 @@ class MirrorDirsTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in target.rglob("*") if p.is_file()), [])
 
 
+class PhaseTextTests(unittest.TestCase):
+    def test_phase_text(self):
+        self.assertEqual(build.phase_text({"figures": 1.25, "latex": 5.6}), "figures 1.2s, latex 5.6s")
+
+
 class CiReportCellTests(unittest.TestCase):
     def test_cell_values(self):
         self.assertEqual(ci_report.cell(None), "-")

@@ -42,6 +42,7 @@ python scripts/build.py --watch --open   # keep running, rebuild on every save, 
 python scripts/build.py --list           # show discovered documents and whether they are up to date
 python scripts/build.py --clean          # delete out/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
+python scripts/build.py --profile        # also print the figures and LaTeX time of each document
 python scripts/build.py my-report --focus Chapters/chapter5   # preview one part in ~2 s, see "Large documents"
 ```
 
@@ -61,7 +62,7 @@ For each document, the script:
 
 Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`. Each error is followed by a plain-language hint when one of the rules in `scripts/hints.py` matches (also in `build-report.json` as `hint`).
 
-After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings) and `error` (the message of a crashed build, otherwise `null`). CI reads this file, so keep its keys stable.
+After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings), `error` (the message of a crashed build, otherwise `null`) and `phases` (seconds spent on `figures` and `latex`, `null` for a crash). CI reads this file, so keep its keys stable.
 
 Before building, it deletes any PDF or log in `out/` whose `main.tex` no longer exists. `--watch` does this too.
 

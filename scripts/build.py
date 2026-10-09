@@ -617,6 +617,7 @@ def build_document(
     errors: list[str] = []
     pages = None
     warnings = 0
+    phases = {"figures": 0.0, "latex": 0.0}  # Seconds, for --profile and build-report.json.
 
     try:
         settings = read_settings(main_tex)
@@ -651,12 +652,19 @@ def build_document(
         # Fixed dates in the PDF's metadata; \today follows the same epoch (README, "Reproducible PDFs").
         epoch = {"SOURCE_DATE_EPOCH": source_date_epoch(main_tex), "FORCE_SOURCE_DATE": "1"}
 
-        def run(command: list[str]) -> int:
-            """Run a command in the document's directory, streaming its output."""
+        def run(command: list[str], phase: str = "latex") -> int:
+            """Run a command in the document's directory, streaming its output. Time goes to phases[phase]."""
             mirror_dirs(main_tex.parent, build_dir)
             say("Running:")
             say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
             say()
+            began = time.monotonic()
+            try:
+                return stream(command)
+            finally:
+                phases[phase] += time.monotonic() - began
+
+        def stream(command: list[str]) -> int:
             try:
                 process = subprocess.Popen(
                     command,
@@ -689,11 +697,13 @@ def build_document(
             last = mode_file.stat().st_mtime if mode_file.exists() and not force else 0.0
             if not figures.names() or figures.touched(last):
                 say("Listing figures ...")
-                run(figures.discover_command())
+                run(figures.discover_command(), "figures")
                 console.clear()  # The listing run is not a result; latexmk's output is.
 
             for attempt in range(3):
+                began = time.monotonic()
                 changed, failures = figures.sync(say)
+                phases["figures"] += time.monotonic() - began
                 if failures:
                     console.extend(f"{text}\n" for text in failures)
                     return 1
@@ -824,6 +834,7 @@ def build_document(
         "errors": latex_errors,
         "warnings": warnings,
         "error": None,
+        "phases": {name: round(seconds, 1) for name, seconds in phases.items()},
     }
 
     return entry, "".join(shown)
@@ -942,6 +953,7 @@ def build_safely(
             "errors": [],
             "warnings": 0,
             "error": message,
+            "phases": None,
         }
         return entry, ""
 
@@ -1256,6 +1268,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Show how long the figures and LaTeX phases of each document took, in the summary.",
+    )
+
+    parser.add_argument(
         "--focus",
         metavar="PATH",
         help="Preview only PATH (a file or directory relative to the document, e.g. Chapters/chapter5) in "
@@ -1277,9 +1295,15 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def print_summary(results: list[dict]) -> None:
+def phase_text(phases: dict) -> str:
+    """"figures 1.2s, latex 5.6s"."""
+    return ", ".join(f"{name} {seconds:.1f}s" for name, seconds in phases.items())
+
+
+def print_summary(results: list[dict], profile: bool = False) -> None:
     """
-    One line per document, then the errors of the failed ones.
+    One line per document, then the errors of the failed ones. With profile,
+    each document also gets its phase times.
     """
     separator()
     info("Build Summary")
@@ -1301,6 +1325,9 @@ def print_summary(results: list[dict]) -> None:
 
         if entry["error"]:
             info(f"      ERROR: {entry['error']}")
+
+        if profile and entry["phases"]:
+            info(f"      phases: {phase_text(entry['phases'])}")
 
         # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
         for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
@@ -1412,7 +1439,7 @@ def main() -> int:
         return 130
 
     write_report(results)
-    print_summary(results)
+    print_summary(results, args.profile)
 
     return 1 if any(not entry["ok"] for entry in results) else 0
 
