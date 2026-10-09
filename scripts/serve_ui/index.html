@@ -55,10 +55,11 @@
 
 <a class="skip" href="#cm">Skip to editor</a>
 <header id="topbar" role="banner">
+  <h1 class="sr">LaTeX Studio</h1>
   <div class="brand" aria-hidden="true"><svg class="ic"><use href="#i-file"/></svg></div>
   <label class="sr" for="doc">Document</label>
   <select id="doc" title="Document"></select>
-  <button id="status" class="pill" aria-live="polite" aria-controls="drawer" aria-expanded="false" title="Build status. Click for problems and log">
+  <button id="status" class="pill" aria-controls="drawer" aria-expanded="false" title="Build status. Click for problems and log">
     <span class="dot"></span><span id="label">Connecting</span><span id="info" class="mute"></span>
   </button>
   <button id="errBadge" class="badge bad" hidden aria-controls="drawer" aria-expanded="false"></button>
@@ -79,9 +80,11 @@
 
 <main id="work">
   <aside id="side" hidden aria-label="Project sidebar">
-    <div class="side-tabs" role="tablist" aria-label="Sidebar">
-      <button role="tab" id="tab-files" aria-controls="panel-files" aria-selected="true"><svg class="ic"><use href="#i-files"/></svg>Files</button>
-      <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
+    <div class="side-tabs">
+      <div class="tl" role="tablist" aria-label="Sidebar">
+        <button role="tab" id="tab-files" aria-controls="panel-files" aria-selected="true"><svg class="ic"><use href="#i-files"/></svg>Files</button>
+        <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
+      </div>
       <button class="icon x" id="sideClose" aria-label="Close sidebar" title="Close sidebar"><svg class="ic"><use href="#i-x"/></svg></button>
     </div>
     <div id="panel-files" role="tabpanel" aria-labelledby="tab-files"><div id="tree" role="tree" aria-label="Files"></div></div>
@@ -144,9 +147,10 @@
   </div>
   <div id="dpanel-problems" role="tabpanel" aria-labelledby="dtab-problems"><ul id="problems" class="plist"></ul></div>
   <div id="dpanel-lint" role="tabpanel" aria-labelledby="dtab-lint" hidden><ul id="lintList" class="plist"></ul></div>
-  <div id="dpanel-log" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
+  <div id="dpanel-log" tabindex="0" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
 </section>
 
+<div id="live" class="sr" role="status" aria-live="polite"></div>
 <div id="toast" role="status" hidden></div>
 <div id="revoked" role="alert" hidden><div><h2>This link no longer works</h2><p>The host stopped sharing, or made new links. Ask them for a new one.</p></div></div>
 

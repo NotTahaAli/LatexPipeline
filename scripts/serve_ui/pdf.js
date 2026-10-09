@@ -59,7 +59,7 @@ export class PdfView {
   layout() {
     this.sizes.forEach((_, i) => {
       let el = this.els[i];
-      if (!el) { el = this.els[i] = document.createElement("div"); el.className = "page"; el.dataset.i = i; el.setAttribute("aria-label", `Page ${i + 1}`); this.pagesEl.append(el); }
+      if (!el) { el = this.els[i] = document.createElement("div"); el.className = "page"; el.dataset.i = i; el.setAttribute("role", "img"); el.setAttribute("aria-label", `Page ${i + 1}`); this.pagesEl.append(el); }
       this.box(el, i);
       this.io.unobserve(el); this.io.observe(el);  // Re-observe: fires again for pages already on screen.
     });

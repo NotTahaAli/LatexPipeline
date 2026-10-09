@@ -77,7 +77,7 @@ function extensionsFor(tab) {
     L.StreamLanguage.define(stex),
     L.syntaxHighlighting(HL.classHighlighter),
     EditorView.lineWrapping,
-    EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, spellcheck: "false" }),
+    EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, spellcheck: "false", tabindex: "0" }),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
       ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
@@ -205,18 +205,21 @@ function renderTabs() {
   const list = $("tabs");
   list.replaceChildren(...[...tabs.values()].map((tab) => {
     const name = tab.path.split("/").pop();
-    const close = el("span", { className: "close", role: "button", tabIndex: -1, title: "Close tab", onclick: (e) => { e.stopPropagation(); closeTab(tab); } }, icon("x"));
-    close.setAttribute("aria-label", `Close ${tab.path}`);
-    const node = el("div", { className: "tab" + (tab.dirty ? " dirty" : ""), role: "tab", tabIndex: tab === active ? 0 : -1, title: tab.path + (tab.dirty ? " (unsaved)" : ""), onclick: () => activate(tab) },
+    // The x is a pointer-only extra (aria-hidden, no role): keyboard users close with Delete or the palette.
+    const close = el("span", { className: "close", title: "Close tab", onclick: (e) => { e.stopPropagation(); closeTab(tab); } }, icon("x"));
+    close.setAttribute("aria-hidden", "true");
+    const node = el("div", { className: "tab" + (tab.dirty ? " dirty" : ""), role: "tab", tabIndex: tab === active ? 0 : -1, title: tab.path + (tab.dirty ? " (unsaved)" : "") + ". Delete closes it.", onclick: () => activate(tab) },
       el("span", { className: "name", textContent: name }), el("span", { className: "u", title: "Unsaved changes" }), close);
     node.setAttribute("aria-selected", tab === active ? "true" : "false");
+    node.setAttribute("aria-label", name + (tab.dirty ? ", unsaved changes" : ""));
     node.dataset.path = tab.path;
+    node.addEventListener("auxclick", (e) => { if (e.button === 1) { e.preventDefault(); closeTab(tab); } });
     node.addEventListener("keydown", (e) => {
       const all = [...tabs.values()], i = all.indexOf(tab);
       if (e.key === "ArrowRight") activate(all[(i + 1) % all.length], 0, { noFocus: true }).then(() => $("tabs").children[(i + 1) % all.length]?.focus());
       else if (e.key === "ArrowLeft") activate(all[(i - 1 + all.length) % all.length], 0, { noFocus: true }).then(() => $("tabs").children[(i - 1 + all.length) % all.length]?.focus());
       else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(tab); }
-      else if (e.key === "Delete" || (e.key === "w" && (e.ctrlKey || e.metaKey))) { e.preventDefault(); closeTab(tab); }
+      else if (e.key === "Delete") { e.preventDefault(); closeTab(tab); }
     });
     return node;
   }));
@@ -414,8 +417,20 @@ $("zFit").onclick = () => pdfView.fit();
 $("toCursor").onclick = toCursor;
 
 // ---- build status and problems ----------------------------------------------------------------------
+let announced = null;
+function announce(d) {   // One short sentence per state change for screen readers (the pill itself is not a live region).
+  const errs = d.errors.length || (d.status === "failed" ? 1 : 0);
+  const key = d.status + (d.finished || "");
+  if (key === announced) return;
+  announced = key;
+  $("live").textContent = d.status === "building" ? "Build started"
+    : d.status === "failed" ? `Build failed, ${errs} ${errs === 1 ? "error" : "errors"}`
+    : `Build finished${d.pages != null ? `, ${d.pages} ${d.pages === 1 ? "page" : "pages"}` : ""}${d.warnings ? `, ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"}` : ""}`;
+}
+
 function renderStatus() {
   const d = docs[cur]; if (!d) return;
+  announce(d);
   $("status").className = "pill " + d.status;
   $("label").textContent = { idle: "Up to date", building: "Building...", ok: "Built", failed: "Build failed" }[d.status];
   const bits = [];
@@ -562,6 +577,16 @@ $("pEmph").onclick = () => {
 $("proseBtn").onclick = () => setProse(!ui.prose);
 $("proseClose").onclick = () => setProse(false);
 
+// A modal <dialog> keeps clicks inside but Tab can still walk out to the browser chrome: wrap it.
+for (const dlg of document.querySelectorAll("dialog")) dlg.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const f = [...dlg.querySelectorAll("button,input,select,textarea,a[href],summary,[tabindex]:not([tabindex='-1'])")].filter((x) => !x.disabled && x.getClientRects().length);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+
 // ---- command palette, menu, settings, cheat sheet ----------------------------------------------------
 const mod = /Mac/.test(navigator.platform) ? "Cmd" : "Ctrl";
 const COMMANDS = [
@@ -615,6 +640,7 @@ function openSettings() {
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
   $("settings").showModal();
+  $("sName").focus();
 }
 const bind = (id, apply) => $(id).addEventListener("change", () => { apply($(id)); saveSettings(); applyAppearance(); });
 $("sName").addEventListener("change", () => {
@@ -693,7 +719,7 @@ $("usersBtn").onclick = (e) => { e.stopPropagation(); const open = $("usersList"
 document.addEventListener("click", (e) => { if (!e.target.closest("#usersWrap")) { $("usersList").hidden = true; $("usersBtn").setAttribute("aria-expanded", "false"); } });
 
 let shareTimer;
-async function openShare() { $("share").showModal(); await refreshShare(); }
+async function openShare() { $("share").showModal(); await refreshShare(); $("shareBody").querySelector("select, button")?.focus(); }
 async function refreshShare() {
   clearTimeout(shareTimer);
   let info;

@@ -1,6 +1,6 @@
 :root{
   --bg:#f4f5f7;--panel:#fff;--panel2:#f8f9fb;--fg:#1f2328;--mute:#59636e;--line:#dfe3e8;--line2:#eceff2;
-  --acc:#0969da;--acc-bg:#ddf4ff;--acc-fg:#0550ae;--ok:#1a7f37;--bad:#cf222e;--bad-bg:#ffebe9;--warn:#8a5a00;--warn-bg:#fff4d6;
+  --acc:#0969da;--btn:#0969da;--acc-bg:#ddf4ff;--acc-fg:#0550ae;--ok:#1a7f37;--bad:#cf222e;--bad-bg:#ffebe9;--warn:#8a5a00;--warn-bg:#fff4d6;
   --sel:#b6d6ff;--shadow:0 8px 28px rgba(31,35,40,.18);--ed-bg:#fff;--gutter:#6e7781;--page-bg:#e6e8ec;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --font-size:14px;--split:50%;--r:7px;color-scheme:light;
@@ -8,12 +8,12 @@
 }
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --bg:#0f1115;--panel:#171a20;--panel2:#1c2027;--fg:#e6e9ee;--mute:#a1abb8;--line:#2b3039;--line2:#232831;
-  --acc:#58a6ff;--acc-bg:#16304f;--acc-fg:#9ccbff;--ok:#3fb950;--bad:#ff7b72;--bad-bg:#3b1a1c;--warn:#e3b341;--warn-bg:#3a2e0e;
+  --acc:#58a6ff;--btn:#1f6feb;--acc-bg:#16304f;--acc-fg:#9ccbff;--ok:#3fb950;--bad:#ff7b72;--bad-bg:#3b1a1c;--warn:#e3b341;--warn-bg:#3a2e0e;
   --sel:#264f78;--shadow:0 8px 28px rgba(0,0,0,.55);--ed-bg:#13161b;--gutter:#7d8794;--page-bg:#0b0d10;color-scheme:dark;
   --t-kw:#ff7b72;--t-str:#a5d6ff;--t-com:#8b949e;--t-num:#79c0ff;--t-meta:#d2a8ff;--t-tag:#7ee787;--t-def:#ffa657;}}
 :root[data-theme="dark"]{
   --bg:#0f1115;--panel:#171a20;--panel2:#1c2027;--fg:#e6e9ee;--mute:#a1abb8;--line:#2b3039;--line2:#232831;
-  --acc:#58a6ff;--acc-bg:#16304f;--acc-fg:#9ccbff;--ok:#3fb950;--bad:#ff7b72;--bad-bg:#3b1a1c;--warn:#e3b341;--warn-bg:#3a2e0e;
+  --acc:#58a6ff;--btn:#1f6feb;--acc-bg:#16304f;--acc-fg:#9ccbff;--ok:#3fb950;--bad:#ff7b72;--bad-bg:#3b1a1c;--warn:#e3b341;--warn-bg:#3a2e0e;
   --sel:#264f78;--shadow:0 8px 28px rgba(0,0,0,.55);--ed-bg:#13161b;--gutter:#7d8794;--page-bg:#0b0d10;color-scheme:dark;
   --t-kw:#ff7b72;--t-str:#a5d6ff;--t-com:#8b949e;--t-num:#79c0ff;--t-meta:#d2a8ff;--t-tag:#7ee787;--t-def:#ffa657;}
 
@@ -44,7 +44,7 @@ select#doc{max-width:200px;font-weight:600}
 
 /* Top bar */
 #topbar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--panel);border-bottom:1px solid var(--line);min-height:46px}
-.brand{width:28px;height:28px;border-radius:7px;background:var(--acc);color:#fff;display:grid;place-items:center;flex:none}
+.brand{width:28px;height:28px;border-radius:7px;background:var(--btn);color:#fff;display:grid;place-items:center;flex:none}
 .pill{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 10px;border-radius:99px;border-color:var(--line);background:var(--panel2);white-space:nowrap}
 .pill:hover{border-color:var(--mute)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--mute)}
@@ -72,7 +72,8 @@ select#doc{max-width:200px;font-weight:600}
 .person .pname{font-weight:600;white-space:nowrap}
 .person .prole{margin-left:auto;font-size:12px;white-space:nowrap}
 .btn.on{background:var(--acc-bg);color:var(--acc-fg);border-color:transparent}
-.btn.primary{background:var(--acc);color:#fff;border-color:transparent}
+.btn.primary{background:var(--btn);color:#fff;border-color:transparent}
+.btn.primary:hover{background:var(--btn);filter:brightness(1.12);color:#fff}
 .btn.danger{color:var(--bad);border-color:var(--bad)}
 .share-body{padding:16px;display:flex;flex-direction:column;gap:10px}
 .share-body p{margin:0}
@@ -92,6 +93,7 @@ select#doc{max-width:200px;font-weight:600}
 .side-tabs{display:flex;align-items:center;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line)}
 .side-tabs button[role=tab]{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 10px;color:var(--mute);border-radius:6px 6px 0 0;border-bottom:2px solid transparent;margin-bottom:-1px}
 .side-tabs button[role=tab][aria-selected=true]{color:var(--fg);border-bottom-color:var(--acc)}
+.side-tabs .tl{display:flex;gap:2px}
 .side-tabs .x{margin-left:auto;margin-bottom:3px}
 #panel-files,#panel-outline{flex:1;min-height:0;overflow:auto;padding:6px}
 .count{background:var(--line2);border-radius:99px;padding:0 6px;font-size:11px;min-width:18px;text-align:center}
