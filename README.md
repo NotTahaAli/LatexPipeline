@@ -144,10 +144,13 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 Security while sharing:
 
 * Every request needs a token, loopback included. A tunnel connects to the server from 127.0.0.1, so "local" proves nothing; your own browser gets a private third token as a cookie when sharing starts. Tokens are random 32-byte URL-safe strings, compared in constant time. A link sets an HttpOnly, SameSite=Lax cookie on the first visit and redirects to a URL without the token. New links ("New links" in the Share dialog) disconnect everyone on the old ones.
-* The view role cannot save, rebuild, or see other documents, in the UI or the API; the edit role can edit only the shared document's files, never `build.toml` or `.latexmkrc`, and rebuilds are rate limited (6 a minute).
-* Shell escape is forced off for the whole server while sharing, and a `build.toml` whose `latexmk_args` enable it (`-shell-escape`, `-enable-write18`) or name programs to run (`-e`, `-r`, `-pdflatex=...`) fails the build. LaTeX itself still runs with TeX Live's default restricted `\write18`.
+* The view role cannot save, rebuild, or see other documents (their messages, cursors and names included), in the UI or the API; it can open existing files of the shared document. The edit role can create and change any file of the shared document (text, `.tex`, `.bib`, `.cls`, ...) and rebuild it, but never `build.toml`, `latexmkrc` or `.latexmkrc`, not even through live co-editing. Rebuilds are rate limited (6 a minute). Each client and room is capped in count and size.
+* Builds while sharing are restricted, because LaTeX source is code:
+  * Shell escape is off (`shell_escape=f`) for the whole server, and `latexmk` runs with `-norc`, so no `latexmkrc` is read. A `build.toml` whose `latexmk_args` enable shell escape, name programs or code to run (`-e`, `-r`, `-pdflatex=...`, `-latexoption`, `-pretex`, `-usepretex`, `-cnf-line`), or move the output (`-outdir`, `-auxdir`, `-jobname`) fails the build.
+  * LuaLaTeX is disabled (it can run code through Lua): a document that selects it fails with "LuaLaTeX is disabled while sharing (it can run code)". Use `pdflatex` or `xelatex`.
+  * TeX may only read and write inside the document's directory (`openin_any=p`, `openout_any=p`): `\input{/etc/passwd}` fails, and so do inputs that leave the directory with `..` (for example `\input{../shared/x}`) and dotfiles. Such a document builds again when you stop sharing. Your own `latexmkrc` is also ignored until then.
 * Responses carry a Content-Security-Policy that allows only this origin and the pinned CDNs, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `frame-ancestors 'none'`. The Host header must be loopback or the tunnel's own host.
-* Anyone with the edit link can change that document, so treat it like a password. Unencrypted `--host 0.0.0.0` access is not what sharing is for.
+* Anyone with the edit link can change every file of that document and make this machine compile it, so share links only with people you trust, and treat the edit link like a password. These restrictions make that much safer, but compiling someone else's LaTeX is never risk-free, and they do not cover `--host 0.0.0.0`, which is not what sharing is for.
 
 ---
 
