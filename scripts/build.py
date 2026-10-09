@@ -175,6 +175,14 @@ def cache_dir_for(main_tex: Path) -> Path:
     return CACHE_DIR / ("_root" if name == "." else escape_name(name))
 
 
+def figure_cache_for(main_tex: Path) -> Path:
+    """
+    Compiled TikZ figures of a document, beside (not inside) its build directory so
+    that wiping a broken build directory keeps them.
+    """
+    return CACHE_DIR / "_figcache" / cache_dir_for(main_tex).name
+
+
 def name_matches(name: str, pattern: str) -> bool:
     return name == pattern or fnmatch.fnmatch(name, pattern)
 
@@ -403,9 +411,10 @@ def newest_input(main_tex: Path) -> float:
     """
     Newest modification time among a document's inputs: every file in its
     directory tree (dotfiles such as .DS_Store excluded), the files outside it
-    that the last build read (recorded_inputs), and this script.
+    that the last build read (recorded_inputs), and build.py and accel.py.
     """
-    newest = Path(__file__).stat().st_mtime
+    # The scripts that decide what a build produces; editing serve.py or ci_report.py rebuilds nothing.
+    newest = max(Path(__file__).stat().st_mtime, (SCRIPT_DIR / "accel.py").stat().st_mtime)
 
     for path in main_tex.parent.rglob("*"):
         if path.name.startswith("."):
@@ -723,34 +732,45 @@ def build_document(
 
             return process.wait()
 
-        def externalized_build() -> int:
-            """TikZ figures compiled in parallel and cached, then latexmk for the text."""
-            figures = accel.Figures(main_tex, build_dir, settings["engine"], settings["shell_escape"], fig_jobs)
-            if force:
-                figures.wipe()
-            say("Figures: TikZ externalization (list and make, compiled in parallel)")
-            say()
+        def externalized_build() -> tuple[int, str]:
+            """
+            TikZ figures compiled in parallel and cached, then latexmk for the text.
+            Returns (exit code, problem). The problem is "" unless the figures could not be
+            made, which is the only case worth a plain rebuild: a LaTeX error in the text
+            would fail the plain build too.
+            """
+            try:
+                figures = accel.Figures(
+                    main_tex, build_dir, settings["engine"], settings["shell_escape"], fig_jobs,
+                    env={**LATEX_LOG_ENV, **epoch}, cache=figure_cache_for(main_tex),
+                )
+                if force:
+                    figures.wipe()
+                say("Figures: TikZ externalization (list and make, compiled in parallel)")
+                say()
 
-            last = mode_file.stat().st_mtime if mode_file.exists() and not force else 0.0
-            if not figures.names() or figures.touched(last):
-                say("Listing figures ...")
-                run(figures.discover_command(), "figures")
-                console.clear()  # The listing run is not a result; latexmk's output is.
+                last = mode_file.stat().st_mtime if mode_file.exists() and not force else 0.0
+                if not figures.names() or figures.touched(last):
+                    say("Listing figures ...")
+                    run(figures.discover_command(), "figures")
+                    console.clear()  # The listing run is not a result; latexmk's output is.
 
-            for attempt in range(3):
-                began = time.monotonic()
-                changed, failures = figures.sync(say)
-                phases["figures"] += time.monotonic() - began
-                if failures:
-                    console.extend(f"{text}\n" for text in failures)
-                    return 1
-                if attempt and not changed:
-                    return 0
-                extra = [f"-usepretex={figures.main_pretex}", f"-jobname={main_tex.stem}"]
-                code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
-                if code != 0:
-                    return code
-            return 0
+                for attempt in range(3):
+                    began = time.monotonic()
+                    changed, failures = figures.sync(say)
+                    phases["figures"] += time.monotonic() - began
+                    if failures:
+                        console.extend(f"{text}\n" for text in failures)
+                        return 1, failures[0].splitlines()[0]
+                    if attempt and not changed:
+                        return 0, ""
+                    extra = [f"-usepretex={figures.main_pretex}", f"-jobname={main_tex.stem}"]
+                    code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
+                    if code != 0:
+                        return code, ""
+                return 0, ""
+            except Exception as exc:  # noqa: BLE001 - any failure of the optimisation means: build plainly.
+                return 1, f"{type(exc).__name__}: {exc}"
 
         # Switching between plain and externalized output needs a rebuild latexmk can't see.
         mode_file = build_dir / ".mode"
@@ -761,10 +781,12 @@ def build_document(
         # --focus needs the \input tree of a full build; (re)build once to get it.
         no_map = record and not (build_dir / f"{main_tex.stem}.focusmap").exists()
         switched = force or previous != mode or no_map
-        recording = (
-            [f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
-             f"-jobname={main_tex.stem}"] if record else []
-        )
+        # Plain builds record the \input tree too (the externalized ones do it through main_pretex),
+        # so --focus and --watch --focus auto work for every document.
+        recording = [
+            f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
+            f"-jobname={main_tex.stem}",
+        ]
 
         say(f"Engine:  {settings['engine']}")
         say()
@@ -775,10 +797,9 @@ def build_document(
 
             if mode == "externalized":
                 console = []
-                code = externalized_build()
-                if code != 0:
-                    reason = next((line.strip() for line in console if line.strip()), "see the log")
-                    notes.append(f"Externalized build failed ({reason}); rebuilt without externalization.")
+                code, problem = externalized_build()
+                if problem:
+                    notes.append(f"TikZ externalization failed ({problem}); rebuilt without it.")
                     say()
                     say(notes[-1])
                     say()
@@ -884,6 +905,15 @@ def focus_paths(main_tex: Path) -> tuple[Path, Path]:
 
 
 def build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int = DEFAULT_JOBS) -> bool:
+    """_build_focus, but an exception (a file that cannot be read or written) is an error message and False."""
+    try:
+        return _build_focus(main_tex, latexmk, focus, fig_jobs)
+    except Exception as exc:  # noqa: BLE001 - a watch loop must survive a failed preview.
+        error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: focus build crashed: {exc}")
+        return False
+
+
+def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> bool:
     """
     Typeset only the part of a document under `focus` (a path relative to the
     document, e.g. "Chapters/chapter5") into out/<name>.focus.pdf, with one
@@ -903,7 +933,7 @@ def build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int = DEFAUL
 
     if not mapfile.exists():
         info("No full build with a recorded input tree yet; building the whole document first.")
-        entry, _ = build_document(main_tex, latexmk, True, False, fig_jobs, record=True)
+        entry, _ = build_safely(main_tex, latexmk, True, False, fig_jobs, record=True)
         info()
         if not entry["ok"] or not mapfile.exists():
             error("The full build did not produce an input tree; --focus cannot be used.")
@@ -967,14 +997,14 @@ def build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int = DEFAUL
 
 
 def build_safely(
-    main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS,
+    main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS, record: bool = False,
 ) -> tuple[dict, str]:
     """
     build_document, but an exception (OSError and the like) fails only this
     document: its report entry carries the message and the run goes on.
     """
     try:
-        return build_document(main_tex, latexmk, live, force, fig_jobs)
+        return build_document(main_tex, latexmk, live, force, fig_jobs, record)
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
         error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
@@ -1049,9 +1079,9 @@ def open_pdf(path: Path) -> None:
         error(f"Could not open {path}: {exc}")
 
 
-def latest_tex(main_tex: Path) -> str | None:
-    """The most recently modified .tex file of a document, relative to its directory."""
-    files = [path for path in main_tex.parent.rglob("*.tex") if not path.name.startswith(".")]
+def latest_file(main_tex: Path) -> str | None:
+    """The most recently modified file of a document (any kind), relative to its directory."""
+    files = [path for path in main_tex.parent.rglob("*") if path.is_file() and not path.name.startswith(".")]
     if not files:
         return None
     return max(files, key=lambda path: path.stat().st_mtime).relative_to(main_tex.parent).as_posix()
@@ -1060,14 +1090,15 @@ def latest_tex(main_tex: Path) -> str | None:
 def watch_target(document: Path, focus: str | None) -> str | None:
     """
     What to focus on after a change: the --focus path, or with "auto" the
-    top-level file that reads the file saved last. None means a full build.
+    top-level file that reads the file saved last. None means a full build,
+    also when the newest file is main.tex, a class, a bibliography, a figure ...
     """
     if focus != "auto":
         return focus
 
     mapfile = cache_dir_for(document) / f"{document.stem}.focusmap"
-    changed = latest_tex(document)
-    if changed is None or changed == document.name or not mapfile.exists():
+    changed = latest_file(document)
+    if changed is None or changed == document.name or not changed.endswith(".tex") or not mapfile.exists():
         return None
     return accel.top_unit(accel.read_focusmap(mapfile), changed)
 
@@ -1126,7 +1157,7 @@ def watch(
                     entry = {"ok": build_focus(document, latexmk, target), "pdf": focus_paths(document)[0]}
                     entry["pdf"] = entry["pdf"].relative_to(OUT_DIR).as_posix()
                 else:
-                    entry, _ = build_document(document, latexmk)
+                    entry, _ = build_safely(document, latexmk, True, False)
 
                 if entry["ok"]:
                     built[document] = newest
