@@ -9,3 +9,15 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# The existing scripts raise inside except blocks without "from"; revisit when they change.
+ignore = ["B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/publish_release.py" = ["EXE001"]
