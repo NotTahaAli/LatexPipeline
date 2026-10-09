@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LaTeX Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230969da'/%3E%3Cpath d='M7 7h10M12 7v10' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="ui/style.css">
+<script type="importmap">
+{
+ "imports": {
+  "@codemirror/state": "https://esm.sh/@codemirror/state@6.5.2?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/view": "https://esm.sh/@codemirror/view@6.38.0?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/language": "https://esm.sh/@codemirror/language@6.11.0?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/commands": "https://esm.sh/@codemirror/commands@6.8.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/search": "https://esm.sh/@codemirror/search@6.5.10?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/autocomplete": "https://esm.sh/@codemirror/autocomplete@6.18.6?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@lezer/common": "https://esm.sh/@lezer/common@1.2.3?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@lezer/highlight": "https://esm.sh/@lezer/highlight@1.2.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@lezer/lr": "https://esm.sh/@lezer/lr@1.4.2?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr"
+ }
+}
+</script>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></symbol>
+    <symbol id="i-files" viewBox="0 0 24 24"><path d="M8 3h7l4 4v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M4 7v12a2 2 0 0 0 2 2h9"/></symbol>
+    <symbol id="i-outline" viewBox="0 0 24 24"><path d="M4 6h16M8 12h12M12 18h8"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17.5v.01"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4L4 9"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14 4l2-2"/><path d="M20 20v-5h-5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4"/></symbol>
+    <symbol id="i-cmd" viewBox="0 0 24 24"><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+    <symbol id="i-kbd" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></symbol>
+    <symbol id="i-para" viewBox="0 0 24 24"><path d="M13 4v16M17 4v16M13 4H9a4 4 0 0 0 0 8h4"/></symbol>
+    <symbol id="i-log" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
+    <symbol id="i-jump" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
+    <symbol id="i-bold" viewBox="0 0 24 24"><path d="M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z"/></symbol>
+    <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
+  </defs>
+</svg>
+
+<a class="skip" href="#cm">Skip to editor</a>
+<header id="topbar" role="banner">
+  <div class="brand" aria-hidden="true"><svg class="ic"><use href="#i-file"/></svg></div>
+  <label class="sr" for="doc">Document</label>
+  <select id="doc" title="Document"></select>
+  <button id="status" class="pill" aria-live="polite" aria-controls="drawer" aria-expanded="false" title="Build status. Click for problems and log">
+    <span class="dot"></span><span id="label">Connecting</span><span id="info" class="mute"></span>
+  </button>
+  <button id="errBadge" class="badge bad" hidden aria-controls="drawer" aria-expanded="false"></button>
+  <button id="warnBadge" class="badge warn" hidden aria-controls="drawer"></button>
+  <span class="spacer"></span>
+  <button id="visualBtn" class="btn" role="switch" aria-checked="false" title="Visual mode (Ctrl+Alt+V)"><svg class="ic"><use href="#i-eye"/></svg><span class="lbl">Visual</span></button>
+  <button id="rebuildBtn" class="btn icon" title="Rebuild from scratch" aria-label="Rebuild from scratch"><svg class="ic"><use href="#i-refresh"/></svg></button>
+  <div class="menu-wrap">
+    <button id="moreBtn" class="btn icon" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu" title="More" aria-label="More"><svg class="ic"><use href="#i-more"/></svg></button>
+    <div id="moreMenu" class="menu" role="menu" hidden></div>
+  </div>
+</header>
+
+<main id="work">
+  <aside id="side" hidden aria-label="Project sidebar">
+    <div class="side-tabs" role="tablist" aria-label="Sidebar">
+      <button role="tab" id="tab-files" aria-controls="panel-files" aria-selected="true"><svg class="ic"><use href="#i-files"/></svg>Files</button>
+      <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
+      <button class="icon x" id="sideClose" aria-label="Close sidebar" title="Close sidebar"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div id="panel-files" role="tabpanel" aria-labelledby="tab-files"><div id="tree" role="tree" aria-label="Files"></div></div>
+    <div id="panel-outline" role="tabpanel" aria-labelledby="tab-outline" hidden>
+      <div id="outlineHead" class="outline-head"></div>
+      <div id="outlineList" role="tree" aria-label="Document outline"></div>
+    </div>
+  </aside>
+
+  <section id="editorPane" aria-label="Editor">
+    <div class="tabbar">
+      <button id="sideBtn" class="icon" aria-controls="side" aria-expanded="false" title="Files and outline (Ctrl+B)" aria-label="Toggle files and outline"><svg class="ic"><use href="#i-files"/></svg></button>
+      <div id="tabs" role="tablist" aria-label="Open files"></div>
+    </div>
+    <div id="banner" class="banner" role="alert" hidden></div>
+    <div id="cmWrap"><div id="cm"></div><div id="imgPreview" hidden></div></div>
+    <div id="prose" hidden>
+      <div class="prose-head">
+        <strong>Paragraph</strong>
+        <span class="mute" id="proseNote"></span>
+        <span class="spacer"></span>
+        <button class="icon" id="pBold" aria-label="Bold" title="Bold (\textbf)"><svg class="ic"><use href="#i-bold"/></svg></button>
+        <button class="icon" id="pItalic" aria-label="Italic" title="Italic (\textit)"><svg class="ic"><use href="#i-italic"/></svg></button>
+        <button class="icon" id="pEmph" aria-label="Emphasis" title="Emphasis (\emph)"><span class="em">em</span></button>
+        <button class="icon" id="proseClose" aria-label="Close paragraph panel"><svg class="ic"><use href="#i-x"/></svg></button>
+      </div>
+      <div id="proseBody" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Paragraph, rich text" spellcheck="true"></div>
+    </div>
+    <div id="editorStatus">
+      <span id="saveState" aria-live="polite">Saved</span>
+      <span class="spacer"></span>
+      <span id="cursorPos" class="mute">Ln 1, Col 1</span>
+      <button id="proseBtn" class="mini" aria-controls="prose" aria-expanded="false" title="Edit paragraph as rich text"><svg class="ic"><use href="#i-para"/></svg>Paragraph</button>
+    </div>
+  </section>
+
+  <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize editor and PDF" aria-valuemin="20" aria-valuemax="80" aria-valuenow="50" tabindex="0"></div>
+
+  <section id="pdfPane" aria-label="PDF preview">
+    <div class="pdf-tools" role="toolbar" aria-label="PDF controls">
+      <button id="zOut" class="icon" aria-label="Zoom out" title="Zoom out"><svg class="ic"><use href="#i-minus"/></svg></button>
+      <span id="zLevel" class="mute" aria-live="polite">133%</span>
+      <button id="zIn" class="icon" aria-label="Zoom in" title="Zoom in"><svg class="ic"><use href="#i-plus"/></svg></button>
+      <button id="zFit" class="icon" aria-label="Fit width" title="Fit width"><svg class="ic"><use href="#i-fit"/></svg></button>
+      <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
+    </div>
+    <div id="viewer" tabindex="0" aria-label="PDF pages"><div id="pages"></div><div id="empty" hidden></div></div>
+  </section>
+</main>
+
+<section id="drawer" hidden aria-label="Problems and log">
+  <div class="drawer-bar">
+    <div class="side-tabs" role="tablist" aria-label="Drawer">
+      <button role="tab" id="dtab-problems" aria-controls="dpanel-problems" aria-selected="true"><svg class="ic"><use href="#i-alert"/></svg>Problems <span id="problemCount" class="count"></span></button>
+      <button role="tab" id="dtab-lint" aria-controls="dpanel-lint" aria-selected="false">Lint <span id="lintCount" class="count"></span></button>
+      <button role="tab" id="dtab-log" aria-controls="dpanel-log" aria-selected="false"><svg class="ic"><use href="#i-log"/></svg>Log</button>
+    </div>
+    <span class="spacer"></span>
+    <button class="icon" id="drawerClose" aria-label="Close panel" title="Close (Esc)"><svg class="ic"><use href="#i-x"/></svg></button>
+  </div>
+  <div id="dpanel-problems" role="tabpanel" aria-labelledby="dtab-problems"><ul id="problems" class="plist"></ul></div>
+  <div id="dpanel-lint" role="tabpanel" aria-labelledby="dtab-lint" hidden><ul id="lintList" class="plist"></ul></div>
+  <div id="dpanel-log" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
+</section>
+
+<div id="toast" role="status" hidden></div>
+
+<dialog id="palette" aria-label="Command palette">
+  <input id="paletteInput" type="text" role="combobox" aria-expanded="true" aria-controls="paletteList" aria-autocomplete="list" placeholder="Type a command..." autocomplete="off" spellcheck="false">
+  <ul id="paletteList" role="listbox"></ul>
+</dialog>
+
+<dialog id="settings" aria-labelledby="settingsTitle">
+  <form method="dialog">
+    <div class="dlg-head"><h2 id="settingsTitle">Settings</h2><button class="icon" value="close" aria-label="Close settings"><svg class="ic"><use href="#i-x"/></svg></button></div>
+    <div class="fields">
+      <label for="sAutosave">Autosave</label>
+      <select id="sAutosave"><option value="0">Off</option><option value="500">After 0.5 s idle</option><option value="1000">After 1 s idle</option><option value="3000">After 3 s idle</option></select>
+      <label for="sTheme">Theme</label>
+      <select id="sTheme"><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select>
+      <label for="sKeys">Keybindings</label>
+      <select id="sKeys"><option value="default">Default</option><option value="vim">Vim</option><option value="emacs">Emacs</option></select>
+      <label for="sFont">Editor font size</label>
+      <input id="sFont" type="number" min="10" max="28" step="1">
+      <label for="sZoom">PDF zoom (%)</label>
+      <input id="sZoom" type="number" min="30" max="500" step="10">
+      <label for="sVisual">Visual mode</label>
+      <label class="check"><input id="sVisual" type="checkbox"> On by default</label>
+      <label for="sInverse">Double-click in PDF</label>
+      <select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="cheat" aria-labelledby="cheatTitle">
+  <form method="dialog">
+    <div class="dlg-head"><h2 id="cheatTitle">Keyboard shortcuts</h2><button class="icon" value="close" aria-label="Close shortcuts"><svg class="ic"><use href="#i-x"/></svg></button></div>
+    <dl id="cheatList"></dl>
+  </form>
+</dialog>
+
+<script type="module" src="ui/app.js"></script>
+</body>
+</html>
