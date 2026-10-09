@@ -782,7 +782,8 @@ class Rooms(SharedState):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        (root / "main.tex").write_text("seed\r\ntext", encoding="utf-8", newline="")
+        with open(root / "main.tex", "w", encoding="utf-8", newline="") as handle:
+            handle.write("seed\r\ntext")
         patch = mock.patch.dict(serve.DOCS, {"d": root / "main.tex"}, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
