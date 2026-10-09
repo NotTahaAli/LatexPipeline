@@ -1,5 +1,7 @@
 """Pure logic in scripts/accel.py: the recorded \\input tree and --focus selection."""
 
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +64,81 @@ class TikzDetectionTests(unittest.TestCase):
             self.assertFalse(accel.uses_tikz(root))
             (root / "my.cls").write_text(r"\RequirePackage{tikz}", encoding="utf-8")
             self.assertTrue(accel.uses_tikz(root))
+
+
+HEAD = "\\documentclass{article}\n\\usepackage{tikz}\n\\pagestyle{empty}\n"
+
+
+def pic(text):
+    return "\\begin{tikzpicture}\\node{" + text + "};\\end{tikzpicture}\n"
+
+
+@unittest.skipUnless(shutil.which("pdflatex") and shutil.which("pdftotext"), "needs pdflatex and pdftotext")
+class ExternalizedBuildTests(unittest.TestCase):
+    """The figure pipeline end to end, with real LaTeX, on tiny documents."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.doc = Path(self.tmp.name) / "doc"
+        self.doc.mkdir()
+        self.build = Path(self.tmp.name) / "cache"
+        self.build.mkdir()
+
+    def write(self, name, text):
+        (self.doc / name).write_text(text, encoding="utf-8")
+
+    def render(self):
+        """One externalized build in the same cache; returns the PDF text."""
+        figures = accel.Figures(self.doc / "main.tex", self.build, "pdflatex", False, 2)
+        tex = ["pdflatex", "-interaction=batchmode", "-halt-on-error", f"-output-directory={self.build}"]
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "check": True}
+        subprocess.run(figures.discover_command(), cwd=self.doc, **quiet)
+        for _ in range(2):
+            changed, errors = figures.sync(lambda text: None)
+            self.assertEqual(errors, [])
+            subprocess.run(
+                [*tex, "-jobname=main", figures.main_pretex + r"\input{main.tex}"],
+                cwd=self.doc, **quiet,
+            )
+        self.figures = figures
+        return subprocess.run(
+            ["pdftotext", str(self.build / "main.pdf"), "-"], capture_output=True, text=True,
+        ).stdout.split()
+
+    def test_cache_hit_after_reordering_chapters(self):
+        self.write("a.tex", pic("AAA"))
+        self.write("b.tex", pic("BBB"))
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{a}\\input{b}\n\\end{document}\n")
+        self.assertEqual(self.render(), ["AAA", "BBB"])
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{b}\\input{a}\n\\end{document}\n")
+        self.assertEqual(self.render(), ["BBB", "AAA"])
+
+    def test_pictures_with_identical_source_stay_distinct(self):
+        loop = "\\foreach \\c in {red,blue}{\\begin{tikzpicture}\\node{\\c};\\end{tikzpicture}}\n"
+        self.write("main.tex", HEAD + "\\begin{document}\n" + loop + "\\end{document}\n")
+        self.assertEqual(self.render(), ["red", "blue"])
+        self.write("main.tex", HEAD + "\\begin{document}\n" + pic("NEW") + loop + "\\end{document}\n")
+        self.assertEqual(self.render(), ["NEW", "red", "blue"])
+
+    def test_file_input_by_the_preamble_invalidates_figures(self):
+        self.write("styles.tex", "\\newcommand{\\lbl}{one}\n")
+        self.write("main.tex", HEAD + "\\input{styles}\n\\begin{document}\n" + pic("\\lbl") + "\\end{document}\n")
+        self.assertEqual(self.render(), ["one"])
+        self.write("styles.tex", "\\newcommand{\\lbl}{two}\n")
+        self.assertEqual(self.render(), ["two"])
+
+    def test_unused_cached_figures_are_deleted(self):
+        self.write("main.tex", HEAD + "\\begin{document}\n" + pic("one") + "\\end{document}\n")
+        self.render()
+        self.write("main.tex", HEAD + "\\begin{document}\n" + pic("two") + "\\end{document}\n")
+        self.render()
+        self.assertEqual(len(list(self.figures.cache.glob("*.pdf"))), 1)
+
+    def test_pictures_that_need_the_page_disable_externalization(self):
+        self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}[remember picture,overlay]"
+                   "\\node{x};\\end{tikzpicture}\n\\end{document}\n")
+        self.assertFalse(accel.uses_tikz(self.doc))
 
 
 if __name__ == "__main__":
