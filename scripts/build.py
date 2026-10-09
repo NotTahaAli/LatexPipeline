@@ -303,7 +303,7 @@ CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
 LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
 LATEX_WARNING = re.compile(r"^(?:LaTeX|Package|Class)\b.*\bWarning", re.MULTILINE)
-LATEX_PAGES = re.compile(r"^Output written on .*\((\d+) pages?", re.MULTILINE)
+LATEX_PAGES = re.compile(r"^Output written on .*?\((\d+) pages?", re.MULTILINE | re.DOTALL)
 
 
 class ConfigError(Exception):
