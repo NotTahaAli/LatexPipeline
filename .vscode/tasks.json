@@ -14,7 +14,7 @@
       "source": "build.py",
       "fileLocation": ["relative", "${workspaceFolder}"],
       "pattern": {
-        "regexp": "^\\s*(files/.*?):(\\d+): (\\S.*)$",
+        "regexp": "^\\s*((?:files|bench)/.*?):(\\d+): (\\S.*)$",
         "file": 1,
         "line": 2,
         "message": 3
