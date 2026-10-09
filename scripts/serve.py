@@ -58,6 +58,7 @@ STATE: dict[str, dict] = {}  # doc name -> status dict sent to browsers
 DOCS: dict[str, Path] = {}  # doc name -> main.tex
 FORCE: set[str] = set()  # documents the browser asked to rebuild from scratch
 SETTINGS = {"editor": "vscode", "check_host": True}
+BUS_MAX_BYTES = 16 * 1024 * 1024  # JSON size of the durable log; the ephemeral one gets a quarter
 
 
 # ---------------------------------------------------------------------------
@@ -70,23 +71,29 @@ class Bus:
     long log; ephemeral ones (cursors, presence) in a short one and are never the reason for a resync.
     """
 
-    def __init__(self, keep: int = 2000, ephemeral: int = 300) -> None:
+    def __init__(self, keep: int = 2000, ephemeral: int = 300, max_bytes: int = BUS_MAX_BYTES) -> None:
         self.cond = threading.Condition()
         self.rev = 0
         self.floor = 0  # newest revision dropped from the durable log
-        self.log: collections.deque = collections.deque(maxlen=keep)
-        self.eph: collections.deque = collections.deque(maxlen=ephemeral)
+        self.keep, self.keep_eph, self.max_bytes = keep, ephemeral, max_bytes
+        self.log: collections.deque = collections.deque()  # (message, size)
+        self.eph: collections.deque = collections.deque()
+        self.bytes = {"log": 0, "eph": 0}
 
     def publish(self, type_: str, data, topic: str = "doc", ephemeral: bool = False) -> int:
         with self.cond:
             self.rev += 1
             message = {"rev": self.rev, "topic": topic, "type": type_, "data": data}
-            if ephemeral:
-                self.eph.append(message)
-            else:
-                if len(self.log) == self.log.maxlen:
-                    self.floor = self.log[0]["rev"]
-                self.log.append(message)
+            size = len(json.dumps(data)) + 64
+            which, queue, limit = ("eph", self.eph, self.keep_eph) if ephemeral else ("log", self.log, self.keep)
+            queue.append((message, size))
+            self.bytes[which] += size
+            cap = self.max_bytes // 4 if ephemeral else self.max_bytes  # Memory is bounded by bytes, not only count.
+            while len(queue) > 1 and (len(queue) > limit or self.bytes[which] > cap):
+                old, old_size = queue.popleft()
+                self.bytes[which] -= old_size
+                if not ephemeral:
+                    self.floor = old["rev"]
             self.cond.notify_all()
             return self.rev
 
@@ -95,12 +102,16 @@ class Bus:
         with self.cond:
             if rev is None or rev > self.rev or rev < self.floor:
                 return [{"rev": self.rev, "topic": "doc", "type": "state", "data": snapshot(), "resync": True}]
-            return sorted((m for m in itertools.chain(self.log, self.eph) if m["rev"] > rev), key=lambda m: m["rev"])
+            return sorted(
+                (m for m, _ in itertools.chain(self.log, self.eph) if m["rev"] > rev), key=lambda m: m["rev"],
+            )
 
     def wait(self, rev: int, timeout: float) -> list[dict]:
         """Block until something newer than rev exists (or timeout); return it."""
         deadline = time.monotonic() + timeout
         with self.cond:
+            if rev > self.rev:  # From a previous server run: resync now instead of holding the poll open.
+                return self.since(None)
             while self.rev <= rev and not STOP.is_set():
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -123,8 +134,14 @@ def handle_client_message(message: dict, client: str, role: str = "owner") -> di
     return handler(message, client, role) if handler else None
 
 
+Y_KINDS = ("y-update", "y-aware", "y-leader", "y-gone")  # data["room"] is "<doc>\n<path>"
+
+
 def visible(messages: list[dict], role: str) -> list[dict]:
-    """What a role may see on the bus: shared sessions only hear about the shared document."""
+    """
+    What a role may see on the bus: shared sessions only hear about the shared document. A whitelist: a message
+    type not handled here (or one naming another document or a build-config file) is dropped.
+    """
     if role == "owner":
         return messages
     shared = SHARE["doc"]
@@ -133,7 +150,16 @@ def visible(messages: list[dict], role: str) -> list[dict]:
         kind, data = message["type"], message["data"]
         if kind == "state":
             message = {**message, "data": {"docs": [d for d in data["docs"] if d["name"] == shared]}}
-        elif kind in ("fs", "forward") and data.get("doc") != shared:
+        elif kind in ("fs", "forward"):
+            if data.get("doc") != shared:
+                continue
+        elif kind in Y_KINDS:
+            doc, _, path = str(data.get("room")).partition("\n")
+            if doc != shared or is_rc(path):
+                continue
+        elif kind == "presence":
+            message = {**message, "data": {"users": presence_for(data["users"], role)}}
+        else:
             continue
         out.append(message)
     return out
@@ -837,18 +863,21 @@ def inverse(main_tex: Path, query: dict) -> dict:
     return {"file": source.as_posix(), "rel": rel, "line": line, "link": editor_link(source, line)}
 
 
-def forward(query: dict) -> tuple[str, dict]:
-    """Returns (doc name, {page, x, y, w, h}) in PDF points from the page's top-left."""
+def forward(query: dict, only: str | None = None) -> tuple[str, dict]:
+    """
+    Returns (doc name, {page, x, y, w, h}) in PDF points from the page's top-left. With `only`, files of other
+    documents answer exactly like missing ones, so the reply says nothing about what else is on this machine.
+    """
     raw = Path(query.get("file", [""])[0])
     name = query.get("doc", [""])[0]
     here = DOCS[name].parent / raw if name in DOCS else raw
     candidates = [raw] if raw.is_absolute() else [here, build.ROOT_DIR / raw]
     source = next((c.resolve() for c in candidates if c.is_file()), None)
-    if source is None:
-        raise SynctexError(f"No such file: {raw}")
-    owner = max((n for n, d in DOCS.items() if d.parent.resolve() in source.parents), key=len, default=None)
-    if owner is None:
-        raise SynctexError(f"{raw} is not inside a served document's directory.")
+    owner = None
+    if source is not None:
+        owner = max((n for n, d in DOCS.items() if d.parent.resolve() in source.parents), key=len, default=None)
+    if owner is None or (only is not None and owner != only):
+        raise SynctexError(f"No such file in the document: {raw}")
     main_tex = DOCS[owner]
     line = int(number(query, "line", "1"))
     column = int(number(query, "col", "-1"))
@@ -871,7 +900,7 @@ def forward(query: dict) -> tuple[str, dict]:
 
 SHARE: dict = {
     "on": False, "tokens": {}, "doc": None, "provider": None, "public": None, "hosts": set(), "status": "off",
-    "error": None, "tunnel": None, "port": 0,
+    "error": None, "tunnel": None, "port": 0, "gen": 0,
 }
 SHARE_LOCK = threading.Lock()
 ROLES = ("owner", "edit", "view")
@@ -881,6 +910,35 @@ COMMAND_KEYS = {
     "ps2pdf", "pdf_previewer", "dvi_previewer", "ps_previewer", "print_pdf_command", "e", "r",
 }  # -key=value forms that name a program to run
 RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # configuration that can run programs
+# Builds while sharing: no shell escape, and TeX may only read and write below the document's directory
+# (openin_any=p also refuses "..", absolute paths and dotfiles). Environment variables beat texmf.cnf.
+SHARE_ENV = {"shell_escape": "f", "openin_any": "p", "openout_any": "p"}
+_SAVED_ENV: dict[str, str | None] = {}
+# latexmk options that take a program, a file or code, or move the output; refused in every spelling.
+VALUE_KEYS = {
+    "e", "r", "latexoption", "pretex", "usepretex", "cnf-line", "outdir", "output-directory", "auxdir",
+    "aux-directory", "jobname",
+}
+LUA_MESSAGE = "LuaLaTeX is disabled while sharing (it can run code)."
+
+
+def is_rc(path: str) -> bool:
+    return posixpath.basename(path).lower() in RC_NAMES
+
+
+def share_env(on: bool) -> None:
+    """Put the build restrictions into this process's environment (builds inherit it) or take them out again."""
+    if on and not _SAVED_ENV:
+        for key, value in SHARE_ENV.items():
+            _SAVED_ENV[key] = os.environ.get(key)
+            os.environ[key] = value
+    elif not on and _SAVED_ENV:
+        for key, old in _SAVED_ENV.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+        _SAVED_ENV.clear()
 REBUILD_LIMIT = (6, 60.0)  # builds per window (seconds) an editor may trigger
 RATE: dict[str, collections.deque] = {}
 
@@ -917,44 +975,54 @@ def rate_ok(key: str, limit: int, window: float) -> bool:
 
 
 def unsafe_latexmk_arg(arg: str) -> bool:
-    """Flags that enable shell escape or let a document pick the programs latexmk runs."""
-    low = arg.lower()
-    if any(token in low for token in SHELL_TOKENS) or low in ("-e", "--e", "-r", "--r"):
+    """Flags that enable shell escape, load rc files or code, move the output, or pick the programs latexmk runs."""
+    low = arg.lower().strip()
+    if any(token in low for token in (*SHELL_TOKENS, "shell_escape", "write18", "lua")):
         return True
-    key = re.match(r"^--?([a-z0-9_]+)=", low)
-    return bool(key) and key.group(1) in COMMAND_KEYS
+    key = re.match(r"^--?([a-z0-9_-]+)(=|$)", low)
+    if not key:
+        return False
+    return key.group(1) in VALUE_KEYS or (key.group(2) == "=" and key.group(1) in COMMAND_KEYS)
 
 
 _READ_SETTINGS = build.read_settings
 
 
 def guarded_read_settings(main_tex: Path) -> dict:
-    """build.read_settings, but while sharing: no shell escape, and no latexmk_args that run commands."""
+    """build.read_settings, but while sharing: no LuaLaTeX, shell escape, rc files or latexmk_args that run code."""
     settings = _READ_SETTINGS(main_tex)
     if SHARE["on"]:
+        if settings["engine"] == "lualatex":
+            raise build.ConfigError(f"{main_tex.parent.name}: {LUA_MESSAGE}")
         bad = [arg for arg in settings["latexmk_args"] if unsafe_latexmk_arg(arg)]
         if bad:
             raise build.ConfigError(f"{main_tex.parent.name}/build.toml: {bad[0]!r} is not allowed while sharing")
         settings["shell_escape"] = False
+        settings["latexmk_args"] = ["-norc", *settings["latexmk_args"]]  # A latexmkrc in the document would run code.
     return settings
 
 
 build.read_settings = guarded_read_settings
 
 
-def share_enable(doc: str | None, provider: str, port: int) -> None:
+def share_enable(doc: str | None, provider: str, port: int) -> int:
+    """Turn sharing on; returns this share's generation, so a late tunnel thread can tell it was stopped."""
     with SHARE_LOCK:
+        share_env(True)
+        SHARE["gen"] = SHARE.get("gen", 0) + 1
         SHARE.update(
             on=True, doc=doc, provider=provider, status="starting", error=None, public=None, port=port,
             tokens={"owner": new_token(), "edit": new_token(), "view": new_token()},
         )
+        return SHARE["gen"]
 
 
-def share_disable() -> None:
-    tunnel = None
+def share_disable(error: str | None = None) -> None:
     with SHARE_LOCK:
         tunnel, SHARE["tunnel"] = SHARE["tunnel"], None
-        SHARE.update(on=False, tokens={}, public=None, hosts=set(), status="off", error=None, provider=None)
+        SHARE["gen"] = SHARE.get("gen", 0) + 1  # Whatever is still starting belongs to a share that no longer exists.
+        SHARE.update(on=False, tokens={}, public=None, hosts=set(), status="off", error=error, provider=None)
+        share_env(False)
     if tunnel:
         tunnel.stop()
 
@@ -1091,6 +1159,8 @@ class Tunnel:
         self.proc: subprocess.Popen | None = None
         self.url: str | None = None
         self.lines: collections.deque = collections.deque(maxlen=40)
+        self.lock = threading.Lock()
+        self.stopped = False  # Set by stop(); start() checks it under the lock, so no process outlives a stop.
 
     def _read(self) -> None:
         for line in self.proc.stdout:
@@ -1104,10 +1174,13 @@ class Tunnel:
         argv = [*spec["cmd"](), *spec["args"](self.port)]
         windows = os.name == "nt"
         group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}
-        self.proc = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            errors="replace", **group,
-        )
+        with self.lock:
+            if self.stopped:
+                raise RuntimeError("Sharing was stopped.")
+            self.proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                errors="replace", **group,
+            )
         threading.Thread(target=self._read, daemon=True).start()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not STOP.is_set():
@@ -1128,8 +1201,11 @@ class Tunnel:
         return " | ".join(list(self.lines)[-4:])
 
     def stop(self) -> None:
-        if self.proc:
-            kill_tree(self.proc)
+        with self.lock:
+            self.stopped = True
+            proc = self.proc
+        if proc:
+            kill_tree(proc)
 
 
 def ngrok_api_url(api: str) -> str | None:
@@ -1147,27 +1223,37 @@ def share_start(provider: str, doc: str | None, port: int, wait: bool = False) -
     with SHARE_LOCK:
         if SHARE["on"]:
             raise ApiError("Already sharing. Stop sharing first.", 409)
-    share_enable(doc, chosen, port)
+    gen = share_enable(doc, chosen, port)
 
     def run() -> None:
+        tunnel = None
         try:
             if chosen == "local":
-                SHARE["status"] = "ready"
+                with SHARE_LOCK:
+                    if SHARE["gen"] == gen:
+                        SHARE["status"] = "ready"
                 return
             tunnel = Tunnel(chosen, port)
-            SHARE["tunnel"] = tunnel
+            with SHARE_LOCK:
+                if SHARE["gen"] != gen:
+                    return  # Stopped before the tunnel was even created.
+                SHARE["tunnel"] = tunnel
             url = tunnel.start()
             host = (urlsplit(url).hostname or "").lower()
             with SHARE_LOCK:
-                if SHARE["tunnel"] is tunnel:
+                if SHARE["gen"] == gen and SHARE["on"]:
                     SHARE.update(public=url, status="ready")
                     SHARE["hosts"].add(host)
-        except RuntimeError as exc:
-            if SHARE["tunnel"] is not tunnel:
-                return  # Sharing was stopped meanwhile.
-            build.error(f"Share failed: {exc}")
-            share_disable()
-            SHARE["error"] = str(exc)
+                    return
+            tunnel.stop()  # Sharing was stopped while the tunnel came up.
+        except (RuntimeError, OSError) as exc:
+            if tunnel:
+                tunnel.stop()
+            with SHARE_LOCK:
+                current = SHARE["gen"] == gen
+            if current:
+                build.error(f"Share failed: {exc}")
+                share_disable(str(exc))
 
     if wait:
         run()
@@ -1186,7 +1272,10 @@ atexit.register(lambda: SHARE["tunnel"] and SHARE["tunnel"].stop())
 # it; Yjs updates are idempotent and commutative, so duplicates and reordering are harmless. Disk writes are done
 # by ONE client per room, the leader (the earliest-joined member who may edit), through the ordinary PUT API, so
 # they stay atomic and serialized by WRITE_LOCK. The leader also folds external disk edits into the Yjs document.
-# ponytail: logs grow with the session and die with the room (no compaction); a leader-made snapshot would bound it.
+# ponytail: logs die with the room and are capped at MAX_ROOM_BYTES (further edits are refused); a leader-made
+# snapshot would allow compaction.
+# A room remembers the disk version and text it last matched (room["disk"], room["saved"]); a leader who takes over
+# after the file changed behind the room's back is told to merge that change instead of overwriting it.
 
 ROOMS: dict[str, dict] = {}
 CLIENTS: dict[str, dict] = {}
@@ -1194,6 +1283,9 @@ COLLAB_LOCK = threading.RLock()
 ROOM_GRACE = float(os.environ.get("LP_ROOM_GRACE", "60"))  # an emptied room (and its log) lingers this long
 CLIENT_TIMEOUT = 60.0
 MAX_UPDATE = 2 * 1024 * 1024
+MAX_ROOM_BYTES = 8 * 1024 * 1024  # base64 update log per room; the server cannot compact what it never decodes
+MAX_ROOMS_PER_CLIENT = 40
+MAX_ROOMS = 300
 
 
 def room_id(doc: str, path: str) -> str:
@@ -1203,7 +1295,9 @@ def room_id(doc: str, path: str) -> str:
 def bind_client(client: str, role: str) -> bool:
     """Remember who a client id belongs to. False if the id was already taken by another role."""
     with COLLAB_LOCK:
-        record = CLIENTS.setdefault(client, {"role": role, "rooms": set(), "name": None, "color": None, "path": None})
+        record = CLIENTS.setdefault(client, {
+            "role": role, "rooms": set(), "name": None, "color": None, "path": None, "doc": None,
+        })
         record["seen"] = time.monotonic()
         return record["role"] == role
 
@@ -1212,20 +1306,51 @@ def room_leader(room: dict) -> str | None:
     return next((cid for cid, m in room["members"].items() if m["role"] in ("owner", "edit")), None)
 
 
+def room_drift(room: dict) -> dict:
+    """
+    Empty when the file is as the room last saw it. Otherwise it changed on disk behind the room's back (the
+    leader was away), and the next leader must merge room["saved"] -> disk before it saves anything.
+    """
+    try:
+        current = version_of(resolve_in_doc(DOCS[room["doc"]].parent, room["path"]).stat())
+    except (OSError, ApiError, KeyError):
+        current = None
+    if current == room["disk"]:
+        return {}
+    return {"stale": True, "base": room["saved"], "gone": current is None and room["disk"] is not None}
+
+
 def publish_leader(rid: str, room: dict) -> None:
     leader = room_leader(room)
     if leader != room.get("leader"):
         room["leader"] = leader
-        BUS.publish("y-leader", {"room": rid, "leader": leader})
+        BUS.publish("y-leader", {"room": rid, "leader": leader, **(room_drift(room) if leader else {})})
 
 
-def presence() -> dict:
+def note_write(doc: str, path: str, text: str, version: str) -> None:
+    """A save went through: the room, if any, now matches the disk again."""
+    with COLLAB_LOCK:
+        room = ROOMS.get(room_id(doc, path))
+        if room:
+            room["disk"], room["saved"] = version, text.replace("\r\n", "\n")
+
+
+def presence(role: str = "owner") -> dict:
     with COLLAB_LOCK:
         users = [
-            {"cid": cid, "name": c["name"], "color": c["color"], "role": c["role"], "path": c["path"]}
+            {"cid": cid, "name": c["name"], "color": c["color"], "role": c["role"], "path": c["path"], "doc": c["doc"]}
             for cid, c in CLIENTS.items() if c["name"]
         ]
-    return {"users": sorted(users, key=lambda u: (u["name"] or "", u["cid"]))}
+    users.sort(key=lambda u: (u["name"] or "", u["cid"]))
+    return {"users": users if role == "owner" else presence_for(users, role)}
+
+
+def presence_for(users: list[dict], role: str) -> list[dict]:
+    """Shared sessions only see who is in the shared document, and not which build-config file they have open."""
+    return [
+        {**u, "path": None if is_rc(u.get("path") or "") else u["path"]}
+        for u in users if role == "owner" or u.get("doc") == SHARE["doc"]
+    ]
 
 
 def publish_presence() -> None:
@@ -1236,9 +1361,14 @@ def check_room(doc, path, role: str) -> tuple[str, Path]:
     """Validate a room request: a served document, and for shared sessions the shared one."""
     if not isinstance(doc, str) or doc not in DOCS or (role != "owner" and doc != SHARE["doc"]):
         raise ApiError("Unknown document.", 404)
+    if role != "owner" and isinstance(path, str) and is_rc(path):  # The PUT API refuses these too.
+        raise ApiError("This file configures the build and cannot be edited through a shared link.", 403)
     if not isinstance(path, str) or file_kind(path) != "text":
         raise ApiError("Not a text file.", 415)
-    return room_id(doc, path), resolve_in_doc(DOCS[doc].parent, path)
+    target = resolve_in_doc(DOCS[doc].parent, path)
+    if role == "view" and not target.is_file():
+        raise ApiError("No such file.", 404)
+    return room_id(doc, path), target
 
 
 def reply_error(exc: ApiError) -> dict:
@@ -1254,8 +1384,10 @@ def on_hello(message: dict, client: str, role: str) -> dict:
         record["color"] = color if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "#0969da"
         path = data.get("path")
         record["path"] = path[:300] if isinstance(path, str) else None
+        doc = data.get("doc")
+        record["doc"] = doc if isinstance(doc, str) and doc in DOCS else None
     publish_presence()
-    return {"type": "presence", "topic": "sys", "data": presence()}
+    return {"type": "presence", "topic": "sys", "data": presence(role)}
 
 
 def on_join(message: dict, client: str, role: str) -> dict:
@@ -1264,22 +1396,29 @@ def on_join(message: dict, client: str, role: str) -> dict:
         rid, path = check_room(data.get("doc"), data.get("path"), role)
     except ApiError as exc:
         return reply_error(exc)
-    epoch = data.get("epoch") if isinstance(data.get("epoch"), str) and role != "view" else None
+    seen = data.get("epoch") if isinstance(data.get("epoch"), str) else None
+    epoch = seen if role != "view" else None
     with COLLAB_LOCK:
         room = ROOMS.get(rid)
         conflict = False
+        if rid not in CLIENTS[client]["rooms"] and len(CLIENTS[client]["rooms"]) >= MAX_ROOMS_PER_CLIENT:
+            return reply_error(ApiError("Too many files open in shared editing.", 429))
         if room is None:
+            if len(ROOMS) >= MAX_ROOMS:
+                return reply_error(ApiError("Too many shared files open on this server.", 503))
             room = ROOMS[rid] = {
                 "epoch": epoch or secrets.token_hex(8), "log": [], "aware": {}, "members": {}, "gone_at": None,
-                "claimed": bool(epoch), "text": "", "eol": "\n", "leader": None,
+                "claimed": bool(epoch), "text": "", "eol": "\n", "leader": None, "bytes": 0,
+                "doc": data["doc"], "path": data["path"], "disk": None, "saved": "",
             }
-            if not epoch:  # The seed every first joiner builds identically; kept in the room so it stays consistent.
-                try:
-                    found = read_text_file(DOCS[data["doc"]].parent, data["path"])
+            try:  # The seed every first joiner builds identically; kept in the room so it stays consistent.
+                found = read_text_file(DOCS[data["doc"]].parent, data["path"])
+                room["disk"], room["saved"] = found["version"], found["text"]
+                if not epoch:
                     room["text"], room["eol"] = found["text"], found["eol"]
-                except ApiError:
-                    pass
-        elif epoch and epoch != room["epoch"]:
+            except ApiError:
+                pass
+        elif seen and seen != room["epoch"]:
             conflict = True
         room["gone_at"] = None
         aid = data.get("aid") if isinstance(data.get("aid"), int) else None
@@ -1291,6 +1430,7 @@ def on_join(message: dict, client: str, role: str) -> dict:
         reply = {
             "room": rid, "epoch": room["epoch"], "updates": list(room["log"]), "aware": dict(room["aware"]),
             "leader": room["leader"], "seed": seed, "eol": room["eol"], "conflict": conflict,
+            **(room_drift(room) if room["leader"] is None or room["leader"] == client else {}),
         }
     return {"type": "y-state", "topic": "sys", "data": reply}
 
@@ -1302,12 +1442,19 @@ def on_update(message: dict, client: str, role: str) -> dict | None:
         return reply_error(ApiError("This link is view-only.", 403))
     if not isinstance(update, str) or len(update) > MAX_UPDATE:
         return reply_error(ApiError("Bad update.", 413))
+    if role != "owner":
+        doc, _, path = str(rid).partition("\n")
+        if doc != SHARE["doc"] or is_rc(path):
+            return reply_error(ApiError("This file cannot be edited through a shared link.", 403))
     with COLLAB_LOCK:
         room = ROOMS.get(rid)
         if room is None or client not in room["members"]:
             return reply_error(ApiError("Join the room first.", 409))
         if len(room["log"]) <= 3 and update in room["log"]:
             return None  # Two clients seeding the same file produce the same bytes.
+        if room["bytes"] + len(update) > MAX_ROOM_BYTES:
+            return reply_error(ApiError("The shared editing history of this file is full; save and reopen it.", 413))
+        room["bytes"] += len(update)
         room["log"].append(update)
         BUS.publish("y-update", {"room": rid, "u": update, "cid": client})
     return None
@@ -1469,6 +1616,7 @@ def health(role: str = "owner") -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+    timeout = 75  # Socket timeout: a stalled client cannot hold a thread forever. The UI pings every 20 s.
     role = "owner"
     token = None
 
@@ -1633,6 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
         result = write_text_file(
             root, query.get("path", [""])[0], data.get("text"), data.get("base"), data.get("eol", "\n"),
         )
+        note_write(query["doc"][0], query.get("path", [""])[0], data["text"], result["version"])
         self.json(result)
 
     def get(self) -> None:
@@ -1686,9 +1835,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise SynctexError("Unknown document.")
             self.json(inverse(DOCS[name], query))
         elif path == "/forward":
-            name, box = forward(query)
-            if self.role != "owner" and name != SHARE["doc"]:
-                raise ApiError("Not part of the shared document.", 403)
+            name, box = forward(query, None if self.role == "owner" else SHARE["doc"])
             box["doc"] = name
             if "quiet" not in query:
                 broadcast("forward", box)
@@ -1744,8 +1891,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def websocket(self, query: dict) -> None:
         key = self.headers.get("Sec-WebSocket-Key")
-        if "websocket" not in self.headers.get("Upgrade", "").lower() or not key or not self.same_origin():
+        if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
             self.reply(400, b"Expected a WebSocket upgrade", "text/plain")
+            return
+        if not self.same_origin():  # Has already answered 403.
             return
         client = str(query.get("cid", ["?"])[0])[:64]
         if not bind_client(client, self.role):

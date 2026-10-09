@@ -935,7 +935,7 @@ if (readOnly) {
 // ---- bus, documents ---------------------------------------------------------------------------------------------
 const channel = new Channel();
 const collab = collabLibs && config.collab !== false ? new Collab(channel, api, {
-  user: () => me, role, saveDelay: () => settings.autosave || 1000,
+  user: () => me, doc: () => cur, role, saveDelay: () => settings.autosave || 1000,
   onChange: (room) => {
     const key = [room.dirty, room.saving, room.error, room.isLeader].join();
     if (room.shown === key) return;

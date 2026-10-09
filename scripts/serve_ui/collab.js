@@ -38,16 +38,16 @@ export function mergeInto(ytext, base, target) {
 }
 
 export class Collab {
-  /** user() -> {name, color}; callbacks: onChange(room), onRebind(room), onWarn(text) */
-  constructor(channel, api, { user, role, saveDelay, onChange, onRebind, onWarn, onPresence }) {
-    Object.assign(this, { channel, api, user, role, saveDelay, onChange, onRebind, onWarn, onPresence });
+  /** user() -> {name, color}, doc() -> the document being viewed; callbacks: onChange(room), onRebind(room), onWarn(text) */
+  constructor(channel, api, { user, doc, role, saveDelay, onChange, onRebind, onWarn, onPresence }) {
+    Object.assign(this, { channel, api, user, doc, role, saveDelay, onChange, onRebind, onWarn, onPresence });
     this.rooms = new Map();
     this.down = false;
     channel.on("y-state", (d) => this.rooms.get(d.room)?.onState(d));
     channel.on("y-update", (d) => { if (d.cid !== channel.cid) this.rooms.get(d.room)?.onRemote(d.u); });
     channel.on("y-aware", (d) => { if (d.cid !== channel.cid) this.rooms.get(d.room)?.onAware(d.u); });
     channel.on("y-gone", (d) => this.rooms.get(d.room)?.onGone(d.aid));
-    channel.on("y-leader", (d) => this.rooms.get(d.room)?.setLeader(d.leader));
+    channel.on("y-leader", (d) => this.rooms.get(d.room)?.setLeader(d.leader, d));
     channel.on("presence", (d) => this.onPresence?.(d.users));
     channel.on("error", (d) => { if (d?.error) this.onWarn?.(d.error); });
     channel.on("transport", (mode) => {
@@ -62,7 +62,7 @@ export class Collab {
   hello(path) {
     if (path !== undefined) this.path = path;
     const u = this.user();
-    this.channel.send({ type: "hello", topic: "y", data: { name: u.name, color: u.color, path: this.path || null } });
+    this.channel.send({ type: "hello", topic: "y", data: { name: u.name, color: u.color, path: this.path || null, doc: this.doc?.() ?? null } });
   }
 
   /** Tab closing: tell the server so the others see us leave at once (a beacon survives pagehide). */
@@ -70,7 +70,7 @@ export class Collab {
     try { navigator.sendBeacon(`api/send?cid=${this.channel.cid}`, new Blob([JSON.stringify({ messages: [{ type: "bye" }] })], { type: "application/json" })); } catch { /* the timeout covers it */ }
   }
 
-  rejoin() { for (const room of this.rooms.values()) room.sendJoin(); }
+  rejoin() { for (const room of this.rooms.values()) if (!room.gone) room.sendJoin(); }
 
   async open(doc, path) {
     const old = this.rooms.get(`${doc}\n${path}`);
@@ -82,7 +82,7 @@ export class Collab {
   }
 }
 
-class Room {
+export class Room {
   constructor(collab, doc, path) {
     this.collab = collab; this.doc = doc; this.path = path; this.rid = `${doc}\n${path}`;
     this.epoch = null; this.leader = null; this.ready = false; this.buffer = [];
@@ -151,7 +151,7 @@ class Room {
     this.collab.channel.send({ type: "y-aware", topic: "y", data: { room: this.rid, u: enc(AP.encodeAwarenessUpdate(this.awareness, [this.awareness.clientID])) } });
     this.ready = true;
     for (const u of this.buffer.splice(0)) Y.applyUpdate(this.ydoc, dec(u), REMOTE);
-    this.setLeader(d.leader);
+    this.setLeader(d.leader, d);
     this.joined?.(); this.joined = null;
   }
 
@@ -171,20 +171,50 @@ class Room {
   onGone(aid) { if (aid != null) AP.removeAwarenessStates(this.awareness, [aid], REMOTE); }
 
   // ---- leader: disk ---------------------------------------------------------------------------------------------
-  setLeader(cid) {
+  /** info: {stale, base, gone} from the server when the file changed on disk while the room had no leader. */
+  setLeader(cid, info) {
     const was = this.isLeader;
     this.leader = cid;
-    if (this.isLeader && !was) this.becomeLeader();
+    if (this.isLeader && !was) this.becomeLeader(info);
     this.collab.onChange?.(this);
   }
 
-  async becomeLeader() {
-    try {
-      const f = await this.collab.api.read(this.doc, this.path);
+  /**
+   * Take over writing. Nothing is saved until the file has been read: a failed read (anything but "missing") must not
+   * turn into a save without a base version, and a file that changed behind the room's back is merged first.
+   */
+  async becomeLeader(info) {
+    clearTimeout(this.retryTimer);
+    const retry = (why) => {
+      this.savedText = null; this.error = `Cannot read ${this.path} (${why}); retrying.`;
+      this.retryTimer = setTimeout(() => { if (this.isLeader && this.savedText === null) this.becomeLeader(info); }, 3000);
+      this.collab.onChange?.(this);
+    };
+    let f = null;
+    try { f = await this.collab.api.read(this.doc, this.path); }
+    catch (e) {
+      if (e.status !== 404) return retry(e.message);
+      if (info?.gone) return this.drop(`${this.path} was deleted on disk; shared editing of it stopped.`);
+    }
+    this.error = null;
+    if (f) {
       this.version = f.version; this.eol = f.eol; this.savedText = f.text;
-    } catch { this.savedText = ""; this.version = null; }   // Missing file: the first save creates it.
+      if (info?.stale && info.base != null && info.base !== f.text) {
+        this.savedText = info.base;
+        try { await this.mergeDisk(); } catch (e) { return retry(e.message); }
+      }
+    } else { this.savedText = ""; this.version = null; }   // Missing file: the first save creates it.
     this.collab.onChange?.(this);
     if (this.dirty) this.scheduleSave();
+  }
+
+  /** The file is gone from disk: stop writing (never recreate it behind the user's back) and leave the room. */
+  drop(why) {
+    clearTimeout(this.saveTimer); clearTimeout(this.retryTimer);
+    this.gone = true; this.canEdit = false; this.savedText = null; this.error = why;
+    this.collab.channel.send({ type: "y-leave", topic: "y", data: { room: this.rid } });
+    this.collab.onWarn?.(why);
+    this.collab.onChange?.(this);
   }
 
   touch() {
@@ -225,7 +255,7 @@ class Room {
 
   async onFs(removed) {
     if (!this.isLeader || this.saving || this.savedText === null) return;
-    if (removed) { this.savedText = ""; this.version = null; this.error = null; this.scheduleSave(0); return; }   // Deleted: the next save recreates it.
+    if (removed) return this.drop(`${this.path} was deleted on disk; shared editing of it stopped.`);
     try {
       const f = await this.collab.api.read(this.doc, this.path);
       if (f.version === this.version || f.text === this.savedText) { this.version = f.version; return; }
@@ -244,7 +274,7 @@ class Room {
   }
 
   destroy(keepRegistered) {
-    clearTimeout(this.saveTimer);
+    clearTimeout(this.saveTimer); clearTimeout(this.retryTimer);
     this.awareness.destroy(); this.undo.destroy(); this.ydoc.destroy();
     clearTimeout(this.awareTimer);
     if (!keepRegistered) this.collab.rooms.delete(this.rid);

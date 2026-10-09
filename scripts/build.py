@@ -45,7 +45,11 @@ MAX_SUMMARY_ERRORS = 10
 
 # Changes to these paths (relative to ROOT_DIR) rebuild every document.
 GLOBAL_INPUTS = (
-    "scripts/",
+    "scripts/build.py",
+    "scripts/accel.py",
+    "scripts/hints.py",
+    "scripts/publish_release.py",
+    "scripts/ci_report.py",
     ".github/workflows/build-pdf.yml",
 )
 

@@ -379,3 +379,26 @@ class CleanCacheRetryTests(unittest.TestCase):
 
             (main.parent / "ch" / "a.tex").write_text("fixed\n", encoding="utf-8")
             self.assertTrue(self.build(main)["ok"])
+
+
+class GlobalInputsTests(unittest.TestCase):
+    """GLOBAL_INPUTS (rebuild everything) and the workflow's paths: filters name the same real build inputs."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_only_build_inputs_are_global_and_the_workflow_filters_agree(self):
+        workflow = (self.ROOT / ".github/workflows/build-pdf.yml").read_text(encoding="utf-8")
+        listed = [name for name in build.GLOBAL_INPUTS if name.startswith("scripts/")]
+        self.assertTrue(listed)
+        for name in listed:
+            self.assertTrue((self.ROOT / name).is_file(), name)
+            self.assertEqual(workflow.count(f'- "{name}"'), 2, name)  # push and pull_request
+        self.assertNotIn('"scripts/**"', workflow)
+        self.assertNotIn("scripts/", [n for n in build.GLOBAL_INPUTS])
+        for editor_file in ("scripts/serve.py", "scripts/serve_ui/app.js", "scripts/serve_ui/collab.js"):
+            self.assertFalse(editor_file.startswith(build.GLOBAL_INPUTS), editor_file)
+
+    def test_ci_scripts_do_not_import_the_editor_server(self):
+        for name in ("build.py", "accel.py", "hints.py", "publish_release.py", "ci_report.py"):
+            text = (self.ROOT / "scripts" / name).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)

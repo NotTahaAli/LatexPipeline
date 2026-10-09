@@ -433,6 +433,7 @@ class SharedState(unittest.TestCase):
         saved = dict(serve.SHARE)
         self.addCleanup(lambda: (serve.SHARE.clear(), serve.SHARE.update(saved)))
         serve.SHARE.update(on=False, tokens={}, doc=None, public=None, hosts=set(), port=0, tunnel=None)
+        self.addCleanup(serve.share_env, False)
         for table in (serve.ROOMS, serve.CLIENTS, serve.RATE):
             table.clear()
             self.addCleanup(table.clear)
@@ -554,7 +555,7 @@ class TokenAuth(SharedState):
                         serve.build.read_settings(main)
             for fine in ("-bibtex", "-f", "-silent", "-pdflatex"):
                 (main.parent / "build.toml").write_text(f"latexmk_args = [{json.dumps(fine)}]\n", encoding="utf-8")
-                self.assertEqual(serve.build.read_settings(main)["latexmk_args"], [fine])
+                self.assertEqual(serve.build.read_settings(main)["latexmk_args"], ["-norc", fine])
 
 
 class ShareHttp(SharedState, ServerCase):
@@ -882,6 +883,319 @@ class Rooms(SharedState):
             bus.publish("y-aware", i, ephemeral=True)
         self.assertEqual([m["type"] for m in bus.since(1)], ["y-aware", "y-aware"])
         self.assertNotIn("resync", bus.since(1)[0])
+
+    def test_resume_from_a_future_revision_resyncs_at_once(self):
+        bus = serve.Bus()
+        bus.publish("fs", 1)
+        began = time.monotonic()
+        (msg,) = bus.wait(99, 5.0)  # A previous server run: no reason to hold the poll open
+        self.assertTrue(msg["resync"])
+        self.assertLess(time.monotonic() - began, 1.0)
+
+    def test_memory_is_bounded_by_bytes_not_only_count(self):
+        bus = serve.Bus(keep=2000, max_bytes=10_000)
+        for _ in range(20):
+            bus.publish("y-update", {"u": "x" * 3000})
+        self.assertLessEqual(bus.bytes["log"], 10_000)
+        self.assertLessEqual(len(bus.log), 3)
+        self.assertTrue(bus.since(1)[0]["resync"])  # What was dropped can no longer be replayed
+        bus.publish("y-aware", {"u": "y" * 100_000}, ephemeral=True)  # Larger than the cap: kept alone, never grows
+        self.assertEqual(len(bus.eph), 1)
+
+
+def pdflatex_reads(source: str, **env) -> bool:
+    """Does `pdflatex` succeed on `source` (a main.tex body) in a scratch directory, under os.environ + env?"""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "main.tex").write_text("\\documentclass{article}\\begin{document}" + source + "\\end{document}")
+        (Path(tmp) / "sub").mkdir()
+        (Path(tmp) / "sub" / "x.tex").write_text("inner")
+        (Path(tmp) / "sub" / "up.tex").write_text("\\input{../sub/x}")
+        done = subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "main.tex"], cwd=tmp, capture_output=True,
+            text=True, stdin=subprocess.DEVNULL, env={**os.environ, **env}, timeout=120,
+        )
+        return done.returncode == 0
+
+
+class SharedBuilds(SharedState):
+    """Builds while sharing cannot run code or read files outside the document."""
+
+    def doc(self, build_toml="", magic=""):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        directory = Path(self.tmpdir.name)
+        (directory / "main.tex").write_text(magic + "\\documentclass{article}\n", encoding="utf-8")
+        if build_toml:
+            (directory / "build.toml").write_text(build_toml, encoding="utf-8")
+        return directory / "main.tex"
+
+    def test_environment_is_restricted_only_while_sharing_and_restored_after(self):
+        before = {k: os.environ.get(k) for k in serve.SHARE_ENV}
+        self.share_on("d")
+        self.assertEqual({k: os.environ[k] for k in serve.SHARE_ENV}, serve.SHARE_ENV)
+        serve.share_disable()
+        self.assertEqual({k: os.environ.get(k) for k in serve.SHARE_ENV}, before)
+
+    def test_lualatex_is_refused_by_magic_comment_and_by_build_toml(self):
+        main = self.doc(magic="% !TeX program = lualatex\n")
+        self.assertEqual(serve.build.read_settings(main)["engine"], "lualatex")  # Not sharing: allowed
+        self.share_on("d")
+        with self.assertRaises(serve.build.ConfigError) as ctx:
+            serve.build.read_settings(main)
+        self.assertIn("LuaLaTeX is disabled while sharing", str(ctx.exception))
+        main = self.doc(build_toml='engine = "lualatex"\n')
+        with self.assertRaises(serve.build.ConfigError):
+            serve.build.read_settings(main)
+        self.assertEqual(serve.build.read_settings(self.doc())["engine"], "pdflatex")
+
+    def test_latexmk_never_reads_rc_files_while_sharing(self):
+        main = self.doc()
+        self.assertNotIn("-norc", serve.build.read_settings(main)["latexmk_args"])
+        self.share_on("d")
+        self.assertEqual(serve.build.read_settings(main)["latexmk_args"][0], "-norc")
+
+    def test_options_that_load_code_or_move_output_are_refused(self):
+        for bad in ("-latexoption=-shell-escape", "-latexoption", "-pretex=\\write18{x}", "-usepretex", "-cnf-line=a=b",
+                    "-e", "-r", "--r", "-r=x", "-pdflua", "-lualatex", "-pdflatex=lualatex", "-outdir=/tmp",
+                    "-auxdir=/tmp", "-jobname=../x", "-pdflatex=x", '-e=$pdflatex="x"', "-SHELL_ESCAPE", "-x-write18"):
+            with self.subTest(arg=bad):
+                self.assertTrue(serve.unsafe_latexmk_arg(bad))
+        for fine in ("-bibtex", "-f", "-silent", "-pdflatex", "-pdfxe", "-g"):
+            with self.subTest(arg=fine):
+                self.assertFalse(serve.unsafe_latexmk_arg(fine))
+
+    @unittest.skipUnless(shutil.which("pdflatex"), "pdflatex not installed")
+    def test_tex_cannot_read_absolute_or_parent_paths_while_sharing(self):
+        absolute = "\\input{/etc/hostname}"
+        self.share_on("d")
+        env = dict(serve.SHARE_ENV)
+        self.assertFalse(pdflatex_reads(absolute, **env))
+        self.assertTrue(pdflatex_reads("\\input{sub/x}", **env))
+        self.assertFalse(pdflatex_reads("\\input{sub/up}", **env))  # "..": blocked on purpose, see README
+        target = Path(tempfile.gettempdir()) / f"lp-pwned-{os.getpid()}"
+        self.addCleanup(lambda: target.unlink(missing_ok=True))
+        pdflatex_reads(f"\\immediate\\openout3={target.as_posix()}\\immediate\\write3{{x}}", **env)
+        self.assertFalse(target.exists())
+
+
+class TunnelLifecycle(SharedState):
+    def test_stop_before_start_leaves_no_process(self):
+        tunnel = serve.Tunnel("localtunnel", 1)
+        tunnel.stop()
+        with self.assertRaises(RuntimeError):
+            tunnel.start(timeout=1)
+        self.assertIsNone(tunnel.proc)
+
+    def test_a_failing_tunnel_start_leaves_the_starting_state(self):
+        for exc in (OSError("no such binary"), RuntimeError("exited")):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(serve.Tunnel, "start", side_effect=exc), \
+                        mock.patch.object(serve.build, "error"), \
+                        mock.patch.object(serve, "pick_provider", return_value="cloudflared"):
+                    serve.share_start("auto", "d", 1, wait=True)
+                self.assertEqual((serve.SHARE["on"], serve.SHARE["status"]), (False, "off"))
+                self.assertIn(str(exc), serve.SHARE["error"])
+                self.assertIsNone(serve.SHARE["tunnel"])
+
+    def test_stopping_while_the_tunnel_comes_up_adds_no_host_and_kills_it(self):
+        started, release = threading.Event(), threading.Event()
+        made = []
+
+        def slow_start(self, timeout=60.0):
+            made.append(self)
+            started.set()
+            release.wait(5)
+            return "https://late.example.com"
+
+        with mock.patch.object(serve.Tunnel, "start", slow_start), mock.patch.object(serve.Tunnel, "stop") as stop, \
+                mock.patch.object(serve, "pick_provider", return_value="cloudflared"):
+            serve.share_start("auto", "d", 1)
+            self.assertTrue(started.wait(5))
+            self.assertIs(serve.SHARE["tunnel"], made[0])
+            serve.share_disable()
+            stopped_by_disable = stop.call_count
+            release.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and stop.call_count == stopped_by_disable:
+                time.sleep(0.02)
+        self.assertEqual(serve.SHARE["hosts"], set())
+        self.assertFalse(serve.SHARE["on"])
+        self.assertEqual(stop.call_count, stopped_by_disable + 1)  # the late thread stopped it again, harmlessly
+
+    def test_a_new_share_is_not_touched_by_the_previous_ones_thread(self):
+        gen = serve.share_enable("d", "local", 1)
+        serve.share_disable()
+        serve.share_enable("d", "local", 1)
+        self.assertNotEqual(serve.SHARE["gen"], gen)
+
+
+class RoomSecurity(SharedState):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        for name in ("main.tex", "ch.tex", "build.toml", ".latexmkrc"):
+            (self.dir / name).write_text("x = 1\n", encoding="utf-8")
+        other = self.dir / "other"
+        other.mkdir()
+        (other / "main.tex").write_text("other", encoding="utf-8")
+        patch = mock.patch.dict(serve.DOCS, {"d": self.dir / "main.tex", "o": other / "main.tex"}, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        serve.SHARE["doc"] = "d"
+
+    def join(self, cid, role="edit", doc="d", path="main.tex", **extra):
+        serve.bind_client(cid, role)
+        reply = serve.handle_client_message(
+            {"type": "y-join", "data": {"doc": doc, "path": path, "aid": 1, **extra}}, cid, role)
+        return reply["data"] if reply["type"] == "y-state" else reply
+
+    def update(self, cid, room, u="AA", role="edit"):
+        return serve.handle_client_message({"type": "y-update", "data": {"room": room, "u": u}}, cid, role)
+
+    def test_build_config_rooms_are_for_the_owner_only(self):
+        for name in ("build.toml", ".latexmkrc", "latexmkrc", "BUILD.TOML"):
+            for role in ("edit", "view"):
+                with self.subTest(name=name, role=role):
+                    reply = self.join(f"{role}-{name}", role, path=name)
+                    self.assertEqual((reply["type"], reply["data"]["status"]), ("error", 403))
+        self.assertEqual(self.join("owner", "owner", path="build.toml")["leader"], "owner")
+        # Even a room that exists already cannot be written to by an editor
+        reply = self.update("e", "d\nbuild.toml")
+        self.assertEqual(reply["data"]["status"], 403)
+        serve.ROOMS["d\nbuild.toml"]["members"]["e"] = {"aid": 1, "role": "edit"}
+        self.assertEqual(self.update("e", "d\nbuild.toml")["data"]["status"], 403)
+        self.assertEqual(serve.ROOMS["d\nbuild.toml"]["log"], [])
+
+    def test_viewers_join_only_existing_files_of_the_shared_document(self):
+        self.assertEqual(self.join("v", "view", path="ch.tex")["leader"], None)
+        self.assertEqual(self.join("v", "view", path="new.tex")["data"]["status"], 404)
+        self.assertEqual(self.join("v", "view", doc="o")["data"]["status"], 404)
+        self.assertIn("room", self.join("e", "edit", path="new.tex"))  # editors may start a new file
+
+    def test_updates_for_another_document_are_refused_even_for_editors(self):
+        self.join("owner", "owner", doc="o")  # the owner works on another document meanwhile
+        serve.CLIENTS["e"] = {"role": "edit", "rooms": set(), "seen": time.monotonic(), "name": None,
+                              "color": None, "path": None, "doc": None}
+        serve.ROOMS["o\nmain.tex"]["members"]["e"] = {"aid": 2, "role": "edit"}
+        self.assertEqual(self.update("e", "o\nmain.tex")["data"]["status"], 403)
+
+    def test_bus_messages_of_other_documents_and_config_files_are_hidden_from_shared_roles(self):
+        bus = [
+            {"rev": 1, "topic": "y", "type": "y-update", "data": {"room": "o\nmain.tex", "u": "A"}},
+            {"rev": 2, "topic": "y", "type": "y-update", "data": {"room": "d\nmain.tex", "u": "B"}},
+            {"rev": 3, "topic": "y", "type": "y-aware", "data": {"room": "o\nmain.tex", "u": "A"}},
+            {"rev": 4, "topic": "y", "type": "y-leader", "data": {"room": "o\nmain.tex", "leader": "x"}},
+            {"rev": 5, "topic": "y", "type": "y-gone", "data": {"room": "o\nmain.tex", "cid": "x", "aid": 1}},
+            {"rev": 6, "topic": "y", "type": "y-update", "data": {"room": "d\nbuild.toml", "u": "C"}},
+            {"rev": 7, "topic": "y", "type": "mystery", "data": {"room": "d\nmain.tex"}},
+            {"rev": 8, "topic": "y", "type": "y-aware", "data": {"room": "d\nmain.tex", "u": "D"}},
+        ]
+        for role in ("view", "edit"):
+            self.assertEqual([m["rev"] for m in serve.visible(bus, role)], [2, 8])
+        self.assertEqual(len(serve.visible(bus, "owner")), 8)
+
+    def test_presence_shows_only_people_in_the_shared_document(self):
+        for cid, role, doc, path in (("a", "edit", "d", "main.tex"), ("me", "owner", "o", "secret/notes.tex"),
+                                     ("c", "owner", "d", "build.toml")):
+            serve.bind_client(cid, role)
+            serve.handle_client_message(
+                {"type": "hello", "data": {"name": cid, "color": "#112233", "path": path, "doc": doc}}, cid, role)
+        reply = serve.handle_client_message({"type": "hello", "data": {"name": "v", "doc": "d"}}, "v", "view")
+        self.assertEqual([u["cid"] for u in reply["data"]["users"]], ["a", "c", "v"])
+        self.assertIsNone(next(u for u in reply["data"]["users"] if u["cid"] == "c")["path"])
+        (message,) = serve.visible([{"rev": 1, "topic": "sys", "type": "presence", "data": serve.presence()}], "view")
+        self.assertEqual([u["cid"] for u in message["data"]["users"]], ["a", "c", "v"])
+        self.assertEqual(len(serve.presence()["users"]), 4)  # the owner sees everybody
+
+    def test_file_changed_while_the_room_had_no_leader_is_reported_to_the_next_leader(self):
+        first = self.join("a", path="ch.tex")
+        self.assertNotIn("stale", first)
+        serve.handle_client_message({"type": "y-leave", "data": {"room": "d\nch.tex"}}, "a", "edit")
+        (self.dir / "ch.tex").write_text("changed on disk, longer\n", encoding="utf-8")
+        taken = self.join("b", path="ch.tex")
+        self.assertEqual((taken["stale"], taken["base"], taken["gone"]), (True, "x = 1\n", False))
+        leaders = [m["data"] for m in serve.BUS.since(0) if m["type"] == "y-leader" and m["data"]["leader"] == "b"]
+        self.assertTrue(leaders[-1]["stale"])
+        # Once a save went through, the room is in step again
+        serve.note_write("d", "ch.tex", "merged\n", serve.version_of((self.dir / "ch.tex").stat()))
+        serve.handle_client_message({"type": "y-leave", "data": {"room": "d\nch.tex"}}, "b", "edit")
+        self.assertNotIn("stale", self.join("c", path="ch.tex"))
+
+    def test_a_file_deleted_behind_the_room_is_reported_as_gone(self):
+        self.join("a", path="ch.tex")
+        serve.handle_client_message({"type": "y-leave", "data": {"room": "d\nch.tex"}}, "a", "edit")
+        (self.dir / "ch.tex").unlink()
+        self.assertTrue(self.join("b", path="ch.tex")["gone"])
+
+    def test_room_history_and_room_count_are_capped(self):
+        self.join("a")
+        with mock.patch.object(serve, "MAX_ROOM_BYTES", 10):
+            self.assertIsNone(self.update("a", "d\nmain.tex", "x" * 6))
+            reply = self.update("a", "d\nmain.tex", "y" * 6)
+        self.assertEqual(reply["data"]["status"], 413)
+        self.assertEqual(serve.ROOMS["d\nmain.tex"]["log"], ["x" * 6])
+        with mock.patch.object(serve, "MAX_ROOMS_PER_CLIENT", 2):
+            self.assertIn("room", self.join("a", path="ch.tex"))
+            self.assertEqual(self.join("a", path="n1.tex")["data"]["status"], 429)
+            self.assertIn("room", self.join("a", path="ch.tex"))  # rejoining a held room is fine
+        with mock.patch.object(serve, "MAX_ROOMS", len(serve.ROOMS)):
+            self.assertEqual(self.join("z", path="n2.tex")["data"]["status"], 503)
+
+
+class SharedHttpDetails(SharedState, ServerCase):
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        other = self.base / "second"
+        other.mkdir()
+        (other / "main.tex").write_text("x", encoding="utf-8")
+        (other / "private.tex").write_text("x", encoding="utf-8")
+        mock.patch.dict(serve.DOCS, {"second": other / "main.tex"}).start()
+        serve.SHARE["port"] = self.port
+        self.tokens = self.share_on()
+
+    def test_forward_does_not_reveal_which_files_exist(self):
+        outside = str(self.base / "secret.tex")
+        errors = set()
+        elsewhere = str(self.base / "second" / "private.tex")
+        for name in (outside, "/nonexistent/x.tex", "../secret.tex", "nope.tex", elsewhere):
+            _, data = self.request(
+                "GET", f"/forward?doc=demo&quiet=1&line=1&file={name.replace('/', '%2F')}",
+                headers={"Cookie": f"{serve.cookie_name()}={self.tokens['view']}"})
+            errors.add(data["error"].split(":")[0])
+        self.assertEqual(errors, {"No such file in the document"})
+
+    def test_handlers_time_out_stalled_sockets(self):
+        self.assertTrue(0 < serve.Handler.timeout <= 75)
+
+    def test_a_foreign_origin_on_the_websocket_gets_one_answer(self):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        sock.sendall((
+            f"GET /ws?cid=o1 HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: http://evil.example\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 13\r\nCookie: {serve.cookie_name()}={self.tokens['view']}\r\n\r\n"
+        ).encode())
+        data = b""
+        while chunk := sock.recv(4096):
+            data += chunk
+        sock.close()
+        self.assertEqual(data.count(b"HTTP/1."), 1)
+        self.assertIn(b" 403 ", data.split(b"\r\n", 1)[0])
+
+
+class CollabClient(unittest.TestCase):
+    """collab.js decisions that cannot be made server-side, run in node with the Yjs libraries stubbed."""
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_leader_takeover_never_saves_blind_and_never_recreates_deleted_files(self):
+        script = (Path(__file__).parent / "collab_check.mjs").resolve()
+        result = subprocess.run(
+            ["node", str(script), str(UI_DIR / "collab.js")], capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 PROSE_JS = r"""

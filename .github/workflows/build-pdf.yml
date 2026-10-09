@@ -7,7 +7,11 @@ on:
     branches: [main]
     paths:
       - "files/**"
-      - "scripts/**"
+      - "scripts/build.py"
+      - "scripts/accel.py"
+      - "scripts/hints.py"
+      - "scripts/publish_release.py"
+      - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - "pyproject.toml"
       - "uv.lock"
@@ -15,7 +19,11 @@ on:
   pull_request:
     paths:
       - "files/**"
-      - "scripts/**"
+      - "scripts/build.py"
+      - "scripts/accel.py"
+      - "scripts/hints.py"
+      - "scripts/publish_release.py"
+      - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - "pyproject.toml"
       - "uv.lock"

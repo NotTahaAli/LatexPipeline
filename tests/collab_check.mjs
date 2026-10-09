@@ -1,0 +1,88 @@
+// Node check for scripts/serve_ui/collab.js: runs the real Room class with the Yjs libraries stubbed out
+// (they come from a CDN in the browser). Usage: node collab_check.mjs <path to collab.js>
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const source = fs.readFileSync(process.argv[2], "utf8").replace(/^import .*libs\.js";$/m, `
+class Doc { constructor() { this.t = ""; this.store = { clients: new Map() }; }
+  getText() { const d = this; return { toString: () => d.t, doc: d, insert(i, s) { d.t = d.t.slice(0, i) + s + d.t.slice(i); }, delete(i, n) { d.t = d.t.slice(0, i) + d.t.slice(i + n); } }; }
+  on() {} destroy() {} transact(fn) { fn(); } }
+const Y = { Doc, UndoManager: class { destroy() {} }, applyUpdate() {}, encodeStateAsUpdate: () => new Uint8Array(), encodeStateVector: () => new Uint8Array() };
+const awarenessProtocol = { Awareness: class { constructor() { this.clientID = 1; } setLocalStateField() {} on() {} destroy() {} }, encodeAwarenessUpdate: () => new Uint8Array() };
+const AP = awarenessProtocol;
+`);
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-"));
+const file = path.join(dir, "collab.mjs");
+fs.writeFileSync(file, source);
+const { Room } = await import(pathToFileURL(file).href);
+
+function make(api) {
+  const sent = [], warned = [];
+  const collab = { channel: { cid: "me", send: (m) => sent.push(m) }, api, role: "edit", user: () => ({ name: "n", color: "#000000" }), saveDelay: () => 5, onWarn: (t) => warned.push(t), onChange() {}, rooms: new Map() };
+  const room = new Room(collab, "d", "main.tex");
+  room.ytext.doc.t = "room text";
+  room.leader = "me";
+  return { room, sent, warned };
+}
+const err = (status) => Object.assign(new Error("boom " + status), { status });
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+let writes;
+
+// 1. A failed read (not 404) must not lead to a save without a base version; it retries and stays read-only.
+{
+  writes = 0; let reads = 0;
+  const { room } = make({ read: async () => { reads++; throw err(500); }, write: async () => { writes++; return { version: "1" }; } });
+  await room.becomeLeader();
+  assert.equal(room.savedText, null);
+  assert.match(room.error, /retrying/);
+  room.touch(); await wait(30);
+  assert.equal(writes, 0, "saved after a failed read");
+  assert.equal(room.save && await room.save(), undefined);
+  assert.equal(writes, 0);
+  clearTimeout(room.retryTimer);
+}
+// 2. 404 on a file that never existed: the first save creates it (base null).
+{
+  let args;
+  const { room } = make({ read: async () => { throw err(404); }, write: async (...a) => { args = a; return { version: "1" }; } });
+  await room.becomeLeader(); await wait(30);
+  assert.equal(args?.[3], null);
+}
+// 3. 404 on a file that was deleted behind the room: drop the room and warn, write nothing.
+{
+  writes = 0;
+  const { room, warned, sent } = make({ read: async () => { throw err(404); }, write: async () => { writes++; return { version: "1" }; } });
+  await room.becomeLeader({ stale: true, base: "old", gone: true }); await wait(30);
+  assert.equal(writes, 0); assert.equal(room.isLeader, false); assert.equal(warned.length, 1);
+  assert.ok(sent.some((m) => m.type === "y-leave"));
+}
+// 4. A leader sees the file removed on disk: no recreate.
+{
+  writes = 0;
+  const { room, warned } = make({ read: async () => ({ text: "room text", version: "1", eol: "\n" }), write: async () => { writes++; return { version: "2" }; } });
+  await room.becomeLeader(); await room.onFs(true); await wait(30);
+  assert.equal(writes, 0); assert.equal(room.gone, true); assert.equal(warned.length, 1);
+}
+// 5. Taking over a stale room merges the newer disk text into the room instead of overwriting it.
+{
+  let saved = null;
+  const disk = "line one\nline TWO from disk\nline three";
+  const { room } = make({ read: async () => ({ text: disk, version: "9", eol: "\n" }), write: async (_d, _p, text) => { saved = text; return { version: "10" }; } });
+  room.ytext.doc.t = "line one\nline two\nline three\nline four typed in the room";
+  await room.becomeLeader({ stale: true, base: "line one\nline two\nline three", gone: false }); await wait(40);
+  assert.ok(room.text().includes("line TWO from disk"), room.text());
+  assert.ok(room.text().includes("typed in the room"), room.text());
+  assert.equal(saved, room.text());
+}
+// 6. A stale takeover whose merge cannot be read stays read-only (no blind save).
+{
+  writes = 0; let n = 0;
+  const { room } = make({ read: async () => { if (n++ === 0) return { text: "disk", version: "9", eol: "\n" }; throw err(500); }, write: async () => { writes++; return { version: "1" }; } });
+  await room.becomeLeader({ stale: true, base: "other", gone: false }); await wait(30);
+  assert.equal(writes, 0); assert.equal(room.savedText, null);
+  clearTimeout(room.retryTimer);
+}
+console.log("collab ok");
