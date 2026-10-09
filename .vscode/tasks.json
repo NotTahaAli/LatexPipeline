@@ -1,0 +1,89 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "document",
+      "type": "promptString",
+      "description": "Document name relative to files/ (e.g. reports/final), or a glob such as reports/*"
+    }
+  ],
+  "problemMatchers": [
+    {
+      "name": "latexPipeline",
+      "owner": "latex-pipeline",
+      "source": "build.py",
+      "fileLocation": ["relative", "${workspaceFolder}"],
+      "pattern": {
+        "regexp": "^\\s*(files/.*?):(\\d+): (\\S.*)$",
+        "file": 1,
+        "line": 2,
+        "message": 3
+      },
+      "background": {
+        "activeOnStart": true,
+        "beginsPattern": "^Started: ",
+        "endsPattern": "^Watching for changes"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "label": "LaTeX: build changed documents",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$latexPipeline",
+      "detail": "Builds documents whose PDF is missing or older than an input. Errors open from the Problems panel."
+    },
+    {
+      "label": "LaTeX: build one document",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py", "${input:document}"],
+      "group": "build",
+      "problemMatcher": "$latexPipeline",
+      "detail": "Builds the named document (or glob) from files/, even when its PDF is up to date."
+    },
+    {
+      "label": "LaTeX: build all (--force)",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py", "--force"],
+      "group": "build",
+      "problemMatcher": "$latexPipeline",
+      "detail": "Rebuilds every document with latexmk -g, ignoring the cache state. Slow."
+    },
+    {
+      "label": "LaTeX: watch",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py", "--watch"],
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": "$latexPipeline",
+      "detail": "Rebuilds on save. Runs until terminated; a failed document is retried only after one of its files changes. Open PDFs with the terminal flag --open."
+    },
+    {
+      "label": "LaTeX: clean",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py", "--clean"],
+      "problemMatcher": [],
+      "detail": "Deletes out/ and .latex-cache/."
+    },
+    {
+      "label": "LaTeX: list documents",
+      "type": "shell",
+      "command": "python3",
+      "windows": { "command": "python" },
+      "args": ["scripts/build.py", "--list"],
+      "problemMatcher": []
+    }
+  ]
+}
