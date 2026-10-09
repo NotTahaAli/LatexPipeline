@@ -189,10 +189,10 @@ class Figures:
             f"{self.pretex}\\input{{{self.main_tex.name}}}",
         ]
 
-    def figure_command(self, name: str, skip: bool = True) -> list[str]:
+    def figure_command(self, name: str, work: Path, skip: bool = True) -> list[str]:
         return [
             self.engine, "-interaction=batchmode", "-halt-on-error", "-file-line-error",
-            f"-output-directory={self.build_dir}", f"-jobname={name}",
+            f"-output-directory={work}", f"-jobname={name}",
             *(["-shell-escape"] if self.shell_escape else []),
             self.pretex + ("" if skip else NOSKIP)
             + f"\\def\\tikzexternalrealjob{{{self.stem}}}\\input{{{self.main_tex.name}}}",
@@ -200,27 +200,37 @@ class Figures:
 
     def compile(self, name: str) -> str | None:
         """Compile one figure. Returns an error text, or None on success."""
-        aux = self.build_dir / f"{self.stem}.aux"
-        (self.build_dir / name).parent.mkdir(parents=True, exist_ok=True)
-        pdf = self.file(name, ".pdf")
+        # A private output directory: the document may write its own .aux files (one per
+        # chapter unit) and parallel jobs must not touch the ones latexmk reads.
+        work = self.build_dir / "figwork" / hashlib.sha1(name.encode()).hexdigest()[:12]
+
+        def made(suffix: str) -> Path:
+            return work / f"{name}{suffix}"
 
         # Skipping the rest of the document is an optimisation; if it breaks
         # something that is read later, run the figure once more without it.
         for skip in (True, False):
-            if aux.exists():  # Lets \ref inside the figure resolve.
-                shutil.copy(aux, self.file(name, ".aux"))
-            pdf.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
+            made(".aux").parent.mkdir(parents=True)
+            for aux in self.build_dir.glob("*.aux"):  # Lets \ref and \cite inside the figure resolve.
+                shutil.copy(aux, work / aux.name)
+            if (work / f"{self.stem}.aux").exists():
+                shutil.copy(work / f"{self.stem}.aux", made(".aux"))
             try:
                 subprocess.run(
-                    self.figure_command(name, skip), cwd=self.main_tex.parent, stdin=subprocess.DEVNULL,
+                    self.figure_command(name, work, skip), cwd=self.main_tex.parent, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return f"{name}: {exc}"
-            if pdf.exists():
+            if made(".pdf").exists():
+                for suffix in (".pdf", ".dpth"):
+                    if made(suffix).exists():
+                        shutil.copy(made(suffix), self.file(name, suffix))
+                shutil.rmtree(work, ignore_errors=True)
                 return None
 
-        log = self.file(name, ".log")
+        log = made(".log")
         lines = log.read_text(encoding="utf-8", errors="replace").splitlines() if log.exists() else []
         errors = [line for line in lines if re.match(r"^(\S.*:\d+:|!) ", line)]
         return f"Figure {name} failed to compile:\n" + "\n".join(errors[:5] or lines[-10:])
