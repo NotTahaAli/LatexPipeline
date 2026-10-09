@@ -59,7 +59,7 @@ For each document, the script:
 4. Carries on with the remaining documents if one fails (an unexpected exception included, reported as `Build crashed: ...`), and prints a summary.
 5. Exits non-zero if any document failed.
 
-Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`.
+Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`. Each error is followed by a plain-language hint when one of the rules in `scripts/hints.py` matches (also in `build-report.json` as `hint`).
 
 After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings) and `error` (the message of a crashed build, otherwise `null`). CI reads this file, so keep its keys stable.
 
@@ -85,6 +85,10 @@ files/My New Document/
 ```
 
 You don't need to change `build.py`. Keep inputs inside the document's directory where you can. A file outside it (for example `\input{../shared/x}`) is tracked for rebuilds once the document's first build has read it: the build records every file it reads in `.latex-cache/<name>/<name>.fls` (latexmk `-recorder`). TeX installation files and the cache are never tracked.
+
+### Reproducible PDFs
+
+latexmk runs with `SOURCE_DATE_EPOCH` set to the time of the last commit that touched the document's directory (its newest input when git has no history for it) and `FORCE_SOURCE_DATE=1`. Building the same commit twice gives byte-identical PDFs. Side effect: `\today` shows that commit's date, not the build date.
 
 ### Engine and settings
 
@@ -156,6 +160,7 @@ Not adopted, because they did not pay off: a precompiled preamble format (saves 
   * A document that fails keeps its previous PDF, and its `.log` shows why the latest build failed.
   * The PDF and log of a deleted document are removed.
   * The release notes list every document with links to its PDF and log, its pages, and the status of its last build.
+  * A file whose bytes the release already holds (same sha256, as GitHub reports it) is not uploaded again.
   * File names on the release are escaped. Every character other than letters, digits, `.` and `-` becomes `_` followed by its UTF-8 bytes in hex: space becomes `_20`, `_` becomes `_5F`, and `/` becomes `_2F`. For example, `FP-123 Proposal.pdf` becomes `FP-123_20Proposal.pdf`. To recover the original name, replace each `_` with `%` and URL-decode. The release page shows the original path as the file's label.
   * After a fully successful build, the `pdfs` tag moves to the commit that was built. That tag marks where the next run starts from.
 * **requirements** fails if `uv.lock` or `requirements.txt` has fallen behind `pyproject.toml`.

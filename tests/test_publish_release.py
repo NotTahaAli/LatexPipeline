@@ -56,5 +56,22 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertEqual(publish_release.read_state("<!-- latex-pipeline-state: {bad -->"), {})
 
 
+class UploadSkipTests(unittest.TestCase):
+    def test_unchanged_pdf_is_not_uploaded_again(self):
+        import hashlib
+        with fake_repo() as root:
+            pdf = root / "out" / "a.pdf"
+            pdf.parent.mkdir(parents=True)
+            pdf.write_bytes(b"%PDF-1.5 same")
+            digest = "sha256:" + hashlib.sha256(b"%PDF-1.5 same").hexdigest()
+            self.assertFalse(publish_release.needs_upload(pdf, {"a.pdf": digest}))
+            self.assertTrue(publish_release.needs_upload(pdf, {"a.pdf": "sha256:" + "0" * 64}))
+            self.assertTrue(publish_release.needs_upload(pdf, {}))  # New, or no digest reported.
+
+    def test_release_digests_parses_gh_output(self):
+        with mock.patch.object(publish_release, "gh", return_value="a.pdf\tsha256:ab\nb.log\tsha256:cd\n"):
+            self.assertEqual(publish_release.release_digests(), {"a.pdf": "sha256:ab", "b.log": "sha256:cd"})
+
+
 if __name__ == "__main__":
     unittest.main()

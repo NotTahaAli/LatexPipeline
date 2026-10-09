@@ -17,6 +17,7 @@ Meant for CI after `build.py`; needs the `gh` CLI and GH_TOKEN.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,19 @@ def asset_name(pdf: Path) -> str:
     escaped by build.escape_name. The original path is kept as the label.
     """
     return escape_name(pdf.relative_to(OUT_DIR).as_posix())
+
+
+def release_digests() -> dict[str, str]:
+    """Asset name -> "sha256:<hex>" as GitHub reports it. Assets without one are left out."""
+    text = gh("api", f"repos/{{owner}}/{{repo}}/releases/tags/{TAG}",
+              "--jq", '.assets[] | select(.digest != null) | "\\(.name)\\t\\(.digest)"')
+    return dict(line.split("\t", 1) for line in text.splitlines() if "\t" in line)
+
+
+def needs_upload(path: Path, digests: dict[str, str]) -> bool:
+    """False when the release already holds these exact bytes under this name."""
+    digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests.get(asset_name(path)) != digest
 
 
 def read_state(body: str) -> dict:
@@ -138,9 +152,18 @@ def main() -> int:
         gh("release", "create", TAG, "--title", "Latest PDFs", "--notes", "",
            "--target", target)
 
+    try:
+        digests = release_digests()
+    except subprocess.CalledProcessError:
+        digests = {}  # Only saves uploads: without the digests, everything is uploaded again.
+        print("Could not read the release's digests: uploading every file.", flush=True)
+
     with tempfile.TemporaryDirectory() as staging:
         for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]):
             label = path.relative_to(OUT_DIR).as_posix()
+            if not needs_upload(path, digests):
+                print(f"Unchanged: {label}", flush=True)
+                continue
             staged = Path(staging) / asset_name(path)
             shutil.copy(path, staged)
             print(f"Uploading: {label}", flush=True)

@@ -314,6 +314,22 @@ def mirror_dirs(source: Path, target: Path) -> None:
             (target / relative).mkdir(parents=True, exist_ok=True)
 
 
+def source_date_epoch(main_tex: Path) -> str:
+    """
+    SOURCE_DATE_EPOCH for a document: the time of the last commit that touched
+    its directory, so the same commit gives the same PDF bytes. Without git
+    history for the directory (new, or no repository), the newest input.
+    """
+    try:
+        found = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", main_tex.parent.relative_to(ROOT_DIR).as_posix()],
+            cwd=ROOT_DIR, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        found = ""
+    return found if found.isdigit() else str(int(newest_input(main_tex)))
+
+
 def recorded_inputs(main_tex: Path) -> list[Path]:
     """
     Files outside the document's directory that its last build read, from the
@@ -632,6 +648,9 @@ def build_document(
                 main_tex.name,
             ]
 
+        # Fixed dates in the PDF's metadata; \today follows the same epoch (README, "Reproducible PDFs").
+        epoch = {"SOURCE_DATE_EPOCH": source_date_epoch(main_tex), "FORCE_SOURCE_DATE": "1"}
+
         def run(command: list[str]) -> int:
             """Run a command in the document's directory, streaming its output."""
             mirror_dirs(main_tex.parent, build_dir)
@@ -642,7 +661,7 @@ def build_document(
                 process = subprocess.Popen(
                     command,
                     cwd=main_tex.parent,
-                    env={**os.environ, **LATEX_LOG_ENV},
+                    env={**os.environ, **LATEX_LOG_ENV, **epoch},
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
