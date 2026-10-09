@@ -394,11 +394,27 @@ async function loadOutline() {
     el("span", {}, el("b", { textContent: d.total_words.toLocaleString() }), " words"),
     ...(pages ? [el("span", {}, el("b", { textContent: pages }), pages === 1 ? " page" : " pages")] : []),
     el("span", { textContent: d.counter === "texcount" ? "via texcount" : "approximate" }));
+  const goals = store.json("goals:" + cur, {});
+  const setGoal = (it, value) => { if (value > 0) goals[`${it.file}:${it.title}`] = value; else delete goals[`${it.file}:${it.title}`]; store.set("goals:" + cur, goals); loadOutline(); };
   $("outlineList").replaceChildren(...d.items.map((it) => {
-    const row = el("button", { className: `orow l${it.level}`, role: "treeitem", title: `${it.file}:${it.line}`, onclick: () => jumpTo(it.file, it.line) },
-      el("span", { className: "t", textContent: it.title }), el("span", { className: "w", textContent: it.words.toLocaleString(), title: `${it.own} in this section, ${it.words} with subsections` }));
-    row.style.paddingLeft = `${8 + Math.max(0, it.level - 1) * 14}px`;
-    return row;
+    const goal = goals[`${it.file}:${it.title}`];
+    const count = el("span", { className: "w", textContent: goal ? `${it.words.toLocaleString()} / ${goal.toLocaleString()}` : it.words.toLocaleString(), title: `${it.own} in this section, ${it.words} with subsections${goal ? `; goal ${goal}` : ""}` });
+    const jump = el("button", { className: `orow l${it.level}`, title: `${it.file}:${it.line}`, onclick: () => jumpTo(it.file, it.line) }, el("span", { className: "t", textContent: it.title }), count);
+    jump.style.paddingLeft = `${8 + Math.max(0, it.level - 1) * 14}px`;
+    // The goal control stays out of sight until the row is hovered or focused (progressive disclosure).
+    const edit = el("button", { type: "button", className: "icon goal", title: goal ? "Change or clear the word goal" : "Set a word goal for this section", onclick: () => {
+      const input = el("input", { type: "number", min: 0, step: 50, className: "goal-in", value: goal || "", placeholder: "goal" });
+      input.setAttribute("aria-label", `Word goal for ${it.title}`);
+      let done = false;
+      const finish = (save) => { if (done) return; done = true; if (save) setGoal(it, Math.round(+input.value) || 0); else loadOutline(); };
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") finish(true); else if (e.key === "Escape") { e.stopPropagation(); finish(false); } });
+      input.addEventListener("blur", () => finish(true));
+      count.replaceWith(input); edit.hidden = true; input.focus(); input.select();
+    } }, icon("target"));
+    edit.setAttribute("aria-label", `${goal ? "Change" : "Set"} word goal for ${it.title}`);
+    const wrap = el("div", { className: "owrap" + (goal ? " has" : "") + (goal && it.words >= goal ? " met" : "") }, jump, ...(readOnly ? [] : [edit]));
+    if (goal) wrap.style.setProperty("--p", Math.min(100, (it.words / goal) * 100) + "%");
+    return wrap;
   }));
 }
 

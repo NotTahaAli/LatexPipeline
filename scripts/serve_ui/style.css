@@ -126,7 +126,12 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 
 .outline-head{padding:6px 8px 8px;color:var(--mute);font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
 .outline-head b{color:var(--fg);font-weight:650}
-.orow{display:flex;align-items:baseline;gap:8px;width:100%;padding:3px 8px;border-radius:5px;text-align:left;color:var(--fg)}
+.owrap{display:flex;align-items:center;border-radius:5px;background:linear-gradient(to right,color-mix(in srgb,var(--acc) 16%,transparent) var(--p,0%),transparent var(--p,0%))}
+.owrap.met{background:linear-gradient(to right,color-mix(in srgb,var(--ok) 22%,transparent) 100%,transparent 100%)}
+.owrap .goal{flex:none;width:0;height:24px;opacity:0;overflow:hidden;pointer-events:none}
+.owrap:hover .goal,.owrap:focus-within .goal,.owrap.has .goal{width:24px;opacity:1;pointer-events:auto}
+.goal-in{width:72px;height:22px;margin-right:6px}
+.orow{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px;width:100%;padding:3px 8px;border-radius:5px;text-align:left;color:var(--fg)}
 .orow:hover,.orow:focus-visible{background:var(--line2)}
 .orow .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .orow .w{color:var(--mute);font-size:12px;font-variant-numeric:tabular-nums}
@@ -183,7 +188,7 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 .skeleton i{display:block;height:6px;border-radius:3px;background:#e3e6ea;animation:shimmer 1.4s ease-in-out infinite alternate}
 .skeleton i:first-child{height:9px;background:#d4d8de;margin-bottom:8px}
 @keyframes shimmer{to{opacity:.45}}
-#progress{height:2px;background:transparent;flex:none;position:relative;margin-top:-2px;z-index:20}
+#progress{height:3px;margin-top:-3px;background:transparent;flex:none;position:relative;z-index:20}
 #progress i{display:block;height:100%;width:0;background:var(--warn);transition:width 1s linear}
 #progress.indeterminate i{width:35%;animation:slide 1.3s ease-in-out infinite}
 @keyframes slide{from{margin-left:-35%}to{margin-left:100%}}

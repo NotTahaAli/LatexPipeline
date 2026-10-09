@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
+import build
 import serve
 
 UI_DIR = Path(serve.__file__).resolve().parent / "serve_ui"
@@ -915,6 +916,27 @@ class ProseRoundTrip(unittest.TestCase):
             ["node", "--input-type=module", "-e", script], capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class UiWiring(unittest.TestCase):
+    """No browser here: check that the scripts only reach for elements the page has, and the page stays accessible."""
+
+    def test_every_id_the_script_uses_exists_in_the_page(self):
+        page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+        ids = set(re.findall(r'\bid="([^"]+)"', page))
+        used = set(re.findall(r'\$\("([A-Za-z][\w-]*)"\)', (UI_DIR / "app.js").read_text(encoding="utf-8")))
+        # Built at runtime: palette rows, dynamic dialogs bodies and tree rows are created by app.js itself.
+        runtime = {"emptyTime"}
+        self.assertEqual(sorted(used - ids - runtime), [])
+
+    def test_page_basics_for_screen_readers(self):
+        page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn("<h1", page)
+        self.assertIn('id="live"', page)  # concise build announcements, not the whole pill
+        self.assertIn('lang="en"', page)
+
+    def test_build_state_carries_a_start_time_for_the_progress_bar(self):
+        self.assertIn("started", serve.fresh_state("x", build.SOURCE_DIR / "x" / "main.tex"))
 
 
 if __name__ == "__main__":
