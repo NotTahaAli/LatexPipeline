@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
 import json
 import os
 import posixpath
@@ -47,8 +48,15 @@ LATEXMK_ARGS = [
     "-interaction=nonstopmode",
     "-halt-on-error",
     "-file-line-error",
+    "-recorder",  # <cache>/<name>.fls: every file the build read, see recorded_inputs().
     "-synctex=1",  # <cache>/<name>.synctex.gz, read by serve.py for source <-> PDF jumps.
 ]
+
+# kpsewhich variables naming directories of the TeX installation. Files there
+# (classes, fonts, texmf.cnf, the format file) never make a document stale.
+TEX_TREE_VARIABLES = (
+    "TEXMFROOT", "TEXMFMAIN", "TEXMFLOCAL", "TEXMFSYSCONFIG", "TEXMFSYSVAR", "TEXMFVAR", "TEXMFCONFIG",
+)
 
 # TeX wraps its log at 79 columns, which splits paths and errors across lines.
 # TeX Live and MiKTeX read these limits from the environment (kpathsea).
@@ -247,10 +255,12 @@ def changed_files(ref: str) -> list[str] | None:
 
 def filter_changed(documents: list[Path], ref: str) -> list[Path]:
     """
-    Keep documents whose directory contains a changed file.
+    Keep documents whose directory contains a changed file, or that list a
+    changed file in their recorded inputs (recorded_inputs: the cached .fls
+    from the last build, restored by CI).
 
     Everything inside a document's directory (.tex, .bib, .cls, figures, ...)
-    counts as its input. Inputs outside that directory are not tracked.
+    counts as its input. Inputs outside it count once a build has recorded them.
     """
     changed = changed_files(ref)
 
@@ -263,16 +273,72 @@ def filter_changed(documents: list[Path], ref: str) -> list[Path]:
 
     changed_paths = [ROOT_DIR / name for name in changed]
 
-    return [
-        document for document in documents
-        if any(document.parent in path.parents for path in changed_paths)
-    ]
+    def affected(document: Path) -> bool:
+        recorded = set(recorded_inputs(document))
+        return any(document.parent in path.parents or path in recorded for path in changed_paths)
+
+    return [document for document in documents if affected(document)]
+
+
+@functools.cache
+def tex_tree_dirs() -> tuple[Path, ...] | None:
+    """
+    Directories of the TeX installation, from kpsewhich (one call per variable,
+    once per run). None if kpsewhich cannot be run, in which case files outside
+    a document's directory are not tracked at all.
+    """
+    dirs = []
+    for variable in TEX_TREE_VARIABLES:
+        try:
+            result = subprocess.run(
+                ["kpsewhich", f"-var-value={variable}"],
+                capture_output=True, text=True, check=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        value = result.stdout.strip()
+        if value:
+            dirs.append(Path(value).resolve())
+    return tuple(dirs)
+
+
+def recorded_inputs(main_tex: Path) -> list[Path]:
+    """
+    Files outside the document's directory that its last build read, from the
+    .fls that latexmk writes (-recorder). Empty before the first build.
+
+    The document directory is skipped (newest_input scans it anyway), and so
+    are the TeX installation, the cache and out/: the cache holds generated
+    figures and .inject files, rewritten on every build.
+    """
+    recorder = cache_dir_for(main_tex) / f"{main_tex.stem}.fls"
+    tree = tex_tree_dirs()
+
+    if tree is None or not recorder.exists():
+        return []
+
+    # A TEXMF* value that contains the repository (say "/") would hide every input.
+    skip = [path for path in (*tree, CACHE_DIR, OUT_DIR) if path not in ROOT_DIR.parents and path != ROOT_DIR]
+    directory = main_tex.parent
+    found: list[Path] = []
+
+    for line in recorder.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("INPUT "):
+            continue
+        path = (directory / line[len("INPUT "):].strip()).resolve()
+        if path.is_relative_to(directory) or any(path.is_relative_to(base) for base in skip):
+            continue
+        if path not in found:
+            found.append(path)
+
+    return found
 
 
 def newest_input(main_tex: Path) -> float:
     """
     Newest modification time among a document's inputs: every file in its
-    directory tree (dotfiles such as .DS_Store excluded) and this script.
+    directory tree (dotfiles such as .DS_Store excluded), the files outside it
+    that the last build read (recorded_inputs), and this script.
     """
     newest = Path(__file__).stat().st_mtime
 
@@ -284,6 +350,12 @@ def newest_input(main_tex: Path) -> float:
                 newest = max(newest, path.stat().st_mtime)
         except OSError:
             pass  # Deleted mid-scan.
+
+    for path in recorded_inputs(main_tex):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass  # Gone since the build; the next build drops it from the .fls.
 
     return newest
 

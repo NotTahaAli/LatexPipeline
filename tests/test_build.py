@@ -1,7 +1,11 @@
 """Pure logic in scripts/build.py and the ci_report markdown helpers."""
 
+import os
+import time
 import unittest
 import urllib.parse
+from pathlib import Path
+from unittest import mock
 
 from _support import build, ci_report, fake_repo, write_doc
 
@@ -205,6 +209,71 @@ class ReadSettingsTests(unittest.TestCase):
             with self.assertRaises(build.ConfigError) as ctx:
                 build.read_settings(path)
             self.assertIn("build.toml", str(ctx.exception))
+
+
+class RecordedInputsTests(unittest.TestCase):
+    """Files outside a document's directory, tracked through the .fls of its last build."""
+
+    def setUp(self):
+        repo = fake_repo()
+        self.root = repo.__enter__()
+        self.addCleanup(repo.__exit__, None, None, None)
+        self.main = write_doc(self.root, "doc", "x")
+        self.shared = self.root / "files" / "shared" / "macros.tex"
+        self.shared.parent.mkdir(parents=True)
+        self.shared.write_text("\\newcommand{\\x}{y}\n", encoding="utf-8")
+        self.fls = self.root / ".latex-cache" / "doc" / "main.fls"
+        self.fls.parent.mkdir(parents=True)
+        self.fls.write_text("\n".join([
+            "PWD /x",
+            "INPUT ./main.tex",
+            "INPUT ../shared/macros.tex",
+            f"INPUT {self.root / 'texlive' / 'tikz.sty'}",        # TeX installation: ignored
+            f"INPUT {self.root / '.latex-cache' / 'doc' / 'tikz' / 'f.pdf'}",  # cache: ignored
+            "INPUT /elsewhere/notes.tex",                         # outside everything: tracked
+            "OUTPUT main.pdf",
+        ]) + "\n", encoding="utf-8")
+        self.tree = mock.patch.object(build, "tex_tree_dirs", return_value=(self.root / "texlive",))
+        self.tree.start()
+        self.addCleanup(self.tree.stop)
+
+    def test_external_inputs_only(self):
+        self.assertEqual(build.recorded_inputs(self.main),
+                         [self.shared.resolve(), Path("/elsewhere/notes.tex")])
+
+    def test_no_recorder_file_means_nothing_recorded(self):
+        self.fls.unlink()
+        self.assertEqual(build.recorded_inputs(self.main), [])
+
+    def test_unknown_tex_tree_disables_the_rule(self):
+        with mock.patch.object(build, "tex_tree_dirs", return_value=None):
+            self.assertEqual(build.recorded_inputs(self.main), [])
+
+    def test_root_directory_in_tex_tree_is_ignored(self):
+        # kpsewhich can report "/" (SELFAUTOPARENT); that must not hide the whole disk.
+        with mock.patch.object(build, "tex_tree_dirs", return_value=(Path("/"),)):
+            self.assertEqual(build.recorded_inputs(self.main), [
+                self.shared.resolve(), self.root / "texlive" / "tikz.sty", Path("/elsewhere/notes.tex"),
+            ])
+
+    def test_is_stale_follows_recorded_input(self):
+        pdf = build.output_path_for(self.main)
+        pdf.parent.mkdir(parents=True)
+        pdf.write_text("pdf")
+        now = time.time()
+        os.utime(pdf, (now + 1000, now + 1000))          # PDF newer than the build script
+        os.utime(self.shared, (now - 1000, now - 1000))
+        self.assertFalse(build.is_stale(self.main))
+        os.utime(self.shared, (now + 2000, now + 2000))  # edited after the build
+        self.assertTrue(build.is_stale(self.main))
+
+    def test_ci_filter_follows_recorded_input(self):
+        doc = self.main
+        other = write_doc(self.root, "other", "x")
+        with mock.patch.object(build, "changed_files", return_value=["files/shared/macros.tex"]):
+            self.assertEqual(build.filter_changed([doc, other], "origin/main"), [doc])
+            self.fls.unlink()
+            self.assertEqual(build.filter_changed([doc, other], "origin/main"), [])
 
 
 class CiReportCellTests(unittest.TestCase):

@@ -26,7 +26,7 @@ __all__ = ["build", "ci_report", "fake_repo", "publish_release", "write_doc"]
 def fake_repo():
     """Point the scripts' path globals at a temporary repository; yields its root."""
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()  # Resolved: the scripts compare resolved paths.
         (root / "files").mkdir()
         values = {
             "ROOT_DIR": root,

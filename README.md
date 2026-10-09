@@ -49,7 +49,7 @@ With uv you can use `uv run scripts/build.py ...` instead of `python`.
 
 Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once. Ctrl+C in a parallel build cancels the documents still in the queue and exits with status 130.
 
-A document counts as **out of date** when any file in its directory, or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored.
+A document counts as **out of date** when any file in its directory, any file outside it that its last build read (from the `.fls` above), or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored. Before the first build, only the directory counts.
 
 For each document, the script:
 
@@ -84,7 +84,7 @@ files/My New Document/
     └── figure.png
 ```
 
-You don't need to change `build.py`. Keep every input inside the document's directory. Files outside it (for example `\input{../shared/x}`) aren't tracked for rebuilds.
+You don't need to change `build.py`. Keep inputs inside the document's directory where you can. A file outside it (for example `\input{../shared/x}`) is tracked for rebuilds once the document's first build has read it: the build records every file it reads in `.latex-cache/<name>/<name>.fls` (latexmk `-recorder`). TeX installation files and the cache are never tracked.
 
 ### Engine and settings
 
@@ -147,6 +147,7 @@ Not adopted, because they did not pay off: a precompiled preamble format (saves 
   * Push to the default branch: everything changed since the last fully successful publish. Runs that were skipped or failed get caught up.
   * Other branches: changed in the push.
   * Pull requests: changed since the base branch.
+  * A document is also changed when a changed file is in its recorded `.fls` inputs, restored from `.latex-cache`.
   * Changes to `scripts/` or the workflow, manual runs, and the first publish rebuild every document.
 * **Job summary** (every run): a table per document with its status, pages, words, build time, LaTeX warnings, chktex warnings and first error. The same table is a comment on the pull request, updated in place on each push, with a link to the run's artifacts. Fork pull requests get no comment, because their token is read-only.
 * **latexdiff** (pull requests): each changed document is compared with the base branch, and the diff PDFs are uploaded as the `diff-pdfs` artifact. A failure is noted in the comment and never fails the run.
