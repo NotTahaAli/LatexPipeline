@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import json
 import os
+import posixpath
+import re
 import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -23,6 +27,12 @@ OUT_DIR = ROOT_DIR / "out"
 # edit reruns only the passes it needs instead of a cold multi-pass build.
 CACHE_DIR = ROOT_DIR / ".latex-cache"
 
+# ponytail: capped at 8; every job is a full TeX run, so more would thrash the disk.
+DEFAULT_JOBS = min(os.cpu_count() or 1, 8)
+
+# ponytail: at most this many errors per failing document in the summary; the log has all.
+MAX_SUMMARY_ERRORS = 10
+
 # Changes to these paths (relative to ROOT_DIR) rebuild every document.
 GLOBAL_INPUTS = (
     "scripts/",
@@ -30,11 +40,18 @@ GLOBAL_INPUTS = (
 )
 
 LATEXMK_ARGS = [
-    "-pdf",
     "-interaction=nonstopmode",
     "-halt-on-error",
     "-file-line-error",
 ]
+
+# Engine name -> latexmk flag. Set per document (see read_settings).
+ENGINES = {
+    "pdflatex": "-pdf",
+    "xelatex": "-pdfxe",
+    "lualatex": "-pdflua",
+}
+DEFAULT_ENGINE = "pdflatex"
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +66,59 @@ def error(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
 
 
+RULE = "=" * 72
+
+# Colour only on a terminal; NO_COLOR (https://no-color.org) turns it off.
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+GREEN = "32"
+RED = "31"
+
+if COLOR and os.name == "nt":
+    os.system("")  # Enables ANSI escape codes in the Windows console.
+
+
+def paint(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
+
 def separator() -> None:
-    print("=" * 72)
+    print(RULE)
+
+
+def doc_name(main_tex: Path) -> str:
+    """
+    files/reports/final/main.tex -> reports/final
+    """
+    return main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+
+
+def name_matches(name: str, pattern: str) -> bool:
+    return name == pattern or fnmatch.fnmatch(name, pattern)
+
+
+def select_documents(documents: list[Path], patterns: list[str]) -> list[Path]:
+    """
+    Documents whose name equals a pattern or matches it as a glob.
+    No patterns selects everything.
+    """
+    if not patterns:
+        return documents
+
+    return [
+        document for document in documents
+        if any(name_matches(doc_name(document), pattern) for pattern in patterns)
+    ]
+
+
+def unknown_patterns(documents: list[Path], patterns: list[str]) -> list[str]:
+    """
+    Patterns that match no document.
+    """
+    names = [doc_name(document) for document in documents]
+    return [
+        pattern for pattern in patterns
+        if not any(name_matches(name, pattern) for name in names)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +293,132 @@ def log_path_for(main_tex: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Per-document settings
+# ---------------------------------------------------------------------------
+
+# "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
+ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
+
+# ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
+LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
+LATEX_WARNING = re.compile(r"^(?:LaTeX|Package|Class)\b.*\bWarning", re.MULTILINE)
+LATEX_PAGES = re.compile(r"^Output written on .*\((\d+) pages?", re.MULTILINE)
+
+
+class ConfigError(Exception):
+    """A document's settings are invalid. The message goes into its log."""
+
+
+def display(path: Path) -> str:
+    """Path relative to the repository root, with forward slashes."""
+    return path.relative_to(ROOT_DIR).as_posix()
+
+
+def read_toml(path: Path) -> dict:
+    """
+    Parse a build.toml. tomllib is in the standard library from Python 3.11;
+    older interpreters need the tomli package.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            raise ConfigError(
+                f"{display(path)} needs Python 3.11+ or the 'tomli' package."
+            ) from None
+
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"{display(path)}: {exc}") from None
+
+
+def read_settings(main_tex: Path) -> dict:
+    """
+    Engine, shell_escape and latexmk_args for one document.
+
+    The engine comes from the magic comment in the first 20 lines of main.tex
+    and can be overridden by build.toml in the document's directory.
+    Raises ConfigError for invalid values.
+    """
+    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": []}
+
+    text = main_tex.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines()[:20]:
+        match = ENGINE_MAGIC.match(line)
+        if match:
+            settings["engine"] = match.group(1)
+            break
+
+    config_path = main_tex.parent / "build.toml"
+    if config_path.exists():
+        data = read_toml(config_path)
+
+        unknown = sorted(set(data) - CONFIG_KEYS)
+        if unknown:
+            raise ConfigError(f"{display(config_path)}: unknown key(s): {', '.join(unknown)}")
+
+        settings.update(data)
+
+    engine = settings["engine"]
+    if not isinstance(engine, str) or engine.lower() not in ENGINES:
+        raise ConfigError(
+            f"{display(main_tex)}: unknown engine {engine!r} "
+            "(use pdflatex, xelatex or lualatex)"
+        )
+    settings["engine"] = engine.lower()
+
+    if not isinstance(settings["shell_escape"], bool):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: shell_escape must be true or false")
+
+    args = settings["latexmk_args"]
+    if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: latexmk_args must be a list of strings")
+
+    return settings
+
+
+def parse_latex_errors(console: str) -> list[dict]:
+    """
+    LaTeX errors in latexmk's console output, as {file, line, message}.
+    File is relative to the document's directory.
+    """
+    found: list[dict] = []
+
+    for line in console.splitlines():
+        match = LATEX_ERROR.match(line)
+        if not match:
+            continue
+
+        item = {
+            "file": posixpath.normpath(match.group("file")),
+            "line": int(match.group("line")),
+            "message": match.group("message"),
+        }
+        if item not in found:
+            found.append(item)
+
+    return found
+
+
+def error_text(name: str, found: dict) -> str:
+    """
+    files/<doc>/<file>:<line>: message. Editors can jump to it.
+    """
+    path = posixpath.normpath(posixpath.join(SOURCE_DIR.name, name, found["file"]))
+    return f"{path}:{found['line']}: {found['message']}"
+
+
+# ---------------------------------------------------------------------------
 # Building
 # ---------------------------------------------------------------------------
 
-def build_document(main_tex: Path, latexmk: str) -> bool:
+def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dict, str]:
     """
-    Build one LaTeX document.
+    Build one LaTeX document. Returns (report entry, console text).
 
     Compilation happens in .latex-cache/, which persists between builds so
     latexmk reruns only the passes an edit needs. LaTeX auxiliary files never
@@ -238,17 +426,47 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
     <name>.log are written to out/. The log holds the result, the latexmk
     console output, and LaTeX's and BibTeX's own logs: every info line,
     warning and error.
+
+    With live=True the output is streamed to the terminal. With live=False
+    nothing is printed except a "Started" line; the caller prints the
+    returned text once the document finishes, so parallel builds don't mix.
     """
+    began = time.monotonic()
     relative = main_tex.relative_to(ROOT_DIR)
+    name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
     output_pdf = output_path_for(main_tex)
     log_path = log_path_for(main_tex)
 
-    separator()
-    info(f"Building: {relative}")
-    info(f"Output:  {output_pdf.relative_to(ROOT_DIR)}")
-    separator()
+    shown: list[str] = []
+
+    def emit(text: str) -> None:
+        shown.append(text)
+        if live:
+            sys.stdout.write(text)
+
+    def say(text: str = "") -> None:
+        emit(text + "\n")
+
+    if not live:
+        info(f"Started: {relative}")
+
+    say(RULE)
+    say(f"Building: {relative}")
+    say(f"Output:  {output_pdf.relative_to(ROOT_DIR)}")
+    say(RULE)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    console: list[str] = []
+    errors: list[str] = []
+    pages = None
+    warnings = 0
+
+    try:
+        settings = read_settings(main_tex)
+    except ConfigError as exc:
+        settings = None
+        errors.append(str(exc))
 
     # Stamp the PDF with the build start time, so edits made while LaTeX is
     # running still count as newer than the PDF.
@@ -257,71 +475,89 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
     build_dir = CACHE_DIR / main_tex.parent.relative_to(SOURCE_DIR)
     cached = build_dir.exists()
     build_dir.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        latexmk,
-        *LATEXMK_ARGS,
-        f"-outdir={build_dir}",
-        main_tex.name,
-    ]
     generated_pdf = build_dir / f"{main_tex.stem}.pdf"
 
-    while True:
-        info("Running:")
-        info("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
-        info()
+    if settings is not None:
+        command = [
+            latexmk,
+            *LATEXMK_ARGS,
+            ENGINES[settings["engine"]],
+            *(["-shell-escape"] if settings["shell_escape"] else []),
+            *settings["latexmk_args"],
+            f"-outdir={build_dir}",
+            main_tex.name,
+        ]
 
-        console = []
-        errors = []
+        say(f"Engine:  {settings['engine']}")
+        say()
 
-        # Stream output to the terminal while keeping a copy for the log.
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=main_tex.parent,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-            )
-        except OSError as exc:
-            errors.append(f"Could not execute latexmk: {exc}")
-            break
+        while True:
+            say("Running:")
+            say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
+            say()
 
-        for line in process.stdout:
-            sys.stdout.write(line)
-            console.append(line)
+            console = []
 
-        if process.wait() == 0 or not cached:
-            break
-
-        # Stale working files can break a build that would pass from scratch.
-        info()
-        info("Build failed with cached files; retrying from a clean cache.")
-        info()
-        shutil.rmtree(build_dir, ignore_errors=True)
-        build_dir.mkdir(parents=True)
-        cached = False
-
-    if not errors:
-        if process.returncode != 0:
-            errors.append(f"LaTeX compilation failed: {relative}")
-        elif not generated_pdf.exists():
-            errors.append("LaTeX reported success, but no PDF was produced.")
-        else:
+            # Stream output to the terminal while keeping a copy for the log.
             try:
-                shutil.copy(generated_pdf, output_pdf)
-                os.utime(output_pdf, (started, started))
+                process = subprocess.Popen(
+                    command,
+                    cwd=main_tex.parent,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
             except OSError as exc:
-                errors.append(f"Could not copy generated PDF: {exc}")
+                errors.append(f"Could not execute latexmk: {exc}")
+                break
+
+            for line in process.stdout:
+                emit(line)
+                console.append(line)
+
+            if process.wait() == 0 or not cached:
+                break
+
+            # Stale working files can break a build that would pass from scratch.
+            say()
+            say("Build failed with cached files; retrying from a clean cache.")
+            say()
+            shutil.rmtree(build_dir, ignore_errors=True)
+            build_dir.mkdir(parents=True)
+            cached = False
+
+        if not errors:
+            if process.returncode != 0:
+                errors.append(f"LaTeX compilation failed: {relative}")
+            elif not generated_pdf.exists():
+                errors.append("LaTeX reported success, but no PDF was produced.")
+            else:
+                try:
+                    shutil.copy(generated_pdf, output_pdf)
+                    os.utime(output_pdf, (started, started))
+                except OSError as exc:
+                    errors.append(f"Could not copy generated PDF: {exc}")
 
     for message in errors:
-        error(message)
+        say(f"ERROR: {message}")
+
+    latex_log = build_dir / f"{main_tex.stem}.log"
+    log_text = latex_log.read_text(encoding="utf-8", errors="replace") if latex_log.exists() else ""
+
+    # Counts from the final LaTeX run, which is the last pass that wrote the log.
+    latex_errors = parse_latex_errors("".join(console))
+    warnings = len(LATEX_WARNING.findall(log_text))
+    page_counts = LATEX_PAGES.findall(log_text)
+
+    if not errors and page_counts:
+        pages = int(page_counts[-1])
 
     sections = [
         f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
         *(f"ERROR: {message}\n" for message in errors),
+        *(f"{error_text(name, found)}\n" for found in latex_errors),
         "\n===== latexmk output =====\n",
         *console,
     ]
@@ -336,17 +572,63 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
 
     log_path.write_text("".join(sections), encoding="utf-8")
 
-    info()
-    info(f"Log:     {log_path.relative_to(ROOT_DIR)}")
+    seconds = round(time.monotonic() - began, 1)
+
+    say()
+    say(f"Log:     {log_path.relative_to(ROOT_DIR)}")
+    say(f"Time:    {seconds:.1f}s")
 
     if errors:
-        return False
+        say(paint(f"FAILED:  {relative.as_posix()}", RED))
+    else:
+        say(paint(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}", GREEN))
 
-    info(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
-    return True
+    entry = {
+        "name": name,
+        "pdf": output_pdf.relative_to(OUT_DIR).as_posix(),
+        "log": log_path.relative_to(OUT_DIR).as_posix(),
+        "ok": not errors,
+        "seconds": seconds,
+        "engine": settings["engine"] if settings else None,
+        "pages": pages,
+        "errors": latex_errors,
+        "warnings": warnings,
+    }
+
+    return entry, "".join(shown)
 
 
-def watch(latexmk: str, interval: float = 1.0) -> int:
+def write_report(entries: list[dict]) -> None:
+    """
+    Write out/build-report.json for the documents built in this run.
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    report = {"documents": sorted(entries, key=lambda entry: entry["name"])}
+    text = json.dumps(report, indent=2) + "\n"
+    (OUT_DIR / "build-report.json").write_text(text, encoding="utf-8")
+
+
+def open_pdf(path: Path) -> None:
+    """
+    Open a PDF in the platform's default viewer.
+    """
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen(
+                [opener, str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except OSError as exc:
+        error(f"Could not open {path}: {exc}")
+
+
+def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 0.5) -> int:
     """
     Poll for changes and rebuild stale documents until interrupted.
     """
@@ -358,13 +640,20 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
     # retried until something changes.
     failed: dict[Path, float] = {}
 
+    # Input timestamp seen on the previous poll. A document is built only once
+    # its inputs have stayed the same for a full interval, so a save that
+    # writes several files triggers one build.
+    seen: dict[Path, float] = {}
+    opened: set[Path] = set()
+
     try:
         while True:
-            documents = find_documents()
-            prune(documents)
+            everything = find_documents()
+            prune(everything)
 
-            for document in documents:
+            for document in select_documents(everything, patterns):
                 if not is_stale(document):
+                    seen.pop(document, None)
                     continue
 
                 newest = newest_input(document)
@@ -372,8 +661,19 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
                 if failed.get(document) == newest:
                     continue
 
-                if build_document(document, latexmk):
+                if seen.get(document) != newest:
+                    seen[document] = newest
+                    continue
+
+                del seen[document]
+                entry, _ = build_document(document, latexmk)
+
+                if entry["ok"]:
                     failed.pop(document, None)
+
+                    if open_pdfs and document not in opened:
+                        opened.add(document)
+                        open_pdf(OUT_DIR / entry["pdf"])
                 else:
                     failed[document] = newest
 
@@ -425,6 +725,55 @@ def clean() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Creating documents
+# ---------------------------------------------------------------------------
+
+NEW_TEMPLATE = r"""\documentclass{article}
+
+\title{%(title)s}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+\end{document}
+"""
+
+LATEX_SPECIAL = {
+    "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$", "&": r"\&",
+    "#": r"\#", "^": r"\textasciicircum{}", "_": r"\_", "%": r"\%", "~": r"\textasciitilde{}",
+}
+
+
+def new_document(name: str) -> int:
+    """
+    Create files/<name>/main.tex from NEW_TEMPLATE. Never overwrites.
+    """
+    path = Path(name)
+
+    if not name.strip() or path.is_absolute() or ".." in path.parts:
+        error(f"Invalid document name: {name!r}")
+        return 1
+
+    target = SOURCE_DIR / path / "main.tex"
+
+    if target.exists():
+        error(f"Already exists: {display(target)}")
+        return 1
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
+    target.write_text(NEW_TEMPLATE % {"title": title}, encoding="utf-8")
+
+    info(f"Created: {display(target)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -434,9 +783,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "docs",
+        nargs="*",
+        metavar="DOC",
+        help="Only build these documents: a name relative to files/ "
+             "(e.g. 'reports/final'), or a glob (e.g. 'reports/*'). Default: all.",
+    )
+
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Remove out/ and the .latex-cache/ directory, then exit.",
+    )
+
+    parser.add_argument(
+        "--new",
+        metavar="NAME",
+        help="Create files/NAME/main.tex from a template and exit.",
     )
 
     parser.add_argument(
@@ -452,6 +815,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=DEFAULT_JOBS,
+        metavar="N",
+        help=f"Build N documents in parallel (default: {DEFAULT_JOBS}). "
+             "A parallel build's output is printed when that document finishes.",
+    )
+
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Rebuild documents even if their PDF is up to date.",
@@ -463,7 +836,59 @@ def parse_args() -> argparse.Namespace:
         help="Keep running and rebuild documents whenever their files change.",
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="With --watch: open each PDF in its default viewer after its first successful build.",
+    )
+
+    args = parser.parse_args()
+
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+
+    if args.open and not args.watch:
+        parser.error("--open needs --watch")
+
+    return args
+
+
+def print_summary(results: list[dict]) -> None:
+    """
+    One line per document, then the errors of the failed ones.
+    """
+    separator()
+    info("Build Summary")
+    separator()
+
+    width = max(len(entry["name"]) for entry in results)
+
+    for entry in results:
+        status = paint("SUCCESS", GREEN) if entry["ok"] else paint("FAILED ", RED)
+
+        details = [entry["engine"] or "-"]
+        if entry["pages"] is not None:
+            details.append(f"{entry['pages']} page{'' if entry['pages'] == 1 else 's'}")
+        if entry["warnings"]:
+            details.append(f"{entry['warnings']} warning(s)")
+
+        info(f"  {status}  {entry['name']:<{width}}  {entry['seconds']:6.1f}s  {', '.join(details)}")
+
+        # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
+        for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
+            info(f"      {error_text(entry['name'], found)}")
+
+        hidden = len(entry["errors"]) - MAX_SUMMARY_ERRORS
+        if hidden > 0:
+            info(f"      ... {hidden} more in out/{entry['log']}")
+
+    successes = sum(entry["ok"] for entry in results)
+
+    info()
+    info(f"Successful: {successes}")
+    info(f"Failed:     {len(results) - successes}")
+    info(f"Total:      {len(results)}")
+    separator()
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +902,18 @@ def main() -> int:
         clean()
         return 0
 
+    if args.new is not None:
+        return new_document(args.new)
+
     documents = find_documents()
+
+    unknown = unknown_patterns(documents, args.docs)
+    if unknown:
+        error(f"No document matches: {', '.join(unknown)}")
+        info("Available documents:")
+        for document in documents:
+            info(f"  {doc_name(document)}")
+        return 2
 
     if not args.list:
         prune(documents)
@@ -485,6 +921,8 @@ def main() -> int:
     if not documents:
         info(f"No main.tex files found under {SOURCE_DIR.relative_to(ROOT_DIR)}/.")
         return 0
+
+    documents = select_documents(documents, args.docs)
 
     if args.changed_since:
         documents = filter_changed(documents, args.changed_since)
@@ -508,7 +946,7 @@ def main() -> int:
     latexmk = check_latex()
 
     if args.watch:
-        return watch(latexmk)
+        return watch(latexmk, args.docs, args.open)
 
     if not args.force:
         documents = [document for document in documents if is_stale(document)]
@@ -521,26 +959,31 @@ def main() -> int:
     info(f"Found {len(documents)} document(s).")
     info()
 
-    successes = 0
-    failures = 0
+    # One document runs live; several run in a pool, printed as each finishes.
+    jobs = min(args.jobs, len(documents))
+    results: list[dict] = []
 
-    for document in documents:
-        if build_document(document, latexmk):
-            successes += 1
-        else:
-            failures += 1
+    if jobs == 1:
+        for document in documents:
+            results.append(build_document(document, latexmk)[0])
+            info()
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(build_document, document, latexmk, False)
+                for document in documents
+            ]
 
-        info()
+            for future in as_completed(futures):
+                entry, text = future.result()
+                sys.stdout.write(text)
+                results.append(entry)
+                info()
 
-    separator()
-    info("Build Summary")
-    separator()
-    info(f"Successful: {successes}")
-    info(f"Failed:     {failures}")
-    info(f"Total:      {len(documents)}")
-    separator()
+    write_report(results)
+    print_summary(results)
 
-    return 1 if failures else 0
+    return 1 if any(not entry["ok"] for entry in results) else 0
 
 
 if __name__ == "__main__":

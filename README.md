@@ -17,7 +17,7 @@ Everything inside a document's directory (`.tex`, `.bib`, `.cls`, figures, ...) 
 
 ## Requirements
 
-* Python 3.9+ (standard library only, no packages needed)
+* Python 3.9+ (standard library only; Python 3.9 and 3.10 also need `tomli` for `build.toml`, see [Engine and settings](#engine-and-settings))
 * A LaTeX distribution that includes `latexmk`:
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
@@ -33,15 +33,20 @@ Check that it works with `latexmk --version`. If the command isn't found, add yo
 From the repository root:
 
 ```bash
-python scripts/build.py            # build documents whose PDF is missing or out of date
-python scripts/build.py --force    # rebuild everything
-python scripts/build.py --watch    # keep running and rebuild on every save (Ctrl+C to stop)
-python scripts/build.py --list     # show discovered documents and whether they are up to date
-python scripts/build.py --clean    # delete out/
+python scripts/build.py                  # build documents whose PDF is missing or out of date
+python scripts/build.py --force          # rebuild everything
+python scripts/build.py -j 2             # build two documents at a time (default: CPU count, up to 8)
+python scripts/build.py "FP-123 Report"  # build only that document (or a glob such as "reports/*")
+python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
+python scripts/build.py --watch --open   # keep running, rebuild on every save, open each PDF after its first build
+python scripts/build.py --list           # show discovered documents and whether they are up to date
+python scripts/build.py --clean          # delete out/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
 ```
 
 With uv you can use `uv run scripts/build.py ...` instead of `python`.
+
+Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once.
 
 A document counts as **out of date** when any file in its directory, or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored.
 
@@ -52,6 +57,10 @@ For each document, the script:
 3. Writes the full build log to `out/<name>.log` (for example `out/FP-123 Proposal.log`), whether the build succeeded or not. The log starts with the result and any errors. Then comes the latexmk console output from every pass, followed by LaTeX's own `.log` and BibTeX's `.blg`, so every info line, warning and error is in it.
 4. Carries on with the remaining documents if one fails, and prints a summary.
 5. Exits non-zero if any document failed.
+
+Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`.
+
+After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`) and `warnings` (a count of LaTeX warnings). CI reads this file, so keep its keys stable.
 
 Before building, it deletes any PDF or log in `out/` whose `main.tex` no longer exists. `--watch` does this too.
 
@@ -75,6 +84,26 @@ files/My New Document/
 ```
 
 You don't need to change `build.py`. Keep every input inside the document's directory. Files outside it (for example `\input{../shared/x}`) aren't tracked for rebuilds.
+
+### Engine and settings
+
+The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex`:
+
+```latex
+% !TEX program = xelatex
+```
+
+Supported engines are `pdflatex` (the default), `xelatex` and `lualatex`.
+
+A document can also have a `build.toml` next to its `main.tex`. Every key is optional:
+
+```toml
+engine = "lualatex"      # overrides the magic comment
+shell_escape = true      # default: false
+latexmk_args = ["-g"]    # extra arguments passed to latexmk
+```
+
+An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
 
 ---
 
