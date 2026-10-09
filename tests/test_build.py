@@ -99,10 +99,21 @@ class ParseLatexErrorsTests(unittest.TestCase):
             "sections/intro.tex:12: Missing $ inserted.\n"
             "./main.tex:5: Undefined control sequence.\n"
         )
-        self.assertEqual(build.parse_latex_errors(console), [
-            {"file": "main.tex", "line": 5, "message": "Undefined control sequence."},
-            {"file": "sections/intro.tex", "line": 12, "message": "Missing $ inserted."},
+        found = build.parse_latex_errors(console)
+        self.assertEqual([(e["file"], e["line"], e["message"]) for e in found], [
+            ("main.tex", 5, "Undefined control sequence."),
+            ("sections/intro.tex", 12, "Missing $ inserted."),
         ])
+        self.assertIn("Check the spelling", found[0]["hint"])
+        self.assertIn("Wrap it in", found[1]["hint"])
+
+    def test_hint_can_come_from_context_lines(self):
+        console = "./main.tex:3: Something vague\nl.3 \\foo\n! Undefined control sequence.\n"
+        self.assertIn("Check the spelling", build.parse_latex_errors(console)[0]["hint"])
+
+    def test_unknown_error_has_no_hint(self):
+        found = build.parse_latex_errors("./main.tex:3: Something vague\nl.3 text\n")
+        self.assertIsNone(found[0]["hint"])
 
     def test_no_errors(self):
         self.assertEqual(build.parse_latex_errors("Latexmk: All targets up-to-date\n"), [])

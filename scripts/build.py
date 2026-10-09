@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import accel
+import hints
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -423,20 +424,26 @@ def read_settings(main_tex: Path) -> dict:
 
 def parse_latex_errors(console: str) -> list[dict]:
     """
-    LaTeX errors in latexmk's console output, as {file, line, message}.
-    File is relative to the document's directory.
+    LaTeX errors in latexmk's console output, as {file, line, message, hint}.
+    File is relative to the document's directory. hint is a plain-language
+    explanation from hints.explain (None when no rule matches), which also
+    reads the three console lines after the error (TeX's context lines).
     """
     found: list[dict] = []
+    lines = console.splitlines()
 
-    for line in console.splitlines():
+    for index, line in enumerate(lines):
         match = LATEX_ERROR.match(line)
         if not match:
             continue
 
+        message = match.group("message")
+        context = "\n".join(lines[index + 1:index + 4])
         item = {
             "file": posixpath.normpath(match.group("file")),
             "line": int(match.group("line")),
-            "message": match.group("message"),
+            "message": message,
+            "hint": hints.explain(message, context),
         }
         if item not in found:
             found.append(item)
@@ -669,7 +676,8 @@ def build_document(
     sections = [
         f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
         *(f"ERROR: {message}\n" for message in errors),
-        *(f"{error_text(name, found)}\n" for found in latex_errors),
+        *(f"{error_text(name, found)}\n" + (f"  Hint: {found['hint']}\n" if found["hint"] else "")
+          for found in latex_errors),
         *(f"NOTE: {note}\n" for note in notes),
         "\n===== latexmk output =====\n",
         *console,
@@ -1188,6 +1196,8 @@ def print_summary(results: list[dict]) -> None:
         # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
         for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
             info(f"      {error_text(entry['name'], found)}")
+            if found["hint"]:
+                info(f"        hint: {found['hint']}")
 
         hidden = len(entry["errors"]) - MAX_SUMMARY_ERRORS
         if hidden > 0:
