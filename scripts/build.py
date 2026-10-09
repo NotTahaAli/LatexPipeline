@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import posixpath
@@ -65,9 +66,57 @@ def error(message: str) -> None:
 
 RULE = "=" * 72
 
+# Colour only on a terminal; NO_COLOR (https://no-color.org) turns it off.
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+GREEN = "32"
+RED = "31"
+
+if COLOR and os.name == "nt":
+    os.system("")  # Enables ANSI escape codes in the Windows console.
+
+
+def paint(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
 
 def separator() -> None:
     print(RULE)
+
+
+def doc_name(main_tex: Path) -> str:
+    """
+    files/reports/final/main.tex -> reports/final
+    """
+    return main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+
+
+def name_matches(name: str, pattern: str) -> bool:
+    return name == pattern or fnmatch.fnmatch(name, pattern)
+
+
+def select_documents(documents: list[Path], patterns: list[str]) -> list[Path]:
+    """
+    Documents whose name equals a pattern or matches it as a glob.
+    No patterns selects everything.
+    """
+    if not patterns:
+        return documents
+
+    return [
+        document for document in documents
+        if any(name_matches(doc_name(document), pattern) for pattern in patterns)
+    ]
+
+
+def unknown_patterns(documents: list[Path], patterns: list[str]) -> list[str]:
+    """
+    Patterns that match no document.
+    """
+    names = [doc_name(document) for document in documents]
+    return [
+        pattern for pattern in patterns
+        if not any(name_matches(name, pattern) for name in names)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -502,18 +551,23 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dic
 
     log_path.write_text("".join(sections), encoding="utf-8")
 
+    seconds = round(time.monotonic() - began, 1)
+
     say()
     say(f"Log:     {log_path.relative_to(ROOT_DIR)}")
+    say(f"Time:    {seconds:.1f}s")
 
-    if not errors:
-        say(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
+    if errors:
+        say(paint(f"FAILED:  {relative.as_posix()}", RED))
+    else:
+        say(paint(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}", GREEN))
 
     entry = {
         "name": name,
         "pdf": output_pdf.relative_to(OUT_DIR).as_posix(),
         "log": log_path.relative_to(OUT_DIR).as_posix(),
         "ok": not errors,
-        "seconds": round(time.monotonic() - began, 1),
+        "seconds": seconds,
         "engine": settings["engine"] if settings else None,
         "pages": pages,
         "errors": latex_errors,
@@ -534,7 +588,26 @@ def write_report(entries: list[dict]) -> None:
     (OUT_DIR / "build-report.json").write_text(text, encoding="utf-8")
 
 
-def watch(latexmk: str, interval: float = 1.0) -> int:
+def open_pdf(path: Path) -> None:
+    """
+    Open a PDF in the platform's default viewer.
+    """
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen(
+                [opener, str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except OSError as exc:
+        error(f"Could not open {path}: {exc}")
+
+
+def watch(latexmk: str, patterns: list[str], open_pdfs: bool, interval: float = 0.5) -> int:
     """
     Poll for changes and rebuild stale documents until interrupted.
     """
@@ -546,13 +619,20 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
     # retried until something changes.
     failed: dict[Path, float] = {}
 
+    # Input timestamp seen on the previous poll. A document is built only once
+    # its inputs have stayed the same for a full interval, so a save that
+    # writes several files triggers one build.
+    seen: dict[Path, float] = {}
+    opened: set[Path] = set()
+
     try:
         while True:
-            documents = find_documents()
-            prune(documents)
+            everything = find_documents()
+            prune(everything)
 
-            for document in documents:
+            for document in select_documents(everything, patterns):
                 if not is_stale(document):
+                    seen.pop(document, None)
                     continue
 
                 newest = newest_input(document)
@@ -560,9 +640,19 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
                 if failed.get(document) == newest:
                     continue
 
+                if seen.get(document) != newest:
+                    seen[document] = newest
+                    continue
+
+                del seen[document]
                 entry, _ = build_document(document, latexmk)
+
                 if entry["ok"]:
                     failed.pop(document, None)
+
+                    if open_pdfs and document not in opened:
+                        opened.add(document)
+                        open_pdf(OUT_DIR / entry["pdf"])
                 else:
                     failed[document] = newest
 
@@ -611,6 +701,55 @@ def clean() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Creating documents
+# ---------------------------------------------------------------------------
+
+NEW_TEMPLATE = r"""\documentclass{article}
+
+\title{%(title)s}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+\end{document}
+"""
+
+LATEX_SPECIAL = {
+    "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$", "&": r"\&",
+    "#": r"\#", "^": r"\textasciicircum{}", "_": r"\_", "%": r"\%", "~": r"\textasciitilde{}",
+}
+
+
+def new_document(name: str) -> int:
+    """
+    Create files/<name>/main.tex from NEW_TEMPLATE. Never overwrites.
+    """
+    path = Path(name)
+
+    if not name.strip() or path.is_absolute() or ".." in path.parts:
+        error(f"Invalid document name: {name!r}")
+        return 1
+
+    target = SOURCE_DIR / path / "main.tex"
+
+    if target.exists():
+        error(f"Already exists: {display(target)}")
+        return 1
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
+    target.write_text(NEW_TEMPLATE % {"title": title}, encoding="utf-8")
+
+    info(f"Created: {display(target)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -620,9 +759,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "docs",
+        nargs="*",
+        metavar="DOC",
+        help="Only build these documents: a name relative to files/ "
+             "(e.g. 'reports/final'), or a glob (e.g. 'reports/*'). Default: all.",
+    )
+
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Remove the generated out/ directory and exit.",
+    )
+
+    parser.add_argument(
+        "--new",
+        metavar="NAME",
+        help="Create files/NAME/main.tex from a template and exit.",
     )
 
     parser.add_argument(
@@ -659,12 +812,59 @@ def parse_args() -> argparse.Namespace:
         help="Keep running and rebuild documents whenever their files change.",
     )
 
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="With --watch: open each PDF in its default viewer after its first successful build.",
+    )
+
     args = parser.parse_args()
 
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
 
+    if args.open and not args.watch:
+        parser.error("--open needs --watch")
+
     return args
+
+
+def print_summary(results: list[dict]) -> None:
+    """
+    One line per document, then the errors of the failed ones.
+    """
+    separator()
+    info("Build Summary")
+    separator()
+
+    width = max(len(entry["name"]) for entry in results)
+
+    for entry in results:
+        status = paint("SUCCESS", GREEN) if entry["ok"] else paint("FAILED ", RED)
+
+        details = [entry["engine"] or "-"]
+        if entry["pages"] is not None:
+            details.append(f"{entry['pages']} page{'' if entry['pages'] == 1 else 's'}")
+        if entry["warnings"]:
+            details.append(f"{entry['warnings']} warning(s)")
+
+        info(f"  {status}  {entry['name']:<{width}}  {entry['seconds']:6.1f}s  {', '.join(details)}")
+
+        # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
+        for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
+            info(f"      {error_text(entry['name'], found)}")
+
+        hidden = len(entry["errors"]) - MAX_SUMMARY_ERRORS
+        if hidden > 0:
+            info(f"      ... {hidden} more in out/{entry['log']}")
+
+    successes = sum(entry["ok"] for entry in results)
+
+    info()
+    info(f"Successful: {successes}")
+    info(f"Failed:     {len(results) - successes}")
+    info(f"Total:      {len(results)}")
+    separator()
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +878,18 @@ def main() -> int:
         clean()
         return 0
 
+    if args.new is not None:
+        return new_document(args.new)
+
     documents = find_documents()
+
+    unknown = unknown_patterns(documents, args.docs)
+    if unknown:
+        error(f"No document matches: {', '.join(unknown)}")
+        info("Available documents:")
+        for document in documents:
+            info(f"  {doc_name(document)}")
+        return 2
 
     if not args.list:
         prune(documents)
@@ -686,6 +897,8 @@ def main() -> int:
     if not documents:
         info(f"No main.tex files found under {SOURCE_DIR.relative_to(ROOT_DIR)}/.")
         return 0
+
+    documents = select_documents(documents, args.docs)
 
     if args.changed_since:
         documents = filter_changed(documents, args.changed_since)
@@ -709,7 +922,7 @@ def main() -> int:
     latexmk = check_latex()
 
     if args.watch:
-        return watch(latexmk)
+        return watch(latexmk, args.docs, args.open)
 
     if not args.force:
         documents = [document for document in documents if is_stale(document)]
@@ -744,33 +957,9 @@ def main() -> int:
                 info()
 
     write_report(results)
+    print_summary(results)
 
-    successes = sum(entry["ok"] for entry in results)
-    failures = len(results) - successes
-
-    separator()
-    info("Build Summary")
-    separator()
-    info(f"Successful: {successes}")
-    info(f"Failed:     {failures}")
-    info(f"Total:      {len(documents)}")
-
-    for entry in results:
-        if entry["ok"]:
-            continue
-
-        info()
-        info(f"Failed: {entry['name']}")
-        for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
-            info(f"  {error_text(entry['name'], found)}")
-
-        hidden = len(entry["errors"]) - MAX_SUMMARY_ERRORS
-        if hidden > 0:
-            info(f"  ... {hidden} more in out/{entry['log']}")
-
-    separator()
-
-    return 1 if failures else 0
+    return 1 if any(not entry["ok"] for entry in results) else 0
 
 
 if __name__ == "__main__":

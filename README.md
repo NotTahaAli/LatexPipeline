@@ -33,15 +33,20 @@ Check that it works with `latexmk --version`. If the command isn't found, add yo
 From the repository root:
 
 ```bash
-python scripts/build.py            # build documents whose PDF is missing or out of date
-python scripts/build.py --force    # rebuild everything
-python scripts/build.py --watch    # keep running and rebuild on every save (Ctrl+C to stop)
-python scripts/build.py --list     # show discovered documents and whether they are up to date
-python scripts/build.py --clean    # delete out/
+python scripts/build.py                  # build documents whose PDF is missing or out of date
+python scripts/build.py --force          # rebuild everything
+python scripts/build.py -j 2             # build two documents at a time (default: CPU count, up to 8)
+python scripts/build.py "FP-123 Report"  # build only that document (or a glob such as "reports/*")
+python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
+python scripts/build.py --watch --open   # keep running, rebuild on every save, open each PDF after its first build
+python scripts/build.py --list           # show discovered documents and whether they are up to date
+python scripts/build.py --clean          # delete out/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
 ```
 
 With uv you can use `uv run scripts/build.py ...` instead of `python`.
+
+Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once.
 
 A document counts as **out of date** when any file in its directory, or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored.
 
