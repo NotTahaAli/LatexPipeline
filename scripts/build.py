@@ -9,8 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -20,6 +20,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 SOURCE_DIR = ROOT_DIR / "files"
 OUT_DIR = ROOT_DIR / "out"
+
+# ponytail: capped at 8; every job is a full TeX run, so more would thrash the disk.
+DEFAULT_JOBS = min(os.cpu_count() or 1, 8)
 
 # Changes to these paths (relative to ROOT_DIR) rebuild every document.
 GLOBAL_INPUTS = (
@@ -47,8 +50,11 @@ def error(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
 
 
+RULE = "=" * 72
+
+
 def separator() -> None:
-    print("=" * 72)
+    print(RULE)
 
 
 # ---------------------------------------------------------------------------
@@ -226,24 +232,41 @@ def log_path_for(main_tex: Path) -> Path:
 # Building
 # ---------------------------------------------------------------------------
 
-def build_document(main_tex: Path, latexmk: str) -> bool:
+def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[bool, str]:
     """
-    Build one LaTeX document.
+    Build one LaTeX document. Returns (success, console text).
 
     Compilation happens inside a temporary directory, so LaTeX auxiliary
     files never pollute the source directory or out/. Only the final PDF and
     <name>.log are written to out/. The log holds the result, the latexmk
     console output, and LaTeX's and BibTeX's own logs: every info line,
     warning and error.
+
+    With live=True the output is streamed to the terminal. With live=False
+    nothing is printed except a "Started" line; the caller prints the
+    returned text once the document finishes, so parallel builds don't mix.
     """
     relative = main_tex.relative_to(ROOT_DIR)
     output_pdf = output_path_for(main_tex)
     log_path = log_path_for(main_tex)
 
-    separator()
-    info(f"Building: {relative}")
-    info(f"Output:  {output_pdf.relative_to(ROOT_DIR)}")
-    separator()
+    shown: list[str] = []
+
+    def emit(text: str) -> None:
+        shown.append(text)
+        if live:
+            sys.stdout.write(text)
+
+    def say(text: str = "") -> None:
+        emit(text + "\n")
+
+    if not live:
+        info(f"Started: {relative}")
+
+    say(RULE)
+    say(f"Building: {relative}")
+    say(f"Output:  {output_pdf.relative_to(ROOT_DIR)}")
+    say(RULE)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
 
@@ -264,9 +287,9 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
             main_tex.name,
         ]
 
-        info("Running:")
-        info("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
-        info()
+        say("Running:")
+        say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
+        say()
 
         generated_pdf = temp_dir / f"{main_tex.stem}.pdf"
 
@@ -285,7 +308,7 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
             errors.append(f"Could not execute latexmk: {exc}")
         else:
             for line in process.stdout:
-                sys.stdout.write(line)
+                emit(line)
                 console.append(line)
 
             if process.wait() != 0:
@@ -300,7 +323,7 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
                     errors.append(f"Could not copy generated PDF: {exc}")
 
         for message in errors:
-            error(message)
+            say(f"ERROR: {message}")
 
         sections = [
             f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
@@ -319,14 +342,14 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
 
     log_path.write_text("".join(sections), encoding="utf-8")
 
-    info()
-    info(f"Log:     {log_path.relative_to(ROOT_DIR)}")
+    say()
+    say(f"Log:     {log_path.relative_to(ROOT_DIR)}")
 
     if errors:
-        return False
+        return False, "".join(shown)
 
-    info(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
-    return True
+    say(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
+    return True, "".join(shown)
 
 
 def watch(latexmk: str, interval: float = 1.0) -> int:
@@ -355,7 +378,8 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
                 if failed.get(document) == newest:
                     continue
 
-                if build_document(document, latexmk):
+                ok, _ = build_document(document, latexmk)
+                if ok:
                     failed.pop(document, None)
                 else:
                     failed[document] = newest
@@ -432,6 +456,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=DEFAULT_JOBS,
+        metavar="N",
+        help=f"Build N documents in parallel (default: {DEFAULT_JOBS}). "
+             "A parallel build's output is printed when that document finishes.",
+    )
+
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Rebuild documents even if their PDF is up to date.",
@@ -443,7 +477,12 @@ def parse_args() -> argparse.Namespace:
         help="Keep running and rebuild documents whenever their files change.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -501,16 +540,29 @@ def main() -> int:
     info(f"Found {len(documents)} document(s).")
     info()
 
-    successes = 0
-    failures = 0
+    # One document runs live; several run in a pool, printed as each finishes.
+    jobs = min(args.jobs, len(documents))
+    results: list[bool] = []
 
-    for document in documents:
-        if build_document(document, latexmk):
-            successes += 1
-        else:
-            failures += 1
+    if jobs == 1:
+        for document in documents:
+            results.append(build_document(document, latexmk)[0])
+            info()
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(build_document, document, latexmk, False)
+                for document in documents
+            ]
 
-        info()
+            for future in as_completed(futures):
+                ok, text = future.result()
+                sys.stdout.write(text)
+                results.append(ok)
+                info()
+
+    successes = sum(results)
+    failures = len(results) - successes
 
     separator()
     info("Build Summary")
