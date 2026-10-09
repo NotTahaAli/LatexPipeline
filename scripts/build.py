@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -20,6 +19,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 SOURCE_DIR = ROOT_DIR / "files"
 OUT_DIR = ROOT_DIR / "out"
+# latexmk's working files (.aux, .bbl, ...) persist here between builds, so an
+# edit reruns only the passes it needs instead of a cold multi-pass build.
+CACHE_DIR = ROOT_DIR / ".latex-cache"
 
 # Changes to these paths (relative to ROOT_DIR) rebuild every document.
 GLOBAL_INPUTS = (
@@ -230,8 +232,9 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
     """
     Build one LaTeX document.
 
-    Compilation happens inside a temporary directory, so LaTeX auxiliary
-    files never pollute the source directory or out/. Only the final PDF and
+    Compilation happens in .latex-cache/, which persists between builds so
+    latexmk reruns only the passes an edit needs. LaTeX auxiliary files never
+    pollute the source directory or out/. Only the final PDF and
     <name>.log are written to out/. The log holds the result, the latexmk
     console output, and LaTeX's and BibTeX's own logs: every info line,
     warning and error.
@@ -247,28 +250,29 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
 
-    console: list[str] = []
-    errors: list[str] = []
-
     # Stamp the PDF with the build start time, so edits made while LaTeX is
     # running still count as newer than the PDF.
     started = time.time()
 
-    with tempfile.TemporaryDirectory(prefix="latex-build-") as temp_dir:
-        temp_dir = Path(temp_dir)
+    build_dir = CACHE_DIR / main_tex.parent.relative_to(SOURCE_DIR)
+    cached = build_dir.exists()
+    build_dir.mkdir(parents=True, exist_ok=True)
 
-        command = [
-            latexmk,
-            *LATEXMK_ARGS,
-            f"-outdir={temp_dir}",
-            main_tex.name,
-        ]
+    command = [
+        latexmk,
+        *LATEXMK_ARGS,
+        f"-outdir={build_dir}",
+        main_tex.name,
+    ]
+    generated_pdf = build_dir / f"{main_tex.stem}.pdf"
 
+    while True:
         info("Running:")
         info("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
         info()
 
-        generated_pdf = temp_dir / f"{main_tex.stem}.pdf"
+        console = []
+        errors = []
 
         # Stream output to the terminal while keeping a copy for the log.
         try:
@@ -283,39 +287,52 @@ def build_document(main_tex: Path, latexmk: str) -> bool:
             )
         except OSError as exc:
             errors.append(f"Could not execute latexmk: {exc}")
+            break
+
+        for line in process.stdout:
+            sys.stdout.write(line)
+            console.append(line)
+
+        if process.wait() == 0 or not cached:
+            break
+
+        # Stale working files can break a build that would pass from scratch.
+        info()
+        info("Build failed with cached files; retrying from a clean cache.")
+        info()
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True)
+        cached = False
+
+    if not errors:
+        if process.returncode != 0:
+            errors.append(f"LaTeX compilation failed: {relative}")
+        elif not generated_pdf.exists():
+            errors.append("LaTeX reported success, but no PDF was produced.")
         else:
-            for line in process.stdout:
-                sys.stdout.write(line)
-                console.append(line)
+            try:
+                shutil.copy(generated_pdf, output_pdf)
+                os.utime(output_pdf, (started, started))
+            except OSError as exc:
+                errors.append(f"Could not copy generated PDF: {exc}")
 
-            if process.wait() != 0:
-                errors.append(f"LaTeX compilation failed: {relative}")
-            elif not generated_pdf.exists():
-                errors.append("LaTeX reported success, but no PDF was produced.")
-            else:
-                try:
-                    shutil.copy(generated_pdf, output_pdf)
-                    os.utime(output_pdf, (started, started))
-                except OSError as exc:
-                    errors.append(f"Could not copy generated PDF: {exc}")
+    for message in errors:
+        error(message)
 
-        for message in errors:
-            error(message)
+    sections = [
+        f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
+        *(f"ERROR: {message}\n" for message in errors),
+        "\n===== latexmk output =====\n",
+        *console,
+    ]
 
-        sections = [
-            f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
-            *(f"ERROR: {message}\n" for message in errors),
-            "\n===== latexmk output =====\n",
-            *console,
-        ]
-
-        for suffix, title in ((".log", "LaTeX log"), (".blg", "BibTeX log")):
-            path = temp_dir / f"{main_tex.stem}{suffix}"
-            if path.exists():
-                sections += [
-                    f"\n===== {title} ({path.name}) =====\n",
-                    path.read_text(encoding="utf-8", errors="replace"),
-                ]
+    for suffix, title in ((".log", "LaTeX log"), (".blg", "BibTeX log")):
+        path = build_dir / f"{main_tex.stem}{suffix}"
+        if path.exists():
+            sections += [
+                f"\n===== {title} ({path.name}) =====\n",
+                path.read_text(encoding="utf-8", errors="replace"),
+            ]
 
     log_path.write_text("".join(sections), encoding="utf-8")
 
@@ -387,19 +404,22 @@ def prune(documents: list[Path]) -> None:
 
 def clean() -> None:
     """
-    Remove all generated build output.
+    Remove all generated build output and the LaTeX cache.
     """
-    if not OUT_DIR.exists():
+    targets = [path for path in (OUT_DIR, CACHE_DIR) if path.exists()]
+
+    if not targets:
         info("Nothing to clean.")
         return
 
-    info(f"Removing: {OUT_DIR.relative_to(ROOT_DIR)}")
+    for path in targets:
+        info(f"Removing: {path.relative_to(ROOT_DIR)}")
 
-    try:
-        shutil.rmtree(OUT_DIR)
-    except OSError as exc:
-        error(f"Could not remove output directory: {exc}")
-        raise SystemExit(1)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            error(f"Could not remove {path.name}: {exc}")
+            raise SystemExit(1)
 
     info("Clean complete.")
 
@@ -416,7 +436,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Remove the generated out/ directory and exit.",
+        help="Remove out/ and the .latex-cache/ directory, then exit.",
     )
 
     parser.add_argument(

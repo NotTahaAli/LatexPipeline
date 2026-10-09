@@ -3,6 +3,7 @@
 .vscode
 
 out/
+.latex-cache/
 
 .DS_Store
 *.pem

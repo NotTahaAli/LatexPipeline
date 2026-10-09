@@ -47,7 +47,7 @@ A document counts as **out of date** when any file in its directory, or `build.p
 
 For each document, the script:
 
-1. Runs `latexmk -pdf` in a temporary directory. No `.aux`, `.log`, `.bbl`, ... files end up in the repository.
+1. Runs `latexmk -pdf` in `.latex-cache/<name>/` (git-ignored). The `.aux`, `.bbl`, ... files stay there between builds, so a text edit needs one LaTeX pass instead of a full cold build (about 7 s instead of 19 s for the report). If a build fails with cached files, the cache is wiped and the build retried once from scratch. CI keeps the same cache with `actions/cache`.
 2. Copies only the final PDF into `out/`.
 3. Writes the full build log to `out/<name>.log` (for example `out/FP-123 Proposal.log`), whether the build succeeded or not. The log starts with the result and any errors. Then comes the latexmk console output from every pass, followed by LaTeX's own `.log` and BibTeX's `.blg`, so every info line, warning and error is in it.
 4. Carries on with the remaining documents if one fails, and prints a summary.

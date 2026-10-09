@@ -53,6 +53,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science
 
+      # latexmk's working files from the previous run, so an edit reruns only
+      # the LaTeX passes it needs. A new key per run keeps the newest cache.
+      - uses: actions/cache@v6
+        with:
+          path: .latex-cache
+          key: latex-${{ github.run_id }}
+          restore-keys: latex-
+
       # Default branch: everything changed since the last fully successful
       # publish (the `pdfs` tag), so skipped or failed runs are caught up.
       # Other pushes: changed by the push. PR: changed since the base branch.
