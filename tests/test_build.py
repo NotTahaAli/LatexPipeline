@@ -241,7 +241,7 @@ class RecordedInputsTests(unittest.TestCase):
 
     def test_external_inputs_only(self):
         self.assertEqual(build.recorded_inputs(self.main),
-                         [self.shared.resolve(), Path("/elsewhere/notes.tex")])
+                         [self.shared.resolve(), Path("/elsewhere/notes.tex").resolve()])
 
     def test_no_recorder_file_means_nothing_recorded(self):
         self.fls.unlink()
@@ -255,7 +255,7 @@ class RecordedInputsTests(unittest.TestCase):
         # kpsewhich can report "/" (SELFAUTOPARENT); that must not hide the whole disk.
         with mock.patch.object(build, "tex_tree_dirs", return_value=(Path("/"),)):
             self.assertEqual(build.recorded_inputs(self.main), [
-                self.shared.resolve(), self.root / "texlive" / "tikz.sty", Path("/elsewhere/notes.tex"),
+                self.shared.resolve(), self.root / "texlive" / "tikz.sty", Path("/elsewhere/notes.tex").resolve(),
             ])
 
     def test_is_stale_follows_recorded_input(self):
