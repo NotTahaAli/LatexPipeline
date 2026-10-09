@@ -90,6 +90,12 @@ class LatexmkArgsTests(unittest.TestCase):
         # serve.py runs synctex against the cache-dir PDF, so focus and full builds both need it.
         self.assertIn("-synctex=1", build.LATEXMK_ARGS)
 
+    def test_log_lines_are_not_wrapped(self):
+        # The keys TeX reads from the environment; the wrapped-line tolerance in the regexes stays.
+        self.assertEqual(build.LATEX_LOG_ENV["max_print_line"], "10000")
+        self.assertLess(int(build.LATEX_LOG_ENV["half_error_line"]), int(build.LATEX_LOG_ENV["error_line"]))
+        self.assertLessEqual(int(build.LATEX_LOG_ENV["error_line"]), 255)
+
 
 class ParseLatexErrorsTests(unittest.TestCase):
     def test_file_line_error_lines(self):

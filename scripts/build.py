@@ -50,6 +50,10 @@ LATEXMK_ARGS = [
     "-synctex=1",  # <cache>/<name>.synctex.gz, read by serve.py for source <-> PDF jumps.
 ]
 
+# TeX wraps its log at 79 columns, which splits paths and errors across lines.
+# TeX Live and MiKTeX read these limits from the environment (kpathsea).
+LATEX_LOG_ENV = {"max_print_line": "10000", "error_line": "254", "half_error_line": "238"}
+
 # Engine name -> latexmk flag. Set per document (see read_settings).
 ENGINES = {
     "pdflatex": "-pdf",
@@ -553,6 +557,7 @@ def build_document(
                 process = subprocess.Popen(
                     command,
                     cwd=main_tex.parent,
+                    env={**os.environ, **LATEX_LOG_ENV},
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
