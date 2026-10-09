@@ -1,7 +1,10 @@
 name: Build PDFs
 
 on:
+  # Feature branches build through their pull request, so a push to them
+  # doesn't run the same job twice with separate caches.
   push:
+    branches: [main]
     paths:
       - "files/**"
       - "scripts/**"
