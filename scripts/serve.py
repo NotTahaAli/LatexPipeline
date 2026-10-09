@@ -16,14 +16,22 @@ long-poll fallback for tunnels); /events (SSE) stays as a legacy read-only endpo
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import collections
 import hashlib
+import hmac
+import http.client
+import itertools
 import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
+import signal
+import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -31,6 +39,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -56,27 +65,37 @@ SETTINGS = {"editor": "vscode", "check_host": True}
 # ---------------------------------------------------------------------------
 
 class Bus:
-    """Append-only message log with a revision counter; readers resume from a revision."""
+    """
+    Message log with a revision counter; readers resume from a revision. Durable messages (state, edits) sit in a
+    long log; ephemeral ones (cursors, presence) in a short one and are never the reason for a resync.
+    """
 
-    def __init__(self, keep: int = 500) -> None:
+    def __init__(self, keep: int = 2000, ephemeral: int = 300) -> None:
         self.cond = threading.Condition()
         self.rev = 0
+        self.floor = 0  # newest revision dropped from the durable log
         self.log: collections.deque = collections.deque(maxlen=keep)
+        self.eph: collections.deque = collections.deque(maxlen=ephemeral)
 
-    def publish(self, type_: str, data, topic: str = "doc") -> int:
+    def publish(self, type_: str, data, topic: str = "doc", ephemeral: bool = False) -> int:
         with self.cond:
             self.rev += 1
-            self.log.append({"rev": self.rev, "topic": topic, "type": type_, "data": data})
+            message = {"rev": self.rev, "topic": topic, "type": type_, "data": data}
+            if ephemeral:
+                self.eph.append(message)
+            else:
+                if len(self.log) == self.log.maxlen:
+                    self.floor = self.log[0]["rev"]
+                self.log.append(message)
             self.cond.notify_all()
             return self.rev
 
     def since(self, rev: int | None) -> list[dict]:
         """Messages after rev. None, or a rev older than the log keeps, yields one fresh state snapshot."""
         with self.cond:
-            gap = rev is None or rev > self.rev or (self.log and self.log[0]["rev"] > rev + 1)
-            if gap:
+            if rev is None or rev > self.rev or rev < self.floor:
                 return [{"rev": self.rev, "topic": "doc", "type": "state", "data": snapshot(), "resync": True}]
-            return [m for m in self.log if m["rev"] > rev]
+            return sorted((m for m in itertools.chain(self.log, self.eph) if m["rev"] > rev), key=lambda m: m["rev"])
 
     def wait(self, rev: int, timeout: float) -> list[dict]:
         """Block until something newer than rev exists (or timeout); return it."""
@@ -91,15 +110,33 @@ class Bus:
 
 
 BUS = Bus()
-HANDLERS: dict = {}  # client message type -> fn(message, client_id) -> reply dict | None (phase 2 plugs in here)
+HANDLERS: dict = {}  # client message type -> fn(message, client_id, role) -> reply dict | None
 
 
-def handle_client_message(message: dict, client: str) -> dict | None:
+def handle_client_message(message: dict, client: str, role: str = "owner") -> dict | None:
     kind = message.get("type")
+    if not bind_client(client, role):
+        return {"type": "error", "topic": "sys", "data": {"error": "Client id belongs to another session."}}
     if kind == "ping":
         return {"type": "pong", "topic": "sys", "data": {"t": message.get("data"), "rev": BUS.rev}}
     handler = HANDLERS.get(kind)
-    return handler(message, client) if handler else None
+    return handler(message, client, role) if handler else None
+
+
+def visible(messages: list[dict], role: str) -> list[dict]:
+    """What a role may see on the bus: shared sessions only hear about the shared document."""
+    if role == "owner":
+        return messages
+    shared = SHARE["doc"]
+    out = []
+    for message in messages:
+        kind, data = message["type"], message["data"]
+        if kind == "state":
+            message = {**message, "data": {"docs": [d for d in data["docs"] if d["name"] == shared]}}
+        elif kind in ("fs", "forward") and data.get("doc") != shared:
+            continue
+        out.append(message)
+    return out
 
 
 # --- RFC 6455, just enough: handshake, text/binary frames, ping/pong, close ---
@@ -823,6 +860,530 @@ def forward(query: dict) -> tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Sharing: token links, roles, tunnels
+# ---------------------------------------------------------------------------
+#
+# While sharing is on EVERY request needs a token, loopback included. A tunnel client connects to us from
+# 127.0.0.1, so the peer address says nothing about who is asking, and the Host header is whatever the tunnel
+# forwards (some rewrite it to localhost). Requiring the token for everyone is the only rule that cannot be
+# bypassed through the tunnel; the owner's browser gets a third, private token as a cookie when sharing starts.
+
+SHARE: dict = {
+    "on": False, "tokens": {}, "doc": None, "provider": None, "public": None, "hosts": set(), "status": "off",
+    "error": None, "tunnel": None, "port": 0,
+}
+SHARE_LOCK = threading.Lock()
+ROLES = ("owner", "edit", "view")
+SHELL_TOKENS = ("shell-escape", "enable-write18", "shell-restricted")
+COMMAND_KEYS = {
+    "pdflatex", "xelatex", "lualatex", "latex", "bibtex", "biber", "makeindex", "makeglossaries", "dvips", "dvipdf",
+    "ps2pdf", "pdf_previewer", "dvi_previewer", "ps_previewer", "print_pdf_command", "e", "r",
+}  # -key=value forms that name a program to run
+RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # configuration that can run programs
+REBUILD_LIMIT = (6, 60.0)  # builds per window (seconds) an editor may trigger
+RATE: dict[str, collections.deque] = {}
+
+
+def new_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def role_for_token(token: str | None) -> str | None:
+    """owner when sharing is off; otherwise the role whose token matches. Compares every token, in constant time."""
+    if not SHARE["on"]:
+        return "owner"
+    found = None
+    probe = (token or "").encode("utf-8", "replace")
+    for role, good in list(SHARE["tokens"].items()):
+        if hmac.compare_digest(probe, good.encode()) and token:
+            found = role
+    return found
+
+
+def cookie_name() -> str:
+    return f"lp_{SHARE['port']}"  # Cookies ignore ports; keep two local servers apart.
+
+
+def rate_ok(key: str, limit: int, window: float) -> bool:
+    now = time.monotonic()
+    hits = RATE.setdefault(key, collections.deque())
+    while hits and now - hits[0] > window:
+        hits.popleft()
+    if len(hits) >= limit:
+        return False
+    hits.append(now)
+    return True
+
+
+def unsafe_latexmk_arg(arg: str) -> bool:
+    """Flags that enable shell escape or let a document pick the programs latexmk runs."""
+    low = arg.lower()
+    if any(token in low for token in SHELL_TOKENS) or low in ("-e", "--e", "-r", "--r"):
+        return True
+    key = re.match(r"^--?([a-z0-9_]+)=", low)
+    return bool(key) and key.group(1) in COMMAND_KEYS
+
+
+_READ_SETTINGS = build.read_settings
+
+
+def guarded_read_settings(main_tex: Path) -> dict:
+    """build.read_settings, but while sharing: no shell escape, and no latexmk_args that run commands."""
+    settings = _READ_SETTINGS(main_tex)
+    if SHARE["on"]:
+        bad = [arg for arg in settings["latexmk_args"] if unsafe_latexmk_arg(arg)]
+        if bad:
+            raise build.ConfigError(f"{main_tex.parent.name}/build.toml: {bad[0]!r} is not allowed while sharing")
+        settings["shell_escape"] = False
+    return settings
+
+
+build.read_settings = guarded_read_settings
+
+
+def share_enable(doc: str | None, provider: str, port: int) -> None:
+    with SHARE_LOCK:
+        SHARE.update(
+            on=True, doc=doc, provider=provider, status="starting", error=None, public=None, port=port,
+            tokens={"owner": new_token(), "edit": new_token(), "view": new_token()},
+        )
+
+
+def share_disable() -> None:
+    tunnel = None
+    with SHARE_LOCK:
+        tunnel, SHARE["tunnel"] = SHARE["tunnel"], None
+        SHARE.update(on=False, tokens={}, public=None, hosts=set(), status="off", error=None, provider=None)
+    if tunnel:
+        tunnel.stop()
+
+
+def share_regenerate() -> None:
+    """New view and edit tokens: every link handed out so far stops working, connections included."""
+    with SHARE_LOCK:
+        if SHARE["on"]:
+            SHARE["tokens"].update(edit=new_token(), view=new_token())
+
+
+def share_links() -> dict:
+    base = SHARE["public"] or f"http://localhost:{SHARE['port']}"
+    frag = "#" + SHARE["doc"].replace(" ", "%20") if SHARE["doc"] else ""
+    tokens = SHARE["tokens"]
+    return {role: f"{base.rstrip('/')}/?token={tokens[role]}{frag}" for role in ("view", "edit") if role in tokens}
+
+
+def share_info() -> dict:
+    return {
+        "on": SHARE["on"], "status": SHARE["status"], "error": SHARE["error"], "provider": SHARE["provider"],
+        "url": SHARE["public"], "doc": SHARE["doc"], "links": share_links() if SHARE["on"] else {},
+        "providers": [{"name": n, "available": a, "hint": TUNNELS[n]["hint"]} for n, a in tunnel_status().items()],
+    }
+
+
+# --- Tunnels: one subprocess each, public URL read from its output --------------------------------------------
+
+def _cmd(name: str) -> list[str] | None:
+    path = shutil.which(name)
+    return [path] if path else None
+
+
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes"]
+
+
+def _ssh_pinggy(port: int) -> list[str]:
+    return ["-p", "443", f"-R0:localhost:{port}", *SSH_OPTS, "a.pinggy.io"]
+
+
+def _ssh_lhr(port: int) -> list[str]:
+    return ["-R", f"80:localhost:{port}", *SSH_OPTS, "nokey@localhost.run"]
+
+
+# argv(port) builds the command after the binary; pattern finds the public https URL in the tool's output.
+TUNNELS: dict[str, dict] = {
+    "cloudflared": {
+        "cmd": lambda: _cmd("cloudflared"), "args": lambda p: ["tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{p}"],
+        "pattern": re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com"),
+        "hint": "Install cloudflared (no account needed): https://developers.cloudflare.com/cloudflare-one/networks/"
+        "connectors/cloudflare-tunnel/downloads/",
+    },
+    "ngrok": {
+        "cmd": lambda: _cmd("ngrok"), "args": lambda p: ["http", str(p), "--log", "stdout", "--log-format", "logfmt"],
+        "pattern": re.compile(r"url=(https://[a-z0-9.-]+\.ngrok[a-z.-]*\.(?:app|io|dev))"), "api": "http://127.0.0.1:4040/api/tunnels",
+        "hint": "Install ngrok and run `ngrok config add-authtoken <token>` (free account): https://ngrok.com/download",
+    },
+    "localtunnel": {
+        "cmd": lambda: _cmd("lt") or (_cmd("npx") and [*_cmd("npx"), "--yes", "localtunnel"]),
+        "args": lambda p: ["--port", str(p)],
+        "pattern": re.compile(r"your url is:\s*(https://[a-z0-9.-]+)"),
+        "hint": "Install Node.js (provides npx); localtunnel is fetched on first use.",
+    },
+    "pinggy": {
+        "cmd": lambda: _cmd("ssh"), "args": _ssh_pinggy,
+        "pattern": re.compile(r"https://(?:[a-z0-9-]+\.)+(?:pinggy-free\.link|pinggy\.link)"),
+        "hint": "Install an OpenSSH client (ssh); pinggy needs no account.",
+    },
+    "localhost.run": {
+        "cmd": lambda: _cmd("ssh"), "args": _ssh_lhr,
+        "pattern": re.compile(r"https://(?!admin\.)[a-z0-9]+\.(?:lhr\.life|localhost\.run)\b"),
+        "hint": "Install an OpenSSH client (ssh); localhost.run needs no account.",
+    },
+}
+AUTO_ORDER = ("cloudflared", "ngrok", "localtunnel", "pinggy", "localhost.run")
+PROVIDER_CHOICES = ("auto", "local", *TUNNELS)
+
+
+def tunnel_status() -> dict[str, bool]:
+    return {name: bool(spec["cmd"]()) for name, spec in TUNNELS.items()}
+
+
+def pick_provider(name: str) -> str:
+    """Resolve 'auto' to the best installed tool; raise ApiError with an install hint when nothing fits."""
+    if name == "local":
+        return name
+    if name == "auto":
+        found = next((n for n in AUTO_ORDER if TUNNELS[n]["cmd"]()), None)
+        if found:
+            return found
+        hints_ = "; ".join(f"{n}: {TUNNELS[n]['hint']}" for n in AUTO_ORDER[:3])
+        raise ApiError(f"No tunnel tool found (looked for cloudflared, ngrok, npx, ssh). {hints_}", 409)
+    if name not in TUNNELS:
+        raise ApiError(f"Unknown provider {name!r}.", 400)
+    if not TUNNELS[name]["cmd"]():
+        raise ApiError(f"{name} is not installed. {TUNNELS[name]['hint']}", 409)
+    return name
+
+
+def find_public_url(provider: str, text: str) -> str | None:
+    """The tunnel's public https URL in a chunk of its output, or None."""
+    match = TUNNELS[provider]["pattern"].search(text)
+    if not match:
+        return None
+    return match.group(1) if match.groups() else match.group(0)
+
+
+def ngrok_public_url(api_json: str) -> str | None:
+    """https public_url from ngrok's local API (http://127.0.0.1:4040/api/tunnels)."""
+    try:
+        tunnels = json.loads(api_json).get("tunnels", [])
+    except (ValueError, AttributeError):
+        return None
+    urls = [t.get("public_url", "") for t in tunnels if isinstance(t, dict)]
+    return next((u for u in urls if u.startswith("https://")), None)
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(5)
+    except (OSError, subprocess.TimeoutExpired):
+        proc.kill()
+
+
+class Tunnel:
+    def __init__(self, provider: str, port: int) -> None:
+        self.provider, self.port = provider, port
+        self.proc: subprocess.Popen | None = None
+        self.url: str | None = None
+        self.lines: collections.deque = collections.deque(maxlen=40)
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            self.lines.append(line.rstrip())
+            if not self.url:
+                self.url = find_public_url(self.provider, line)
+        self.proc.stdout.close()
+
+    def start(self, timeout: float = 60.0) -> str:
+        spec = TUNNELS[self.provider]
+        argv = [*spec["cmd"](), *spec["args"](self.port)]
+        windows = os.name == "nt"
+        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            errors="replace", **group,
+        )
+        threading.Thread(target=self._read, daemon=True).start()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not STOP.is_set():
+            if self.url:
+                return self.url
+            if "api" in spec:
+                self.url = self.url or ngrok_api_url(spec["api"])
+            if self.proc.poll() is not None and not self.url:
+                time.sleep(0.2)  # let the reader drain
+                if self.url:
+                    return self.url
+                raise RuntimeError(f"{self.provider} exited ({self.proc.returncode}): {self.tail()}")
+            time.sleep(0.25)
+        self.stop()
+        raise RuntimeError(f"{self.provider} gave no public URL within {int(timeout)} s: {self.tail()}")
+
+    def tail(self) -> str:
+        return " | ".join(list(self.lines)[-4:])
+
+    def stop(self) -> None:
+        if self.proc:
+            kill_tree(self.proc)
+
+
+def ngrok_api_url(api: str) -> str | None:
+    try:
+        with http.client.HTTPConnection("127.0.0.1", 4040, timeout=1) as conn:
+            conn.request("GET", api.split("4040", 1)[1])
+            return ngrok_public_url(conn.getresponse().read().decode("utf-8", "replace"))
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def share_start(provider: str, doc: str | None, port: int, wait: bool = False) -> None:
+    """Turn sharing on and bring the tunnel up in the background (or here with wait=True). Raises ApiError up front."""
+    chosen = pick_provider(provider)
+    with SHARE_LOCK:
+        if SHARE["on"]:
+            raise ApiError("Already sharing. Stop sharing first.", 409)
+    share_enable(doc, chosen, port)
+
+    def run() -> None:
+        try:
+            if chosen == "local":
+                SHARE["status"] = "ready"
+                return
+            tunnel = Tunnel(chosen, port)
+            SHARE["tunnel"] = tunnel
+            url = tunnel.start()
+            host = (urlsplit(url).hostname or "").lower()
+            with SHARE_LOCK:
+                if SHARE["tunnel"] is tunnel:
+                    SHARE.update(public=url, status="ready")
+                    SHARE["hosts"].add(host)
+        except RuntimeError as exc:
+            if SHARE["tunnel"] is not tunnel:
+                return  # Sharing was stopped meanwhile.
+            build.error(f"Share failed: {exc}")
+            share_disable()
+            SHARE["error"] = str(exc)
+
+    if wait:
+        run()
+    else:
+        threading.Thread(target=run, daemon=True).start()
+
+
+atexit.register(lambda: SHARE["tunnel"] and SHARE["tunnel"].stop())
+
+
+# ---------------------------------------------------------------------------
+# Co-editing: a relay for Yjs updates (the server never decodes them)
+# ---------------------------------------------------------------------------
+#
+# One room per (document, file). The server keeps the room's update log, base64 as sent, so a late joiner replays
+# it; Yjs updates are idempotent and commutative, so duplicates and reordering are harmless. Disk writes are done
+# by ONE client per room, the leader (the earliest-joined member who may edit), through the ordinary PUT API, so
+# they stay atomic and serialized by WRITE_LOCK. The leader also folds external disk edits into the Yjs document.
+# ponytail: logs grow with the session and die with the room (no compaction); a leader-made snapshot would bound it.
+
+ROOMS: dict[str, dict] = {}
+CLIENTS: dict[str, dict] = {}
+COLLAB_LOCK = threading.RLock()
+ROOM_GRACE = float(os.environ.get("LP_ROOM_GRACE", "60"))  # an emptied room (and its log) lingers this long
+CLIENT_TIMEOUT = 60.0
+MAX_UPDATE = 2 * 1024 * 1024
+
+
+def room_id(doc: str, path: str) -> str:
+    return f"{doc}\n{path}"
+
+
+def bind_client(client: str, role: str) -> bool:
+    """Remember who a client id belongs to. False if the id was already taken by another role."""
+    with COLLAB_LOCK:
+        record = CLIENTS.setdefault(client, {"role": role, "rooms": set(), "name": None, "color": None, "path": None})
+        record["seen"] = time.monotonic()
+        return record["role"] == role
+
+
+def room_leader(room: dict) -> str | None:
+    return next((cid for cid, m in room["members"].items() if m["role"] in ("owner", "edit")), None)
+
+
+def publish_leader(rid: str, room: dict) -> None:
+    leader = room_leader(room)
+    if leader != room.get("leader"):
+        room["leader"] = leader
+        BUS.publish("y-leader", {"room": rid, "leader": leader})
+
+
+def presence() -> dict:
+    with COLLAB_LOCK:
+        users = [
+            {"cid": cid, "name": c["name"], "color": c["color"], "role": c["role"], "path": c["path"]}
+            for cid, c in CLIENTS.items() if c["name"]
+        ]
+    return {"users": sorted(users, key=lambda u: (u["name"] or "", u["cid"]))}
+
+
+def publish_presence() -> None:
+    BUS.publish("presence", presence(), topic="sys", ephemeral=True)
+
+
+def check_room(doc, path, role: str) -> tuple[str, Path]:
+    """Validate a room request: a served document, and for shared sessions the shared one."""
+    if not isinstance(doc, str) or doc not in DOCS or (role != "owner" and doc != SHARE["doc"]):
+        raise ApiError("Unknown document.", 404)
+    if not isinstance(path, str) or file_kind(path) != "text":
+        raise ApiError("Not a text file.", 415)
+    return room_id(doc, path), resolve_in_doc(DOCS[doc].parent, path)
+
+
+def reply_error(exc: ApiError) -> dict:
+    return {"type": "error", "topic": "sys", "data": {"error": str(exc), "status": exc.status}}
+
+
+def on_hello(message: dict, client: str, role: str) -> dict:
+    data = message.get("data") or {}
+    with COLLAB_LOCK:
+        record = CLIENTS[client]
+        record["name"] = str(data.get("name") or "Guest")[:40]
+        color = str(data.get("color") or "")
+        record["color"] = color if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "#0969da"
+        path = data.get("path")
+        record["path"] = path[:300] if isinstance(path, str) else None
+    publish_presence()
+    return {"type": "presence", "topic": "sys", "data": presence()}
+
+
+def on_join(message: dict, client: str, role: str) -> dict:
+    data = message.get("data") or {}
+    try:
+        rid, path = check_room(data.get("doc"), data.get("path"), role)
+    except ApiError as exc:
+        return reply_error(exc)
+    epoch = data.get("epoch") if isinstance(data.get("epoch"), str) and role != "view" else None
+    with COLLAB_LOCK:
+        room = ROOMS.get(rid)
+        conflict = False
+        if room is None:
+            room = ROOMS[rid] = {
+                "epoch": epoch or secrets.token_hex(8), "log": [], "aware": {}, "members": {}, "gone_at": None,
+                "claimed": bool(epoch), "text": "", "eol": "\n", "leader": None,
+            }
+            if not epoch:  # The seed every first joiner builds identically; kept in the room so it stays consistent.
+                try:
+                    found = read_text_file(DOCS[data["doc"]].parent, data["path"])
+                    room["text"], room["eol"] = found["text"], found["eol"]
+                except ApiError:
+                    pass
+        elif epoch and epoch != room["epoch"]:
+            conflict = True
+        room["gone_at"] = None
+        aid = data.get("aid") if isinstance(data.get("aid"), int) else None
+        member = room["members"].setdefault(client, {"aid": aid, "role": role})
+        member["aid"] = aid
+        CLIENTS[client]["rooms"].add(rid)
+        publish_leader(rid, room)
+        seed = room["text"] if not room["log"] and not room["claimed"] else None
+        reply = {
+            "room": rid, "epoch": room["epoch"], "updates": list(room["log"]), "aware": dict(room["aware"]),
+            "leader": room["leader"], "seed": seed, "eol": room["eol"], "conflict": conflict,
+        }
+    return {"type": "y-state", "topic": "sys", "data": reply}
+
+
+def on_update(message: dict, client: str, role: str) -> dict | None:
+    data = message.get("data") or {}
+    rid, update = data.get("room"), data.get("u")
+    if role == "view":
+        return reply_error(ApiError("This link is view-only.", 403))
+    if not isinstance(update, str) or len(update) > MAX_UPDATE:
+        return reply_error(ApiError("Bad update.", 413))
+    with COLLAB_LOCK:
+        room = ROOMS.get(rid)
+        if room is None or client not in room["members"]:
+            return reply_error(ApiError("Join the room first.", 409))
+        if len(room["log"]) <= 3 and update in room["log"]:
+            return None  # Two clients seeding the same file produce the same bytes.
+        room["log"].append(update)
+        BUS.publish("y-update", {"room": rid, "u": update, "cid": client})
+    return None
+
+
+def on_aware(message: dict, client: str, role: str) -> None:
+    data = message.get("data") or {}
+    rid, update = data.get("room"), data.get("u")
+    with COLLAB_LOCK:
+        room = ROOMS.get(rid)
+        if room is None or client not in room["members"] or not isinstance(update, str) or len(update) > 64 * 1024:
+            return
+        room["aware"][client] = update
+    BUS.publish("y-aware", {"room": rid, "u": update, "cid": client}, topic="sys", ephemeral=True)
+
+
+def leave_room(client: str, rid: str) -> None:
+    with COLLAB_LOCK:
+        room = ROOMS.get(rid)
+        if CLIENTS.get(client):
+            CLIENTS[client]["rooms"].discard(rid)
+        if room is None or client not in room["members"]:
+            return
+        member = room["members"].pop(client)
+        room["aware"].pop(client, None)
+        BUS.publish("y-gone", {"room": rid, "cid": client, "aid": member["aid"]}, topic="sys", ephemeral=True)
+        publish_leader(rid, room)
+        if not room["members"]:
+            room["gone_at"] = time.monotonic()
+
+
+def on_leave(message: dict, client: str, role: str) -> None:
+    leave_room(client, (message.get("data") or {}).get("room"))
+
+
+def client_gone(client: str) -> None:
+    with COLLAB_LOCK:
+        record = CLIENTS.get(client)
+        for rid in list(record["rooms"]) if record else []:
+            leave_room(client, rid)
+        CLIENTS.pop(client, None)
+    publish_presence()
+
+
+def ws_closed(client: str) -> None:
+    """A socket died. The client may be switching transports, so give it a few seconds before it counts as gone."""
+    with COLLAB_LOCK:
+        if client in CLIENTS:
+            CLIENTS[client]["seen"] = min(CLIENTS[client]["seen"], time.monotonic() - CLIENT_TIMEOUT + 8)
+
+
+def reap(now: float | None = None) -> None:
+    """Drop silent clients and rooms that stayed empty past the grace period."""
+    now = time.monotonic() if now is None else now
+    with COLLAB_LOCK:
+        stale = [cid for cid, c in CLIENTS.items() if now - c["seen"] > CLIENT_TIMEOUT]
+        old = [
+            rid for rid, r in ROOMS.items()
+            if not r["members"] and r["gone_at"] is not None and now - r["gone_at"] > ROOM_GRACE
+        ]
+        for rid in old:
+            del ROOMS[rid]
+    for cid in stale:
+        client_gone(cid)
+
+
+def housekeeping() -> None:
+    while not STOP.wait(3.0):
+        reap()
+
+
+HANDLERS.update({
+    "hello": on_hello, "y-join": on_join, "y-update": on_update, "y-aware": on_aware, "y-leave": on_leave,
+})
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -833,15 +1394,77 @@ MAX_BODY = 8 * 1024 * 1024
 POLL_HOLD = 25.0
 
 
-def health() -> dict:
+CDNS = "https://esm.sh https://cdnjs.cloudflare.com https://cdn.jsdelivr.net"
+READ_API = {
+    "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/synctex/edit",
+}
+
+
+def csp(page: bytes, host: str) -> str:
+    """Only our own files, the pinned CDNs and this origin's sockets; the inline import map is allowed by hash."""
+    block = re.search(rb'<script type="importmap">(.*?)</script>', page, re.S)
+    inline = f" 'sha256-{base64.b64encode(hashlib.sha256(block.group(1)).digest()).decode()}'" if block else ""
+    return "; ".join([
+        "default-src 'none'", f"script-src 'self'{inline} {CDNS}", f"style-src 'self' 'unsafe-inline' {CDNS}",
+        "img-src 'self' data: blob:", f"font-src 'self' data: {CDNS}", f"worker-src blob: {CDNS}",
+        f"connect-src 'self' ws://{host} wss://{host} {CDNS}", "base-uri 'none'", "form-action 'self'",
+        "frame-ancestors 'none'", "object-src 'none'",
+    ])
+
+
+def check_permission(role: str, method: str, path: str, query: dict) -> None:
+    """Raise ApiError unless this role may make this request. The owner may do anything."""
+    if role == "owner":
+        return
+    doc = (query.get("doc") or [None])[0]
+
+    def scoped(name) -> None:
+        if name != SHARE["doc"]:
+            raise ApiError("Not part of the shared document.", 403)
+
+    def need_edit() -> None:
+        if role != "edit":
+            raise ApiError("This link is view-only.", 403)
+
+    if method == "GET":
+        if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll"):
+            return
+        if path.startswith(("/pdf/", "/log/")):
+            scoped(path[1:].partition("/")[2])
+        elif path in READ_API:
+            scoped(doc)
+        elif path == "/forward" and "quiet" in query:
+            return  # Checked again once the target document is known.
+        else:
+            raise ApiError("Forbidden.", 403)
+    elif method == "POST" and path == "/api/send":
+        return
+    elif method == "POST" and path == "/rebuild":
+        need_edit()
+        scoped(doc)
+        if not rate_ok("rebuild", *REBUILD_LIMIT):
+            raise ApiError("Too many rebuilds; wait a moment.", 429)
+    elif method == "PUT" and path == "/api/file":
+        need_edit()
+        scoped(doc)
+        if posixpath.basename((query.get("path") or [""])[0]).lower() in RC_NAMES:
+            raise ApiError("This file configures the build and cannot be edited through a shared link.", 403)
+    else:
+        raise ApiError("Forbidden.", 403)
+
+
+def health(role: str = "owner") -> dict:
     return {
-        "ok": True, "rev": BUS.rev, "uptime": round(time.time() - STARTED, 1), "docs": sorted(DOCS),
+        "ok": True, "rev": BUS.rev, "uptime": round(time.time() - STARTED, 1),
+        "docs": sorted(DOCS) if role == "owner" else [d for d in sorted(DOCS) if d == SHARE["doc"]],
         "synctex": shutil.which("synctex") is not None, "texcount": shutil.which("texcount") is not None,
     }
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+    role = "owner"
+    token = None
 
     def log_message(self, *args) -> None:  # Quiet: build output is the interesting part.
         pass
@@ -852,19 +1475,43 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        if kind.startswith("text/html"):
+            self.send_header("Content-Security-Policy", csp(body, self.headers.get("Host", "")))
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def json(self, data, status: int = 200) -> None:
-        self.reply(status, json.dumps(data).encode(), "application/json")
+    def json(self, data, status: int = 200, extra: dict | None = None) -> None:
+        self.reply(status, json.dumps(data).encode(), "application/json", extra)
+
+    def cookie(self, token: str) -> dict:
+        secure = SHARE["public"] and SHARE["public"].startswith("https") and self.hostname() in SHARE["hosts"]
+        flags = "; Path=/; HttpOnly; SameSite=Lax" + ("; Secure" if secure else "")
+        return {"Set-Cookie": f"{cookie_name()}={token}{flags}"}
+
+    def hostname(self) -> str:
+        host = self.headers.get("Host", "")
+        return (host if host.endswith("]") else host.rsplit(":", 1)[0]).lower()
+
+    def authenticate(self) -> str | None:
+        if not SHARE["on"]:
+            return "owner"
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except Exception:  # noqa: BLE001 - a malformed Cookie header is just "no token".
+            pass
+        morsel = jar.get(cookie_name())
+        self.token = morsel.value if morsel else None
+        return role_for_token(self.token)
 
     def allowed(self) -> bool:
         """Refuse foreign Host headers (DNS rebinding) while bound to loopback."""
-        host = self.headers.get("Host", "")
-        host = host if host.endswith("]") else host.rsplit(":", 1)[0]
-        if SETTINGS["check_host"] and host not in LOOPBACK_HOSTS:
+        host = self.hostname()
+        if SETTINGS["check_host"] and host not in LOOPBACK_HOSTS and host not in SHARE["hosts"]:
             self.reply(403, b"Forbidden host", "text/plain")
             return False
         return True
@@ -906,6 +1553,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed():
             return
         try:
+            url = urlsplit(self.path)
+            query = parse_qs(url.query)
+            if self.command == "GET" and url.path == "/" and SHARE["on"] and "token" in query:
+                if role_for_token(query["token"][0]):  # First visit through a link: keep the token in a cookie only.
+                    self.reply(302, b"", "text/plain", {"Location": "/", **self.cookie(query["token"][0])})
+                    return
+            self.role = self.authenticate()
+            if self.role is None:
+                self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain")
+                return
+            check_permission(self.role, self.command, unquote(url.path), query)
             method()
         except ApiError as exc:
             self.json({"error": str(exc), **exc.extra}, exc.status)
@@ -938,10 +1596,21 @@ class Handler(BaseHTTPRequestHandler):
             client = str(query.get("cid", ["?"])[0])[:64]
             replies = []
             for message in data.get("messages", []):
-                reply = handle_client_message(message, client) if isinstance(message, dict) else None
+                reply = handle_client_message(message, client, self.role) if isinstance(message, dict) else None
                 if reply:
                     replies.append(reply)
             self.json({"replies": replies, "rev": BUS.rev})
+        elif url.path == "/api/share":
+            data = self.body()
+            doc = data.get("doc") if data.get("doc") in DOCS else next(iter(sorted(DOCS)), None)
+            share_start(str(data.get("provider", "auto")), doc, SHARE["port"])
+            self.json(share_info(), extra=self.cookie(SHARE["tokens"]["owner"]))
+        elif url.path == "/api/share/regenerate":
+            share_regenerate()
+            self.json(share_info())
+        elif url.path == "/api/share/stop":
+            share_disable()
+            self.json(share_info())
         else:
             self.reply(404, b"Not found", "text/plain")
 
@@ -970,9 +1639,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/ui/"):
             self.static(path[4:])
         elif path == "/api/health":
-            self.json(health())
+            self.json(health(self.role))
         elif path == "/api/config":
-            self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"]})
+            self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"], "role": self.role, "collab": True})
+        elif path == "/api/share":
+            self.json(share_info())
         elif path == "/ws":
             self.websocket(query)
         elif path == "/api/poll":
@@ -1010,6 +1681,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json(inverse(DOCS[name], query))
         elif path == "/forward":
             name, box = forward(query)
+            if self.role != "owner" and name != SHARE["doc"]:
+                raise ApiError("Not part of the shared document.", 403)
             box["doc"] = name
             if "quiet" not in query:
                 broadcast("forward", box)
@@ -1056,14 +1729,21 @@ class Handler(BaseHTTPRequestHandler):
             since = int(query["since"][0]) if "since" in query else None
         except ValueError:
             since = None
+        if not bind_client(str(query.get("cid", ["?"])[0])[:64], self.role):
+            raise ApiError("Client id belongs to another session.", 403)
         events = BUS.wait(since, POLL_HOLD) if since is not None else BUS.since(None)
-        self.json({"rev": BUS.rev, "events": events})
+        bind_client(str(query.get("cid", ["?"])[0])[:64], self.role)
+        # rev is where the client resumes: filtered-out messages still advance it, so it cannot spin on them.
+        self.json({"rev": events[-1]["rev"] if events else since, "events": visible(events, self.role)})
 
     def websocket(self, query: dict) -> None:
         key = self.headers.get("Sec-WebSocket-Key")
         if "websocket" not in self.headers.get("Upgrade", "").lower() or not key or not self.same_origin():
             self.reply(400, b"Expected a WebSocket upgrade", "text/plain")
             return
+        client = str(query.get("cid", ["?"])[0])[:64]
+        if not bind_client(client, self.role):
+            raise ApiError("Client id belongs to another session.", 403)
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
@@ -1071,11 +1751,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
 
-        client = str(query.get("cid", ["?"])[0])[:64]
         try:
             since = int(query["since"][0]) if "since" in query else None
         except ValueError:
             since = None
+        role, token = self.role, self.token
         send_lock = threading.Lock()
         alive = threading.Event()
 
@@ -1084,27 +1764,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(ws_encode(opcode, payload))
                 self.wfile.flush()
 
+        def revoked() -> bool:
+            return role_for_token(token) != role  # Tokens regenerated or sharing stopped.
+
         def pump() -> None:  # Bus -> socket.
             cursor = since
             try:
-                while not alive.is_set() and not STOP.is_set():
+                while not alive.is_set() and not STOP.is_set() and not revoked():
                     messages = BUS.since(cursor) if cursor is None else BUS.wait(cursor, 5.0)
-                    for message in messages:
+                    bind_client(client, role)  # Keeps the client "seen" while the socket idles.
+                    for message in visible(messages, role):
                         send(0x1, json.dumps(message).encode())
-                        cursor = message["rev"]
-                    if cursor is None:
+                    if messages:
+                        cursor = messages[-1]["rev"]
+                    elif cursor is None:
                         cursor = BUS.rev
             except OSError:
                 pass
             finally:
                 alive.set()
+                try:
+                    send(0x8, b"")  # Wakes the reader below if we are the one closing.
+                except OSError:
+                    pass
 
         threading.Thread(target=pump, daemon=True).start()
         partial: dict = {}
         try:
             while not alive.is_set():
                 frame = ws_read(self.rfile.read, partial)  # Socket -> bus handlers.
-                if frame is None or frame[0] == 0x8:
+                if frame is None or frame[0] == 0x8 or revoked():
                     break
                 opcode, payload = frame
                 if opcode == 0x9:
@@ -1114,13 +1803,14 @@ class Handler(BaseHTTPRequestHandler):
                         message = json.loads(payload)
                     except ValueError:
                         continue
-                    reply = handle_client_message(message, client) if isinstance(message, dict) else None
+                    reply = handle_client_message(message, client, role) if isinstance(message, dict) else None
                     if reply:
                         send(0x1, json.dumps(reply).encode())
         except (OSError, ValueError, struct.error):
             pass
         finally:
             alive.set()
+            ws_closed(client)
             try:
                 send(0x8, b"")
             except OSError:
@@ -1148,6 +1838,119 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
+# Self-test: probe the tunnel from outside, the way a collaborator's browser would
+# ---------------------------------------------------------------------------
+
+def _public_connection(url: str, timeout: float):
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+
+
+def probe_http(url: str, path: str, cookie: str | None, timeout: float = 60.0) -> tuple[int, bytes, float]:
+    headers = {"ngrok-skip-browser-warning": "1", "bypass-tunnel-reminder": "1", "User-Agent": "serve-selftest"}
+    if cookie:
+        headers["Cookie"] = cookie
+    began = time.monotonic()
+    conn = _public_connection(url, timeout)
+    try:
+        conn.request("GET", path, headers=headers)
+        res = conn.getresponse()
+        return res.status, res.read(), time.monotonic() - began
+    finally:
+        conn.close()
+
+
+def probe_ws(url: str, cookie: str) -> float:
+    """Open a WebSocket through the tunnel, send a ping, wait for the pong. Returns seconds."""
+    parts = urlsplit(url)
+    tls = parts.scheme == "https"
+    began = time.monotonic()
+    raw = socket.create_connection((parts.hostname, parts.port or (443 if tls else 80)), timeout=20)
+    sock = ssl.create_default_context().wrap_socket(raw, server_hostname=parts.hostname) if tls else raw
+    try:
+        sock.sendall((
+            f"GET /ws?cid=selftest HTTP/1.1\r\nHost: {parts.netloc}\r\nOrigin: {parts.scheme}://{parts.netloc}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 13\r\nCookie: {cookie}\r\nngrok-skip-browser-warning: 1\r\n\r\n"
+        ).encode())
+        stream = sock.makefile("rb")
+        status = stream.readline()
+        if b" 101 " not in status:
+            raise OSError(f"handshake refused: {status.decode(errors='replace').strip()}")
+        while stream.readline() not in (b"\r\n", b""):
+            pass
+        sock.sendall(ws_encode(0x1, json.dumps({"type": "ping", "data": 1}).encode(), b"\x01\x02\x03\x04"))
+        for _ in range(10):
+            frame = ws_read(stream.read)
+            if frame and frame[0] == 0x1 and json.loads(frame[1]).get("type") == "pong":
+                return time.monotonic() - began
+        raise OSError("no pong")
+    finally:
+        sock.close()
+
+
+def selftest(provider: str, port: int) -> int:
+    global POLL_HOLD
+    POLL_HOLD = 30.0
+    SETTINGS["check_host"] = True
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    SHARE["port"] = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=housekeeping, daemon=True).start()
+    rows: list[tuple[str, bool, str]] = []
+    try:
+        try:
+            share_start(provider, None, SHARE["port"], wait=True)
+        except ApiError as exc:
+            build.error(str(exc))
+            return 1
+        if SHARE["status"] != "ready":
+            build.error(SHARE["error"] or "The tunnel did not come up.")
+            return 1
+        url = SHARE["public"] or f"http://127.0.0.1:{SHARE['port']}"
+        cookie = f"{cookie_name()}={SHARE['tokens']['owner']}"
+        build.info(f"Probing {url} through {SHARE['provider']} ...")
+
+        def check(name: str, fn) -> None:
+            try:
+                ok, detail = fn()
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            rows.append((name, ok, detail))
+
+        def health_check():
+            status, body, took = probe_http(url, "/api/health", cookie)
+            return status == 200 and b'"ok": true' in body, f"HTTP {status} in {took:.2f}s"
+
+        def token_check():
+            status, _, _ = probe_http(url, "/api/health", None)
+            return status == 401, f"HTTP {status} without a token (want 401)"
+
+        def ws_check():
+            return True, f"ping/pong in {probe_ws(url, cookie):.2f}s"
+
+        def poll_check():
+            status, body, took = probe_http(url, f"/api/poll?since={BUS.rev}&cid=selftest", cookie, timeout=120)
+            return status == 200 and took >= 28, f"HTTP {status} after {took:.1f}s (held 30s; want 200 after ~30s)"
+
+        check("GET /api/health", health_check)
+        check("token required", token_check)
+        check("WebSocket echo", ws_check)
+        check("30 s long-poll", poll_check)
+    finally:
+        share_disable()
+        server.shutdown()
+    width = max(len(r[0]) for r in rows)
+    print(f"\n{'check'.ljust(width)}  result  detail")
+    for name, ok, detail in rows:
+        print(f"{name.ljust(width)}  {'PASS' if ok else 'FAIL':6}  {detail}")
+    return 0 if all(r[1] for r in rows) else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1159,7 +1962,18 @@ def main() -> int:
     parser.add_argument("--source", metavar="DIR", help="Directory holding the documents (default: files/).")
     parser.add_argument("--no-open", action="store_true", help="Do not open a browser.")
     parser.add_argument("--editor", default="vscode", help="URL scheme for source links (vscode, cursor, ...).")
+    parser.add_argument(
+        "--share", nargs="?", const="auto", choices=PROVIDER_CHOICES, metavar="PROVIDER",
+        help="Share the first document through a tunnel with token links (view and edit). PROVIDER: "
+        f"{', '.join(PROVIDER_CHOICES)} (default auto; 'local' = token links without a tunnel).",
+    )
+    parser.add_argument(
+        "--share-selftest", action="store_true",
+        help="Start a tunnel (--share PROVIDER, default auto); check health, WebSocket and a 30 s long-poll.",
+    )
     args = parser.parse_args()
+    if args.share_selftest:
+        return selftest(args.share or "auto", args.port if args.port != 8000 else 0)
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else build.ROOT_DIR / args.source
@@ -1188,6 +2002,7 @@ def main() -> int:
     server.daemon_threads = True
 
     port = server.server_address[1]
+    SHARE["port"] = port
     address = f"http://{'localhost' if args.host == '127.0.0.1' else args.host}:{port}/"
     first = build.select_documents(documents, args.docs)
     if first:
@@ -1196,15 +2011,38 @@ def main() -> int:
 
     threading.Thread(target=watcher, args=(latexmk, args.docs), daemon=True).start()
     threading.Thread(target=fs_watcher, daemon=True).start()
+    threading.Thread(target=housekeeping, daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    if args.share:
+        shared = build.doc_name(first[0]) if first else None
+        try:
+            share_start(args.share, shared, port, wait=True)
+        except ApiError as exc:
+            build.error(str(exc))
+            STOP.set()
+            return 1
+        if SHARE["status"] != "ready":
+            build.error(SHARE["error"] or "The tunnel did not come up.")
+            STOP.set()
+            return 1
+        links = share_links()
+        print(f"\nSharing '{shared}' via {SHARE['provider']} until you press Ctrl+C. Anyone with a link can use it:")
+        print(f"  view (read-only): {links['view']}\n  edit            : {links['edit']}")
+        if SHARE["provider"] == "ngrok":
+            print("  ngrok's free plan shows a warning page first; each visitor clicks 'Visit Site' once.")
+        address = address.replace(f":{port}/", f":{port}/?token={SHARE['tokens']['owner']}", 1)
     if not args.no_open:
         threading.Timer(0.3, webbrowser.open, (address,)).start()
 
     try:
-        server.serve_forever()
+        while not STOP.wait(0.5):
+            pass
     except KeyboardInterrupt:
         build.info("\nStopping.")
     finally:
         STOP.set()
+        share_disable()
+        server.shutdown()
         server.server_close()
     return 0
 
