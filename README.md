@@ -53,6 +53,10 @@ For each document, the script:
 4. Carries on with the remaining documents if one fails, and prints a summary.
 5. Exits non-zero if any document failed.
 
+Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`.
+
+After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`) and `warnings` (a count of LaTeX warnings). CI reads this file, so keep its keys stable.
+
 Before building, it deletes any PDF or log in `out/` whose `main.tex` no longer exists. `--watch` does this too.
 
 In `--watch` mode, a document that fails is retried only after one of its files changes again.

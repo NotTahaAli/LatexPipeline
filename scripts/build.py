@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -24,6 +26,9 @@ OUT_DIR = ROOT_DIR / "out"
 
 # ponytail: capped at 8; every job is a full TeX run, so more would thrash the disk.
 DEFAULT_JOBS = min(os.cpu_count() or 1, 8)
+
+# ponytail: at most this many errors per failing document in the summary; the log has all.
+MAX_SUMMARY_ERRORS = 10
 
 # Changes to these paths (relative to ROOT_DIR) rebuild every document.
 GLOBAL_INPUTS = (
@@ -244,6 +249,11 @@ def log_path_for(main_tex: Path) -> Path:
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
 CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
 
+# ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
+LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
+LATEX_WARNING = re.compile(r"^(?:LaTeX|Package|Class)\b.*\bWarning", re.MULTILINE)
+LATEX_PAGES = re.compile(r"^Output written on .*\((\d+) pages?", re.MULTILINE)
+
 
 class ConfigError(Exception):
     """A document's settings are invalid. The message goes into its log."""
@@ -320,13 +330,44 @@ def read_settings(main_tex: Path) -> dict:
     return settings
 
 
+def parse_latex_errors(console: str) -> list[dict]:
+    """
+    LaTeX errors in latexmk's console output, as {file, line, message}.
+    File is relative to the document's directory.
+    """
+    found: list[dict] = []
+
+    for line in console.splitlines():
+        match = LATEX_ERROR.match(line)
+        if not match:
+            continue
+
+        item = {
+            "file": posixpath.normpath(match.group("file")),
+            "line": int(match.group("line")),
+            "message": match.group("message"),
+        }
+        if item not in found:
+            found.append(item)
+
+    return found
+
+
+def error_text(name: str, found: dict) -> str:
+    """
+    files/<doc>/<file>:<line>: message. Editors can jump to it.
+    """
+    path = posixpath.normpath(posixpath.join(SOURCE_DIR.name, name, found["file"]))
+    return f"{path}:{found['line']}: {found['message']}"
+
+
 # ---------------------------------------------------------------------------
 # Building
 # ---------------------------------------------------------------------------
 
-def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[bool, str]:
+def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[dict, str]:
     """
-    Build one LaTeX document. Returns (success, console text).
+    Build one LaTeX document. Returns (report entry, console text).
 
     Compilation happens inside a temporary directory, so LaTeX auxiliary
     files never pollute the source directory or out/. Only the final PDF and
@@ -338,7 +379,9 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[boo
     nothing is printed except a "Started" line; the caller prints the
     returned text once the document finishes, so parallel builds don't mix.
     """
+    began = time.monotonic()
     relative = main_tex.relative_to(ROOT_DIR)
+    name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
     output_pdf = output_path_for(main_tex)
     log_path = log_path_for(main_tex)
 
@@ -364,6 +407,8 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[boo
 
     console: list[str] = []
     errors: list[str] = []
+    pages = None
+    warnings = 0
 
     try:
         settings = read_settings(main_tex)
@@ -428,9 +473,21 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[boo
         for message in errors:
             say(f"ERROR: {message}")
 
+        latex_log = temp_dir / f"{main_tex.stem}.log"
+        log_text = latex_log.read_text(encoding="utf-8", errors="replace") if latex_log.exists() else ""
+
+        # Counts from the final LaTeX run, which is the last pass that wrote the log.
+        latex_errors = parse_latex_errors("".join(console))
+        warnings = len(LATEX_WARNING.findall(log_text))
+        page_counts = LATEX_PAGES.findall(log_text)
+
+        if not errors and page_counts:
+            pages = int(page_counts[-1])
+
         sections = [
             f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
             *(f"ERROR: {message}\n" for message in errors),
+            *(f"{error_text(name, found)}\n" for found in latex_errors),
             "\n===== latexmk output =====\n",
             *console,
         ]
@@ -448,11 +505,33 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[boo
     say()
     say(f"Log:     {log_path.relative_to(ROOT_DIR)}")
 
-    if errors:
-        return False, "".join(shown)
+    if not errors:
+        say(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
 
-    say(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}")
-    return True, "".join(shown)
+    entry = {
+        "name": name,
+        "pdf": output_pdf.relative_to(OUT_DIR).as_posix(),
+        "log": log_path.relative_to(OUT_DIR).as_posix(),
+        "ok": not errors,
+        "seconds": round(time.monotonic() - began, 1),
+        "engine": settings["engine"] if settings else None,
+        "pages": pages,
+        "errors": latex_errors,
+        "warnings": warnings,
+    }
+
+    return entry, "".join(shown)
+
+
+def write_report(entries: list[dict]) -> None:
+    """
+    Write out/build-report.json for the documents built in this run.
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    report = {"documents": sorted(entries, key=lambda entry: entry["name"])}
+    text = json.dumps(report, indent=2) + "\n"
+    (OUT_DIR / "build-report.json").write_text(text, encoding="utf-8")
 
 
 def watch(latexmk: str, interval: float = 1.0) -> int:
@@ -481,8 +560,8 @@ def watch(latexmk: str, interval: float = 1.0) -> int:
                 if failed.get(document) == newest:
                     continue
 
-                ok, _ = build_document(document, latexmk)
-                if ok:
+                entry, _ = build_document(document, latexmk)
+                if entry["ok"]:
                     failed.pop(document, None)
                 else:
                     failed[document] = newest
@@ -645,7 +724,7 @@ def main() -> int:
 
     # One document runs live; several run in a pool, printed as each finishes.
     jobs = min(args.jobs, len(documents))
-    results: list[bool] = []
+    results: list[dict] = []
 
     if jobs == 1:
         for document in documents:
@@ -659,12 +738,14 @@ def main() -> int:
             ]
 
             for future in as_completed(futures):
-                ok, text = future.result()
+                entry, text = future.result()
                 sys.stdout.write(text)
-                results.append(ok)
+                results.append(entry)
                 info()
 
-    successes = sum(results)
+    write_report(results)
+
+    successes = sum(entry["ok"] for entry in results)
     failures = len(results) - successes
 
     separator()
@@ -673,6 +754,20 @@ def main() -> int:
     info(f"Successful: {successes}")
     info(f"Failed:     {failures}")
     info(f"Total:      {len(documents)}")
+
+    for entry in results:
+        if entry["ok"]:
+            continue
+
+        info()
+        info(f"Failed: {entry['name']}")
+        for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
+            info(f"  {error_text(entry['name'], found)}")
+
+        hidden = len(entry["errors"]) - MAX_SUMMARY_ERRORS
+        if hidden > 0:
+            info(f"  ... {hidden} more in out/{entry['log']}")
+
     separator()
 
     return 1 if failures else 0
