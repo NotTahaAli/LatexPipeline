@@ -7,6 +7,8 @@ PDF of every document.
   out/ holds only what this run built: a failed document keeps its previous
   PDF on the release, next to the log of the failed build.
 - Deletes assets whose main.tex no longer exists.
+- Release notes: a table of every document (links, pages, last build). The
+  state behind it is kept in the notes themselves, see release_notes().
 - If BUILD_OK=true, moves the `pdfs` tag to the built commit. CI rebuilds
   everything changed since that tag, so skipped or failed runs are caught up.
 
@@ -15,6 +17,7 @@ Meant for CI after `build.py`; needs the `gh` CLI and GH_TOKEN.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -23,9 +26,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-from build import OUT_DIR, find_documents, log_path_for, output_path_for
+from build import (
+    OUT_DIR,
+    SOURCE_DIR,
+    find_documents,
+    log_path_for,
+    output_path_for,
+)
+from ci_report import cell, load_documents
 
 TAG = "pdfs"
+STATE_RE = re.compile(r"<!-- latex-pipeline-state: (.*?) -->", re.DOTALL)
 
 
 def gh(*args: str) -> str:
@@ -50,15 +61,81 @@ def asset_name(pdf: Path) -> str:
     )
 
 
+def read_state(body: str) -> dict:
+    """Per-document state stored by the previous run's release notes."""
+    match = STATE_RE.search(body)
+    try:
+        return json.loads(match.group(1)) if match else {}
+    except ValueError:
+        return {}
+
+
+def release_notes(previous: dict, built: list[dict], commit: str) -> str:
+    """
+    Notes with one row per document on disk.
+
+    A document built in this run gets its new status. A document that was not
+    built keeps its previous row. A failed build keeps the PDF of its last
+    success (`pdf_commit`). The state is stored in an HTML comment at the end,
+    so the next run can read it back.
+    """
+    built_by_name = {doc["name"]: doc for doc in built}
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    download = f"https://github.com/{repo}/releases/download/{TAG}/"
+    state = {}
+    rows = []
+    for main_tex in find_documents():
+        name = main_tex.parent.relative_to(SOURCE_DIR).as_posix()
+        old = previous.get(name, {})
+        doc = built_by_name.get(name)
+        if doc is None:
+            new = old
+        elif doc["ok"]:
+            new = {"pdf_commit": commit, "pages": doc.get("pages"),
+                   "status": "ok", "commit": commit}
+        else:
+            new = {"pdf_commit": old.get("pdf_commit"), "pages": old.get("pages"),
+                   "status": "failed", "commit": commit}
+        state[name] = new
+
+        if new.get("pdf_commit"):
+            pdf = f"[PDF]({download}{asset_name(output_path_for(main_tex))})"
+            log = f"[log]({download}{asset_name(log_path_for(main_tex))})"
+        else:
+            pdf = log = None
+        last_build = f"{new.get('status')} ({new['commit'][:7]})" if new.get("commit") else None
+        cells = [name, pdf, new.get("pages"), (new.get("pdf_commit") or "")[:7] or None,
+                 last_build, log]
+        rows.append("| " + " | ".join(cell(value) for value in cells) + " |")
+
+    # "--" is not allowed inside an HTML comment, so escape it in the JSON.
+    encoded = json.dumps(state, sort_keys=True).replace("--", "\\u002d\\u002d")
+    return "\n".join([
+        (f"Latest PDF of every document, built from {commit[:7]}. "
+         "A document whose latest build failed keeps the PDF named in \"PDF from\"."),
+        "",
+        "| Document | PDF | Pages | PDF from | Last build | Log |",
+        "|---|---|---|---|---|---|",
+        *rows,
+        "",
+        f"<!-- latex-pipeline-state: {encoded} -->",
+        "",
+    ])
+
+
 def main() -> int:
     commit = os.environ.get("GITHUB_SHA", "unknown commit")
     build_ok = os.environ.get("BUILD_OK") == "true"
-    notes = f"Latest PDF of every document, built from {commit}."
 
     try:
-        gh("release", "view", TAG)
-        gh("release", "edit", TAG, "--notes", notes)
+        previous = gh("release", "view", TAG, "--json", "body", "--jq", ".body")
     except subprocess.CalledProcessError:
+        previous = None
+    notes = release_notes(read_state(previous or ""), load_documents(), commit)
+
+    if previous is not None:
+        gh("release", "edit", TAG, "--notes", notes)
+    else:
         # After a failed build, start the tag at the root commit so the next
         # run rebuilds everything.
         target = commit if build_ok else subprocess.run(
