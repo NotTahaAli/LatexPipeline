@@ -17,13 +17,15 @@ const store = {
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
 const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app" }, store.json("settings", {}));
+if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
 // ---- state ------------------------------------------------------------------------------
 let docs = {}, cur = decodeURIComponent(location.hash.slice(1));
 const tabs = new Map();      // path -> tab (per-file editor state)
 let active = null, files = [], refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
-const ui = Object.assign({ side: false, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
+const firstVisit = store.get("ui") === null;
+const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
 let view;
 
@@ -70,7 +72,8 @@ function extensionsFor(tab) {
     keysC.of([]),
     lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
     room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
-    readOnly ? EditorState.readOnly.of(true) : [],
+    readOnly ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
+    errField,
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
@@ -103,6 +106,35 @@ function onUpdate(u) {
 }
 
 const proseEdit = S.Annotation.define();
+
+let nudged = 0;
+function nudgeReadOnly() {   // Typing into a locked editor must not look like a bug.
+  if (Date.now() - nudged < 15000) return;
+  nudged = Date.now();
+  toast(el("span", { textContent: "This is a view-only link, so the text can't be changed. Ask the host for the edit link." }));
+}
+
+// ---- build errors in the source: the failing line is marked where you will look for it -----------------
+const setErrors = S.StateEffect.define();
+const errField = S.StateField.define({
+  create: () => V.Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) if (e.is(setErrors)) deco = e.value;
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+function markErrors() {
+  if (!view || !active || active.kind !== "text") return;
+  const doc = view.state.doc, seen = new Set(), marks = [];
+  for (const e of (docs[cur]?.status === "failed" ? docs[cur].errors : [])) {
+    if (e.file !== active.path || seen.has(e.line) || e.line < 1) continue;
+    seen.add(e.line);
+    marks.push(V.Decoration.line({ class: "cm-errLine", attributes: { title: e.message } }).range(doc.line(Math.min(e.line, doc.lines)).from));
+  }
+  view.dispatch({ effects: setErrors.of(V.Decoration.set(marks.sort((a, b) => a.from - b.from), true)) });
+}
 
 async function applyConfig() {
   if (!view) return;
@@ -177,7 +209,7 @@ async function activate(tab, line, opts = {}) {
     if (line) gotoLine(line);
     if (!opts.noFocus) view.focus();
   }
-  renderTabs(); renderTree(); showSaveState(); showBanner();
+  renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
 }
@@ -230,7 +262,7 @@ function showSaveState() {
   const tab = active;
   s.className = "";
   if (!tab || tab.kind !== "text") { s.textContent = ""; return; }
-  if (readOnly) s.textContent = "View only";
+  if (readOnly) s.textContent = "View only: you can't edit this document";
   else if (tab.collab && !tab.collab.isLeader) s.textContent = "Live";
   else if (tab.error) { s.textContent = "Save failed: " + tab.error; s.className = "err"; }
   else if (tab.saving) s.textContent = "Saving...";
@@ -341,7 +373,7 @@ function renderTree() {
         if (open) walk(v, path, depth + 1);
       } else {
         const text = v.kind === "text", img = v.kind === "image";
-        const row = el("button", { className: "row" + (text || img ? "" : " dim"), role: "treeitem", title: v.path + (text || img ? "" : " (not editable)"), disabled: !(text || img), onclick: () => openFile(v.path) }, el("span", { style: "width:16px" }), icon(img ? "image" : "file"), el("span", { className: "name", textContent: name }));
+        const row = el("button", { className: "row" + (text || img ? "" : " dim"), role: "treeitem", title: v.path + (text || img ? "" : " (not editable)"), disabled: !(text || img), onclick: () => { if (narrow()) setSide(false); openFile(v.path); } }, el("span", { style: "width:16px" }), icon(img ? "image" : "file"), el("span", { className: "name", textContent: name }));
         row.style.paddingLeft = pad;
         row.setAttribute("aria-selected", String(active?.path === v.path));
         rows.push(row);
@@ -370,7 +402,9 @@ async function loadOutline() {
   }));
 }
 
+const narrow = () => window.matchMedia("(max-width: 1000px)").matches;
 async function jumpTo(path, line) {
+  if (narrow()) setSide(false);   // The sidebar overlays the editor at this width: get out of the way.
   await openFile(path, line);
   forwardSearch(path, line);
 }
@@ -378,10 +412,14 @@ async function jumpTo(path, line) {
 // ---- PDF -----------------------------------------------------------------------------------------
 const pdfView = new PdfView($("viewer"), $("pages"), {
   zoom: (settings.zoom || 100) / 100,
-  onZoom: (z) => { settings.zoom = Math.round(z * 100); $("zLevel").textContent = settings.zoom + "%"; saveSettings(); },
+  onZoom: (z, fit) => { settings.zoom = Math.round(z * 100); settings.fit = !!fit; $("zLevel").textContent = settings.zoom + "%"; $("zFit").setAttribute("aria-pressed", String(!!fit)); saveSettings(); },
   onFirstPage: () => { window.__firstPage = Math.round(performance.now() - (window.__loadStart ?? t0)); },
 });
 $("zLevel").textContent = (settings.zoom || 100) + "%";
+pdfView.fitMode = settings.fit; $("zFit").setAttribute("aria-pressed", String(settings.fit));
+{   // Follow the pane while in fit mode: opening the sidebar or dragging the splitter must not crop the page.
+  let t; new ResizeObserver(() => { clearTimeout(t); t = setTimeout(() => pdfView.fitMode && pdfView.sizes.length && pdfView.fit(), 120); }).observe($("viewer"));
+}
 
 async function loadPdf() {
   const d = docs[cur];
@@ -389,7 +427,7 @@ async function loadPdf() {
   $("empty").hidden = true;
   window.__loadStart = performance.now();
   await pdfView.load(api.pdfUrl(cur, d.version), d.version);
-  if (!settings.zoom) pdfView.fit();   // First visit: fit the page width.
+  if (pdfView.fitMode) pdfView.fit();
 }
 /** The PDF pane before there is a PDF: a page-shaped skeleton and what is going on, never a blank pane. */
 function showEmpty(d) {
@@ -487,7 +525,7 @@ function renderStatus() {
   note.hidden = !(d.status === "failed" && d.version);
   if (!note.hidden) note.replaceChildren(el("span", { textContent: "Build failed. This is the last good PDF." }), el("button", { className: "link", textContent: "Show errors", onclick: () => setDrawer(true, "problems") }));
   if (!d.version) showEmpty(d);
-  renderProblems();
+  renderProblems(); markErrors();
 }
 
 function disclosure(head, more, open = false) {
@@ -643,17 +681,33 @@ $("proseClose").onclick = () => setProse(false);
 // A modal <dialog> keeps clicks inside but Tab can still walk out to the browser chrome: wrap it.
 for (const dlg of document.querySelectorAll("dialog")) dlg.addEventListener("keydown", (e) => {
   if (e.key !== "Tab") return;
-  const f = [...dlg.querySelectorAll("button,input,select,textarea,a[href],summary,[tabindex]:not([tabindex='-1'])")].filter((x) => !x.disabled && x.getClientRects().length);
+  const f = [...dlg.querySelectorAll("button,input,select,textarea,a[href],summary,[tabindex]:not([tabindex='-1'])")].filter((x) => !x.disabled && x.getClientRects().length && (x.tagName === "SUMMARY" || !x.closest("details:not([open])")));
   if (!f.length) return;
   const first = f[0], last = f[f.length - 1];
   if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
+// ---- first-run tips: one dismissible line that teaches the four things worth knowing ----------------------------
+function showTips(force) {
+  const box = $("tips");
+  if (!force && (readOnly || store.get("tips") === "done")) { box.hidden = true; return; }
+  const tip = (label, text, run) => el("button", { className: "tip", onclick: run }, el("b", { textContent: label }), el("span", { textContent: text }));
+  box.replaceChildren(
+    el("span", { className: "tips-title", textContent: "Quick start" }),
+    tip("Outline", "jump to any section, with word counts", () => setSide(true, "outline")),
+    tip("Visual", "see formatting and math instead of raw LaTeX", () => setVisual(true)),
+    tip(`${mod}+K`, "search every command", () => openPalette()),
+    el("span", { className: "tip plain", textContent: "Double-click the PDF to jump to its source" }),
+    el("span", { className: "spacer" }),
+    el("button", { className: "btn", textContent: "Got it", onclick: () => { store.set("tips", "done"); box.hidden = true; } }));
+  box.hidden = false;
+}
+
 // ---- command palette, menu, settings, cheat sheet ----------------------------------------------------
 const mod = /Mac/.test(navigator.platform) ? "Cmd" : "Ctrl";
 const COMMANDS = [
-  { id: "save", title: "Save file", keys: `${mod}+S`, run: () => saveTab(active) },
+  { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveTab(active) },
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
@@ -661,8 +715,9 @@ const COMMANDS = [
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
-  { id: "prose", title: "Toggle paragraph (rich text) panel", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
-  { id: "rebuild", title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
+  { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
+  { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
+  { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
   { id: "zout", title: "PDF zoom out", run: () => pdfView.setZoom(pdfView.zoom / 1.2) },
@@ -670,6 +725,7 @@ const COMMANDS = [
   ...(role === "owner" ? [{ id: "share", title: "Share...", run: () => openShare() }] : []),
   { id: "settings", title: "Settings", keys: `${mod}+,`, run: () => openSettings() },
   { id: "cheat", title: "Keyboard shortcuts", keys: "?", run: () => $("cheat").showModal() },
+  { id: "tips", title: "Show getting-started tips", run: () => showTips(true) },
   { id: "theme", get title() { return `Theme: ${settings.theme} (change)`; }, run: () => { settings.theme = { system: "light", light: "dark", dark: "system" }[settings.theme]; saveSettings(); applyAppearance(); toast(el("span", { textContent: "Theme: " + settings.theme })); } },
   { id: "keys-default", title: "Keybindings: default", run: () => { settings.keys = "default"; saveSettings(); applyConfig(); } },
   { id: "keys-vim", title: "Keybindings: Vim", run: () => { settings.keys = "vim"; saveSettings(); applyConfig(); } },
@@ -680,7 +736,7 @@ let paletteItems = [], paletteSel = 0;
 function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
   $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
     const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
@@ -720,11 +776,11 @@ bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { if (e.target === $(d)) $(d).close(); });
 
-$("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys), { title: "Close dialogs and panels", keys: "Esc" }].flatMap((c) => [el("dt", { textContent: c.title }), el("dd", {}, el("kbd", { textContent: c.keys }))]));
+$("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnly && c.edit)), { title: "Close dialogs and panels", keys: "Esc" }].flatMap((c) => [el("dt", { textContent: c.title }), el("dd", {}, el("kbd", { textContent: c.keys }))]));
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "problems", "lint", "log", "prose", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "cheat", "palette"];
+  const entries = ["files", "outline", "-", "problems", "lint", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
@@ -833,7 +889,20 @@ $("share").addEventListener("click", (e) => { if (e.target === $("share")) $("sh
 $("share").addEventListener("close", () => clearTimeout(shareTimer));
 if (readOnly || role !== "owner") $("shareBtn").hidden = true;
 else api.share().then((i) => $("shareBtn").classList.toggle("on", i.on)).catch(() => {});
-if (readOnly) { $("rebuildBtn").hidden = true; $("proseBtn").hidden = true; }
+// Roles: say who you are, and keep what you cannot do visible but disabled, with the reason.
+if (role !== "owner") {
+  const chip = $("roleChip");
+  chip.hidden = false; chip.className = "role " + role;
+  chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: readOnly ? "View only" : "Can edit" }));
+  chip.title = readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
+  chip.tabIndex = 0;
+}
+if (readOnly) {
+  for (const [id, why] of [["rebuildBtn", "Only people with the edit link can rebuild"], ["proseBtn", "Paragraph editing needs the edit link"]]) {
+    $(id).disabled = true; $(id).title = why;
+  }
+  $("rebuildBtn").setAttribute("aria-label", "Rebuild from scratch (disabled: view only)");
+}
 
 // ---- splitter ----------------------------------------------------------------------------------------------
 {
@@ -916,7 +985,7 @@ window.addEventListener("pagehide", () => { for (const t of tabs.values()) if (t
 
 // ---- boot --------------------------------------------------------------------------------------------------------------
 view = new EditorView({ state: EditorState.create({ doc: "" }), parent: $("cm") });
-applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); buildMenu();
+applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); buildMenu(); showTips();
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
 window.__app = { get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };

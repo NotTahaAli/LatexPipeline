@@ -65,12 +65,13 @@
   <button id="errBadge" class="badge bad" hidden aria-controls="drawer" aria-expanded="false"></button>
   <button id="warnBadge" class="badge warn" hidden aria-controls="drawer"></button>
   <span class="spacer"></span>
+  <span id="roleChip" class="role" hidden></span>
   <div class="menu-wrap" id="usersWrap" hidden>
     <button id="usersBtn" class="avatars" aria-haspopup="true" aria-expanded="false" aria-controls="usersList" title="People in this document"></button>
     <div id="usersList" class="menu users" role="group" aria-label="People in this document" hidden></div>
   </div>
   <button id="shareBtn" class="btn" title="Share this document: view and edit links"><svg class="ic"><use href="#i-share"/></svg><span class="lbl">Share</span></button>
-  <button id="visualBtn" class="btn" role="switch" aria-checked="false" title="Visual mode (Ctrl+Alt+V)"><svg class="ic"><use href="#i-eye"/></svg><span class="lbl">Visual</span></button>
+  <button id="visualBtn" class="btn" role="switch" aria-checked="false" title="Visual mode: show formatting, math and figures inline instead of raw LaTeX (Ctrl+Alt+V)"><svg class="ic"><use href="#i-eye"/></svg><span class="lbl">Visual</span></button>
   <button id="rebuildBtn" class="btn icon" title="Rebuild from scratch" aria-label="Rebuild from scratch"><svg class="ic"><use href="#i-refresh"/></svg></button>
   <div class="menu-wrap">
     <button id="moreBtn" class="btn icon" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu" title="More" aria-label="More"><svg class="ic"><use href="#i-more"/></svg></button>
@@ -78,6 +79,7 @@
   </div>
 </header>
 
+<div id="tips" role="region" aria-label="Getting started" hidden></div>
 <div id="progress" role="presentation" hidden><i></i></div>
 <main id="work">
   <aside id="side" hidden aria-label="Project sidebar">
@@ -97,7 +99,7 @@
 
   <section id="editorPane" aria-label="Editor">
     <div class="tabbar">
-      <button id="sideBtn" class="icon" aria-controls="side" aria-expanded="false" title="Files and outline (Ctrl+B)" aria-label="Toggle files and outline"><svg class="ic"><use href="#i-files"/></svg></button>
+      <button id="sideBtn" class="icon" aria-controls="side" aria-expanded="false" title="Files and outline: jump between sections, see word counts (Ctrl+B)" aria-label="Toggle files and outline"><svg class="ic"><use href="#i-files"/></svg></button>
       <div id="tabs" role="tablist" aria-label="Open files"></div>
     </div>
     <div id="banner" class="banner" role="alert" hidden></div>
@@ -174,21 +176,31 @@
     <div class="fields">
       <label for="sName">Your name</label>
       <input id="sName" type="text" maxlength="40" autocomplete="off">
-      <label for="sAutosave">Autosave</label>
-      <select id="sAutosave"><option value="0">Off</option><option value="500">After 0.5 s idle</option><option value="1000">After 1 s idle</option><option value="3000">After 3 s idle</option></select>
       <label for="sTheme">Theme</label>
       <select id="sTheme"><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select>
-      <label for="sKeys">Keybindings</label>
-      <select id="sKeys"><option value="default">Default</option><option value="vim">Vim</option><option value="emacs">Emacs</option></select>
-      <label for="sFont">Editor font size</label>
-      <input id="sFont" type="number" min="10" max="28" step="1">
-      <label for="sZoom">PDF zoom (%)</label>
-      <input id="sZoom" type="number" min="30" max="500" step="10">
-      <label for="sVisual">Visual mode</label>
-      <label class="check"><input id="sVisual" type="checkbox"> On by default</label>
-      <label for="sInverse">Double-click in PDF</label>
-      <select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select>
+      <label for="sAutosave">Autosave</label>
+      <select id="sAutosave"><option value="0">Off</option><option value="500">After 0.5 s idle</option><option value="1000">After 1 s idle</option><option value="3000">After 3 s idle</option></select>
     </div>
+    <details class="set-more">
+      <summary>Editor</summary>
+      <div class="fields">
+        <label for="sKeys">Keybindings</label>
+        <select id="sKeys"><option value="default">Default</option><option value="vim">Vim</option><option value="emacs">Emacs</option></select>
+        <label for="sFont">Font size</label>
+        <input id="sFont" type="number" min="10" max="28" step="1">
+        <label for="sVisual">Visual mode</label>
+        <label class="check"><input id="sVisual" type="checkbox"> On by default</label>
+      </div>
+    </details>
+    <details class="set-more">
+      <summary>PDF preview</summary>
+      <div class="fields">
+        <label for="sZoom">Zoom (%)</label>
+        <input id="sZoom" type="number" min="30" max="500" step="10">
+        <label for="sInverse">Double-click in PDF</label>
+        <select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select>
+      </div>
+    </details>
   </form>
 </dialog>
 

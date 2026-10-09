@@ -86,15 +86,16 @@ export class PdfView {
     this.viewer.scrollTop = top;
   }
 
-  setZoom(z) {
+  setZoom(z, keepFit) {
+    if (!keepFit) this.fitMode = false;   // A manual zoom stops following the pane width.
     const ratio = Math.max(0.3, Math.min(5, z)) / this.zoom;
     this.zoom = this.zoom * ratio;
     const top = this.viewer.scrollTop * ratio;
     this.layout(); this.viewer.scrollTop = top;
-    this.onZoom?.(this.zoom);
+    this.onZoom?.(this.zoom, this.fitMode);
   }
 
-  fit() { if (this.sizes.length) this.setZoom((this.viewer.clientWidth - 40) / this.sizes[0][0]); }
+  fit() { this.fitMode = true; if (this.sizes.length) this.setZoom((this.viewer.clientWidth - 40) / this.sizes[0][0], true); }
 
   async pageSize(i) {   // Exact size of page i (needed for a precise forward-search jump).
     const page = await this.pdf.getPage(i + 1);
