@@ -1338,6 +1338,10 @@ def leave_room(client: str, rid: str) -> None:
             room["gone_at"] = time.monotonic()
 
 
+def on_bye(message: dict, client: str, role: str) -> None:
+    client_gone(client)  # The tab is closing (sent as a beacon): no need to wait for the timeout.
+
+
 def on_leave(message: dict, client: str, role: str) -> None:
     leave_room(client, (message.get("data") or {}).get("room"))
 
@@ -1380,6 +1384,7 @@ def housekeeping() -> None:
 
 HANDLERS.update({
     "hello": on_hello, "y-join": on_join, "y-update": on_update, "y-aware": on_aware, "y-leave": on_leave,
+    "bye": on_bye,
 })
 
 
@@ -1772,6 +1777,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 while not alive.is_set() and not STOP.is_set() and not revoked():
                     messages = BUS.since(cursor) if cursor is None else BUS.wait(cursor, 5.0)
+                    if alive.is_set():
+                        break
                     bind_client(client, role)  # Keeps the client "seen" while the socket idles.
                     for message in visible(messages, role):
                         send(0x1, json.dumps(message).encode())
@@ -1972,6 +1979,7 @@ def main() -> int:
         help="Start a tunnel (--share PROVIDER, default auto); check health, WebSocket and a 30 s long-poll.",
     )
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())  # Stop like Ctrl+C would: tunnels must not be orphaned.
     if args.share_selftest:
         return selftest(args.share or "auto", args.port if args.port != 8000 else 0)
 

@@ -1,5 +1,5 @@
-// Transport layer. Everything the UI knows about the server goes through here, so a later
-// collaboration layer (Yjs over the same message bus) can plug in without touching the views.
+// Transport layer. Everything the UI knows about the server goes through here; the co-editing layer
+// (collab.js) rides on the same message bus.
 
 const enc = encodeURIComponent;
 const qs = (o) => new URLSearchParams(o).toString();
@@ -15,9 +15,14 @@ async function call(path, opts) {
 export const api = {
   files: (doc) => call(`api/files?${qs({ doc })}`),
   read: (doc, path) => call(`api/file?${qs({ doc, path })}`),
-  write: (doc, path, text, base, eol) => call(`api/file?${qs({ doc, path })}`, {
-    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, base, eol }),
+  write: (doc, path, text, base, eol, keepalive) => call(`api/file?${qs({ doc, path })}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, base, eol }), keepalive: !!keepalive,
   }),
+  config: () => call("api/config"),
+  share: () => call("api/share"),
+  shareStart: (provider, doc) => call("api/share", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, doc }) }),
+  shareStop: () => call("api/share/stop", { method: "POST" }),
+  shareRegenerate: () => call("api/share/regenerate", { method: "POST" }),
   outline: (doc) => call(`api/outline?${qs({ doc })}`),
   refs: (doc) => call(`api/refs?${qs({ doc })}`),
   lint: (doc) => call(`api/lint?${qs({ doc })}`),
@@ -45,6 +50,7 @@ export class Channel {
     this.lastSeen = 0;
     this.stopped = false;
     this.attempt = 0;
+    this.denied = 0;
   }
 
   on(type, fn) { (this.handlers.get(type) || this.handlers.set(type, []).get(type)).push(fn); return this; }
@@ -77,7 +83,8 @@ export class Channel {
     const base = location.pathname.replace(/[^/]*$/, "");
     const url = `${proto}//${location.host}${base}ws?${qs(this.rev == null ? { cid: this.cid } : { cid: this.cid, since: this.rev })}`;
     let opened = false;
-    const ws = this.ws = new WebSocket(url);
+    let ws;
+    try { ws = this.ws = new WebSocket(url); } catch { this.forcePoll = true; return this.poll(); }   // Blocked by policy or an extension.
     const timer = setTimeout(() => { if (!opened) { ws.onclose = null; ws.close(); this.forcePoll = true; this.poll(); } }, 3000);
     ws.onopen = () => { opened = true; clearTimeout(timer); this.attempt = 0; this.setMode("ws"); };
     ws.onmessage = (e) => { try { this.emit(JSON.parse(e.data)); } catch { /* ignore */ } };
@@ -98,9 +105,10 @@ export class Channel {
         const res = await call(`api/poll?${qs(this.rev == null ? { cid: this.cid } : { cid: this.cid, since: this.rev })}`);
         if (this.mode !== "poll") this.setMode("poll");
         for (const m of res.events) this.emit(m);
-        this.attempt = 0;
-        if (!res.events.length && this.rev == null) this.rev = res.rev;
-      } catch {
+        this.attempt = 0; this.denied = 0;
+        if (res.rev != null && res.rev > (this.rev ?? -1)) this.rev = res.rev;   // The server may have hidden messages from us.
+      } catch (e) {
+        if (e.status === 401 && ++this.denied >= 3) { this.stopped = true; this.setMode("revoked"); return; }   // 3 tries: a new cookie may still be in flight
         this.setMode("reconnecting");
         await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** this.attempt++, 8000)));
       }
@@ -108,12 +116,13 @@ export class Channel {
   }
 
   async send(message) {
-    if (this.mode === "ws" && this.ws?.readyState === 1) { this.ws.send(JSON.stringify(message)); return; }
+    if (this.mode === "ws" && this.ws?.readyState === 1) { this.ws.send(JSON.stringify(message)); return true; }
     try {
       const res = await call(`api/send?${qs({ cid: this.cid })}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [message] }),
       });
       for (const r of res.replies) this.emit(r);
-    } catch { /* the poll loop reports connectivity */ }
+      return true;
+    } catch { return false; /* the poll loop reports connectivity; co-editing re-sends what the server lacks on reconnect */ }
   }
 }

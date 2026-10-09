@@ -1,4 +1,5 @@
-import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs } from "./libs.js";
+import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
+import { Collab, PALETTE } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
@@ -25,6 +26,11 @@ let active = null, files = [], refs = { labels: {}, bib: {} }, outlineData = nul
 const ui = Object.assign({ side: false, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
 let view;
+
+// ---- who am I, what may I do ---------------------------------------------------------------------
+const config = await api.config().catch(() => ({ role: "owner" }));
+const role = config.role, readOnly = role === "view";
+const me = store.json("user", null) || (() => { const u = { name: "Guest " + (100 + Math.floor(Math.random() * 900)), color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }; store.set("user", u); return u; })();
 
 // ---- toast ------------------------------------------------------------------------------
 function toast(...kids) { const t = $("toast"); t.replaceChildren(...kids); t.hidden = false; clearTimeout(t.t); t.t = setTimeout(() => t.hidden = true, 5000); }
@@ -59,10 +65,13 @@ const latexComplete = (ctx) => {
 };
 
 function extensionsFor(tab) {
+  const room = tab.collab;
   return [
     keysC.of([]),
     lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
-    C.history(), L.bracketMatching(), AC.closeBrackets(),
+    room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
+    readOnly ? EditorState.readOnly.of(true) : [],
+    L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
     L.StreamLanguage.define(stex),
@@ -71,7 +80,7 @@ function extensionsFor(tab) {
     EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, spellcheck: "false" }),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
-      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...C.historyKeymap, ...AC.completionKeymap,
+      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
     ]),
     SR.search({ top: true }),
     visualC.of([]),
@@ -82,7 +91,7 @@ function extensionsFor(tab) {
 
 function onUpdate(u) {
   if (!active) return;
-  if (u.docChanged) {
+  if (u.docChanged && !active.collab) {   // A collaborative tab's room tracks what still has to reach the disk.
     active.dirty = !u.state.doc.eq(active.savedDoc);
     if (!active.fromDisk) { renderTabs(); showSaveState(); scheduleAutosave(); }
   }
@@ -127,12 +136,26 @@ async function openFile(path, line, opts = {}) {
         tab.version = f.version; tab.eol = f.eol;
         const doc = S.Text.of(f.text.split("\n"));
         tab.savedDoc = doc;
-        tab.state = EditorState.create({ doc, extensions: extensionsFor(tab) });
+        if (collab) {
+          try { attachRoom(tab, await collab.open(cur, path)); }
+          catch (e) { console.warn("co-editing unavailable for", path, e); toast(el("span", { textContent: "Live co-editing is unavailable; editing a local copy." })); }
+        }
+        tab.state = EditorState.create({ doc: tab.collab ? S.Text.of(tab.collab.text().split("\n")) : doc, extensions: extensionsFor(tab) });
       } catch (e) { toast(el("span", { textContent: `${path}: ${e.message}` })); return; }
     }
     tabs.set(path, tab);
   }
   await activate(tab, line, opts);
+}
+
+// A collaborative tab reads its dirty/saving/error state from the room (only the leader writes to disk).
+function attachRoom(tab, room) {
+  tab.collab = room;
+  for (const key of ["dirty", "saving", "error"]) Object.defineProperty(tab, key, { get: () => room[key], set() { /* the room owns it */ }, configurable: true });
+}
+function collabState(tab) {
+  const len = tab.collab.text().length, head = Math.min(tab.state?.selection.main.head ?? 0, len);
+  return EditorState.create({ doc: S.Text.of(tab.collab.text().split("\n")), selection: { anchor: head }, extensions: extensionsFor(tab) });
 }
 
 async function activate(tab, line, opts = {}) {
@@ -145,6 +168,7 @@ async function activate(tab, line, opts = {}) {
     $("imgPreview").replaceChildren(el("img", { src: api.rawUrl(cur, tab.path), alt: tab.path }));
   } else {
     if (!same) {   // The live view already holds the active tab's newest state.
+      if (tab.collab) tab.state = collabState(tab);   // The shared text moved on while this tab was in the background.
       tab.fromDisk = true;
       view.setState(tab.state);
       tab.fromDisk = false;
@@ -154,6 +178,7 @@ async function activate(tab, line, opts = {}) {
     if (!opts.noFocus) view.focus();
   }
   renderTabs(); renderTree(); showSaveState(); showBanner();
+  collab?.hello(tab.path);
   if (ui.prose) syncProse();
 }
 
@@ -163,8 +188,9 @@ function gotoLine(line) {
 }
 
 function closeTab(tab) {
-  if (tab.dirty && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
+  if (!tab.collab && tab.dirty && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
   tabs.delete(tab.path);
+  tab.collab?.leave();
   if (active === tab) {
     active = null;
     const next = [...tabs.values()].pop();
@@ -201,7 +227,9 @@ function showSaveState() {
   const tab = active;
   s.className = "";
   if (!tab || tab.kind !== "text") { s.textContent = ""; return; }
-  if (tab.error) { s.textContent = "Save failed: " + tab.error; s.className = "err"; }
+  if (readOnly) s.textContent = "View only";
+  else if (tab.collab && !tab.collab.isLeader) s.textContent = "Live";
+  else if (tab.error) { s.textContent = "Save failed: " + tab.error; s.className = "err"; }
   else if (tab.saving) s.textContent = "Saving...";
   else if (tab.dirty) { s.textContent = settings.autosave ? "Unsaved changes" : "Unsaved changes (Ctrl+S)"; s.className = "unsaved"; }
   else s.textContent = "Saved";
@@ -239,8 +267,9 @@ function scheduleAutosave() {
   if (settings.autosave > 0) autosaveTimer = setTimeout(() => active?.dirty && saveTab(active), settings.autosave);
 }
 
-async function saveTab(tab) {
+async function saveTab(tab, opts) {
   if (!tab || tab.kind !== "text" || tab.saving) return;
+  if (tab.collab) return tab.collab.save(opts);
   clearTimeout(autosaveTimer);
   const doc = tab === active ? view.state.doc : tab.state.doc;
   if (!tab.dirty && !tab.conflict) return;
@@ -262,6 +291,7 @@ async function onFsEvent(msg) {
   loadFiles();
   for (const path of [...msg.changed, ...msg.removed]) {
     const tab = tabs.get(path);
+    if (tab?.collab) { tab.collab.onFs(msg.removed.includes(path)); continue; }   // The room's leader folds it into the shared text.
     if (!tab || tab.kind !== "text" || tab.saving) continue;
     if (msg.removed.includes(path)) { tab.conflict = "deleted"; if (tab === active) showBanner(); continue; }
     const info = files.find((f) => f.path === path);
@@ -544,11 +574,12 @@ const COMMANDS = [
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", title: "Toggle paragraph (rich text) panel", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
-  { id: "rebuild", title: "Rebuild from scratch", run: () => api.rebuild(cur) },
+  { id: "rebuild", title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
   { id: "zout", title: "PDF zoom out", run: () => pdfView.setZoom(pdfView.zoom / 1.2) },
   { id: "fit", title: "PDF fit width", run: () => pdfView.fit() },
+  ...(role === "owner" ? [{ id: "share", title: "Share...", run: () => openShare() }] : []),
   { id: "settings", title: "Settings", keys: `${mod}+,`, run: () => openSettings() },
   { id: "cheat", title: "Keyboard shortcuts", keys: "?", run: () => $("cheat").showModal() },
   { id: "theme", get title() { return `Theme: ${settings.theme} (change)`; }, run: () => { settings.theme = { system: "light", light: "dark", dark: "system" }[settings.theme]; saveSettings(); applyAppearance(); toast(el("span", { textContent: "Theme: " + settings.theme })); } },
@@ -581,10 +612,16 @@ $("palette").addEventListener("click", (e) => { if (e.target === $("palette")) $
 
 function openSettings() {
   $("sAutosave").value = settings.autosave; $("sTheme").value = settings.theme; $("sKeys").value = settings.keys;
+  $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
   $("settings").showModal();
 }
 const bind = (id, apply) => $(id).addEventListener("change", () => { apply($(id)); saveSettings(); applyAppearance(); });
+$("sName").addEventListener("change", () => {
+  me.name = $("sName").value.trim().slice(0, 40) || me.name; store.set("user", me);
+  for (const room of collab?.rooms.values() || []) room.awareness.setLocalStateField("user", { name: me.name, color: me.color, colorLight: me.color + "33" });
+  collab?.hello(active?.path);
+});
 bind("sAutosave", (n) => { settings.autosave = +n.value; showSaveState(); });
 bind("sTheme", (n) => settings.theme = n.value);
 bind("sKeys", (n) => { settings.keys = n.value; applyConfig(); });
@@ -598,7 +635,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys), { title: "
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "problems", "lint", "log", "prose", "-", "theme", "settings", "cheat", "palette"];
+  const entries = ["files", "outline", "problems", "lint", "log", "prose", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "cheat", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
@@ -640,6 +677,75 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "Escape" && !document.querySelector("dialog[open]") && !typing) { if (ui.drawer) setDrawer(false); else if (ui.side) setSide(false); }
 });
 
+// ---- people and sharing ---------------------------------------------------------------------------------
+const avatar = (u) => { const a = el("span", { className: "av", textContent: (u.name || "?").trim().slice(0, 1).toUpperCase(), title: u.name }); a.style.background = u.color; return a; };
+const roleLabel = (r) => ({ owner: "host", edit: "can edit", view: "view only" }[r] || r);
+function renderUsers(users) {
+  const everyone = users || [], others = everyone.filter((u) => u.cid !== channel.cid);
+  $("usersWrap").hidden = everyone.length < 2;
+  $("usersBtn").replaceChildren(...others.slice(0, 4).map(avatar), ...(others.length > 4 ? [el("span", { className: "av more", textContent: "+" + (others.length - 4) })] : []));
+  $("usersBtn").setAttribute("aria-label", `${everyone.length} people here. Show list`);
+  $("usersList").replaceChildren(...everyone.map((u) => el("div", { className: "person" }, avatar(u),
+    el("span", { className: "pname", textContent: u.name + (u.cid === channel.cid ? " (you)" : "") }),
+    el("span", { className: "mute prole", textContent: roleLabel(u.role) + (u.path ? " · " + u.path.split("/").pop() : "") }))));
+}
+$("usersBtn").onclick = (e) => { e.stopPropagation(); const open = $("usersList").hidden; $("usersList").hidden = !open; $("usersBtn").setAttribute("aria-expanded", String(open)); };
+document.addEventListener("click", (e) => { if (!e.target.closest("#usersWrap")) { $("usersList").hidden = true; $("usersBtn").setAttribute("aria-expanded", "false"); } });
+
+let shareTimer;
+async function openShare() { $("share").showModal(); await refreshShare(); }
+async function refreshShare() {
+  clearTimeout(shareTimer);
+  let info;
+  try { info = await api.share(); } catch (e) { $("shareBody").textContent = e.message; return; }
+  renderShare(info);
+  $("shareBtn").classList.toggle("on", info.on);
+  if ($("share").open && info.on && info.status === "starting") shareTimer = setTimeout(refreshShare, 1000);
+}
+function linkRow(label, url, note) {
+  const input = el("input", { type: "text", readOnly: true, value: url, id: "link-" + label.split(" ")[0].toLowerCase() });
+  input.setAttribute("aria-label", label);
+  const copy = el("button", { type: "button", className: "btn", textContent: "Copy", onclick: async () => {
+    try { await navigator.clipboard.writeText(url); copy.textContent = "Copied"; } catch { input.select(); copy.textContent = "Press Ctrl+C"; }
+    setTimeout(() => copy.textContent = "Copy", 2000);
+  } });
+  return el("div", { className: "link-row" }, el("b", { textContent: label }), el("div", { className: "link-line" }, input, copy), el("span", { className: "mute", textContent: note }));
+}
+function renderShare(info) {
+  const body = $("shareBody");
+  if (!info.on) {
+    const select = el("select", { id: "shareProvider" }, new Option("Automatic (best installed tool)", "auto"),
+      ...info.providers.map((p) => new Option(p.name + (p.available ? "" : " (not installed)"), p.name)), new Option("No tunnel (links for this machine only)", "local"));
+    const start = el("button", { type: "button", className: "btn primary", id: "shareStart", textContent: "Start sharing", onclick: async () => {
+      start.disabled = true;
+      try { await api.shareStart(select.value, cur); await refreshShare(); } catch (e) { start.disabled = false; msg.textContent = e.message; msg.hidden = false; }
+    } });
+    const msg = el("p", { className: "err", role: "alert", hidden: !info.error, textContent: info.error || "" });
+    body.replaceChildren(
+      el("p", { textContent: "Start a tunnel and get two links to this document: one to read, one to edit together in real time. Each link holds a secret token and works until you stop sharing or quit." }),
+      el("label", { htmlFor: "shareProvider", textContent: "Tunnel" }), select, msg, el("div", { className: "actions" }, start));
+  } else if (info.status === "starting") {
+    body.replaceChildren(el("p", { role: "status", textContent: `Starting ${info.provider}... this can take up to a minute.` }),
+      el("div", { className: "actions" }, el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: async () => { await api.shareStop(); refreshShare(); } })));
+  } else {
+    const notes = [info.provider === "ngrok" && "ngrok's free plan shows a warning page first; visitors click Visit Site once.", info.provider === "localtunnel" && "localtunnel may ask visitors for a tunnel password (your public IP)."].filter(Boolean);
+    body.replaceChildren(
+      el("p", { textContent: `Sharing ${info.doc || "the document"} through ${info.provider}.` }),
+      linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline."),
+      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Shell escape stays off."),
+      ...notes.map((t) => el("p", { className: "mute", textContent: t })),
+      el("div", { className: "actions" },
+        el("button", { type: "button", className: "btn", id: "shareRegen", textContent: "New links", title: "Revoke both links and make new ones", onclick: async () => { if (confirm("Everyone using the current links loses access. Make new links?")) { await api.shareRegenerate(); refreshShare(); } } }),
+        el("button", { type: "button", className: "btn danger", id: "shareStop", textContent: "Stop sharing", onclick: async () => { await api.shareStop(); refreshShare(); } })));
+  }
+}
+$("shareBtn").onclick = openShare;
+$("share").addEventListener("click", (e) => { if (e.target === $("share")) $("share").close(); });
+$("share").addEventListener("close", () => clearTimeout(shareTimer));
+if (readOnly || role !== "owner") $("shareBtn").hidden = true;
+else api.share().then((i) => $("shareBtn").classList.toggle("on", i.on)).catch(() => {});
+if (readOnly) { $("rebuildBtn").hidden = true; $("proseBtn").hidden = true; }
+
 // ---- splitter ----------------------------------------------------------------------------------------------
 {
   const sp = $("splitter");
@@ -654,6 +760,22 @@ document.addEventListener("keydown", (e) => {
 
 // ---- bus, documents ---------------------------------------------------------------------------------------------
 const channel = new Channel();
+const collab = collabLibs && config.collab !== false ? new Collab(channel, api, {
+  user: () => me, role, saveDelay: () => settings.autosave || 1000,
+  onChange: (room) => {
+    const key = [room.dirty, room.saving, room.error, room.isLeader].join();
+    if (room.shown === key) return;
+    room.shown = key; renderTabs(); showSaveState();
+  },
+  onRebind: (room) => {
+    const tab = tabs.get(room.path);
+    if (!tab) return;
+    tab.state = collabState(tab);
+    if (tab === active) { tab.fromDisk = true; view.setState(tab.state); tab.fromDisk = false; applyConfig(); }
+  },
+  onWarn: (text) => toast(el("span", { textContent: text })),
+  onPresence: (users) => renderUsers(users),
+}) : null;
 channel.on("state", (data) => {
   const list = data.docs;
   docs = Object.fromEntries(list.map((d) => [d.name, d]));
@@ -672,6 +794,7 @@ channel.on("fs", onFsEvent);
 channel.on("forward", (b) => { if (b.doc !== cur) pick(b.doc); pdfView.reveal(b); });
 channel.on("transport", (mode) => {
   document.documentElement.dataset.transport = mode;
+  if (mode === "revoked") $("revoked").hidden = false;
   if (mode === "reconnecting") $("label").textContent = "Reconnecting...";
   else if (docs[cur]) renderStatus();
 });
@@ -679,7 +802,8 @@ channel.on("transport", (mode) => {
 async function pick(name) {
   if (!name) return;
   const changing = cur && cur !== name;
-  if (changing && [...tabs.values()].some((t) => t.dirty)) await Promise.all([...tabs.values()].filter((t) => t.dirty).map(saveTab));
+  if (changing && [...tabs.values()].some((t) => t.dirty && !t.collab)) await Promise.all([...tabs.values()].filter((t) => t.dirty && !t.collab).map((t) => saveTab(t)));
+  if (changing) await Promise.all([...tabs.values()].map((t) => t.collab?.leave()));
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
   $("doc").value = name;
   tabs.clear(); active = null; files = []; outlineData = null; refs = { labels: {}, bib: {} };
@@ -698,8 +822,8 @@ async function restoreTabs() {
 }
 
 $("doc").onchange = (e) => pick(e.target.value);
-window.addEventListener("beforeunload", (e) => { if ([...tabs.values()].some((t) => t.dirty)) { e.preventDefault(); e.returnValue = ""; } });
-window.addEventListener("pagehide", () => { for (const t of tabs.values()) if (t.dirty && t.kind === "text") saveTab(t); });
+window.addEventListener("beforeunload", (e) => { if ([...tabs.values()].some((t) => t.dirty && !t.collab)) { e.preventDefault(); e.returnValue = ""; } });
+window.addEventListener("pagehide", () => { for (const t of tabs.values()) if (t.kind === "text" && (t.dirty || t.collab)) saveTab(t, { keepalive: true }); collab?.bye(); });
 
 // ---- boot --------------------------------------------------------------------------------------------------------------
 view = new EditorView({ state: EditorState.create({ doc: "" }), parent: $("cm") });

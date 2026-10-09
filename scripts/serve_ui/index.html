@@ -17,6 +17,7 @@
   "@codemirror/autocomplete": "https://esm.sh/@codemirror/autocomplete@6.18.6?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@lezer/common": "https://esm.sh/@lezer/common@1.2.3?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@lezer/highlight": "https://esm.sh/@lezer/highlight@1.2.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "yjs": "https://esm.sh/yjs@13.6.27?deps=lib0@0.2.99",
   "@lezer/lr": "https://esm.sh/@lezer/lr@1.4.2?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr"
  }
 }
@@ -47,6 +48,7 @@
     <symbol id="i-jump" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
     <symbol id="i-bold" viewBox="0 0 24 24"><path d="M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
   </defs>
 </svg>
@@ -62,6 +64,11 @@
   <button id="errBadge" class="badge bad" hidden aria-controls="drawer" aria-expanded="false"></button>
   <button id="warnBadge" class="badge warn" hidden aria-controls="drawer"></button>
   <span class="spacer"></span>
+  <div class="menu-wrap" id="usersWrap" hidden>
+    <button id="usersBtn" class="avatars" aria-haspopup="true" aria-expanded="false" aria-controls="usersList" title="People in this document"></button>
+    <div id="usersList" class="menu users" role="group" aria-label="People in this document" hidden></div>
+  </div>
+  <button id="shareBtn" class="btn" title="Share this document: view and edit links"><svg class="ic"><use href="#i-share"/></svg><span class="lbl">Share</span></button>
   <button id="visualBtn" class="btn" role="switch" aria-checked="false" title="Visual mode (Ctrl+Alt+V)"><svg class="ic"><use href="#i-eye"/></svg><span class="lbl">Visual</span></button>
   <button id="rebuildBtn" class="btn icon" title="Rebuild from scratch" aria-label="Rebuild from scratch"><svg class="ic"><use href="#i-refresh"/></svg></button>
   <div class="menu-wrap">
@@ -141,6 +148,14 @@
 </section>
 
 <div id="toast" role="status" hidden></div>
+<div id="revoked" role="alert" hidden><div><h2>This link no longer works</h2><p>The host stopped sharing, or made new links. Ask them for a new one.</p></div></div>
+
+<dialog id="share" aria-labelledby="shareTitle">
+  <form method="dialog">
+    <div class="dlg-head"><h2 id="shareTitle">Share</h2><button class="icon" value="close" aria-label="Close share dialog"><svg class="ic"><use href="#i-x"/></svg></button></div>
+    <div id="shareBody" class="share-body"></div>
+  </form>
+</dialog>
 
 <dialog id="palette" aria-label="Command palette">
   <input id="paletteInput" type="text" role="combobox" aria-expanded="true" aria-controls="paletteList" aria-autocomplete="list" placeholder="Type a command..." autocomplete="off" spellcheck="false">
@@ -151,6 +166,8 @@
   <form method="dialog">
     <div class="dlg-head"><h2 id="settingsTitle">Settings</h2><button class="icon" value="close" aria-label="Close settings"><svg class="ic"><use href="#i-x"/></svg></button></div>
     <div class="fields">
+      <label for="sName">Your name</label>
+      <input id="sName" type="text" maxlength="40" autocomplete="off">
       <label for="sAutosave">Autosave</label>
       <select id="sAutosave"><option value="0">Off</option><option value="500">After 0.5 s idle</option><option value="1000">After 1 s idle</option><option value="3000">After 3 s idle</option></select>
       <label for="sTheme">Theme</label>

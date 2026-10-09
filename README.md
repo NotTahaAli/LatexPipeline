@@ -129,7 +129,23 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 ## Live preview
 
-`python scripts/serve.py [DOC] [--port 8000] [--no-open]` starts a live preview at http://localhost:8000, bound to 127.0.0.1 only; rebuilds on save, keeps scroll and zoom, lists errors with editor links; double-click the PDF to jump to source; needs the synctex CLI from TeX Live and internet for PDF.js from cdnjs.
+`python scripts/serve.py [DOC] [--port 8000] [--no-open]` starts an editor and live preview at http://localhost:8000, bound to 127.0.0.1 only. It rebuilds on save, keeps scroll and zoom, lists errors with editor links, and double-click in the PDF jumps to the source. It needs the synctex CLI from TeX Live, and internet for PDF.js, CodeMirror and Yjs from pinned CDN versions.
+
+**Editing together.** Everyone who opens the same document edits it live (Yjs): you see each other's cursors and selections with names and colours, and a stack of avatars in the top bar opens the list of people. The server only relays the changes. One editor per file, the "leader", saves to disk through the normal atomic save; if the leader leaves, another takes over. If you change a file outside the editor (git, vim) while it is open, the change is merged into the shared text instead of overwriting anyone's typing. If the connection drops, you can keep typing; the edits merge when it returns, over WebSocket or the long-poll fallback.
+
+**Sharing.** `python scripts/serve.py --share [cloudflared|ngrok|localtunnel|pinggy|localhost.run|auto]` (or Share in the top bar) starts a tunnel and prints two links for the first document: a view link (read-only source, PDF and outline) and an edit link (edit the document's files and rebuild it). `auto` picks the first installed of cloudflared, ngrok, npx localtunnel, then ssh (pinggy, localhost.run); with none installed it tells you what to install. No link works after you stop sharing or quit.
+
+* Install: [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) (no account, the default), [ngrok](https://ngrok.com/download) (free account and `ngrok config add-authtoken`), Node.js for localtunnel, or ssh for pinggy and localhost.run. The ssh and ngrok parsers follow each tool's documented output but are untested here; if one fails, please report its output.
+* ngrok's free plan shows a warning page on the first visit; each visitor clicks Visit Site once. localtunnel may ask for a tunnel password (your public IP).
+* Cloudflare quick tunnels do not support Server-Sent Events; the editor uses WebSocket with a long-poll fallback, so it works. `python scripts/serve.py --share-selftest [--share PROVIDER]` starts the tunnel and checks `/api/health`, a WebSocket echo and a 30 s long-poll through the public URL, then prints a table. Run it on your own machine before a session; it needs outbound access that restricted networks do not give.
+
+Security while sharing:
+
+* Every request needs a token, loopback included. A tunnel connects to the server from 127.0.0.1, so "local" proves nothing; your own browser gets a private third token as a cookie when sharing starts. Tokens are random 32-byte URL-safe strings, compared in constant time. A link sets an HttpOnly, SameSite=Lax cookie on the first visit and redirects to a URL without the token. New links ("New links" in the Share dialog) disconnect everyone on the old ones.
+* The view role cannot save, rebuild, or see other documents, in the UI or the API; the edit role can edit only the shared document's files, never `build.toml` or `.latexmkrc`, and rebuilds are rate limited (6 a minute).
+* Shell escape is forced off for the whole server while sharing, and a `build.toml` whose `latexmk_args` enable it (`-shell-escape`, `-enable-write18`) or name programs to run (`-e`, `-r`, `-pdflatex=...`) fails the build. LaTeX itself still runs with TeX Live's default restricted `\write18`.
+* Responses carry a Content-Security-Policy that allows only this origin and the pinned CDNs, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `frame-ancestors 'none'`. The Host header must be loopback or the tunnel's own host.
+* Anyone with the edit link can change that document, so treat it like a password. Unencrypted `--host 0.0.0.0` access is not what sharing is for.
 
 ---
 

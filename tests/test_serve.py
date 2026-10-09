@@ -1,6 +1,7 @@
 """serve.py: path safety, atomic writes, outline and word counts, message bus, WebSocket frames, HTTP API."""
 
 import http.client
+import importlib.util
 import io
 import json
 import os
@@ -536,6 +537,7 @@ class TokenAuth(SharedState):
         self.assertEqual([serve.rate_ok("k", 2, 60) for _ in range(3)], [True, True, False])
         self.assertTrue(serve.rate_ok("other", 2, 60))
 
+    @unittest.skipUnless(sys.version_info >= (3, 11) or importlib.util.find_spec("tomli"), "build.toml needs tomllib")
     def test_shell_escape_is_refused_while_sharing(self):
         with _support.fake_repo() as root:
             main = _support.write_doc(root, "d", "x", 'shell_escape = true\nlatexmk_args = ["-bibtex"]\n')
@@ -865,6 +867,12 @@ class Rooms(SharedState):
         self.assertEqual(got, [("Ada", "edit", "#112233"), ("Bob", "view", "#0969da")])
         serve.client_gone("a")
         self.assertEqual([u["name"] for u in serve.presence()["users"]], ["Bob"])
+
+    def test_bye_removes_the_client_and_hands_over_leadership(self):
+        self.join("a")
+        self.join("b")
+        serve.handle_client_message({"type": "bye"}, "a", "edit")
+        self.assertEqual((serve.ROOMS["d\nmain.tex"]["leader"], list(serve.CLIENTS)), ("b", ["b"]))
 
     def test_ephemeral_messages_never_cause_a_resync(self):
         bus = serve.Bus(keep=3, ephemeral=2)
