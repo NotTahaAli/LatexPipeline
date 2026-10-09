@@ -46,6 +46,7 @@ LATEXMK_ARGS = [
     "-interaction=nonstopmode",
     "-halt-on-error",
     "-file-line-error",
+    "-synctex=1",  # <cache>/<name>.synctex.gz, read by serve.py for source <-> PDF jumps.
 ]
 
 # Engine name -> latexmk flag. Set per document (see read_settings).

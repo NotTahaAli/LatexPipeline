@@ -85,6 +85,12 @@ class DocumentSelectionTests(unittest.TestCase):
                          ["nope", "x*"])
 
 
+class LatexmkArgsTests(unittest.TestCase):
+    def test_synctex_is_on_for_every_build(self):
+        # serve.py runs synctex against the cache-dir PDF, so focus and full builds both need it.
+        self.assertIn("-synctex=1", build.LATEXMK_ARGS)
+
+
 class ParseLatexErrorsTests(unittest.TestCase):
     def test_file_line_error_lines(self):
         console = (
