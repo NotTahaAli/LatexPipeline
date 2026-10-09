@@ -115,6 +115,24 @@ An invalid `build.toml` or unknown engine fails that document only, and the reas
 
 ---
 
+## VS Code
+
+[`.vscode/tasks.json`](.vscode/tasks.json) has the build commands as tasks (Terminal, Run Task):
+
+* **LaTeX: build changed documents** (the default build task): documents whose PDF is missing or out of date.
+* **LaTeX: build one document**: asks for a name or glob, and builds it even when up to date.
+* **LaTeX: build all (--force)**, **LaTeX: watch** (rebuilds on save), **LaTeX: list documents**, **LaTeX: clean**.
+
+Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.vscode/settings.json) makes LaTeX Workshop build through `build.py`. Its PDF viewer can't read `out/<doc>.pdf`, so use the live preview below or an external viewer.
+
+---
+
+## Live preview
+
+`python scripts/serve.py [DOC] [--port 8000] [--no-open]` starts a live preview at http://localhost:8000, bound to 127.0.0.1 only; rebuilds on save, keeps scroll and zoom, lists errors with editor links; double-click the PDF to jump to source; needs the synctex CLI from TeX Live and internet for PDF.js from cdnjs.
+
+---
+
 ## Large documents
 
 Nothing here needs a change to the document.
@@ -145,13 +163,35 @@ Not adopted, because they did not pay off: a precompiled preamble format (saves 
 
 ---
 
+## Benchmarks
+
+`bench/` holds local benchmark documents, such as `bench/sample-report` (303 pages, 25 TikZ figures). CI never builds them. Build one with:
+
+```bash
+python scripts/build.py --source bench sample-report
+```
+
+`--source DIR` (relative to the repository root) selects the documents to build instead of `files/`. The output goes to `out/` as usual, named after the document: `out/sample-report.pdf`. So a document in `bench/` and one in `files/` with the same name share that output file; give them different names. Building one tree never deletes the other tree's outputs.
+
+---
+
+## Tests and lint
+
+```bash
+python3 -m unittest discover -s tests   # unit tests, standard library only
+uvx ruff check scripts tests            # lint: rules in pyproject.toml
+```
+
+The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, and ruff (pinned version) on Ubuntu.
+
+---
+
 ## GitHub Actions
 
-[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs when anything under `files/` or `scripts/`, the workflow itself, or the Python project files change. It can also be started manually (`workflow_dispatch`).
+[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when anything under `files/` or `scripts/`, the workflow itself, or the Python project files change. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
 
 * **build** installs TeX Live, compiles only the documents that changed, and uploads the resulting PDFs and logs as the `pdfs` run artifact. What counts as changed depends on the trigger:
   * Push to the default branch: everything changed since the last fully successful publish. Runs that were skipped or failed get caught up.
-  * Other branches: changed in the push.
   * Pull requests: changed since the base branch.
   * A document is also changed when a changed file is in its recorded `.fls` inputs, restored from `.latex-cache`.
   * Changes to `scripts/` or the workflow, manual runs, and the first publish rebuild every document.
