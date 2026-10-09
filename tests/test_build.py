@@ -193,7 +193,7 @@ class CiReportCellTests(unittest.TestCase):
         rows = ci_report.table([doc], {})
         row = rows[2]
         self.assertIn("weird\\|name", row)
-        self.assertEqual(row.replace("\\|", "").count("|"), 9)  # 8 columns
+        self.assertEqual(row.replace("\\|", "").count("|"), 10)  # 9 columns
         self.assertTrue(row.startswith("| weird\\|name | **failed** |"))
 
 
