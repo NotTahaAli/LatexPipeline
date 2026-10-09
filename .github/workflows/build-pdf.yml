@@ -66,6 +66,9 @@ jobs:
             -o APT::Sandbox::User=root \
             latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
             texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff
+          # apt leaves root-owned files, and a lock file, that actions/cache cannot save.
+          sudo chown -R "$USER" "$RUNNER_TEMP/apt-archives"
+          rm -f "$RUNNER_TEMP/apt-archives/lock"
 
       # latexmk's working files from the previous run, so an edit reruns only
       # the LaTeX passes it needs. A new key per run keeps the newest cache.

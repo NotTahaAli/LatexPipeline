@@ -26,18 +26,15 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
-from build import OUT_DIR, ROOT_DIR, SOURCE_DIR
+from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, read_settings
 
 REPORT_PATH = OUT_DIR / "build-report.json"
 LINT_PATH = OUT_DIR / "lint-report.json"
 DIFF_REPORT = "diff-report.json"
 MARKER = "<!-- latex-pipeline -->"
+BOT_LOGIN = "github-actions[bot]"
 TOP_N = 5  # chktex warnings listed per document.
-ENGINE_FLAGS = {"pdflatex": "-pdf", "xelatex": "-pdfxe", "lualatex": "-pdflua"}
 CHKTEX_WARNING = re.compile(r"^Warning \d+ in (.+) line (\d+): (.*)$", re.MULTILINE)
-MAGIC_ENGINE = re.compile(
-    r"^\s*%\s*!TEX\s+(?:TS-)?program\s*=\s*(\w+)", re.IGNORECASE | re.MULTILINE
-)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +74,7 @@ def gh(*args: str) -> str:
 def first_error(doc: dict) -> str | None:
     errors = doc.get("errors") or []
     if not errors:
-        return None
+        return doc.get("error")  # A crashed build has no LaTeX errors.
     error = errors[0]
     where = error.get("file", "")
     if error.get("line") is not None:
@@ -193,9 +190,10 @@ def cmd_pr_comment(args: argparse.Namespace) -> None:
         return
 
     number = pull["number"]
+    # Only our own comment: anyone can paste the marker into a comment.
     ids = gh(
         "api", "--paginate", f"repos/{repo}/issues/{number}/comments",
-        "--jq", f'.[] | select(.body | contains("{MARKER}")) | .id',
+        "--jq", f'.[] | select(.user.login == "{BOT_LOGIN}" and (.body | contains("{MARKER}"))) | .id',
     ).split()
     with tempfile.TemporaryDirectory() as tmp:
         payload = Path(tmp) / "comment.json"
@@ -268,18 +266,13 @@ def git_paths(*args: str) -> list[str]:
     return [path for path in output.decode("utf-8").split("\0") if path]
 
 
-def engine_of(doc_dir: Path) -> str:
-    """build.toml's `engine`, else the `% !TEX program` magic comment, else pdflatex."""
-    config = doc_dir / "build.toml"
-    # ponytail: build.toml needs tomllib (3.11+); CI runs 3.12, so no tomli fallback.
-    if config.exists() and sys.version_info >= (3, 11):
-        import tomllib
-        engine = tomllib.loads(config.read_text(encoding="utf-8")).get("engine")
-        if engine:
-            return engine
-    head = (doc_dir / "main.tex").read_text(encoding="utf-8", errors="replace")
-    match = MAGIC_ENGINE.search("\n".join(head.splitlines()[:20]))
-    return match.group(1).lower() if match else "pdflatex"
+def owning_document(path: str, names: list[str]) -> str | None:
+    """
+    The document a changed file belongs to: the deepest one whose directory
+    contains it. A nested child's files are the child's, not its parent's.
+    """
+    owners = [name for name in names if path.startswith(f"files/{name}/")]
+    return max(owners, key=len, default=None)
 
 
 def diff_document(name: str, base: str, work: Path) -> Path | None:
@@ -307,9 +300,7 @@ def diff_document(name: str, base: str, work: Path) -> Path | None:
     # Compile in a copy of the working tree, so latexmk's files stay out of the repo.
     new = work / "new"
     shutil.copytree(SOURCE_DIR / name, new)
-    engine = engine_of(new)
-    if engine not in ENGINE_FLAGS:
-        raise ValueError(f"unknown engine {engine!r}")
+    settings = read_settings(new / "main.tex")
 
     diff = subprocess.run(
         ["latexdiff", "--flatten", str(old / "main.tex"), str(new / "main.tex")],
@@ -321,8 +312,9 @@ def diff_document(name: str, base: str, work: Path) -> Path | None:
     (new / "diff.tex").write_bytes(diff.stdout)
 
     run = subprocess.run(
-        ["latexmk", ENGINE_FLAGS[engine], "-interaction=nonstopmode",
-         "-halt-on-error", "-file-line-error", "diff.tex"],
+        ["latexmk", *LATEXMK_ARGS, ENGINES[settings["engine"]],
+         *(["-shell-escape"] if settings["shell_escape"] else []),
+         *settings["latexmk_args"], "diff.tex"],
         cwd=new, check=False, capture_output=True, text=True, errors="replace",
     )
     if run.returncode:
@@ -336,11 +328,14 @@ def cmd_diff(args: argparse.Namespace) -> None:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     changed = git_paths("diff", "--name-only", "-z", args.base, "--", "files")
+    documents = load_documents()
+    names = [doc["name"] for doc in documents]
+    changed_names = {owning_document(path, names) for path in changed}
     results = {}
     with tempfile.TemporaryDirectory() as tmp:
-        for doc in load_documents():
+        for doc in documents:
             name = doc["name"]
-            if not any(path.startswith(f"files/{name}/") for path in changed):
+            if name not in changed_names:
                 continue
             if not doc["ok"]:
                 results[name] = {"ok": False, "error": "the new version does not build"}
