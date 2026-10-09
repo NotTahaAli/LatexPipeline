@@ -34,7 +34,8 @@ class TempDoc(unittest.TestCase):
     def write(self, rel: str, text: str) -> Path:
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
         return path
 
 
