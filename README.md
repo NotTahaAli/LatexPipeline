@@ -21,7 +21,7 @@ Everything inside a document's directory (`.tex`, `.bib`, `.cls`, figures, ...) 
 * A LaTeX distribution that includes `latexmk`:
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
-  * Debian/Ubuntu: `sudo apt install latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science`
+  * Debian/Ubuntu: `sudo apt install latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff`
 * Optional: [uv](https://docs.astral.sh/uv/)
 
 Check that it works with `latexmk --version`. If the command isn't found, add your LaTeX installation to `PATH` and restart the terminal.
@@ -87,10 +87,13 @@ You don't need to change `build.py`. Keep every input inside the document's dire
   * Other branches: changed in the push.
   * Pull requests: changed since the base branch.
   * Changes to `scripts/` or the workflow, manual runs, and the first publish rebuild every document.
+* **Job summary** (every run): a table per document with its status, pages, words, build time, LaTeX warnings, chktex warnings and first error. The same table is a comment on the pull request, updated in place on each push, with a link to the run's artifacts. Fork pull requests get no comment, because their token is read-only.
+* **latexdiff** (pull requests): each changed document is compared with the base branch, and the diff PDFs are uploaded as the `diff-pdfs` artifact. A failure is noted in the comment and never fails the run.
 * **Publish** runs only on the default branch. [`scripts/publish_release.py`](scripts/publish_release.py) syncs the [`pdfs` release](https://github.com/NotTahaAli/LatexPipeline/releases/tag/pdfs):
   * Each rebuilt document's PDF and `<name>.log` replace their older versions.
   * A document that fails keeps its previous PDF, and its `.log` shows why the latest build failed.
   * The PDF and log of a deleted document are removed.
+  * The release notes list every document with links to its PDF and log, its pages, and the status of its last build.
   * File names on the release are escaped. Every character other than letters, digits, `.` and `-` becomes `_` followed by its UTF-8 bytes in hex: space becomes `_20`, `_` becomes `_5F`, and `/` becomes `_2F`. For example, `FP-123 Proposal.pdf` becomes `FP-123_20Proposal.pdf`. To recover the original name, replace each `_` with `%` and URL-decode. The release page shows the original path as the file's label.
   * After a fully successful build, the `pdfs` tag moves to the commit that was built. That tag marks where the next run starts from.
 * **requirements** fails if `uv.lock` or `requirements.txt` has fallen behind `pyproject.toml`.
@@ -115,4 +118,4 @@ On every commit, [`.githooks/pre-commit`](.githooks/pre-commit) re-exports `requ
 uv export --no-hashes --no-emit-project -o requirements.txt
 ```
 
-Add dependencies with `uv add <package>`. Both scripts use only the standard library, so keep it that way where possible. `publish_release.py` also needs the `gh` CLI, which GitHub runners already include; it's only used in CI.
+Add dependencies with `uv add <package>`. The scripts use only the standard library, so keep it that way where possible. `publish_release.py` also needs the `gh` CLI, which GitHub runners already include; it's only used in CI.
