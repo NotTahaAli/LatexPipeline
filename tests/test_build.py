@@ -276,6 +276,21 @@ class RecordedInputsTests(unittest.TestCase):
             self.assertEqual(build.filter_changed([doc, other], "origin/main"), [])
 
 
+class MirrorDirsTests(unittest.TestCase):
+    def test_subdirectories_are_created_without_files(self):
+        with fake_repo() as root:
+            source = root / "files" / "doc"
+            (source / "Chapters" / "ch1").mkdir(parents=True)
+            (source / ".hidden").mkdir()
+            (source / "Chapters" / "ch1.tex").write_text("x")
+            target = root / ".latex-cache" / "doc"
+            target.mkdir(parents=True)
+            build.mirror_dirs(source, target)
+            self.assertTrue((target / "Chapters" / "ch1").is_dir())
+            self.assertFalse((target / ".hidden").exists())
+            self.assertEqual(sorted(p.name for p in target.rglob("*") if p.is_file()), [])
+
+
 class CiReportCellTests(unittest.TestCase):
     def test_cell_values(self):
         self.assertEqual(ci_report.cell(None), "-")

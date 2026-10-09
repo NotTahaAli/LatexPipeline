@@ -302,6 +302,18 @@ def tex_tree_dirs() -> tuple[Path, ...] | None:
     return tuple(dirs)
 
 
+def mirror_dirs(source: Path, target: Path) -> None:
+    """
+    Create the subdirectories of source (no files, no hidden ones) under target.
+    latexmk writes the .aux of \\include{Chapters/ch1} to <outdir>/Chapters/,
+    which must exist before it can.
+    """
+    for path in source.rglob("*"):
+        relative = path.relative_to(source)
+        if path.is_dir() and not any(part.startswith(".") for part in relative.parts):
+            (target / relative).mkdir(parents=True, exist_ok=True)
+
+
 def recorded_inputs(main_tex: Path) -> list[Path]:
     """
     Files outside the document's directory that its last build read, from the
@@ -622,6 +634,7 @@ def build_document(
 
         def run(command: list[str]) -> int:
             """Run a command in the document's directory, streaming its output."""
+            mirror_dirs(main_tex.parent, build_dir)
             say("Running:")
             say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
             say()
