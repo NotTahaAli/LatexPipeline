@@ -17,7 +17,7 @@ Everything inside a document's directory (`.tex`, `.bib`, `.cls`, figures, ...) 
 
 ## Requirements
 
-* Python 3.9+ (standard library only, no packages needed)
+* Python 3.9+ (standard library only; Python 3.9 and 3.10 also need `tomli` for `build.toml`, see [Engine and settings](#engine-and-settings))
 * A LaTeX distribution that includes `latexmk`:
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
@@ -75,6 +75,26 @@ files/My New Document/
 ```
 
 You don't need to change `build.py`. Keep every input inside the document's directory. Files outside it (for example `\input{../shared/x}`) aren't tracked for rebuilds.
+
+### Engine and settings
+
+The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex`:
+
+```latex
+% !TEX program = xelatex
+```
+
+Supported engines are `pdflatex` (the default), `xelatex` and `lualatex`.
+
+A document can also have a `build.toml` next to its `main.tex`. Every key is optional:
+
+```toml
+engine = "lualatex"      # overrides the magic comment
+shell_escape = true      # default: false
+latexmk_args = ["-g"]    # extra arguments passed to latexmk
+```
+
+An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
 
 ---
 

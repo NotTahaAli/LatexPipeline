@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,11 +32,18 @@ GLOBAL_INPUTS = (
 )
 
 LATEXMK_ARGS = [
-    "-pdf",
     "-interaction=nonstopmode",
     "-halt-on-error",
     "-file-line-error",
 ]
+
+# Engine name -> latexmk flag. Set per document (see read_settings).
+ENGINES = {
+    "pdflatex": "-pdf",
+    "xelatex": "-pdfxe",
+    "lualatex": "-pdflua",
+}
+DEFAULT_ENGINE = "pdflatex"
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +237,90 @@ def log_path_for(main_tex: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Per-document settings
+# ---------------------------------------------------------------------------
+
+# "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
+ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
+
+
+class ConfigError(Exception):
+    """A document's settings are invalid. The message goes into its log."""
+
+
+def display(path: Path) -> str:
+    """Path relative to the repository root, with forward slashes."""
+    return path.relative_to(ROOT_DIR).as_posix()
+
+
+def read_toml(path: Path) -> dict:
+    """
+    Parse a build.toml. tomllib is in the standard library from Python 3.11;
+    older interpreters need the tomli package.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            raise ConfigError(
+                f"{display(path)} needs Python 3.11+ or the 'tomli' package."
+            ) from None
+
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"{display(path)}: {exc}") from None
+
+
+def read_settings(main_tex: Path) -> dict:
+    """
+    Engine, shell_escape and latexmk_args for one document.
+
+    The engine comes from the magic comment in the first 20 lines of main.tex
+    and can be overridden by build.toml in the document's directory.
+    Raises ConfigError for invalid values.
+    """
+    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": []}
+
+    text = main_tex.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines()[:20]:
+        match = ENGINE_MAGIC.match(line)
+        if match:
+            settings["engine"] = match.group(1)
+            break
+
+    config_path = main_tex.parent / "build.toml"
+    if config_path.exists():
+        data = read_toml(config_path)
+
+        unknown = sorted(set(data) - CONFIG_KEYS)
+        if unknown:
+            raise ConfigError(f"{display(config_path)}: unknown key(s): {', '.join(unknown)}")
+
+        settings.update(data)
+
+    engine = settings["engine"]
+    if not isinstance(engine, str) or engine.lower() not in ENGINES:
+        raise ConfigError(
+            f"{display(main_tex)}: unknown engine {engine!r} "
+            "(use pdflatex, xelatex or lualatex)"
+        )
+    settings["engine"] = engine.lower()
+
+    if not isinstance(settings["shell_escape"], bool):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: shell_escape must be true or false")
+
+    args = settings["latexmk_args"]
+    if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: latexmk_args must be a list of strings")
+
+    return settings
+
+
+# ---------------------------------------------------------------------------
 # Building
 # ---------------------------------------------------------------------------
 
@@ -273,54 +365,65 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True) -> tuple[boo
     console: list[str] = []
     errors: list[str] = []
 
+    try:
+        settings = read_settings(main_tex)
+    except ConfigError as exc:
+        settings = None
+        errors.append(str(exc))
+
     # Stamp the PDF with the build start time, so edits made while LaTeX is
     # running still count as newer than the PDF.
     started = time.time()
 
     with tempfile.TemporaryDirectory(prefix="latex-build-") as temp_dir:
         temp_dir = Path(temp_dir)
-
-        command = [
-            latexmk,
-            *LATEXMK_ARGS,
-            f"-outdir={temp_dir}",
-            main_tex.name,
-        ]
-
-        say("Running:")
-        say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
-        say()
-
         generated_pdf = temp_dir / f"{main_tex.stem}.pdf"
 
-        # Stream output to the terminal while keeping a copy for the log.
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=main_tex.parent,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-            )
-        except OSError as exc:
-            errors.append(f"Could not execute latexmk: {exc}")
-        else:
-            for line in process.stdout:
-                emit(line)
-                console.append(line)
+        if settings is not None:
+            command = [
+                latexmk,
+                *LATEXMK_ARGS,
+                ENGINES[settings["engine"]],
+                *(["-shell-escape"] if settings["shell_escape"] else []),
+                *settings["latexmk_args"],
+                f"-outdir={temp_dir}",
+                main_tex.name,
+            ]
 
-            if process.wait() != 0:
-                errors.append(f"LaTeX compilation failed: {relative}")
-            elif not generated_pdf.exists():
-                errors.append("LaTeX reported success, but no PDF was produced.")
+            say(f"Engine:  {settings['engine']}")
+            say()
+            say("Running:")
+            say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
+            say()
+
+            # Stream output to the terminal while keeping a copy for the log.
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=main_tex.parent,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+            except OSError as exc:
+                errors.append(f"Could not execute latexmk: {exc}")
             else:
-                try:
-                    shutil.copy(generated_pdf, output_pdf)
-                    os.utime(output_pdf, (started, started))
-                except OSError as exc:
-                    errors.append(f"Could not copy generated PDF: {exc}")
+                for line in process.stdout:
+                    emit(line)
+                    console.append(line)
+
+                if process.wait() != 0:
+                    errors.append(f"LaTeX compilation failed: {relative}")
+                elif not generated_pdf.exists():
+                    errors.append("LaTeX reported success, but no PDF was produced.")
+                else:
+                    try:
+                        shutil.copy(generated_pdf, output_pdf)
+                        os.utime(output_pdf, (started, started))
+                    except OSError as exc:
+                        errors.append(f"Could not copy generated PDF: {exc}")
 
         for message in errors:
             say(f"ERROR: {message}")
