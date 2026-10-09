@@ -37,7 +37,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Update the `pdfs` release.
+      contents: write        # Update the `pdfs` release.
+      pull-requests: write   # Sticky comment on pull requests.
     # One run per branch at a time, so two never edit the release at once.
     # A pending run may be superseded; the `pdfs` tag bookmark covers its changes.
     concurrency: build-pdf-${{ github.ref }}
@@ -48,10 +49,23 @@ jobs:
         with:
           fetch-depth: 0  # --changed-since needs history.
 
+      # The .debs are cached, so a run with the same workflow skips the download.
+      - name: Restore apt package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-latex-${{ runner.os }}-${{ hashFiles('.github/workflows/build-pdf.yml') }}
+
+      # Keep this package list identical to README.md and AGENTS.md.
       - name: Install LaTeX
         run: |
+          mkdir -p "$RUNNER_TEMP/apt-archives/partial"
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science
+          sudo apt-get install -y --no-install-recommends \
+            -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" \
+            -o APT::Sandbox::User=root \
+            latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
+            texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff
 
       # Default branch: everything changed since the last fully successful
       # publish (the `pdfs` tag), so skipped or failed runs are caught up.
@@ -74,12 +88,49 @@ jobs:
             python3 scripts/build.py
           fi
 
+      # chktex warnings and word counts go into out/lint-report.json (in the artifact).
+      - name: Lint and word counts
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 scripts/ci_report.py lint
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 scripts/ci_report.py summary >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pdfs
           path: out/
           if-no-files-found: ignore
+
+      # Pull requests: latexdiff of each changed document against the base.
+      # The PDFs go to their own artifact, outside out/, so they are never published.
+      - name: latexdiff changed documents
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/ci_report.py diff --base "$BASE_SHA" --out "$RUNNER_TEMP/diff-pdfs"
+
+      - name: Upload latexdiff PDFs
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: diff-pdfs
+          path: ${{ runner.temp }}/diff-pdfs
+          if-no-files-found: ignore
+
+      # Skipped for fork pull requests: their token cannot comment.
+      - name: Comment on the pull request
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_report.py pr-comment --diff-dir "$RUNNER_TEMP/diff-pdfs"
 
       # Keep the `pdfs` release holding the latest PDF of every document.
       # Runs even if some documents failed, so the rest still publish.
