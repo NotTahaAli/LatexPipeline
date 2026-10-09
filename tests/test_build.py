@@ -141,7 +141,7 @@ class ReadSettingsTests(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
-                         {"engine": "pdflatex", "shell_escape": False, "latexmk_args": []})
+                         {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -160,7 +160,10 @@ class ReadSettingsTests(unittest.TestCase):
     def test_build_toml_overrides_engine_and_sets_options(self):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
-                         {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"]})
+                         {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True})
+
+    def test_build_toml_can_opt_out_of_externalize(self):
+        self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
 
     def test_invalid_values_raise_config_error(self):
         self.assertConfigError("% !TEX program = pdftex\n" + self.PLAIN)
@@ -168,6 +171,7 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertConfigError(self.PLAIN, 'engine = 3\n')
         self.assertConfigError(self.PLAIN, 'unknown_key = 1\n')
         self.assertConfigError(self.PLAIN, 'shell_escape = "yes"\n')
+        self.assertConfigError(self.PLAIN, 'externalize = "no"\n')
         self.assertConfigError(self.PLAIN, 'latexmk_args = "-g"\n')
         self.assertConfigError(self.PLAIN, 'latexmk_args = [1]\n')
         self.assertConfigError(self.PLAIN, 'engine = \n')  # invalid TOML

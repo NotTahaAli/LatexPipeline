@@ -16,6 +16,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import accel
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -334,7 +336,7 @@ def log_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args"}
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize"}
 
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
 LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
@@ -380,7 +382,7 @@ def read_settings(main_tex: Path) -> dict:
     and can be overridden by build.toml in the document's directory.
     Raises ConfigError for invalid values.
     """
-    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": []}
+    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -407,8 +409,9 @@ def read_settings(main_tex: Path) -> dict:
         )
     settings["engine"] = engine.lower()
 
-    if not isinstance(settings["shell_escape"], bool):
-        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: shell_escape must be true or false")
+    for key in ("shell_escape", "externalize"):
+        if not isinstance(settings[key], bool):
+            raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: {key} must be true or false")
 
     args = settings["latexmk_args"]
     if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
@@ -452,7 +455,9 @@ def error_text(name: str, found: dict) -> str:
 # Building
 # ---------------------------------------------------------------------------
 
-def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool = False) -> tuple[dict, str]:
+def build_document(
+    main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
+) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
 
@@ -515,29 +520,26 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool 
     build_dir.mkdir(parents=True, exist_ok=True)
     generated_pdf = build_dir / f"{main_tex.stem}.pdf"
 
+    notes: list[str] = []
+
     if settings is not None:
-        command = [
-            latexmk,
-            *LATEXMK_ARGS,
-            ENGINES[settings["engine"]],
-            *(["-shell-escape"] if settings["shell_escape"] else []),
-            *settings["latexmk_args"],
-            *(["-g"] if force else []),
-            f"-outdir={build_dir}",
-            main_tex.name,
-        ]
+        def latexmk_command(*extra: str) -> list[str]:
+            return [
+                latexmk,
+                *LATEXMK_ARGS,
+                ENGINES[settings["engine"]],
+                *(["-shell-escape"] if settings["shell_escape"] else []),
+                *settings["latexmk_args"],
+                *extra,
+                f"-outdir={build_dir}",
+                main_tex.name,
+            ]
 
-        say(f"Engine:  {settings['engine']}")
-        say()
-
-        while True:
+        def run(command: list[str]) -> int:
+            """Run a command in the document's directory, streaming its output."""
             say("Running:")
             say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
             say()
-
-            console = []
-
-            # Stream output to the terminal while keeping a copy for the log.
             try:
                 process = subprocess.Popen(
                     command,
@@ -549,14 +551,73 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool 
                     errors="replace",
                 )
             except OSError as exc:
-                errors.append(f"Could not execute latexmk: {exc}")
-                break
+                errors.append(f"Could not execute {command[0]}: {exc}")
+                return -1
 
             for line in process.stdout:
                 emit(line)
                 console.append(line)
 
-            if process.wait() == 0 or not cached:
+            return process.wait()
+
+        def externalized_build() -> int:
+            """TikZ figures compiled in parallel and cached, then latexmk for the text."""
+            figures = accel.Figures(main_tex, build_dir, settings["engine"], settings["shell_escape"], fig_jobs)
+            if force:
+                figures.wipe()
+            say("Figures: TikZ externalization (list and make, compiled in parallel)")
+            say()
+
+            last = mode_file.stat().st_mtime if mode_file.exists() and not force else 0.0
+            if not figures.names() or figures.touched(last):
+                say("Listing figures ...")
+                run(figures.discover_command())
+                console.clear()  # The listing run is not a result; latexmk's output is.
+
+            for attempt in range(3):
+                changed, failures = figures.sync(say)
+                if failures:
+                    console.extend(f"{text}\n" for text in failures)
+                    return 1
+                if attempt and not changed:
+                    return 0
+                extra = [f"-usepretex={figures.pretex}", f"-jobname={main_tex.stem}"]
+                code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
+                if code != 0:
+                    return code
+            return 0
+
+        # Switching between plain and externalized output needs a rebuild latexmk can't see.
+        mode_file = build_dir / ".mode"
+        mode = "plain"
+        if settings["externalize"] and accel.uses_tikz(main_tex.parent):
+            mode = "externalized"
+        previous = mode_file.read_text() if mode_file.exists() else mode
+        switched = force or previous != mode
+
+        say(f"Engine:  {settings['engine']}")
+        say()
+
+        while True:
+            code = -1
+            used = mode
+
+            if mode == "externalized":
+                console = []
+                code = externalized_build()
+                if code != 0:
+                    reason = next((line.strip() for line in console if line.strip()), "see the log")
+                    notes.append(f"Externalized build failed ({reason}); rebuilt without externalization.")
+                    say()
+                    say(notes[-1])
+                    say()
+                    used, switched = "plain", True
+
+            if used == "plain":
+                console = []
+                code = run(latexmk_command(*(["-g"] if switched else [])))
+
+            if code == 0 or not cached or errors:
                 break
 
             # Stale working files can break a build that would pass from scratch.
@@ -566,9 +627,13 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool 
             shutil.rmtree(build_dir, ignore_errors=True)
             build_dir.mkdir(parents=True)
             cached = False
+            switched = False
+
+        mode_file.write_text(used)
+        os.utime(mode_file, (started, started))
 
         if not errors:
-            if process.returncode != 0:
+            if code != 0:
                 errors.append(f"LaTeX compilation failed: {relative}")
             elif not generated_pdf.exists():
                 errors.append("LaTeX reported success, but no PDF was produced.")
@@ -597,6 +662,7 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool 
         f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
         *(f"ERROR: {message}\n" for message in errors),
         *(f"{error_text(name, found)}\n" for found in latex_errors),
+        *(f"NOTE: {note}\n" for note in notes),
         "\n===== latexmk output =====\n",
         *console,
     ]
@@ -638,13 +704,15 @@ def build_document(main_tex: Path, latexmk: str, live: bool = True, force: bool 
     return entry, "".join(shown)
 
 
-def build_safely(main_tex: Path, latexmk: str, live: bool, force: bool) -> tuple[dict, str]:
+def build_safely(
+    main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS,
+) -> tuple[dict, str]:
     """
     build_document, but an exception (OSError and the like) fails only this
     document: its report entry carries the message and the run goes on.
     """
     try:
-        return build_document(main_tex, latexmk, live, force)
+        return build_document(main_tex, latexmk, live, force, fig_jobs)
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
         error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
@@ -670,7 +738,8 @@ def build_parallel(documents: list[Path], latexmk: str, jobs: int, force: bool) 
     KeyboardInterrupt; the running ones finish or die with the terminal's SIGINT.
     """
     pool = ThreadPoolExecutor(max_workers=jobs)
-    futures = [pool.submit(build_safely, document, latexmk, False, force) for document in documents]
+    fig_jobs = max(1, DEFAULT_JOBS // jobs)
+    futures = [pool.submit(build_safely, document, latexmk, False, force, fig_jobs) for document in documents]
     results: list[dict] = []
 
     try:
