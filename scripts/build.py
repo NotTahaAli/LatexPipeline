@@ -783,10 +783,11 @@ def build_document(
         switched = force or previous != mode or no_map
         # Plain builds record the \input tree too (the externalized ones do it through main_pretex),
         # so --focus and --watch --focus auto work for every document.
-        recording = [
-            f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
-            f"-jobname={main_tex.stem}",
-        ]
+        def recording() -> list[str]:
+            return [
+                f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
+                f"-jobname={main_tex.stem}",
+            ]
 
         say(f"Engine:  {settings['engine']}")
         say()
@@ -807,7 +808,7 @@ def build_document(
 
             if used == "plain":
                 console = []
-                code = run(latexmk_command(*recording, *(["-g"] if switched else [])))
+                code = run(latexmk_command(*recording(), *(["-g"] if switched else [])))
 
             if code == 0 or not cached or errors:
                 break
@@ -818,6 +819,7 @@ def build_document(
             say()
             shutil.rmtree(build_dir, ignore_errors=True)
             build_dir.mkdir(parents=True)
+            mirror_dirs(main_tex.parent, build_dir)  # \include{dir/x} writes dir/x.aux here.
             cached = False
             switched = False
 

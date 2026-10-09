@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import shutil
 import time
 import unittest
 import urllib.parse
@@ -354,3 +355,27 @@ class CiReportCellTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+class CleanCacheRetryTests(unittest.TestCase):
+    """A failed build with cached files retries from scratch; the retry must report the real error."""
+
+    def build(self, main):
+        report, _ = build.build_document(main, shutil.which("latexmk"), live=False)
+        return report
+
+    def test_retry_keeps_injected_files_and_include_dirs(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "doc", "\\documentclass{article}\\begin{document}\\include{ch/a}\\end{document}\n")
+            (main.parent / "ch").mkdir()
+            (main.parent / "ch" / "a.tex").write_text("ok\n", encoding="utf-8")
+            self.assertTrue(self.build(main)["ok"])
+
+            (main.parent / "ch" / "a.tex").write_text("\\undefinedmacro\n", encoding="utf-8")
+            report = self.build(main)
+            self.assertFalse(report["ok"])
+            self.assertEqual([e["file"] for e in report["errors"]], ["ch/a.tex"])
+
+            (main.parent / "ch" / "a.tex").write_text("fixed\n", encoding="utf-8")
+            self.assertTrue(self.build(main)["ok"])
