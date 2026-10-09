@@ -42,6 +42,7 @@ python scripts/build.py --watch --open   # keep running, rebuild on every save, 
 python scripts/build.py --list           # show discovered documents and whether they are up to date
 python scripts/build.py --clean          # delete out/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
+python scripts/build.py my-report --focus Chapters/chapter5   # preview one part in ~2 s, see "Large documents"
 ```
 
 With uv you can use `uv run scripts/build.py ...` instead of `python`.
@@ -101,9 +102,40 @@ A document can also have a `build.toml` next to its `main.tex`. Every key is opt
 engine = "lualatex"      # overrides the magic comment
 shell_escape = true      # default: false
 latexmk_args = ["-g"]    # extra arguments passed to latexmk
+externalize = false      # default: true; see "Large documents"
 ```
 
 An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
+
+---
+
+## Large documents
+
+Nothing here needs a change to the document.
+
+**TikZ/pgfplots figures are compiled once and cached.** If a document uses `tikz` or `pgfplots` (in `main.tex`, a class, a package or a chapter), `build.py` switches on TikZ's `external` library through `latexmk -usepretex`. A first run lists the figures, they are compiled in parallel (one process per CPU, no `make` and no shell escape needed), and the text passes then include the finished PDFs. Figures are cached in `.latex-cache/` by the hash of their source, so an edit re-typesets only the text, and renumbering or moving a figure costs nothing. The cache is also invalidated when the preamble or a local `.cls`/`.sty`/`.csv`/`.dat`/`.tikz` file changes. Works with `pdflatex`, `xelatex` and `lualatex`. Documents without TikZ are built as before. If the externalized build fails, the document is built again without it and its log says so.
+
+Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to recompile every figure):
+
+* A figure is recompiled when its source text changes. A macro or `\tikzset` defined in a chapter, a changed `\ref` value inside a figure, or an `\input` file read inside the picture is not noticed. `\addplot table` files are only noticed when they have a `.csv`, `.dat`, `.tsv` or `.table` extension.
+* Figures inside macros or loops that run several pictures per call are handled by TikZ itself; see its manual, section "Externalization".
+
+**`--focus` previews one part of a document.** `python scripts/build.py my-report --focus Chapters/chapter5` typesets only the files under that path (a file or a directory, relative to the document) into `out/my-report.focus.pdf` with one LaTeX run, about 2 s for a 300 page report. The first full build records the `\input`/`\include` tree and all counters. The preview reads the full build's `.aux`, `.bbl` and `.toc` files, so chapter, figure and page numbers, references and citations match the full document. Every other `\input` does nothing (`\include` uses `\includeonly`), and pages outside the focused part are discarded. With `--watch`, `--focus auto` previews the top-level file that holds the file you saved last and builds the whole document when `main.tex`, a class or a bibliography changed. Limits:
+
+* It shows the state of the last *full* build for everything outside the focus. New labels or citations show as `??` until the next full build.
+* Macros defined in a skipped file are missing. The title page, table of contents and lists are skipped. Material typeset by `main.tex` itself between chapters is not in the preview.
+* `out/<name>.focus.pdf` and `.focus.log` are local previews and are never part of CI.
+
+**Measured on `files/sample-report`** (303 pages, 25 TikZ figures, 4 CPUs):
+
+| Step | before | after |
+| --- | --- | --- |
+| cold build (`--force`) | 93 s | 65 s |
+| one-line text edit | 47 s | 20 s |
+| edit one figure | 24 s | 23 s |
+| `--focus Chapters/chapter5` | n/a | 1.7 s |
+
+Not adopted, because they did not pay off: a precompiled preamble format (saves about 1.5 s of a 23 s pass), parallel BibTeX (the ten units take 0.2 s together), and splicing separately built chapters into the full PDF (needs a PDF library; `pdfunite` drops the outline and breaks cross-chapter links).
 
 ---
 
