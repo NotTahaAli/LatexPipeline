@@ -567,8 +567,10 @@ class ServeApi(ts.SharedState, ts.ServerCase):
         self.tokens = self.share_on()
         self.turn_on(share=True)
         mock.patch.object(serve, "AI_GUEST_HOURLY", 2).start()
-        alice = serve.named.create(serve.SHARE["links"], "Alice", "edit", "demo")
-        bob = serve.named.create(serve.SHARE["links"], "Bob", "edit", "demo")
+        links = []  # named links live in the (test) links file, bound to this checkout of "demo"
+        alice = serve.named.create(links, "Alice", "edit", "demo", serve.link_root("demo"))
+        bob = serve.named.create(links, "Bob", "edit", "demo", serve.link_root("demo"))
+        serve.named.save(links)
         data = {"task": "rewrite", "selection": {"text": "x"}}
 
         def run(token, cid):

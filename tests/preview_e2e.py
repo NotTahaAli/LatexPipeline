@@ -107,6 +107,16 @@ def main() -> int:
             assert page.evaluate("() => window.__splices.length") == before + 1, "an aborted preview was shown"
             print(f"median keystroke -> spliced pages: {statistics.median(times):.0f} ms "
                   f"(min {min(times):.0f}, includes the 700 ms pause)")
+            # Double-click on a page of the live preview: SyncTeX of the preview itself leads back to the source.
+            box = page.evaluate("""() => { const v = window.__app.pdfView, el = v.els[v.splice.from];
+                el.scrollIntoView(); const r = el.getBoundingClientRect();
+                return { x: r.left + r.width / 2, y: r.top + r.height / 3 }; }""")
+            page.wait_for_timeout(500)
+            page.mouse.dblclick(box["x"], box["y"])
+            page.wait_for_function("() => /:\\d+/.test(document.getElementById('toast').textContent)", timeout=15000)
+            toast = page.inner_text("#toast")
+            print(f"double-click on a preview page: '{toast.strip()}'")
+            assert args.file.rsplit("/", 1)[0] in toast and "live preview" not in toast, toast
             for theme in ("light", "dark"):
                 page.evaluate("t => document.documentElement.dataset.theme = t", theme)
                 if not page.evaluate("() => !!window.axe"):

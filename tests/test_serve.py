@@ -456,7 +456,7 @@ class SharedState(unittest.TestCase):
     def setUp(self):
         saved = dict(serve.SHARE)
         self.addCleanup(lambda: (serve.SHARE.clear(), serve.SHARE.update(saved)))
-        serve.SHARE.update(on=False, tokens={}, doc=None, public=None, hosts=set(), port=0, tunnel=None, links=[])
+        serve.SHARE.update(on=False, tokens={}, doc=None, public=None, hosts=set(), port=0, tunnel=None)
         self.addCleanup(serve.share_env, False)
         links_dir = tempfile.TemporaryDirectory()
         self.addCleanup(links_dir.cleanup)
@@ -500,9 +500,8 @@ class GatewayMode(SharedState, ServerCase):
 
     def test_named_links_do_not_exist_behind_the_gateway(self):
         links = []
-        link = serve.named.create(links, "Alice", "edit", "demo")
-        serve.named.save(links)
-        serve.SHARE["links"] = serve.named.load()  # even a loaded record is never consulted here
+        link = serve.named.create(links, "Alice", "edit", "demo", serve.link_root("demo"))
+        serve.named.save(links)  # a valid record for this very document: never consulted here
         cookie = {"Cookie": f"{serve.cookie_name()}={link['token']}"}
         self.assertEqual(self.request("GET", "/api/health", headers=cookie)[0], 401)
         self.assertEqual(self.request("GET", f"/?token={link['token']}")[0], 401)
@@ -1993,8 +1992,8 @@ class LivePreviewApi(ServerCase):
         return self.request("POST", "/api/preview?doc=demo&cid=c1", {"path": rel, "text": text})
 
     def test_only_chapter_files_of_the_document(self):
-        for rel, status in (("main.tex", 400), ("build.toml", 400), ("notes.txt", 400), ("../x.tex", 400),
-                            ("Chapters/none.tex", 404), (None, 400)):
+        for rel, status in (("build.toml", 400), ("notes.txt", 400), ("../x.tex", 400),
+                            ("Chapters/none.tex", 404), ("x.sty", 404), (None, 400)):
             with self.subTest(rel=rel):
                 self.assertEqual(self.post(rel)[0], status)
         bad = {"path": "Chapters/one.tex", "text": 3}
@@ -2019,6 +2018,26 @@ class LivePreviewApi(ServerCase):
         self.assertTrue(reply["errors"][0]["hint"])
         self.warm.compile.side_effect = serve.preview.PreviewError("not a chapter")
         self.assertEqual(self.post("Chapters/one.tex"), (409, {"error": "not a chapter"}))
+
+    def test_statuses_without_a_pdf_come_back_as_json(self):
+        self.warm.compile.return_value = {"ok": False, "pdf": None, "log": "", "errors": [], "status": "preamble",
+                                          "saved": False}
+        status, reply = self.post("main.tex", "\\documentclass{book}")
+        self.assertEqual((status, reply["status"], reply["saved"]), (200, "preamble", False))
+        self.warm.compile.assert_called_with("c1", "main.tex", "\\documentclass{book}")
+
+    def test_double_click_on_a_live_preview_page_names_the_file_being_typed(self):
+        pdf = self.root / "p.pdf"
+        found = (pdf, {"pgfwarm-ov0.tex": "Chapters/one.tex"})
+        fields = {"Input": "/cache/p1/pgfwarm-ov0.tex", "Line": "7"}
+        with mock.patch.object(serve.preview, "sync_files", return_value=found), \
+                mock.patch.object(serve, "synctex", return_value=fields) as run:
+            status, reply = self.request("GET", "/synctex/edit?doc=demo&page=2&x=10&y=20&preview=c1")
+        self.assertEqual((status, reply["rel"], reply["line"]), (200, "Chapters/one.tex", 7))
+        self.assertEqual(run.call_args[0][3], pdf)  # The preview's own PDF and SyncTeX file, not the full build's.
+        with mock.patch.object(serve.preview, "sync_files", return_value=None):
+            status, reply = self.request("GET", "/synctex/edit?doc=demo&page=2&x=10&y=20&preview=gone")
+        self.assertIn("no SyncTeX data", reply["error"])
 
 
 class FocusPreview(ServerCase):
@@ -3345,7 +3364,7 @@ class NamedLinks(SharedState, ServerCase):
         self.assertEqual(sorted((x["name"], x["role"]) for x in info["named"]),
                          [("Alice", "edit"), ("Reviewer 2", "view")])
         stored = json.loads(self.links_file.read_text("utf-8"))
-        self.assertEqual((stored["version"], len(stored["links"])), (1, 2))
+        self.assertEqual((stored["version"], len(stored["links"])), (2, 2))
         self.assertFalse(str(self.links_file).startswith(str(self.root)))  # never in a document directory
         if os.name != "nt":
             self.assertEqual(self.links_file.stat().st_mode & 0o777, 0o600)
@@ -3363,6 +3382,31 @@ class NamedLinks(SharedState, ServerCase):
         self.share_on("second")
         self.assertIsNone(serve.role_for_token(self.tokens["alice"]))  # a link names one document
         self.assertEqual(self.get("POST", "/api/share/links", "owner", {"name": "Bob", "role": "view"})[0], 401)
+
+    def test_a_link_belongs_to_one_checkout_of_its_document(self):
+        clone = self.base / "clone" / "demo"
+        clone.mkdir(parents=True)
+        (clone / "main.tex").write_text("another checkout", encoding="utf-8")
+        with mock.patch.dict(serve.DOCS, {"demo": clone / "main.tex"}):  # same name, another project root
+            self.assertIsNone(serve.identity_for_token(self.tokens["alice"]))
+            self.assertEqual(self.get("GET", "/api/health", "alice")[0], 401)
+            self.assertEqual(self.get("GET", "/api/share", "owner")[1]["named"], [])
+            self.assertEqual(self.get("POST", "/api/share/links/revoke", "owner", {"id": self.alice_id})[0], 404)
+        self.assertEqual(self.get("GET", "/api/health", "alice")[0], 200)
+
+    def test_a_revoke_by_another_process_holds_here_at_once(self):
+        self.assertEqual(self.get("GET", "/api/health", "alice")[0], 200)
+        links = [x for x in serve.named.load() if x["id"] != self.alice_id]
+        serve.named.save(links)  # what a second serve.py of this user does on Revoke
+        self.assertEqual(self.get("GET", "/api/health", "alice")[0], 401)
+        self.assertEqual(self.get("GET", "/api/health", "rev")[0], 200)
+
+    def test_records_without_a_checkout_are_dropped(self):
+        old = {"id": "abc", "token": self.tokens["alice"], "name": "Old", "role": "edit", "doc": "demo", "created": 1}
+        self.links_file.write_text(json.dumps({"version": 1, "links": [old]}), encoding="utf-8")
+        self.assertEqual(serve.named.load(), [])  # version 1: no root, so no way to tell checkouts apart
+        self.assertIsNone(serve.identity_for_token(self.tokens["alice"]))
+        self.assertEqual(self.get("GET", "/api/share", "owner")[1]["named"], [])
 
     def test_names_come_from_the_link_not_the_request(self):
         anchor = {"from": 12, "to": 17, "quote": "hello", "prefix": "", "suffix": ""}

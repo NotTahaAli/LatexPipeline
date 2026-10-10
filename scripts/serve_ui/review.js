@@ -12,6 +12,7 @@ const FILTERS = [["comments", "Comments"], ["suggestions", "Suggestions"], ["res
 const IDLE_COMMIT = 1500;   // ms of no typing before a suggestion in progress is sent
 const UNDO_GROUP = 600;     // ms: keystrokes closer together than this are one undo step in suggest mode
 const UNDO_DEPTH = 100;
+const MAX_HOLD = 5000;      // ms an IME composition may hold the co-editing room before it is ended
 const clip = (s, n = 280) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 /**
@@ -188,27 +189,55 @@ export function reviewSupport(S, V, ctx) {
   // IME composition (CJK input, dead keys, phone keyboards): the browser owns the text being composed, so it goes
   // into the editor as usual, but held back from co-editors and the disk (ctx.hold); when the composition ends the
   // text is taken out again and typed once more, which suggest mode turns into a suggestion like any other typing.
-  let ime = null;   // {base: the text before, changes: what the composition did to it}
-  function endIme(view) {
+  // A hold never lasts long (MAX_HOLD, blur, a hidden tab): a held leader saves nothing and others' edits wait.
+  // If anything but the composition changed the editor meanwhile, the composition cannot be taken out exactly:
+  // then the shared text is put back (ctx.dropHeld) and the composed text is dropped, never published as an edit.
+  let ime = null;   // {base: the text before, changes: what the composition did to it, timer}
+  function startIme(tr) {
+    ime = { base: tr.startState.doc, changes: tr.changes, timer: setTimeout(forceEndIme, MAX_HOLD) };
+    ctx.hold?.(true);
+  }
+  function forceEndIme() {
+    const view = ctx.view();
+    if (!ime || !view) return;
+    const focused = view.hasFocus;
+    if (view.composing) view.contentDOM.blur();   // the browser ends the composition
+    endIme(view, true);
+    if (focused) view.focus();
+  }
+  function endIme(view, force = false) {
     const p = ime;
-    if (!p || !view || view.composing) return;
+    if (!p || !view || (view.composing && !force)) return;
     ime = null;
+    clearTimeout(p.timer);
     try {
-      view.dispatch({ changes: p.changes.invert(p.base), annotations: [bypass.of(true), S.Transaction.addToHistory.of(false)] });
-      if (view.state.doc.eq(p.base) && !p.changes.empty) view.dispatch({ changes: p.changes, userEvent: "input.type", scrollIntoView: true });
+      let clean = false;
+      try { clean = p.changes.apply(p.base).eq(view.state.doc); } catch { clean = false; }
+      if (clean) {
+        view.dispatch({ changes: p.changes.invert(p.base), annotations: [bypass.of(true), S.Transaction.addToHistory.of(false)] });
+        if (view.state.doc.eq(p.base) && !p.changes.empty) view.dispatch({ changes: p.changes, userEvent: "input.type", scrollIntoView: true });
+      } else {
+        ctx.dropHeld?.(view);
+        ctx.toast("The text you were composing was not kept: the document changed at the same moment. Type it again.");
+      }
     } finally {
       ctx.hold?.(false);
     }
   }
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", () => { if (document.hidden && ime) forceEndIme(); });
 
   const filterTr = S.EditorState.transactionFilter.of((tr) => {
     // Every change while suggesting becomes a suggestion: typing, commands, panels. What goes through: edits that
     // must (accept, restore, reloads: the bypass annotation), and changes the co-editing binding applies because
     // the shared text already changed (another person's edit, a merge from disk: ctx.fromYjs, from the Yjs
     // transaction in progress, so no guessing from missing user events).
-    if (!suggesting || !tr.docChanged || tr.annotation(bypass) || ctx.fromYjs?.()) return tr;
+    if (!suggesting || !tr.docChanged || tr.annotation(bypass)) return tr;
+    if (ctx.fromYjs?.()) {   // the shared text moved under a composition: end it (endIme sees the change)
+      if (ime) setTimeout(forceEndIme, 0);
+      return tr;
+    }
     if (ime || ctx.view()?.composing || tr.isUserEvent("input.type.compose")) {
-      if (!ime) { ime = { base: tr.startState.doc, changes: tr.changes }; ctx.hold?.(true); }
+      if (!ime) startIme(tr);
       else ime.changes = ime.changes.compose(tr.changes);
       return tr;
     }
@@ -242,7 +271,10 @@ export function reviewSupport(S, V, ctx) {
     if (u.selectionSet && !d.parts.some((p) => head >= p.from && head <= p.to)) { setTimeout(() => flush(ctx.view()), 0); return; }   // Moved away: send it now.
     if (draftOf(u.startState) !== d) { clearTimeout(idle); idle = setTimeout(() => flush(ctx.view()), IDLE_COMMIT); }
   });
-  const imeEnd = V.EditorView.domEventHandlers({ compositionend: (_e, view) => { setTimeout(() => endIme(view), 0); return false; } });
+  const imeEnd = V.EditorView.domEventHandlers({
+    compositionend: (_e, view) => { setTimeout(() => endIme(view), 0); return false; },
+    blur: (_e, view) => { if (ime) setTimeout(() => endIme(view, true), 0); return false; },
+  });
 
   /** Send the suggestion being typed, if any (before a tab switch, on idle, when suggest mode goes off). */
   function flush(view = ctx.view()) {
@@ -381,7 +413,8 @@ export function reviewSupport(S, V, ctx) {
     for (const [path, items] of byPath) {
       await ctx.openFile(path, 0, { noFocus: true });
       const view = ctx.view();
-      if (ctx.activePath() !== path) { failed.push(...items); continue; }
+      // A composition holds the room (nothing sent, nothing saved): an accept now would reach no one, so not now.
+      if (ctx.activePath() !== path || ime || view.composing) { failed.push(...items); continue; }
       const { ok, failed: missed } = placeGroups(view.state.doc.toString(), items);   // a group applies whole or not at all
       failed.push(...missed);
       if (ok.length) view.dispatch({ changes: ok.map(({ from, to, insert }) => ({ from, to, insert })), annotations: bypass.of(true), userEvent: "input.review" });

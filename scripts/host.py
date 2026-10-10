@@ -1013,7 +1013,22 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, handler, limit: int) -> None:
         self.slots = threading.BoundedSemaphore(limit)
+        self.lingering = threading.BoundedSemaphore(16)
         super().__init__(address, handler)
+
+    def linger_close(self, request) -> None:
+        """Close a refused connection without a reset (Windows drops the 503 when unread bytes are discarded)."""
+        try:
+            request.shutdown(socket.SHUT_WR)
+            request.settimeout(1)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and request.recv(65536):
+                pass
+        except OSError:
+            pass
+        finally:
+            self.lingering.release()
+            self.shutdown_request(request)
 
     def process_request(self, request, client_address) -> None:
         if not self.slots.acquire(blocking=False):
@@ -1022,7 +1037,10 @@ class Server(ThreadingHTTPServer):
                                 b"Connection: close\r\n\r\n")
             except OSError:
                 pass
-            self.shutdown_request(request)
+            if self.lingering.acquire(blocking=False):  # a few at most: read the request off so closing is no reset
+                threading.Thread(target=self.linger_close, args=(request,), daemon=True).start()
+            else:
+                self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)

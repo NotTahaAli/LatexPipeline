@@ -42,6 +42,9 @@ INJECT = r"""\makeatletter
 
 # Full builds record, for every \input/\include after \begin{document}, its file name,
 # nesting depth and all counters, in <jobname>.focusmap. --focus uses that map.
+# \pgff@s is the number of pages shipped out when the file starts and ends, and what is pending:
+# 1 the page in progress holds something, 2 floats wait, 3 both (the live preview places its pages
+# in the full PDF with it, also without hyperref's page labels).
 # \pgff@f and \pgff@x add the number of TikZ figures before the file and the figures
 # and counters after it, so a figure job can skip the file (see Figures.skip_tex).
 RECORD = r"""\makeatletter
@@ -51,11 +54,13 @@ RECORD = r"""\makeatletter
 \def\pgff@figs{\ifcsname tikzexternal@realjob\endcsname
 \ifcsname c@tikzext@no@\tikzexternal@realjob-figure\endcsname
 \csname c@tikzext@no@\tikzexternal@realjob-figure\endcsname\else0\fi\else-1\fi}
+\def\pgff@shipped{\string\pgff@s{\ifdefined\ReadonlyShipoutCounter\the\ReadonlyShipoutCounter\else-1\fi}%
+{\the\numexpr\ifdim\pagegoal=\maxdimen0\else1\fi+\ifx\@deferlist\@empty0\else2\fi\relax}}
 \def\pgff@enter#1#2{\global\advance\pgff@depth\@ne \pgff@cnt
 \immediate\write\pgff@w{\string\pgff@e{#1}{\the\pgff@depth}{#2}{\pgff@cnt@}}%
-\immediate\write\pgff@w{\string\pgff@f{\pgff@figs}}}
+\immediate\write\pgff@w{\string\pgff@f{\pgff@figs}}\immediate\write\pgff@w{\pgff@shipped}}
 \def\pgff@leave{\pgff@cnt\immediate\write\pgff@w{\string\pgff@x{\the\pgff@depth}{\pgff@figs}{\pgff@cnt@}}%
-\global\advance\pgff@depth\m@ne}
+\immediate\write\pgff@w{\pgff@shipped}\global\advance\pgff@depth\m@ne}
 \AddToHook{begindocument/end}{\immediate\openout\pgff@w=\jobname.focusmap
 \let\pgff@oldinput\input \let\pgff@oldinclude\include
 \def\input{\@ifnextchar\bgroup\pgff@input\pgff@oldinput}
@@ -131,6 +136,8 @@ TIKZ_WORDS = re.compile(r"tikz|pgfplots")
 # every other line that mentions tikz, pgf or axis (\tikzset, \pgfplotsset, \tikz ...;).
 FIGURE_TEXT = re.compile(r"(?s:\\begin\{tikzpicture\}.*?\\end\{tikzpicture\})|^.*(?:tikz|pgf|axis).*$", re.M)
 NO_FIGURES = hashlib.sha1(b"").hexdigest()
+# Pictures a file shows in its text. A figure drawn by a macro (\myplot{...}) has no such line.
+VISIBLE = re.compile(r"\\begin\{tikzpicture\}|\\tikz(?![a-zA-Z@])")
 
 
 # Pictures that refer to each other or to the page cannot be cut out as stand-alone
@@ -401,6 +408,20 @@ class Figures:
             except OSError:
                 return True
 
+        def unseen(i: int, j: int) -> bool:
+            # The map holds figures that the text of entries i..j-1 does not show: made by a macro, whose
+            # definition may have changed with the dirty files, so how many there are now is unknown.
+            # ponytail: a macro that drew nothing before and draws now still passes; the text pass corrects it.
+            shown = 0
+            for entry in entries[i:j]:
+                path = doc / entry["raw"]
+                path = path if path.suffix == ".tex" and path.is_file() else path.with_name(path.name + ".tex")
+                try:
+                    shown += len(VISIBLE.findall(COMMENT.sub("", path.read_text(encoding="utf-8", errors="replace"))))
+                except OSError:
+                    return True
+            return shown != entries[i]["end"] - entries[i]["figs"]
+
         wanted = {normalize(path) for path in self.dirty}
         if not (wanted - {normalize(self.main_tex.name)}) <= set(files):
             return False  # A changed file the last run did not read: its place is unknown.
@@ -412,7 +433,7 @@ class Figures:
             if (
                 entry["kind"] == "n" and quiet[i] and files.count(files[i]) == 1
                 and 0 <= entry.get("figs", -1) <= entry.get("end", -1)
-                and not wanted & set(files[i:j]) and not any(edited(e) for e in entries[i:j])
+                and not wanted & set(files[i:j]) and not any(edited(e) for e in entries[i:j]) and not unseen(i, j)
             ):
                 skip.append(entry)
                 covered.update(range(entry["figs"], entry["end"]))
@@ -526,6 +547,7 @@ class Figures:
             shutil.copy(self.build_dir / "_inject.tex", work / "_inject.tex")  # See write_inject.
             if (work / f"{self.stem}.aux").exists():
                 shutil.copy(work / f"{self.stem}.aux", made(".aux"))
+            sandbox.wait_turn()  # A live preview typesetting now goes first (serve.py).
             try:
                 subprocess.run(
                     **sandbox.spawn(self.figure_command(name, work, skip), self.main_tex.parent, self.build_dir,
@@ -625,6 +647,10 @@ ENTRY = re.compile(r"\\pgff@e\{([in])\}\{(\d+)\}\{(.*?)\}\{(.*)\}$")
 COUNTER = re.compile(r"\\pgff@c\{([^}]*)\}\{(-?\d+)\}")
 FIGS = re.compile(r"\\pgff@f\{(-?\d+)\}$")
 EXIT = re.compile(r"\\pgff@x\{(\d+)\}\{(-?\d+)\}\{(.*)\}$")
+SHIPPED = re.compile(r"\\pgff@s\{(-?\d+)\}\{([0-3])\}$")
+# Commands that start a new page: a file that begins with one starts after the page in progress.
+BREAKS = re.compile(r"\\(?:chapter|part|addchap|addpart|clearpage|cleardoublepage|newpage|pagebreak)(?![a-zA-Z@])")
+NEUTRAL = re.compile(r"\\(?:appendix|phantomsection|label\s*\{[^{}]*\}|(?:this)?pagestyle\s*\{[^{}]*\})(?![a-zA-Z@])")
 
 
 def normalize(path: str) -> str:
@@ -638,10 +664,13 @@ def read_focusmap(path: Path) -> list[dict]:
     """
     The \\input tree a full build recorded: [{kind, depth, path, counters}, ...] in reading order.
     Entries whose file was read to the end also have figs/end (TikZ figures before and after it)
-    and exit (counters after it).
+    and exit (counters after it), and shipped/shipped_end: pages shipped out before it starts and ends,
+    pending/pending_end: 1 if the page in progress then held something, + 2 if floats waited.
     """
     entries: list[dict] = []
     open_: list[dict] = []
+    shipped = ""  # Where the next \pgff@s goes: "shipped" (pages before the file) or "shipped_end" (after it).
+    last: dict = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         match = ENTRY.match(line)
@@ -651,11 +680,17 @@ def read_focusmap(path: Path) -> list[dict]:
                 "raw": match.group(3), "counters": COUNTER.findall(match.group(4)),
             })
             open_.append(entries[-1])
+            last, shipped = entries[-1], "shipped"
         elif (match := FIGS.match(line)) and entries:
             entries[-1]["figs"] = int(match.group(1))
         elif (match := EXIT.match(line)) and open_ and open_[-1]["depth"] == int(match.group(1)):
-            entry = open_.pop()
+            entry = last = open_.pop()
             entry["end"], entry["exit"] = int(match.group(2)), COUNTER.findall(match.group(3))
+            shipped = "shipped_end"
+        elif (match := SHIPPED.match(line)) and shipped and int(match.group(1)) >= 0:
+            last[shipped] = int(match.group(1))
+            last[shipped.replace("shipped", "pending")] = int(match.group(2))
+            shipped = ""
     return entries
 
 
@@ -687,14 +722,57 @@ def focus_selection(entries: list[dict], focus: str) -> tuple[set[int], int | No
     return keep, (matches[0] if matches else None)
 
 
-def focus_tex(entries: list[dict], keep: set[int], first: int) -> str:
-    """The TeX file injected for a focus run."""
+def starts_page(text: str, doc_dir: Path, depth: int = 0) -> bool:
+    """
+    The text starts a new page: its first command (after \\appendix, \\label and the like) is \\chapter,
+    \\clearpage ..., or a leading \\input of a file that does.
+    """
+    text = COMMENT.sub("", text).lstrip()
+    while (skip := NEUTRAL.match(text)):
+        text = text[skip.end():].lstrip()
+    if BREAKS.match(text):
+        return True
+    name = re.match(r"\\(?:input|include)\s*\{([^{}]+)\}", text)
+    if name and depth < 3:
+        raw = name.group(1).strip()
+        try:
+            path = doc_dir / (raw if raw.endswith(".tex") else raw + ".tex")
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return starts_page(text, doc_dir, depth + 1)
+    return False
+
+
+def next_page(entry: dict, doc_dir: Path, text: str | None = None) -> int:
+    """
+    How many pages after the one in progress when entry was read the full build began it: if the file (text,
+    else read from disk) starts with a page break, the page that held something and one page of floats that
+    waited (at least one). A focus run starts on an empty page, so it counts that many pages more to number
+    its pages like the full build.
+    """
+    pending = entry.get("pending", 0)
+    if not pending or entry["kind"] != "n":
+        return 0
+    if text is None:
+        raw = entry["raw"]
+        try:
+            path = doc_dir / (raw if raw.endswith(".tex") else raw + ".tex")
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0
+    return (pending & 1) + (pending >> 1) if starts_page(text, doc_dir) else 0
+
+
+def focus_tex(entries: list[dict], keep: set[int], first: int, bump: int = 0) -> str:
+    """The TeX file injected for a focus run. bump: the first file starts that many pages later (next_page)."""
     allow = "\n".join(
         rf"\expandafter\def\csname pgff@ok@{entries[i]['raw']}\endcsname{{}}"
         for i in sorted(keep) if entries[i]["kind"] == "n"
     )
     restore = "".join(
-        rf"\pgff@c{{{name}}}{{{value}}}" for name, value in entries[first]["counters"]
+        rf"\pgff@c{{{name}}}{{{int(value) + bump if name == 'page' else value}}}"
+        for name, value in entries[first]["counters"]
     ) if entries[first]["kind"] == "n" else ""
     included = [entries[i]["raw"] for i in sorted(keep) if entries[i]["kind"] == "i"]
     # \includeonly lets LaTeX itself keep the counters and page numbers of skipped chapters.

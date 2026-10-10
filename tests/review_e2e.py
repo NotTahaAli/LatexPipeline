@@ -145,6 +145,12 @@ def main() -> int:
                 page.evaluate("""(ps) => { const v = window.__app.view, S = v.state.selection.constructor;
                     v.dispatch({ selection: S.create(ps.map((p) => S.cursor(p))) }); v.focus(); }""", list(positions))
 
+            def sent_has(page, chars):
+                return page.evaluate("""cs => window.__sent.some((u) => {
+                    const s = atob(u), b = new Uint8Array(s.length);
+                    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+                    const t = new TextDecoder().decode(b); return [...cs].some((c) => t.includes(c)); })""", chars)
+
             def draft_text(page):
                 return page.evaluate("() => [...document.querySelectorAll('.cm-sug-ins.draft')]"
                                      ".map((e) => e.textContent)")
@@ -178,6 +184,8 @@ def main() -> int:
             print("multi-cursor: one suggestion with 2 ranges")
 
             # 3. IME composition: held back while composing, a suggestion afterwards.
+            alice.evaluate("""() => { const ch = window.__app.channel, send = ch.send.bind(ch); window.__sent = [];
+                ch.send = (m) => { if (m.type === 'y-update') window.__sent.push(m.data.u); return send(m); }; }""")
             cdp = alice.context.new_cdp_session(alice)
             put_cursor(alice, TEXT.index("fox") + 3)
             cdp.send("Input.imeSetComposition", {"text": "に", "selectionStart": 1, "selectionEnd": 1})
@@ -193,7 +201,8 @@ def main() -> int:
             assert text_of(alice) == TEXT == text_of(owner), text_of(alice)
             time.sleep(1.5)
             assert main_tex.read_text("utf-8") == TEXT
-            print("IME: the composition became one suggestion; co-editors and the disk never saw it")
+            assert not sent_has(alice, "にほ日本"), "composed text left the browser in a Yjs update (tombstone)"
+            print("IME: the composition became one suggestion; co-editors, the disk and Yjs updates never saw it")
 
             # 4. The owner types (not suggesting): it reaches Alice's editor as text, not as her suggestion.
             count = len(review()["suggestions"])
@@ -224,6 +233,57 @@ def main() -> int:
             phone.wait_for_selector(".named-list")
             axe(phone, "owner, phone, share dialog")
             print("accepted the group as a whole; axe: 0 violations (light, dark, phone)")
+
+            # 7. A composition left open is ended after a few seconds; others' edits waited and then arrive.
+            put_cursor(owner, 0)
+            before = text_of(alice)
+            put_cursor(alice, before.index("brown"))
+            cdp.send("Input.imeSetComposition", {"text": "ほん", "selectionStart": 2, "selectionEnd": 2})
+            time.sleep(0.5)
+            owner.keyboard.type("W")
+            time.sleep(1.0)
+            assert not text_of(alice).startswith("W"), "remote edit applied into a held room"
+            began = time.monotonic()
+            alice.wait_for_function("() => window.__app.view.state.doc.toString().startsWith('W')", timeout=15000)
+            print(f"IME hold ended by the time limit after {time.monotonic() - began + 1.5:.1f} s")
+            put_cursor(alice, 0)
+            wait(lambda: any(s["insert"] == "ほん" for s in review()["suggestions"]), "timed-out composition suggested")
+            assert "ほ" not in text_of(owner) and "ほ" not in text_of(alice)
+            time.sleep(1.5)
+            assert "ほ" not in main_tex.read_text("utf-8")
+
+            # 8. The shared text changes under a composition (a Yjs change from elsewhere): the composition is
+            # dropped, the shared text put back, nothing published as a direct edit.
+            before, count = text_of(alice), len(review()["suggestions"])
+            put_cursor(alice, before.index("brown"))
+            cdp.send("Input.imeSetComposition", {"text": "かき", "selectionStart": 2, "selectionEnd": 2})
+            time.sleep(0.3)
+            alice.evaluate("""() => { const r = window.__app.active.collab;
+                r.ydoc.transact(() => r.ytext.insert(0, 'Q'), 'external'); }""")
+            alice.wait_for_function("t => window.__app.view.state.doc.toString() === t", arg=before, timeout=10000)
+            cdp.send("Input.insertText", {"text": ""})
+            time.sleep(2)
+            assert text_of(owner) == before == text_of(alice), (text_of(owner), text_of(alice))
+            assert "か" not in main_tex.read_text("utf-8") and len(review()["suggestions"]) == count
+            assert not sent_has(alice, "かきQ"), "a dropped composition left the browser"
+            print("IME under a foreign change: dropped, shared text untouched")
+
+            # 9. Accepting while a composition holds the room: not applied, the suggestion stays open.
+            target = next(s for s in review()["suggestions"] if s["insert"] == " very")
+            alice.evaluate("id => window.__app.REV.focusItem(id)", target["id"])
+            before = text_of(alice)
+            put_cursor(alice, before.index("brown"))
+            cdp.send("Input.imeSetComposition", {"text": "さ", "selectionStart": 1, "selectionEnd": 1})
+            time.sleep(0.3)
+            accept = "id => document.querySelector(`li[data-id='${id}'] .rv-actions button`).click()"
+            alice.evaluate(accept, target["id"])
+            time.sleep(1.5)
+            assert any(s["id"] == target["id"] for s in review()["suggestions"]), "accepted into a held room"
+            assert " very" not in text_of(owner)
+            cdp.send("Input.insertText", {"text": "さ"})
+            time.sleep(1)
+            assert "さ" not in text_of(owner) and text_of(alice) == before
+            print("accept during a composition: released, stays open")
 
             # 6. Revoking Alice ends her session at once; Reviewer 2 stays.
             owner.click("#shareBtn")
