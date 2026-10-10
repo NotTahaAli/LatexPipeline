@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, read_settings
+from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, read_settings, size_text
 from hints import overfull_boxes
 
 REPORT_PATH = OUT_DIR / "build-report.json"
@@ -106,7 +106,7 @@ def first_error(doc: dict) -> str | None:
 
 
 def table(documents: list[dict], lint: dict) -> list[str]:
-    columns = ["Document", "Status", "Pages", "Words", "Time", "Warnings", "chktex", "Lint", "First error"]
+    columns = ["Document", "Status", "Pages", "Size", "Words", "Time", "Warnings", "chktex", "Lint", "First error"]
     rows = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
     for doc in documents:
         info = lint.get(doc["name"], {})
@@ -115,6 +115,7 @@ def table(documents: list[dict], lint: dict) -> list[str]:
             doc["name"],
             "ok" if doc["ok"] else "**failed**",
             doc.get("pages"),
+            size_text(doc["size"]) if doc.get("size") else None,
             info.get("words"),
             None if seconds is None else f"{seconds:.1f} s",
             doc.get("warnings"),

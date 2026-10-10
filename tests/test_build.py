@@ -171,7 +171,8 @@ class ReadSettingsTests(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
-                         {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True})
+                         {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
+                          "pdfa": None, "lang": "en-US"})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -190,7 +191,8 @@ class ReadSettingsTests(unittest.TestCase):
     def test_build_toml_overrides_engine_and_sets_options(self):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
-                         {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True})
+                         {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
+                          "pdfa": None, "lang": "en-US"})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
@@ -205,6 +207,28 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertConfigError(self.PLAIN, 'latexmk_args = "-g"\n')
         self.assertConfigError(self.PLAIN, 'latexmk_args = [1]\n')
         self.assertConfigError(self.PLAIN, 'engine = \n')  # invalid TOML
+
+    def test_pdfa_levels_and_metadata(self):
+        for value in ("2b", "a-2b", "A-2B"):
+            settings = self.settings(self.PLAIN, f'pdfa = "{value}"\nlang = "de-DE"\n')
+            self.assertEqual(settings["pdfa"], "a-2b")
+            self.assertEqual(build.pdfa_metadata(settings), r"\DocumentMetadata{pdfstandard=a-2b,lang=de-DE}")
+        self.assertEqual(build.pdfa_metadata(self.settings(self.PLAIN)), "")
+        self.assertConfigError(self.PLAIN, 'pdfa = "9z"\n')
+        self.assertConfigError(self.PLAIN, 'pdfa = true\n')
+        self.assertConfigError(self.PLAIN, 'lang = "en}US"\n')
+
+    def test_pdfa_check_reads_xmp_and_output_intent(self):
+        with fake_repo() as root:
+            pdf = root / "a.pdf"
+            pdf.write_bytes(b"%PDF-1.7\n<pdfaid:part>2</pdfaid:part>\n/OutputIntents [1 0 R]\n")
+            self.assertIn("present", build.pdfa_check(pdf, "a-2b"))
+            pdf.write_bytes(b"%PDF-1.7\n")
+            self.assertIn("no XMP pdfaid or OutputIntent", build.pdfa_check(pdf, "a-2b"))
+
+    def test_size_text(self):
+        self.assertEqual(build.size_text(101324), "101 KB")
+        self.assertEqual(build.size_text(1622508), "1.6 MB")
 
     def test_config_error_names_the_file(self):
         with fake_repo() as root:
@@ -349,7 +373,8 @@ class CiReportCellTests(unittest.TestCase):
         rows = ci_report.table([doc], {})
         row = rows[2]
         self.assertIn("weird\\|name", row)
-        self.assertEqual(row.replace("\\|", "").count("|"), 10)  # 9 columns
+        self.assertEqual(row.replace("\\|", "").count("|"), 11)  # 10 columns
+        self.assertIn("| 12 KB |", ci_report.table([{**doc, "size": 12000}], {})[2])
         self.assertTrue(row.startswith("| weird\\|name | **failed** |"))
 
 

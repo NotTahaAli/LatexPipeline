@@ -109,9 +109,17 @@ engine = "lualatex"      # overrides the magic comment
 shell_escape = true      # default: false
 latexmk_args = ["-g"]    # extra arguments passed to latexmk
 externalize = false      # default: true; see "Large documents"
+pdfa = "2b"              # default: off; PDF/A-2b, see "PDF/A"
+lang = "en-US"           # document language, written into the PDF/A metadata
 ```
 
 An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
+
+### PDF/A
+
+`pdfa = "2b"` (also `"a-2b"`, `"3b"`, ...) injects `\DocumentMetadata{pdfstandard=a-2b,lang=...}` before `\documentclass` through latexmk's `-usepretex`, so remove any `\DocumentMetadata` from `main.tex`. It needs LaTeX 2023-06 or newer. After the build the PDF is checked for the XMP `pdfaid` declaration and an OutputIntent, and the result is a note in the log. That is a presence check, not validation: fonts, transparency and the like can still break conformance, so run [veraPDF](https://verapdf.org) for that. Tagging for accessibility (`tagging=on`) is not switched on.
+
+`build-report.json` and the CI summary table list each PDF's size. A `qpdf --object-streams=generate` pass was measured and dropped: pdfTeX already writes object streams, and it saved 0.3% (`files/test`, 101 KB) to 0.9% (`bench/sample-report`, 1.6 MB).
 
 ---
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -493,7 +494,8 @@ def log_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize"}
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang"}
+PDFA_LEVEL = re.compile(r"^(?:a-)?([123][abu])$")
 
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
 LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
@@ -539,7 +541,8 @@ def read_settings(main_tex: Path) -> dict:
     and can be overridden by build.toml in the document's directory.
     Raises ConfigError for invalid values.
     """
-    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True}
+    settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
+                "pdfa": None, "lang": "en-US"}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -570,11 +573,52 @@ def read_settings(main_tex: Path) -> dict:
         if not isinstance(settings[key], bool):
             raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: {key} must be true or false")
 
+    if settings["pdfa"] is not None:
+        match = PDFA_LEVEL.match(str(settings["pdfa"]).lower())
+        if not match:
+            raise ConfigError(
+                f"{display(main_tex.parent / 'build.toml')}: pdfa must be a PDF/A level such as \"2b\" or \"a-2b\""
+            )
+        settings["pdfa"] = f"a-{match.group(1)}"
+    if not (isinstance(settings["lang"], str) and re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]+)*", settings["lang"])):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: lang must be a language tag such as \"en-US\"")
+
     args = settings["latexmk_args"]
     if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
         raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: latexmk_args must be a list of strings")
 
     return settings
+
+
+def pdfa_metadata(settings: dict) -> str:
+    """The \\DocumentMetadata line for build.toml's pdfa, or "" when it is off."""
+    if not settings["pdfa"]:
+        return ""
+    return f"\\DocumentMetadata{{pdfstandard={settings['pdfa']},lang={settings['lang']}}}"
+
+
+def pdfa_check(pdf: Path, level: str) -> str:
+    """
+    A cheap look, not validation (use veraPDF for that): does the PDF carry
+    the XMP pdfaid declaration and an OutputIntent? Returns a one-line note.
+    """
+    data = pdf.read_bytes()
+    streams = [data]
+    for chunk in re.findall(rb"stream\r?\n(.*?)endstream", data, re.DOTALL):  # object streams hide the catalog
+        try:
+            streams.append(zlib.decompress(chunk))
+        except zlib.error:
+            pass
+    text = b"\n".join(streams)
+    part = re.search(rb"<pdfaid:part>(\d)</pdfaid:part>|pdfaid:part=\"(\d)\"", text)
+    missing = []
+    if not part:
+        missing.append("XMP pdfaid")
+    if b"/OutputIntents" not in text:
+        missing.append("OutputIntent")
+    if missing:
+        return f"PDF/A {level} requested, but the PDF has no {' or '.join(missing)} (needs LaTeX 2023-06 or newer)."
+    return f"PDF/A {level}: XMP pdfaid and OutputIntent present (not validated; run veraPDF to check conformance)."
 
 
 def parse_latex_errors(console: str) -> list[dict]:
@@ -769,7 +813,7 @@ def build_document(
                         return 1, failures[0].splitlines()[0]
                     if attempt and not changed:
                         return 0, ""
-                    extra = [f"-usepretex={figures.main_pretex}", f"-jobname={main_tex.stem}"]
+                    extra = [f"-usepretex={meta}{figures.main_pretex}", f"-jobname={main_tex.stem}"]
                     code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
                     if code != 0:
                         return code, ""
@@ -779,18 +823,20 @@ def build_document(
 
         # Switching between plain and externalized output needs a rebuild latexmk can't see.
         mode_file = build_dir / ".mode"
+        # \DocumentMetadata must precede \documentclass, which is what -usepretex gives it.
+        meta = pdfa_metadata(settings)
         mode = "plain"
         if settings["externalize"] and accel.uses_tikz(main_tex.parent):
             mode = "externalized"
-        previous = mode_file.read_text() if mode_file.exists() else mode
+        previous = mode_file.read_text() if mode_file.exists() else mode + meta
         # --focus needs the \input tree of a full build; (re)build once to get it.
         no_map = record and not (build_dir / f"{main_tex.stem}.focusmap").exists()
-        switched = force or previous != mode or no_map
+        switched = force or previous != mode + meta or no_map
         # Plain builds record the \input tree too (the externalized ones do it through main_pretex),
         # so --focus and --watch --focus auto work for every document.
         def recording() -> list[str]:
             return [
-                f"-usepretex={accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
+                f"-usepretex={meta}{accel.write_inject(build_dir, main_tex.parent, '_record.tex', accel.RECORD)}",
                 f"-jobname={main_tex.stem}",
             ]
 
@@ -828,7 +874,7 @@ def build_document(
             cached = False
             switched = False
 
-        mode_file.write_text(used)
+        mode_file.write_text(used + meta)
         os.utime(mode_file, (started, started))
 
         if not errors:
@@ -840,6 +886,9 @@ def build_document(
                 try:
                     shutil.copy(generated_pdf, output_pdf)
                     os.utime(output_pdf, (started, started))
+                    if settings["pdfa"]:
+                        notes.append(pdfa_check(output_pdf, settings["pdfa"]))
+                        say(notes[-1])
                 except OSError as exc:
                     errors.append(f"Could not copy generated PDF: {exc}")
 
@@ -856,6 +905,7 @@ def build_document(
 
     if not errors and page_counts:
         pages = int(page_counts[-1])
+    size = output_pdf.stat().st_size if not errors and output_pdf.exists() else None
 
     sections = [
         f"Build of {relative.as_posix()}: {'FAILED' if errors else 'SUCCESS'}\n",
@@ -896,6 +946,7 @@ def build_document(
         "seconds": seconds,
         "engine": settings["engine"] if settings else None,
         "pages": pages,
+        "size": size,
         "errors": latex_errors,
         "warnings": warnings,
         "error": None,
@@ -1024,6 +1075,7 @@ def build_safely(
             "seconds": None,
             "engine": None,
             "pages": None,
+            "size": None,
             "errors": [],
             "warnings": 0,
             "error": message,
@@ -1379,6 +1431,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def size_text(size: int) -> str:
+    """"101 KB", "1.6 MB"."""
+    return f"{size / 1e6:.1f} MB" if size >= 1e6 else f"{max(1, round(size / 1e3))} KB"
+
+
 def phase_text(phases: dict) -> str:
     """"figures 1.2s, latex 5.6s"."""
     return ", ".join(f"{name} {seconds:.1f}s" for name, seconds in phases.items())
@@ -1401,6 +1458,8 @@ def print_summary(results: list[dict], profile: bool = False) -> None:
         details = [entry["engine"] or "-"]
         if entry["pages"] is not None:
             details.append(f"{entry['pages']} page{'' if entry['pages'] == 1 else 's'}")
+        if entry.get("size"):
+            details.append(size_text(entry["size"]))
         if entry["warnings"]:
             details.append(f"{entry['warnings']} warning(s)")
 
