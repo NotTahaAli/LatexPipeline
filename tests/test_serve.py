@@ -2406,6 +2406,100 @@ class BibPanelApi(SharedState, ServerCase):
         self.assertEqual(self.post("/api/bib/lookup", {"text": self.BIB, "key": "used"}, role="edit")[0], 429)
 
 
+class ZoteroApi(SharedState, ServerCase):
+    """/api/zotero*: owner only, except the network-free apply. Zotero itself is mocked."""
+
+    KEY = "AbCdEfGhIjKlMnOp"
+    BIB = "@article{a,\n  title = {Old},\n  doi = {10.1/a}\n}\n"
+    REMOTE = "@article{a,\n  title = {New},\n  doi = {10.1/a}\n}\n@misc{b,\n  title = {Other}\n}\n"
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import zotero
+        self.zotero = zotero
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mock.patch.object(zotero, "config_path", return_value=Path(tmp.name) / "zotero.json").start()
+        mock.patch.dict(os.environ).start()
+        os.environ.pop("ZOTERO_API_KEY", None)
+        zotero.CACHE.clear()
+        head = {"last-modified-version": "3", "total-results": "2"}
+        self.get = mock.patch.object(zotero, "get", return_value=(200, head,
+                                                                  self.REMOTE.encode())).start()
+        self.tokens = {}
+
+    def call(self, method, path, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        sep = "&" if "?" in path else "?"
+        return self.request(method, f"{path}{sep}doc={doc}", body, hdrs)
+
+    def test_owner_configures_previews_and_applies_without_the_key_leaking(self):
+        status, info = self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY})
+        self.assertEqual((status, info["configured"], info["has_key"]), (200, True, True))
+        status, body = self.call("GET", "/api/zotero")
+        self.assertEqual((status, body["library_id"], body["local_ok"]), (200, "42", True))
+        status, prev = self.call("POST", "/api/zotero/preview", {"text": self.BIB, "taken": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(([e["key"] for e in prev["new"]], [c["key"] for c in prev["changed"]]), (["b"], ["a"]))
+        status, splice = self.call("POST", "/api/zotero/apply", {"text": self.BIB, "ops": [
+            {"op": "update", "key": "a", "fields": {"title": "New"}},
+            {"op": "add", "type": "misc", "key": "b", "fields": {"title": "Other"}}]})
+        self.assertEqual(status, 200)
+        self.assertIn("title = {New}", self.BIB[:splice["from"]] + splice["insert"] + self.BIB[splice["to"]:])
+        for reply in (info, body, prev, splice):
+            self.assertNotIn(self.KEY, json.dumps(reply))
+        self.assertNotIn(self.KEY, "".join(p.read_text(errors="ignore") for p in self.root.rglob("*") if p.is_file()))
+
+    def test_errors_are_api_errors_and_bad_input_is_400(self):
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB})[0], 400)  # not configured yet
+        self.assertEqual(self.call("POST", "/api/zotero/settings", {"library_id": "x"})[0], 400)
+        self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY})
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": 5})[0], 400)
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": "x" * (serve.BIB_MAX_CHARS + 1)})[0], 413)
+        self.get.side_effect = self.zotero.ZoteroError("Zotero refused the API key.", 502)
+        status, body = self.call("POST", "/api/zotero/preview", {"text": self.BIB})
+        self.assertEqual((status, body["error"]), (502, "Zotero refused the API key."))
+
+    def test_only_the_owner_reaches_settings_and_the_network_while_sharing(self):
+        self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY})
+        self.tokens = self.share_on()
+        for role in ("view", "edit"):
+            attempts = (("GET", "/api/zotero", None),
+                        ("POST", "/api/zotero/settings", {"library_id": "1", "key": "Z" * 12}),
+                        ("POST", "/api/zotero/preview", {"text": self.BIB}))
+            for method, path, body in attempts:
+                self.assertEqual(self.call(method, path, body, role=role)[0], 403, (role, path))
+        self.assertEqual(self.get.call_count, 0)
+        self.assertEqual(self.zotero.info()["library_id"], "42")
+        apply = {"text": self.BIB, "ops": []}
+        self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="view")[0], 403)
+        self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="edit")[0], 200)
+        self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="edit", doc="demo2")[0], 403)
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")[0], 200)
+
+    def test_better_bibtex_is_refused_while_sharing(self):
+        self.call("POST", "/api/zotero/settings", {"mode": "local"})
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB})[0], 200)
+        self.tokens = self.share_on()
+        status, body = self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")
+        self.assertEqual(status, 409)
+        self.assertEqual(self.call("GET", "/api/zotero", role="owner")[1]["local_ok"], False)
+
+    def test_gateway_workers_have_no_owner(self):
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable("s" * 40, "demo")
+        hdrs = {"X-Host-Secret": "s" * 40, "X-Host-Role": "edit", "X-Host-User": "7;Ada"}
+        self.assertEqual(self.request("GET", "/api/zotero", None, hdrs)[0], 403)
+        self.assertEqual(self.request("POST", "/api/zotero/settings?doc=demo", {"library_id": "1"}, hdrs)[0], 403)
+
+    def test_import_reads_ris(self):
+        ris = "TY  - JOUR\nAU  - Doe, J\nTI  - A title here\nPY  - 2001\nER  -\n"
+        status, body = self.call("POST", "/api/bib/import", {"bibtex": ris})
+        self.assertEqual((status, body["entries"][0]["key"], body["error"]), (200, "Doe2001Title", None))
+        self.assertEqual(self.call("POST", "/api/bib/import", {"bibtex": "TY  - \nnothing"})[1]["error"][:2], "No")
+
+
 class UiWiring(unittest.TestCase):
     """No browser here: check that the scripts only reach for elements the page has, and the page stays accessible."""
 

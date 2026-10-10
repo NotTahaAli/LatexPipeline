@@ -504,3 +504,71 @@ def suggest_for(text: str, key: str) -> dict:
     if edit:
         result["at"], result["insert"] = grammar.to_utf16(text, edit[0]), edit[1]
     return result
+
+
+# ---------------------------------------------------------------------------
+# RIS (Mendeley, EndNote, Zotero, publishers' "export citation"): entries for the import dialog
+# ---------------------------------------------------------------------------
+
+RIS_KINDS = {"JOUR": "article", "JFULL": "article", "CONF": "inproceedings", "CPAPER": "inproceedings",
+             "BOOK": "book", "EBOOK": "book", "CHAP": "incollection", "THES": "phdthesis", "RPRT": "techreport"}
+RIS_TAGS = {"TI": "title", "T1": "title", "VL": "volume", "IS": "number", "PB": "publisher", "CY": "address",
+            "UR": "url", "AB": "abstract", "SN": "issn", "N1": "note"}
+
+
+def from_ris(text: str) -> list[dict]:
+    """[{"type", "key", "fields"}] for each TY ... ER record; keys are made unique."""
+    out: list[dict] = []
+    record: dict[str, list[str]] | None = None
+    for line in text.splitlines():
+        match = re.match(r"^\s*([A-Z][A-Z0-9])  ?-\s?(.*)$", line)
+        if not match:
+            continue
+        tag, value = match.group(1), match.group(2).strip()
+        if tag == "TY":
+            if record and len(record) > 1:
+                out.append(_ris_entry(record, {e["key"] for e in out}))
+            record = {"TY": [value.upper()]}
+        elif tag == "ER":
+            if record and len(record) > 1:
+                out.append(_ris_entry(record, {e["key"] for e in out}))
+            record = None
+        elif record is not None and value:
+            record.setdefault(tag, []).append(value)
+    if record and len(record) > 1:
+        out.append(_ris_entry(record, {e["key"] for e in out}))
+    return out
+
+
+def _ris_entry(record: dict[str, list[str]], taken: set) -> dict:
+    kind = RIS_KINDS.get(record["TY"][0], "misc")
+    fields: dict[str, str] = {}
+    for tag, name in RIS_TAGS.items():
+        if tag in record and name not in fields:
+            fields[name] = tex(record[tag][0])
+    for name, tags in (("author", ("AU", "A1")), ("editor", ("ED", "A2"))):
+        people = [tex(v) for tag in tags for v in record.get(tag, [])]
+        if people:
+            fields[name] = " and ".join(people)
+    container = next((record[tag][0] for tag in ("T2", "JO", "JF", "JA", "BT") if tag in record), "")
+    if container and kind != "misc":
+        fields[CONTAINER_KINDS.get(kind, "booktitle" if kind == "incollection" else "journal")] = tex(container)
+    dates = [v for tag in ("PY", "Y1", "DA") for v in record.get(tag, [])]
+    years = [m.group(0) for m in (re.search(r"\d{4}", v) for v in dates) if m]
+    if years:
+        fields["year"] = years[0]
+    if "SP" in record:
+        fields["pages"] = tex(record["SP"][0]) + (f"--{tex(record['EP'][0])}" if "EP" in record else "")
+    if "DO" in record:
+        fields["doi"] = clean_doi(re.sub(r"[\s{}]", "", record["DO"][0]))
+    surname = re.sub(r"[^A-Za-z0-9]", "", re.split(r"[,\s]", fields.get("author", "").lstrip("{"))[0])
+    skip = ("this", "that", "with", "from")
+    words = [w for w in re.findall(r"[A-Za-z]{4,}", fields.get("title", "")) if w.lower() not in skip]
+    word = words[0] if words else ""
+    base = surname + (years[0] if years else "") + word.capitalize() or "ref"
+    key = base
+    for i in range(26):
+        if key not in taken:
+            break
+        key = base + chr(97 + i)
+    return {"type": kind, "key": key, "fields": fields}

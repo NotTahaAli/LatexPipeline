@@ -49,6 +49,7 @@ import bibfix
 import build
 import grammar
 import hints
+import zotero
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 UI_DIR = Path(__file__).resolve().parent / "serve_ui"
@@ -1481,6 +1482,9 @@ def bib_import(data: dict) -> dict:
             return {"entries": [], "error": str(exc)}
     if not isinstance(bibtex, str) or len(bibtex) > BIB_MAX_CHARS:
         raise ApiError("Paste BibTeX (up to 1 MB) or a DOI.", 400)
+    if not re.search(r"@[ \t]*\w+[ \t\r\n]*[({]", bibtex) and re.search(r"^\s*TY  ?-", bibtex, re.M):
+        ris = bibfix.from_ris(bibtex)  # Mendeley, EndNote and publisher exports.
+        return {"entries": ris, "error": None if ris else "No complete RIS record found."}
     found = []
     for entry in bibfix.parse(bibtex):
         fields: dict[str, str] = {}
@@ -1494,6 +1498,30 @@ def bib_import(data: dict) -> dict:
         f"{skipped} entr{'y' if skipped == 1 else 'ies'} could not be read (check braces, quotes and commas)."
         if found else "No complete BibTeX entry found (check braces, quotes and commas).")
     return {"entries": found, "error": error}
+
+
+def zotero_call(fn, *args) -> dict:
+    """Owner-only Zotero settings and sync (scripts/zotero.py); its errors become API errors."""
+    try:
+        return fn(*args)
+    except zotero.ZoteroError as exc:
+        raise ApiError(str(exc), exc.status)
+
+
+def zotero_preview(data: dict) -> dict:
+    text, taken = data.get("text"), data.get("taken") or []
+    if not (isinstance(text, str) and isinstance(taken, list) and all(isinstance(k, str) for k in taken)):
+        raise ApiError("Send the .bib text.", 400)
+    if len(text) > BIB_MAX_CHARS:
+        raise ApiError("This .bib file is too large to sync (1 MB limit).", 413)
+    return zotero_call(zotero.preview, text, taken, not SHARE["on"])
+
+
+def zotero_apply(data: dict) -> dict:
+    text = data.get("text")
+    if not isinstance(text, str) or len(text) > BIB_MAX_CHARS:
+        raise ApiError("Send the .bib text (up to 1 MB).", 400)
+    return zotero_call(zotero.apply, text, data.get("ops"))
 
 
 def grammar_info(role: str = "owner") -> dict:
@@ -2438,6 +2466,10 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
             raise ApiError("Too many lookups; wait a moment.", 429)
+    elif method == "POST" and path == "/api/zotero/apply":
+        need_edit()  # No network: a splice for the chosen entries, like /api/bib/edit.
+        # Settings and fetching stay owner only (the default deny below).
+        scoped(doc)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2628,6 +2660,12 @@ class Handler(BaseHTTPRequestHandler):
             self.json(bib_edit(self.body()))
         elif url.path == "/api/bib/import" and name in DOCS:
             self.json(bib_import(self.body()))
+        elif url.path == "/api/zotero/apply" and name in DOCS:
+            self.json(zotero_apply(self.body()))
+        elif url.path == "/api/zotero/preview" and self.role == "owner" and name in DOCS:
+            self.json(zotero_preview(self.body()))
+        elif url.path == "/api/zotero/settings" and self.role == "owner":
+            self.json(zotero_call(zotero.save_settings, self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:
@@ -2700,6 +2738,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
+        elif path == "/api/zotero" and self.role == "owner" and not GATEWAY["secret"]:
+            self.json({**zotero.info(), "local_ok": not SHARE["on"]})
         elif path == "/api/share":
             self.json(share_info())
         elif path == "/ws":
