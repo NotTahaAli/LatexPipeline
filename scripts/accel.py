@@ -68,7 +68,7 @@ RECORD = r"""\makeatletter
 # and set the counters and the figure count to what the full run recorded after them.
 # Measured on a 300 page report: the last figure takes 1.8 s instead of 7.3 s.
 FIGSKIP = r"""\makeatletter
-\def\pgff@c#1#2{\setcounter{#1}{#2}}
+\def\pgff@c#1#2{\ifcsname c@#1\endcsname\setcounter{#1}{#2}\fi}
 \def\pgff@n#1{\expandafter\xdef\csname c@tikzext@no@\tikzexternal@realjob-figure\endcsname{#1}}
 %s
 \AddToHook{begindocument/end}{\let\pgfx@in\input
@@ -96,7 +96,7 @@ PICTURE = re.compile(r"(?s)\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}")
 # (\include uses \includeonly). Counters are restored when the first focused file starts.
 # %(allow)s, %(restore)s and %(only)s are filled in by focus_tex().
 FOCUS = r"""\makeatletter
-\def\pgff@c#1#2{\setcounter{#1}{#2}}
+\def\pgff@c#1#2{\ifcsname c@#1\endcsname\setcounter{#1}{#2}\fi}
 %(allow)s
 \def\pgff@restore{%(restore)s}
 \def\pgff@first{%(first)s}
@@ -258,10 +258,22 @@ class Figures:
         self.main_pretex = self.pretex + write_inject(build_dir, main_tex.parent, "_record.tex", RECORD)
         # When the run that wrote <stem>.focusmap started; figure jobs trust the map only if
         # no file of the document changed after that (build.py sets it before each run).
-        self.recorded: float | None = None
+        self.recorded: float | None = self.load_recorded()
         self.skips: dict[str, str] = {}
         # .tex files whose figure text changed (set by touched()); None: something else changed too.
         self.dirty: set[str] | None = set()
+
+    def load_recorded(self) -> float | None:
+        """Start time of the run that wrote the focusmap, as persisted by mark_recorded()."""
+        try:
+            return float((self.build_dir / "focusmap.time").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def mark_recorded(self) -> None:
+        """A run that rewrites the focusmap starts now. A partial listing does not, so it must not call this."""
+        self.recorded = time.time()
+        (self.build_dir / "focusmap.time").write_text(repr(self.recorded))
 
     def file(self, name: str, suffix: str) -> Path:
         # Not with_suffix(): a document called "v1.2" would lose its tail.
@@ -374,9 +386,21 @@ class Figures:
         if not self.dirty or not old or not mapfile.exists():
             return False
         doc = self.main_tex.parent
+        if self.recorded is None:
+            return False  # Unknown when the map was written: nothing in it can be trusted.
         entries = read_focusmap(mapfile)
         quiet = self.quiet_entries(entries)
         files = [normalize(entry["raw"]) for entry in entries]
+
+        def edited(entry: dict) -> bool:
+            # A file changed since the map can hold other figures (made by a macro) or other counters.
+            path = doc / entry["raw"]
+            path = path if path.suffix == ".tex" and path.is_file() else path.with_name(path.name + ".tex")
+            try:
+                return path.stat().st_mtime > self.recorded - 2
+            except OSError:
+                return True
+
         wanted = {normalize(path) for path in self.dirty}
         if not (wanted - {normalize(self.main_tex.name)}) <= set(files):
             return False  # A changed file the last run did not read: its place is unknown.
@@ -388,7 +412,7 @@ class Figures:
             if (
                 entry["kind"] == "n" and quiet[i] and files.count(files[i]) == 1
                 and 0 <= entry.get("figs", -1) <= entry.get("end", -1)
-                and not wanted & set(files[i:j])
+                and not wanted & set(files[i:j]) and not any(edited(e) for e in entries[i:j])
             ):
                 skip.append(entry)
                 covered.update(range(entry["figs"], entry["end"]))

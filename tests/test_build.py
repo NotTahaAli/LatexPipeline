@@ -236,10 +236,10 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertIn(r"\DocumentMetadata{pdfstandard=ua-1,lang=en-US,tagging=on}", meta)
         self.assertIn(r"\DocumentMetadata{pdfstandard=ua-1,lang=en-US,testphase={phase-III,firstaid}}", meta)
         self.assertIn(r"\IfFormatAtLeastTF{2025-06-01}", meta)
-        self.assertIn("WARNING: tagged = true needs LaTeX 2023-06-01", meta)  # old kernels: untagged, with a note
+        self.assertIn("WARNING: tagged = true needs LaTeX 2023-11-01", meta)  # old kernels: untagged, with a note
         self.assertIn("pdfdisplaydoctitle", meta)
         combined = build.document_metadata(self.settings(self.PLAIN, 'tagged = true\npdfa = "2a"\nlang = "de-DE"\n'))
-        self.assertIn(r"\DocumentMetadata{pdfstandard=a-2a,lang=de-DE,tagging=on}", combined)
+        self.assertIn(r"\DocumentMetadata{pdfstandard=a-2a,lang=de-DE,testphase={phase-III,firstaid}}", combined)
         self.assertIn("glyphtounicode", combined)
         self.assertNotIn("\n", combined)
         self.assertEqual(build.document_metadata(self.settings(self.PLAIN, "tagged = false\n")), "")
@@ -257,6 +257,11 @@ class ReadSettingsTests(unittest.TestCase):
             note = build.verapdf_note("verapdf", Path("a.pdf"), "a-2a", tagged=True)
         self.assertEqual([c[0][0][4] for c in call.call_args_list], ["2a", "ua1"])
         self.assertEqual(note, "PDF/A a-2a: veraPDF passed. PDF/UA-1: veraPDF passed.")
+
+    def test_tagged_pdfa_list_form_on_new_kernels(self):
+        meta = build.document_metadata(self.settings(self.PLAIN, 'tagged = true\npdfa = "2a"\n'))
+        self.assertIn(r"\DocumentMetadata{pdfstandard={a-2a,ua-1},lang=en-US,tagging=on}", meta)
+        self.assertIn(r"\DocumentMetadata{pdfstandard=a-2a,lang=en-US,testphase={phase-III,firstaid}}", meta)
 
     def test_pdfa_check_reads_xmp_and_output_intent(self):
         with fake_repo() as root:
@@ -302,6 +307,9 @@ class RecordedInputsTests(unittest.TestCase):
         self.shared = self.root / "files" / "shared" / "macros.tex"
         self.shared.parent.mkdir(parents=True)
         self.shared.write_text("\\newcommand{\\x}{y}\n", encoding="utf-8")
+        self.notes = self.root / "outside" / "notes.tex"
+        self.notes.parent.mkdir()
+        self.notes.write_text("n", encoding="utf-8")
         self.fls = self.root / ".latex-cache" / "doc" / "main.fls"
         self.fls.parent.mkdir(parents=True)
         self.fls.write_text("\n".join([
@@ -310,7 +318,7 @@ class RecordedInputsTests(unittest.TestCase):
             "INPUT ../shared/macros.tex",
             f"INPUT {self.root / 'texlive' / 'tikz.sty'}",        # TeX installation: ignored
             f"INPUT {self.root / '.latex-cache' / 'doc' / 'tikz' / 'f.pdf'}",  # cache: ignored
-            "INPUT /elsewhere/notes.tex",                         # outside everything: tracked
+            f"INPUT {self.notes}",                                # outside everything: tracked
             "OUTPUT main.pdf",
         ]) + "\n", encoding="utf-8")
         self.tree = mock.patch.object(build, "tex_tree_dirs", return_value=(self.root / "texlive",))
@@ -319,7 +327,7 @@ class RecordedInputsTests(unittest.TestCase):
 
     def test_external_inputs_only(self):
         self.assertEqual(build.recorded_inputs(self.main),
-                         [self.shared.resolve(), (self.main.parent / "/elsewhere/notes.tex").resolve()])
+                         [self.shared.resolve(), self.notes.resolve()])
 
     def test_no_recorder_file_means_nothing_recorded(self):
         self.fls.unlink()
@@ -334,7 +342,7 @@ class RecordedInputsTests(unittest.TestCase):
         with mock.patch.object(build, "tex_tree_dirs", return_value=(Path("/"),)):
             self.assertEqual(build.recorded_inputs(self.main), [
                 self.shared.resolve(), self.root / "texlive" / "tikz.sty",
-                (self.main.parent / "/elsewhere/notes.tex").resolve(),
+                self.notes.resolve(),
             ])
 
     def test_is_stale_follows_recorded_input(self):
@@ -347,6 +355,35 @@ class RecordedInputsTests(unittest.TestCase):
         self.assertFalse(build.is_stale(self.main))
         os.utime(self.shared, (now + 2000, now + 2000))  # edited after the build
         self.assertTrue(build.is_stale(self.main))
+
+    def test_deleted_input_makes_the_pdf_stale(self):
+        pdf = build.output_path_for(self.main)
+        pdf.parent.mkdir(parents=True)
+        pdf.write_text("pdf")
+        now = time.time()
+        os.utime(pdf, (now + 1000, now + 1000))
+        self.assertFalse(build.is_stale(self.main))
+        self.shared.unlink()  # Recorded input outside the document.
+        self.assertTrue(build.is_stale(self.main))
+        self.shared.write_text("back", encoding="utf-8")
+        os.utime(self.shared, (now - 1000, now - 1000))
+        self.assertFalse(build.is_stale(self.main))
+        (self.main.parent / "part.tex").write_text("p", encoding="utf-8")
+        os.utime(self.main.parent / "part.tex", (now - 1000, now - 1000))
+        os.utime(self.main.parent, (now - 1000, now - 1000))
+        self.assertFalse(build.is_stale(self.main))
+        (self.main.parent / "part.tex").unlink()  # Only the folder's time moves.
+        os.utime(self.main.parent, (now + 2000, now + 2000))
+        self.assertTrue(build.is_stale(self.main))
+
+    def test_symlinked_folder_inside_the_document_is_tracked(self):
+        link = self.main.parent / "shared"
+        try:
+            link.symlink_to(self.shared.parent, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("no symlinks")
+        self.fls.write_text("INPUT ./shared/macros.tex\nINPUT ./main.tex\n", encoding="utf-8")
+        self.assertEqual(build.recorded_inputs(self.main), [self.shared.resolve()])
 
     def test_ci_filter_follows_recorded_input(self):
         doc = self.main
