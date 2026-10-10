@@ -6,7 +6,13 @@ comes from the link, not from the browser: comments, suggestions, history author
 live in the owner's config folder (0600 file in a 0700 folder), never in a document directory, and stay valid for
 every later share of the same document until the owner revokes them. Tokens are compared in constant time.
 
-File format: {"version": 1, "links": [{"id", "token", "name", "role", "doc", "created"}]}.
+A link belongs to one document of one checkout: its doc name and the resolved path of that document's main.tex
+(root), so a link for "paper" in one clone never opens "paper" in another. The file is shared by every serve.py
+of this user; current() re-reads it whenever it changed, so a revoke in one process holds in all of them.
+
+File format: {"version": 2, "links": [{"id", "token", "name", "role", "doc", "root", "created"}]}. Version 1
+records (no root) are dropped on load: they cannot be told apart between checkouts, and binding them to whichever
+checkout reads them first would hand them to the wrong one.
 """
 
 from __future__ import annotations
@@ -16,14 +22,17 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
 FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "latex-pipeline" / "share-links.json"
-VERSION = 1
+VERSION = 2
 MAX_LINKS = 200
 MAX_NAME = 40
 ROLES = ("edit", "view")
+_CACHE: dict = {"key": None, "links": []}
+_LOCK = threading.Lock()
 
 
 class LinkError(Exception):
@@ -41,19 +50,31 @@ def clean_name(value) -> str:
 def _valid(link) -> bool:
     if not isinstance(link, dict) or link.get("role") not in ROLES or not isinstance(link.get("created"), (int, float)):
         return False
-    return all(isinstance(link.get(k), str) and link[k] for k in ("id", "token", "name", "doc"))
+    return all(isinstance(link.get(k), str) and link[k] for k in ("id", "token", "name", "doc", "root"))
 
 
 def load(path: Path | None = None) -> list:
-    """Every link record. A missing file is no links; a damaged one too (it is rewritten on the next change)."""
+    """Every valid link record. A missing or damaged file is no links (fail closed)."""
     try:
         data = json.loads((path or FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    if isinstance(data, list):  # never written by a release, but cheap to accept: a bare list of records
-        data = {"version": VERSION, "links": data}
     links = data.get("links") if isinstance(data, dict) else None
     return [link for link in links if _valid(link)] if isinstance(links, list) else []
+
+
+def current(path: Path | None = None) -> list:
+    """load(), re-read only when the file changed (inode, size or mtime): cheap enough for every request."""
+    path = path or FILE
+    try:
+        st = path.stat()
+        key = (str(path), st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = (str(path), None)
+    with _LOCK:
+        if _CACHE["key"] != key:
+            _CACHE["links"], _CACHE["key"] = load(path), key
+        return list(_CACHE["links"])
 
 
 def save(links: list, path: Path | None = None) -> None:
@@ -62,7 +83,7 @@ def save(links: list, path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(path.parent, 0o700)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as out:
         json.dump({"version": VERSION, "links": links}, out)
@@ -71,24 +92,24 @@ def save(links: list, path: Path | None = None) -> None:
     os.replace(tmp, path)
 
 
-def create(links: list, name, role, doc: str, now: float | None = None) -> dict:
+def create(links: list, name, role, doc: str, root: str, now: float | None = None) -> dict:
     """A new link record (appended to links; the caller saves)."""
     if role not in ROLES:
         raise LinkError("A link is for editing or for viewing.")
     if len(links) >= MAX_LINKS:
         raise LinkError(f"There are {MAX_LINKS} named links; revoke some first.")
     link = {"id": secrets.token_hex(6), "token": secrets.token_urlsafe(32), "name": clean_name(name), "role": role,
-            "doc": doc, "created": time.time() if now is None else now}
+            "doc": doc, "root": root, "created": time.time() if now is None else now}
     links.append(link)
     return link
 
 
-def find(links: list, token: str | None, doc: str | None) -> dict | None:
-    """The link of this document whose token matches. Compares every token, so timing says nothing."""
+def find(links: list, token: str | None, doc: str | None, root: str | None) -> dict | None:
+    """The link of this document of this checkout whose token matches. Compares every token, in constant time."""
     probe = (token or "").encode("utf-8", "replace")
     found = None
     for link in links:
-        if hmac.compare_digest(probe, link["token"].encode()) and token and link["doc"] == doc:
+        if hmac.compare_digest(probe, link["token"].encode()) and token and link["doc"] == doc and link["root"] == root:
             found = link
     return found
 

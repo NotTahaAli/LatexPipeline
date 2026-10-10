@@ -136,6 +136,7 @@ export class Room {
   hasState() { return this.ydoc.store.clients.size > 0; }
 
   onState(d) {
+    if (this.held) { this.held.state = d; return; }   // a rejoin during a composition: taken up by hold(false)
     if (d.conflict) return this.reset(d);   // The room was rebuilt from disk while we were away.
     this.epoch = d.epoch;
     if (d.eol) this.eol = d.eol;
@@ -151,9 +152,8 @@ export class Room {
     for (const u of Object.values(d.aware || {})) AP.applyAwarenessUpdate(this.awareness, dec(u), REMOTE);
     // Whatever the server lacks (our seed, edits made offline) goes up as one update.
     const missing = Y.encodeStateAsUpdate(this.ydoc, Y.encodeStateVector(server));
-    if (this.held) this.held.sv = Y.encodeStateVector(server);   // sent by hold(false), without the held text
     server.destroy();
-    if (this.canEdit && missing.length > 2 && !this.held) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(missing) } });
+    if (this.canEdit && missing.length > 2) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(missing) } });
     this.collab.channel.send({ type: "y-aware", topic: "y", data: { room: this.rid, u: enc(AP.encodeAwarenessUpdate(this.awareness, [this.awareness.clientID])) } });
     this.ready = true;
     for (const u of this.buffer.splice(0)) Y.applyUpdate(this.ydoc, dec(u), REMOTE);
@@ -184,18 +184,31 @@ export class Room {
    * change since hold(true) goes out as one update (the composed text is only a deleted range in it), the waiting
    * edits are applied, and the composition is dropped from the shared undo history.
    */
+  /** Put text into the room as one edit (history restore); refused while a composition holds the room. */
+  applyText(text) { return this.ready && this.canEdit && !this.held && mergeInto(this.ytext, this.text(), text); }
+
   hold(on) {
     if (on) {
-      if (!this.held) { this.undo.stopCapturing?.(); this.held = { sv: Y.encodeStateVector(this.ydoc), remote: [], undo: this.undo.undoStack?.length }; }
+      if (this.held) return;
+      // The shared undo history must not track the composition: an undo manager keeps deleted items' content
+      // (keepItem), so a tracked composition would travel in later updates as tombstones. Untracked, the
+      // composed-then-removed text is garbage-collected and only its length remains.
+      const origins = this.undo.trackedOrigins;
+      this.held = { sv: Y.encodeStateVector(this.ydoc), remote: [], text: this.text(), origins: origins && new Set(origins), state: null, fs: undefined, merge: false };
+      this.undo.stopCapturing?.();
+      origins?.clear();
       return;
     }
     const h = this.held;
     if (!h) return;
     this.held = null;
-    if (h.undo != null) { this.undo.undoStack.splice(h.undo); this.undo.stopCapturing?.(); }
+    if (h.origins) { for (const o of h.origins) this.undo.trackedOrigins.add(o); this.undo.stopCapturing?.(); }
     const mine = Y.encodeStateAsUpdate(this.ydoc, h.sv);
     if (this.canEdit && mine.length > 2) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(mine) } });
+    if (h.state) this.onState(h.state);
     for (const u of h.remote) this.onRemote(u);
+    if (h.merge) this.mergeDisk().catch(() => {});
+    if (h.fs !== undefined) this.onFs(h.fs);
     this.touch();
   }
   onAware(u) { AP.applyAwarenessUpdate(this.awareness, dec(u), REMOTE); }
@@ -282,6 +295,7 @@ export class Room {
 
   /** The file changed on disk behind our back: fold the difference into the shared text. */
   async mergeDisk() {
+    if (this.held) { this.held.merge = true; return; }   // after the composition
     const f = await this.collab.api.read(this.doc, this.path);
     const base = this.savedText ?? f.text;
     if (f.text !== base && f.text !== this.text() && !mergeInto(this.ytext, base, f.text)) {
@@ -291,6 +305,7 @@ export class Room {
   }
 
   async onFs(removed) {
+    if (this.held) { this.held.fs = this.held.fs || removed; return; }
     if (!this.isLeader || this.saving || this.savedText === null) return;
     if (removed) return this.drop(`${this.path} was deleted on disk; shared editing of it stopped.`);
     try {

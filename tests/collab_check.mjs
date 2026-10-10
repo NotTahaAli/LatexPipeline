@@ -148,7 +148,9 @@ for (const leader of [true, false]) {
   const { room } = make({ read: async () => ({ text: "room text", version: "1", eol: "\n" }), write: async () => { writes++; return { version: "2" }; } });
   await room.becomeLeader();
   room.ready = true;
+  room.undo.trackedOrigins = new Set(["sync"]);
   room.hold(true);
+  assert.equal(room.undo.trackedOrigins.size, 0, "the shared undo history tracks the composition (tombstones keep its text)");
   room.ytext.doc.t = "room text composing";
   room.touch(); await wait(30);
   assert.equal(writes, 0, "saved while composing");
@@ -156,8 +158,24 @@ for (const leader of [true, false]) {
   assert.equal(writes, 0);
   room.onRemote("AAAA");
   assert.equal(room.held.remote.length, 1, "remote update applied during a composition");
+  // Nothing else may change the held room: a restore is refused, a rejoin and a disk merge wait for the release.
+  assert.equal(room.applyText("restored"), false, "restore applied into a held room");
+  assert.equal(room.text(), "room text composing");
+  room.onState({ updates: [], aware: {}, leader: "me", epoch: "e2" });
+  assert.equal(room.epoch, null, "rejoin applied during a hold");
+  let merged = 0;
+  room.collab.api.read = async () => { merged++; return { text: "room text", version: "1", eol: "\n" }; };
+  await room.mergeDisk();
+  assert.equal(merged, 0, "disk merged into a held room");
   room.ytext.doc.t = "room text";   // the composition was taken out again
   room.hold(false);
+  assert.equal(room.epoch, "e2", "the rejoin is taken up after the hold");
+  assert.deepEqual([...room.undo.trackedOrigins], ["sync"], "shared undo tracking back after the hold");
+  await wait(10);
+  assert.equal(merged, 1, "the disk merge runs after the hold");
+  assert.equal(room.applyText("room text restored"), true);
+  assert.equal(room.text(), "room text restored");
+  room.ytext.doc.t = "room text";
   assert.equal(room.held, null);
   room.ytext.doc.t = "room text, typed later";
   room.touch(); await wait(30);

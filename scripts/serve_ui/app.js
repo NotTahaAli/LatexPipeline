@@ -1,5 +1,5 @@
 import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
-import { Collab, PALETTE, mergeInto } from "./collab.js";
+import { Collab, PALETTE, hunk } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
@@ -74,6 +74,7 @@ const REV = reviewSupport(S, V, {
   showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
   fromYjs: () => !!active?.collab?.yTx,
+  dropHeld: (v) => { const t = heldRoom?.held?.text; if (t == null) return false; const h = hunk(v.state.doc.toString(), t); if (h.to > h.from || h.insert) v.dispatch({ changes: h, annotations: REV.bypass.of(true) }); return true; },
   hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
 });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
@@ -941,7 +942,7 @@ const historyUi = historyPanel($("dpanel-history"), {
   toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
   inRoom: (path) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit); },
-  roomApply: (path, text) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit) && mergeInto(room.ytext, room.text(), text); },
+  roomApply: (path, text) => !!tabs.get(path)?.collab?.applyText(text),   // false while an IME composition holds the room
   send: (message) => channel.send(message),
 });
 $("diffClose").onclick = () => $("diffDlg").close();

@@ -1770,10 +1770,11 @@ def forward(query: dict, only: str | None = None) -> tuple[str, dict]:
 
 SHARE: dict = {
     "on": False, "tokens": {}, "doc": None, "provider": None, "public": None, "hosts": set(), "status": "off",
-    "error": None, "tunnel": None, "port": 0, "gen": 0, "links": [],
+    "error": None, "tunnel": None, "port": 0, "gen": 0,
 }
-# Named links (share_links.py): one token per person, the name set by the owner. SHARE["links"] is the file's
-# content, loaded when sharing starts and kept in step by share_link_create/revoke (this process is the only writer).
+# Named links (share_links.py): one token per person, the name set by the owner, bound to the document's name and
+# the resolved path of its main.tex (link_root). Read through named.current(), which follows the file, so a revoke
+# made by another serve.py of this user holds here too.
 SHARE_LOCK = threading.Lock()
 ROLES = ("owner", "edit", "view")
 # --gateway (scripts/host.py): one worker per project, reached only through the gateway, which authenticates the
@@ -1839,8 +1840,16 @@ def identity_for_token(token: str | None) -> tuple[str, str | None] | None:
     for role, good in list(SHARE["tokens"].items()):
         if hmac.compare_digest(probe, good.encode()) and token:
             found = role, None
-    link = None if GATEWAY["secret"] else named.find(list(SHARE["links"]), token, SHARE["doc"])
+    link = None if GATEWAY["secret"] else named.find(named.current(), token, SHARE["doc"], link_root(SHARE["doc"]))
     return (link["role"], named.user_of(link)) if link else found
+
+
+def link_root(doc: str | None) -> str | None:
+    """Which checkout a named link belongs to: the resolved path of the document's main.tex."""
+    try:
+        return str(DOCS[doc].resolve()) if doc in DOCS else None
+    except OSError:
+        return None
 
 
 def role_for_token(token: str | None) -> str | None:
@@ -1854,7 +1863,7 @@ def gateway_enable(secret: str, doc: str, timeout: int | None = None) -> None:
     global SHARE_TIMEOUT
     GATEWAY["secret"] = secret.encode()
     SETTINGS["check_host"] = False  # Loopback only, and every request must carry the secret instead.
-    SHARE.update(on=True, doc=doc, provider="gateway", status="ready", tokens={}, public=None, hosts=set(), links=[])
+    SHARE.update(on=True, doc=doc, provider="gateway", status="ready", tokens={}, public=None, hosts=set())
     share_env(True)
     if timeout:
         SHARE_TIMEOUT = timeout
@@ -1924,7 +1933,7 @@ def share_enable(doc: str | None, provider: str, port: int) -> int:
         SHARE["gen"] = SHARE.get("gen", 0) + 1
         SHARE.update(
             on=True, doc=doc, provider=provider, status="starting", error=None, public=None, port=port,
-            tokens={"owner": new_token(), "edit": new_token(), "view": new_token()}, links=named.load(),
+            tokens={"owner": new_token(), "edit": new_token(), "view": new_token()},
         )
         return SHARE["gen"]
 
@@ -1959,7 +1968,8 @@ def share_links() -> dict:
 
 def share_info() -> dict:
     """Owner only (check_permission): the links carry their tokens."""
-    mine = [link for link in SHARE["links"] if link["doc"] == SHARE["doc"]] if SHARE["on"] else []
+    root = link_root(SHARE["doc"])
+    mine = [x for x in named.current() if x["doc"] == SHARE["doc"] and x["root"] == root] if SHARE["on"] else []
     return {
         "on": SHARE["on"], "status": SHARE["status"], "error": SHARE["error"], "provider": SHARE["provider"],
         "url": SHARE["public"], "doc": SHARE["doc"], "links": share_links() if SHARE["on"] else {},
@@ -1976,13 +1986,15 @@ def share_link_create(data: dict) -> dict:
             raise ApiError("Start sharing first.", 409)
         links = named.load()  # the file, not the cache: never lose a record written by another run
         try:
-            named.create(links, data.get("name"), data.get("role"), SHARE["doc"])
+            root = link_root(SHARE["doc"])
+            if root is None:
+                raise named.LinkError("The shared document is not available.")
+            named.create(links, data.get("name"), data.get("role"), SHARE["doc"], root)
             named.save(links)
         except named.LinkError as exc:
             raise ApiError(str(exc), 400)
         except OSError as exc:
             raise ApiError(f"Could not save the link: {exc}", 500)
-        SHARE["links"] = links
     return share_info()
 
 
@@ -1990,7 +2002,8 @@ def share_link_revoke(data: dict) -> dict:
     """POST /api/share/links/revoke (owner): the link stops working at once, open connections included."""
     with SHARE_LOCK:
         links = named.load()
-        gone = [link for link in links if link["id"] == data.get("id")]
+        root = link_root(SHARE["doc"])  # only this checkout's links of the shared document
+        gone = [x for x in links if x["id"] == data.get("id") and x["doc"] == SHARE["doc"] and x["root"] == root]
         if not gone:
             raise ApiError("No such link.", 404)
         links = [link for link in links if link not in gone]
@@ -1998,7 +2011,6 @@ def share_link_revoke(data: dict) -> dict:
             named.save(links)
         except OSError as exc:
             raise ApiError(f"Could not save the links: {exc}", 500)
-        SHARE["links"] = links
     users = {named.user_of(link) for link in gone}
     with COLLAB_LOCK:
         clients = [cid for cid, c in CLIENTS.items() if c.get("user") in users]
