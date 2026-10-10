@@ -2940,7 +2940,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("preview", 120, 60.0):
             raise ApiError("Too many previews; wait a moment.", 429)
-        if doc in DOCS and not preview.has_snapshot(DOCS[doc]) and not rate_ok("rebuild", *REBUILD_LIMIT):
+        try:
+            warm = doc in DOCS and preview.has_snapshot(DOCS[doc])
+        except ValueError:  # no cache directory for this document yet
+            warm = False
+        if not warm and not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many builds; wait a moment.", 429)  # the first preview runs a full build
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
