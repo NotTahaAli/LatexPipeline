@@ -2427,5 +2427,342 @@ class UiWiring(unittest.TestCase):
         self.assertIn("started", serve.fresh_state("x", build.SOURCE_DIR / "x" / "main.tex"))
 
 
+class HistoryStore(unittest.TestCase):
+    """history.py on its own: merging saves, labels with their own manifest, pruning, blob collection, diffs."""
+
+    def setUp(self):
+        import history
+        self.history = history
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = history.Store(Path(self.tmp.name))
+
+    def blobs(self):
+        return sorted(p.name for p in Path(self.tmp.name, "blobs").rglob("*") if p.is_file())
+
+    def test_saves_merge_per_author_and_window_and_labels_pin_their_state(self):
+        s, t = self.store, 1000.0
+        first = s.record("a.tex", "one", ["Ada"], now=t)
+        self.assertIsNone(s.record("a.tex", "one two", ["Ada"], now=t + 10))  # merged into the first
+        self.assertIsNone(s.record("a.tex", "one two", ["Ada"], now=t + 20))  # nothing new
+        bob = s.record("a.tex", "one two three", ["Bob"], now=t + 30)  # another author: a new version
+        self.assertEqual(s.text_at(first, "a.tex"), "one two")
+        self.assertEqual(len(self.blobs()), 2)  # "one" was replaced by the merge and collected
+        label = s.label("Draft", ["Ada"], {"a.tex": "one two three", "b.tex": "bee"}, now=t + 40)
+        after = s.record("a.tex", "changed", ["Bob"], now=t + 50)
+        self.assertIsNotNone(after)  # never merged across a label
+        self.assertEqual(s.state_at(label), {"a.tex": self.history.digest("one two three"),
+                                             "b.tex": self.history.digest("bee")})
+        self.assertEqual(s.state_at(bob), {"a.tex": self.history.digest("one two three")})
+        self.assertEqual(s.text_at(label, "b.tex"), "bee")
+        self.assertIsNone(s.text_at(first, "b.tex"))
+        self.assertEqual(s.record("a.tex", None, ["Bob"], "delete", now=t + 60) is not None, True)
+        self.assertIsNone(s.record("a.tex", None, ["Bob"], "delete", now=t + 61))
+        self.assertEqual([v["kind"] for v in s.versions("a.tex")], ["delete", "auto", "label", "auto", "auto"])
+        self.assertEqual(s.previous(after, "a.tex"), bob)
+
+    def test_pruning_keeps_each_files_newest_version_and_labels(self):
+        with mock.patch.object(self.history, "MAX_ROWS", 5):
+            for n in range(12):
+                self.store.record(f"f{n % 2}.tex", f"text {n}", [f"p{n}"], now=float(n))
+            label = self.store.label("keep", [], {"f0.tex": "text 10"}, now=20.0)
+            rows = self.store.versions()
+        self.assertLessEqual(len(rows), 5)
+        self.assertEqual({r["path"] for r in rows if r["kind"] == "auto"} >= {"f0.tex", "f1.tex"}, True)
+        self.assertIn(label, [r["id"] for r in rows])
+        self.assertEqual(self.store.text_at(label, "f0.tex"), "text 10")
+        self.assertLessEqual(len(self.blobs()), len(rows))  # pruned versions' blobs were collected
+
+    def test_byte_cap_and_quota(self):
+        small = self.history.Store(Path(self.tmp.name) / "s", max_bytes=200)
+        for n in range(30):
+            small.record("a.tex", os.urandom(40).hex(), ["x"], now=n * 1000.0)
+        total = sum(p.stat().st_size for p in (Path(self.tmp.name) / "s" / "blobs").rglob("*") if p.is_file())
+        self.assertLessEqual(total, 400)  # the newest version always stays, even when it alone is over the cap
+        full = self.history.Store(Path(self.tmp.name) / "q", allow=lambda size: False)
+        with self.assertRaises(self.history.Full):
+            full.record("a.tex", "x", [])
+
+    def test_diff_rows(self):
+        d = self.history.diff("a\nb\nc", "a\nB\nc\nd")
+        self.assertEqual((d["added"], d["removed"]), (2, 1))
+        self.assertEqual(d["hunks"][0], [[" ", 1, 1, "a"], ["-", 2, None, "b"], ["+", None, 2, "B"], [" ", 3, 3, "c"],
+                                         ["+", None, 4, "d"]])
+        self.assertEqual(self.history.diff("same", "same")["hunks"], [])
+
+
+class HistoryApi(SharedState, ServerCase):
+    """Versions from editor saves, file tree changes, labels and restores; who may see and do what."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("build.toml", "engine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        other = self.base / "second"
+        other.mkdir()
+        (other / "main.tex").write_text("secret doc", encoding="utf-8")
+        mock.patch.dict(serve.DOCS, {"second": other / "main.tex"}).start()
+        self.tokens = {}
+
+    def call(self, method, path, body=None, role=None):
+        role = role or ("owner" if self.tokens else None)
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request(method, path, body, hdrs)
+
+    def put(self, text, path="main.tex", role=None):
+        return self.call("PUT", f"/api/file?doc=demo&path={path}", {"text": text}, role)[0]
+
+    def versions(self, query="", role=None):
+        return self.call("GET", f"/api/history?doc=demo{query}", role=role)[1]["versions"]
+
+    def test_saves_keep_the_text_before_and_after(self):
+        self.assertEqual(self.put("\\section{A}\nhello world\n"), 200)
+        rows = self.versions("&path=main.tex")
+        self.assertEqual([r["kind"] for r in rows], ["auto", "outside"])  # the disk text first, then the save
+        self.assertEqual(rows[0]["authors"], ["Owner"])
+        self.assertTrue((self.base / ".hist").is_dir())
+        self.assertFalse(any(".hist" in str(p) for p in self.root.rglob("*")))  # nothing in the document folder
+        status, diff = self.call("GET", f"/api/history/diff?doc=demo&id={rows[0]['id']}&against=previous")
+        self.assertEqual(status, 200)
+        self.assertEqual([r[0] for r in diff["hunks"][0] if r[0] != " "], ["-", "+"])
+        self.assertEqual(self.call("GET", f"/api/history/version?doc=demo&id={rows[1]['id']}")[1]["text"],
+                         "\\section{A}\nhello\n")
+        (self.root / "main.tex").write_text("edited in another editor\n", encoding="utf-8")
+        self.put("mine\n")
+        self.assertEqual([r["kind"] for r in self.versions("&path=main.tex")][:2], ["auto", "outside"])
+
+    def test_label_and_restore_are_new_versions(self):
+        self.put("draft one\n")
+        self.write("ch.tex", "chapter\n")
+        status, made = self.call("POST", "/api/history/label?doc=demo", {"label": "Sent to supervisor"})
+        self.assertEqual(status, 200)
+        self.put("draft two\n")
+        self.write("ch.tex", "chapter changed\n")
+        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": made["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(out["written"]), ["ch.tex", "main.tex"])
+        self.assertEqual((self.root / "main.tex").read_text(), "draft one\n")
+        self.assertEqual((self.root / "ch.tex").read_text(), "chapter\n")
+        rows = self.versions()
+        self.assertIn("restore", [r["kind"] for r in rows])
+        before = next(r for r in rows if r["path"] == "ch.tex" and r["kind"] == "outside")
+        self.assertEqual(self.call("GET", f"/api/history/version?doc=demo&id={before['id']}")[1]["text"],
+                         "chapter changed\n")  # undoable: what the restore replaced is a version too
+        self.assertEqual(self.call("POST", "/api/history/label?doc=demo", {"label": " "})[0], 400)
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": 99999})[0], 404)
+
+    def test_a_file_with_an_open_room_is_restored_through_the_room(self):
+        self.put("new\n")
+        first = self.versions("&path=main.tex")[-1]["id"]  # the text before the first save
+        serve.bind_client("c1", "owner")
+        serve.handle_client_message({"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}}, "c1")
+        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": first, "path": "main.tex"})
+        self.assertEqual((status, out["written"], out["apply"]),
+                         (200, [], [{"path": "main.tex", "text": "\\section{A}\nhello\n"}]))
+        self.assertEqual((self.root / "main.tex").read_text(), "new\n")  # the browser applies it through the room
+        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
+        self.put("\\section{A}\nhello\n")  # the leader saves the restored text: no "from disk" row for the old one
+        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
+
+    def test_file_tree_deletes_and_renames_are_versions(self):
+        self.write("sub/a.tex", "a text\n")
+        self.assertEqual(self.call("POST", "/api/fs?doc=demo&op=rename&path=sub&to=moved")[0], 200)
+        self.assertEqual(self.call("POST", "/api/fs?doc=demo&op=delete&path=moved/a.tex")[0], 200)
+        kinds = [(r["path"], r["kind"], r["label"]) for r in self.versions()]
+        self.assertIn(("sub/a.tex", "rename", "Renamed to moved/a.tex"), kinds)
+        self.assertIn(("moved/a.tex", "delete", None), kinds)
+        old = next(r for r in self.versions() if r["path"] == "sub/a.tex" and r["kind"] == "outside")
+        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": old["id"], "path": "sub/a.tex"})
+        self.assertEqual((status, out["written"]), (200, ["sub/a.tex"]))  # its folder comes back too
+        self.assertEqual((self.root / "sub" / "a.tex").read_text(), "a text\n")
+
+    def test_roles_and_build_config(self):
+        self.tokens = self.share_on()
+        self.put("x\n")
+        self.call("POST", "/api/history/label?doc=demo", {"label": "v1"})
+        self.write("build.toml", "engine = 'xelatex'\n")
+        self.put("y\n")
+        label = next(r for r in self.versions() if r["kind"] == "label")
+        self.assertIn("build.toml", label["files"])
+        shared = next(r for r in self.versions(role="view") if r["kind"] == "label")
+        self.assertNotIn("build.toml", shared["files"])  # shared links never see build configuration
+        self.assertEqual(self.call("GET", "/api/history?doc=demo&path=build.toml", role="edit")[0], 403)
+        self.assertEqual(self.call("GET", f"/api/history/version?doc=demo&id={label['id']}&path=build.toml",
+                                   role="edit")[0], 403)
+        self.assertEqual(self.call("GET", "/api/history?doc=second", role="view")[0], 403)
+        self.assertEqual(self.call("POST", "/api/history/label?doc=demo", {"label": "v"}, role="view")[0], 403)
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": label["id"]}, role="view")[0], 403)
+        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": label["id"]}, role="edit")
+        self.assertEqual((status, out["skipped"]), (200, ["build.toml"]))
+        self.assertEqual((self.root / "build.toml").read_text(), "engine = 'xelatex'\n")  # owner only
+        self.assertEqual((self.root / "main.tex").read_text(), "x\n")
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": label["id"], "path": "build.toml"},
+                                   role="edit")[0], 403)
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": label["id"], "path": "build.toml"},
+                                   role="owner")[0], 200)
+        self.assertEqual((self.root / "build.toml").read_text(), "engine = 'pdflatex'\n")
+
+    def test_bus_messages_name_only_the_document_and_are_filtered(self):
+        serve.SHARE["doc"] = "demo"
+        msgs = [{"rev": 1, "topic": "doc", "type": kind, "data": {"doc": doc}}
+                for kind in ("history", "review") for doc in ("demo", "second")]
+        for role in ("edit", "view"):
+            self.assertEqual([(m["type"], m["data"]["doc"]) for m in serve.visible(msgs, role)],
+                             [("history", "demo"), ("review", "demo")])
+        rev = serve.BUS.rev
+        self.put("bus\n")
+        self.assertEqual([m["data"] for m in serve.BUS.since(rev) if m["type"] == "history"], [{"doc": "demo"}] * 2)
+
+
+class ReviewApi(SharedState, ServerCase):
+    """Comment threads and suggestions: roles, own-comment deletion, claim-once accept, build-config files."""
+
+    KEY_A, KEY_B = "a" * 32, "b" * 32
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("build.toml", "engine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        self.tokens = {}
+        self.anchor = {"from": 12, "to": 17, "quote": "hello", "prefix": "\\section{A}\n", "suffix": "\n"}
+
+    def op(self, body, role=None, key=None, doc="demo"):
+        role = role or ("owner" if self.tokens else None)
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/review?doc={doc}", {**body, "key": key or self.KEY_A, "name": "Ann"}, hdrs)
+
+    def get(self, role=None, key=None):
+        role = role or ("owner" if self.tokens else None)
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("GET", f"/api/review?doc=demo&key={key or self.KEY_A}", None, hdrs)
+
+    def test_threads_replies_resolve_and_delete_own(self):
+        self.tokens = self.share_on()
+        status, made = self.op({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "<b>Why?</b>"},
+                               role="edit")
+        self.assertEqual(status, 200)
+        tid = made["item"]["id"]
+        self.assertEqual(made["item"]["comments"][0]["text"], "<b>Why?</b>")  # stored as text; the UI never parses it
+        self.assertNotIn("author", made["item"]["comments"][0])
+        _, reply = self.op({"op": "reply", "thread": tid, "text": "Because."}, role="edit", key=self.KEY_B)
+        own, other = reply["item"]["comments"]
+        self.assertEqual((own["mine"], other["mine"]), (False, True))
+        self.assertEqual(self.op({"op": "delete", "thread": tid, "comment": own["id"]}, role="edit",
+                                 key=self.KEY_B)[0], 403)
+        self.assertEqual(self.op({"op": "delete", "thread": tid, "comment": own["id"]}, role="edit")[0], 200)
+        self.assertEqual(self.op({"op": "resolve", "thread": tid, "resolved": True}, role="edit", key=self.KEY_B)[0],
+                         200)
+        _, data = self.get(role="view")
+        self.assertEqual((len(data["threads"]), data["threads"][0]["resolved"], data["moderator"]), (1, True, False))
+        self.assertEqual(self.op({"op": "delete", "thread": tid, "comment": other["id"]})[0], 200)  # owner moderates
+        self.assertEqual(self.get()[1]["threads"], [])
+
+    def test_viewers_read_only_and_bad_input(self):
+        self.tokens = self.share_on()
+        self.op({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "note"})
+        self.assertEqual(self.get(role="view")[0], 200)
+        self.assertEqual(self.op({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "x"},
+                                 role="view")[0], 403)
+        self.assertEqual(self.op({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "x"},
+                                 role="edit", doc="second")[0], 403)
+        for body, code in (({"op": "comment", "path": "../secret.tex", "anchor": self.anchor, "text": "x"}, 400),
+                           ({"op": "comment", "path": "fig.png", "anchor": self.anchor, "text": "x"}, 400),
+                           ({"op": "comment", "path": "nope.tex", "anchor": self.anchor, "text": "x"}, 404),
+                           ({"op": "comment", "path": "main.tex", "anchor": {"from": 5, "to": 2}, "text": "x"}, 400),
+                           ({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": " "}, 400),
+                           ({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "x" * 5000}, 400),
+                           ({"op": "reply", "thread": "zz", "text": "x"}, 404), ({"op": "nuke"}, 400)):
+            with self.subTest(body=str(body)[:50]):
+                self.assertEqual(self.op(body, role="edit")[0], code)
+        status, _ = self.request("POST", "/api/review?doc=demo", {"op": "comment", "path": "main.tex",
+                                 "anchor": self.anchor, "text": "x"},
+                                 {"Cookie": f"{serve.cookie_name()}={self.tokens['edit']}"})
+        self.assertEqual(status, 400)  # a link guest without an author key
+
+    def test_build_config_files_stay_with_the_owner(self):
+        self.tokens = self.share_on()
+        anchor = {"from": 0, "to": 6, "quote": "engine", "prefix": "", "suffix": " = "}
+        self.assertEqual(self.op({"op": "comment", "path": "build.toml", "anchor": anchor, "text": "x"},
+                                 role="edit")[0], 403)
+        self.assertEqual(self.op({"op": "comment", "path": "build.toml", "anchor": anchor, "text": "owner note"})[0],
+                         200)
+        self.assertEqual(len(self.get()[1]["threads"]), 1)
+        self.assertEqual(self.get(role="edit")[1]["threads"], [])
+
+    def test_suggestions_are_claimed_once(self):
+        self.tokens = self.share_on()
+        status, made = self.op({"op": "suggest", "path": "main.tex", "anchor": self.anchor, "insert": "hi"},
+                               role="edit")
+        self.assertEqual((status, made["item"]["mine"]), (200, True))
+        self.assertEqual(self.op({"op": "suggest", "path": "main.tex", "anchor": self.anchor, "insert": "hello"},
+                                 role="edit")[0], 400)  # changes nothing
+        sid = made["item"]["id"]
+        self.assertEqual(self.op({"op": "accept", "ids": [sid]}, role="view")[0], 403)
+        status, won = self.op({"op": "accept", "ids": [sid]}, role="edit", key=self.KEY_B)
+        self.assertEqual((status, [s["id"] for s in won["removed"]]), (200, [sid]))
+        self.assertEqual(self.op({"op": "accept", "ids": [sid]}, role="edit")[0], 409)  # a second click loses
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")  # the editor applies it
+
+    def test_reanchor_and_rename_follow_the_text(self):
+        _, made = self.op({"op": "comment", "path": "main.tex", "anchor": self.anchor, "text": "x"})
+        moved = {**self.anchor, "from": 20, "to": 25}
+        self.assertEqual(self.op({"op": "reanchor", "items": [{"id": made["item"]["id"], "anchor": moved},
+                                                             {"id": "gone", "anchor": moved}]})[1]["moved"], 1)
+        self.assertEqual(self.get()[1]["threads"][0]["anchor"]["from"], 20)
+        self.assertEqual(self.request("POST", "/api/fs?doc=demo&op=rename&path=main.tex&to=x.tex")[0], 409)
+        self.write("ch.tex", "hello\n")
+        self.op({"op": "comment", "path": "ch.tex", "anchor": self.anchor, "text": "y"})
+        self.assertEqual(self.request("POST", "/api/fs?doc=demo&op=rename&path=ch.tex&to=part/ch.tex")[0], 404)
+        (self.root / "part").mkdir()
+        self.assertEqual(self.request("POST", "/api/fs?doc=demo&op=rename&path=ch.tex&to=part/ch.tex")[0], 200)
+        self.assertEqual(sorted(t["path"] for t in self.get()[1]["threads"]), ["main.tex", "part/ch.tex"])
+
+
+class HostedHistoryAndReview(SharedState, ServerCase):
+    """Behind the gateway: authors are the accounts, and history and review data count toward the quota."""
+
+    as_ = GatewayMode.as_
+    SECRET = GatewayMode.SECRET
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable(self.SECRET, "demo")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".latex-history"}).start()
+
+    def test_accounts_are_the_authors(self):
+        anchor = {"from": 0, "to": 1, "quote": "\\", "prefix": "", "suffix": "section"}
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "v2"})[0], 200)
+        rows = self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"]
+        self.assertEqual(rows[0]["authors"], ["Ada"])
+        status, made = self.as_("edit", "POST", "/api/review?doc=demo",
+                                {"op": "comment", "path": "main.tex", "anchor": anchor, "text": "x", "name": "Mallory"})
+        self.assertEqual((status, made["item"]["comments"][0]["name"]), (200, "Ada"))  # not what the browser claims
+        cid = made["item"]["comments"][0]["id"]
+        tid = made["item"]["id"]
+        delete = {"op": "delete", "thread": tid, "comment": cid}
+        self.assertEqual(self.as_("edit", "POST", "/api/review?doc=demo", delete, user="8;Bob")[0], 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/review?doc=demo", delete)[0], 200)
+        self.assertEqual(self.as_("view", "POST", "/api/review?doc=demo",
+                                  {"op": "comment", "path": "main.tex", "anchor": anchor, "text": "x"})[0], 403)
+
+    def test_quota_stops_history_but_never_a_save(self):
+        mock.patch.dict(serve.QUOTA, {"bytes": serve.folder_bytes(self.base) + 3 * serve.ENTRY_BYTES,
+                                      "area": self.base}).start()
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "a"})[0], 200)
+        (self.base / "filler").write_bytes(b"0" * 8 * serve.ENTRY_BYTES)
+        before = self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"]
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": ""})[0], 200)  # shrinks
+        self.assertEqual((self.root / "main.tex").read_text(), "")
+        self.assertEqual(self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"], before)  # history stopped
+        status, _ = self.as_("edit", "POST", "/api/review?doc=demo", {"op": "comment", "path": "main.tex", "text": "x",
+                             "anchor": {"from": 0, "to": 0, "quote": "", "prefix": "", "suffix": ""}})
+        self.assertEqual(status, 507)
+        self.assertEqual(self.as_("edit", "POST", "/api/history/label?doc=demo", {"label": "v"})[0], 507)
+
+
 if __name__ == "__main__":
     unittest.main()
