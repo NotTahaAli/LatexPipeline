@@ -36,6 +36,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 * [GitHub Actions](#github-actions)
 * [Tests and lint](#tests-and-lint)
 * [Python project](#python-project-and-requirementstxt)
+* [Licence](#licence)
 
 ---
 
@@ -485,3 +486,7 @@ uv export --no-hashes --no-emit-project -o requirements.txt
 ```
 
 Add dependencies with `uv add <package>`. The scripts use only the standard library, so keep it that way where possible. `publish_release.py` also needs the `gh` CLI, which GitHub runners already include; it's only used in CI.
+
+## Licence
+
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`), see [`LICENSE`](LICENSE). If you run a modified copy as a network service (for example the hosted mode), you must offer its users the modified source. The bundled fonts in `scripts/fonts/` keep their own SIL Open Font License (`scripts/fonts/OFL.txt`).
