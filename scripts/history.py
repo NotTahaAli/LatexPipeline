@@ -25,24 +25,31 @@ from contextlib import closing
 from pathlib import Path
 
 COALESCE = 300.0  # seconds: one author's saves of one file merge into one version for this long
-MAX_ROWS = 3000  # versions per document; the oldest unlabelled ones go first
-MAX_LABELS = 300
+MAX_ROWS = 3000  # file versions per document (labels not counted); the oldest superseded ones go first
+MAX_LABELS = 300  # named versions per document; never evicted, refused past this
+MAX_SHARED_LABELS = 100  # of which a shared role (not the owner) may make this many
 MAX_BYTES = 64 * 1024 * 1024  # compressed blob bytes per document
 MAX_DIFF_ROWS = 4000
+MAX_DIFF_LINES = 2000  # lines of the changed middle (after the common start and end) the diff matcher looks at
+BLOCK = 4096  # a quota charges at least one disk block per file
 LOCK = threading.RLock()  # ponytail: one lock for every store; history writes are small and rare enough
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, started REAL NOT NULL,
     path TEXT, hash TEXT, size INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL,
-    authors TEXT NOT NULL DEFAULT '[]', label TEXT, manifest TEXT);
+    authors TEXT NOT NULL DEFAULT '[]', label TEXT, manifest TEXT, role TEXT);
 CREATE INDEX IF NOT EXISTS versions_path ON versions(path, id);
 CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
 """
 
 
 class Full(Exception):
-    """The store may not grow (the caller's quota said no)."""
+    """The store may not grow: over its caps, or the caller's quota said no. Nothing was recorded."""
+
+
+class Refused(Full):
+    """Too many named versions; the caller should say so rather than fail quietly."""
 
 
 def digest(text: str) -> str:
@@ -50,10 +57,10 @@ def digest(text: str) -> str:
 
 
 class Store:
-    def __init__(self, folder: Path, max_bytes: int = MAX_BYTES, allow=None) -> None:
+    def __init__(self, folder: Path, max_bytes: int = MAX_BYTES, room=None) -> None:
         self.folder = folder
         self.max_bytes = max_bytes
-        self.allow = allow or (lambda size: True)  # allow(new bytes) -> bool, e.g. a project quota
+        self.room = room or (lambda: None)  # room() -> bytes the store may still add (e.g. a quota), None: no limit
 
     # --- storage -----------------------------------------------------------------------------------------------
 
@@ -62,18 +69,24 @@ class Store:
         con = sqlite3.connect(str(self.folder / "index.sqlite3"), timeout=10)
         con.row_factory = sqlite3.Row
         con.executescript(SCHEMA)
+        if "role" not in {r[1] for r in con.execute("PRAGMA table_info(versions)")}:  # stores made before it
+            con.execute("ALTER TABLE versions ADD COLUMN role TEXT")
         return con
 
     def _blob_path(self, h: str) -> Path:
         return self.folder / "blobs" / h[:2] / h
 
-    def _put(self, con: sqlite3.Connection, text: str) -> str:
+    def _put(self, con: sqlite3.Connection, text: str, budget: list, written: list) -> str:
+        """Store a blob; budget = [bytes left or None], measured once per record; written collects new files."""
         h = digest(text)
         if con.execute("SELECT 1 FROM blobs WHERE hash = ?", (h,)).fetchone() and self._blob_path(h).is_file():
             return h
         data = zlib.compress(text.encode("utf-8"), 6)
-        if not self.allow(len(data)):
-            raise Full("no room for history")
+        cost = max(len(data), BLOCK)
+        if budget[0] is not None:
+            if cost > budget[0]:
+                raise Full("no room for history")
+            budget[0] -= cost
         path = self._blob_path(h)
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=".blob.")
@@ -87,8 +100,31 @@ class Store:
             except OSError:
                 pass
             raise
+        written.append(h)
         con.execute("INSERT OR REPLACE INTO blobs (hash, bytes) VALUES (?, ?)", (h, len(data)))
         return h
+
+    def _write(self, work):
+        """Run work(con, put) in one transaction; on any failure nothing stays, the new blob files included."""
+        written: list = []
+        with LOCK, closing(self._db()) as con:
+            self._doomed = []
+            budget = [self.room()]
+            try:
+                with con:
+                    result = work(con, lambda text: self._put(con, text, budget, written))
+            except BaseException:
+                gone = written
+                raise
+            else:
+                gone = self._doomed
+            finally:
+                for h in gone:
+                    try:
+                        self._blob_path(h).unlink()
+                    except OSError:
+                        pass
+            return result
 
     def blob(self, h: str) -> str:
         try:
@@ -102,11 +138,13 @@ class Store:
                now: float | None = None) -> int | None:
         """
         Add a version of one file (text None: it was deleted). Returns the new row's id, or None when nothing new
-        was stored (same content as the file's latest version, or merged into it).
+        was stored (same content as the file's latest version, or merged into it). Raises Full when the store is at
+        its caps and nothing old may go: history then stops instead of forgetting.
         """
         now = time.time() if now is None else now
         names = json.dumps(sorted({str(a)[:80] for a in authors if a}))
-        with LOCK, closing(self._db()) as con, con:
+
+        def work(con, put):
             last = con.execute("SELECT * FROM versions WHERE path = ? ORDER BY id DESC LIMIT 1", (path,)).fetchone()
             h = None if text is None else digest(text)
             if last is not None and last["hash"] == h and kind in ("auto", "outside", "delete"):
@@ -114,7 +152,7 @@ class Store:
             if last is None and text is None:
                 return None  # A file we never saw went away: nothing to remember.
             if text is not None:
-                self._put(con, text)
+                put(text)
             size = 0 if text is None else len(text)
             merge = (kind == "auto" and last is not None and last["kind"] == "auto" and last["hash"] is not None
                      and last["authors"] == names and now - last["started"] < COALESCE
@@ -122,7 +160,8 @@ class Store:
                                          (last["id"],)).fetchone())
             if merge:
                 con.execute("UPDATE versions SET time = ?, hash = ?, size = ? WHERE id = ?", (now, h, size, last["id"]))
-                self._prune(con, orphaned=True)
+                self._collect(con)
+                self._prune(con)
                 return None
             cur = con.execute(
                 "INSERT INTO versions (time, started, path, hash, size, kind, authors, label) VALUES (?,?,?,?,?,?,?,?)",
@@ -130,52 +169,53 @@ class Store:
             self._prune(con)
             return cur.lastrowid
 
-    def label(self, name: str, authors, texts: dict[str, str], now: float | None = None) -> int:
-        """Name the current state of the project (texts: every text file's content)."""
+        return self._write(work)
+
+    def label(self, name: str, authors, texts: dict[str, str], now: float | None = None, role: str = "owner") -> int:
+        """Name the current state of the project (texts: every text file's content). Raises Refused past the caps."""
         now = time.time() if now is None else now
-        with LOCK, closing(self._db()) as con, con:
-            manifest = {path: self._put(con, text) for path, text in sorted(texts.items())}
+
+        def work(con, put):
+            total, shared = con.execute("SELECT COUNT(*), COALESCE(SUM(role != 'owner'), 0) FROM versions "
+                                        "WHERE kind = 'label'").fetchone()
+            if total >= MAX_LABELS or (role != "owner" and shared >= MAX_SHARED_LABELS):
+                raise Refused(f"This document has {total} named versions, the most it keeps.")
+            manifest = {path: put(text) for path, text in sorted(texts.items())}
             cur = con.execute(
-                "INSERT INTO versions (time, started, path, hash, size, kind, authors, label, manifest) "
-                "VALUES (?, ?, NULL, NULL, ?, 'label', ?, ?, ?)",
+                "INSERT INTO versions (time, started, path, hash, size, kind, authors, label, manifest, role) "
+                "VALUES (?, ?, NULL, NULL, ?, 'label', ?, ?, ?, ?)",
                 (now, now, sum(len(t) for t in texts.values()), json.dumps(sorted({str(a)[:80] for a in authors})),
-                 name, json.dumps(manifest)))
+                 name, json.dumps(manifest), role))
             self._prune(con)
             return cur.lastrowid
 
-    def _prune(self, con: sqlite3.Connection, orphaned: bool = False) -> None:
-        """Keep MAX_ROWS rows, MAX_LABELS labels and max_bytes of blobs. A file's newest row always stays."""
-        labels = con.execute("SELECT COUNT(*) FROM versions WHERE kind = 'label'").fetchone()[0]
-        if labels > MAX_LABELS:
-            con.execute("DELETE FROM versions WHERE id IN (SELECT id FROM versions WHERE kind = 'label' "
-                        "ORDER BY id LIMIT ?)", (labels - MAX_LABELS,))
-            orphaned = True
-        if orphaned:
-            self._collect(con)
-        while (con.execute("SELECT COUNT(*) FROM versions").fetchone()[0] > MAX_ROWS
+        return self._write(work)
+
+    def _prune(self, con: sqlite3.Connection) -> None:
+        """
+        Keep MAX_ROWS file versions and max_bytes of blobs by dropping the oldest superseded versions (a version
+        with a newer one holding text). Labels, each file's newest text and the text before a deletion always stay;
+        when that is not enough, raise Full (the caller's transaction rolls back).
+        """
+        while (con.execute("SELECT COUNT(*) FROM versions WHERE kind != 'label'").fetchone()[0] > MAX_ROWS
                or con.execute("SELECT COALESCE(SUM(bytes), 0) FROM blobs").fetchone()[0] > self.max_bytes):
             victims = [r[0] for r in con.execute(
-                "SELECT v.id FROM versions v WHERE v.path IS NOT NULL AND EXISTS "
-                "(SELECT 1 FROM versions w WHERE w.path = v.path AND w.id > v.id) ORDER BY v.id LIMIT 50")]
-            victims = victims or [r[0] for r in con.execute(
-                "SELECT id FROM versions WHERE kind = 'label' ORDER BY id LIMIT 1")]
+                "SELECT v.id FROM versions v WHERE v.path IS NOT NULL AND EXISTS (SELECT 1 FROM versions w "
+                "WHERE w.path = v.path AND w.id > v.id AND w.hash IS NOT NULL) ORDER BY v.id LIMIT 50")]
             if not victims:
-                break
+                raise Full("history is full")
             con.execute(f"DELETE FROM versions WHERE id IN ({','.join('?' * len(victims))})", victims)
             self._collect(con)
 
     def _collect(self, con: sqlite3.Connection) -> None:
-        """Delete blobs no row and no label manifest refers to."""
+        """Forget blobs no row and no label manifest refers to; their files go once the transaction commits."""
         used = {r[0] for r in con.execute("SELECT hash FROM versions WHERE hash IS NOT NULL")}
         for (manifest,) in con.execute("SELECT manifest FROM versions WHERE manifest IS NOT NULL"):
             used.update(json.loads(manifest).values())
         for (h,) in con.execute("SELECT hash FROM blobs").fetchall():
             if h not in used:
                 con.execute("DELETE FROM blobs WHERE hash = ?", (h,))
-                try:
-                    self._blob_path(h).unlink()
-                except OSError:
-                    pass
+                self._doomed.append(h)
 
     # --- reading ----------------------------------------------------------------------------------------------
 
@@ -243,21 +283,35 @@ class Store:
 
 
 def diff(a: str, b: str, context: int = 3) -> dict:
-    """Line diff a -> b as hunks of rows [op, old line, new line, text]; op is ' ', '-' or '+'."""
+    """
+    Line diff a -> b as hunks of rows [op, old line, new line, text]; op is ' ', '-' or '+'. The common start and end
+    are cut first; the matcher (quadratic at worst) sees at most MAX_DIFF_LINES lines of each changed middle, and
+    "truncated" says when that or MAX_DIFF_ROWS cut the diff short.
+    """
     old, new = a.split("\n"), b.split("\n")
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=len(old) + len(new) > 40000)
-    hunks, added, removed, rows_out, cut = [], 0, 0, 0, False
+    head = 0
+    while head < min(len(old), len(new)) and old[head] == new[head]:
+        head += 1
+    tail = 0
+    while tail < min(len(old), len(new)) - head and old[-1 - tail] == new[-1 - tail]:
+        tail += 1
+    start = max(0, head - context)
+    a_mid, b_mid = old[start:len(old) - max(0, tail - context)], new[start:len(new) - max(0, tail - context)]
+    cut = len(a_mid) > MAX_DIFF_LINES + 2 * context or len(b_mid) > MAX_DIFF_LINES + 2 * context
+    a_mid, b_mid = a_mid[:MAX_DIFF_LINES + 2 * context], b_mid[:MAX_DIFF_LINES + 2 * context]
+    matcher = difflib.SequenceMatcher(None, a_mid, b_mid)  # autojunk: very common lines anchor nothing (fast)
+    hunks, added, removed, rows_out = [], 0, 0, 0
     for group in matcher.get_grouped_opcodes(context):
         rows: list[list] = []
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
-                rows += [[" ", i + 1, j1 + (i - i1) + 1, old[i]] for i in range(i1, i2)]
+                rows += [[" ", start + i + 1, start + j1 + (i - i1) + 1, a_mid[i]] for i in range(i1, i2)]
                 continue
             if tag in ("replace", "delete"):
-                rows += [["-", i + 1, None, old[i]] for i in range(i1, i2)]
+                rows += [["-", start + i + 1, None, a_mid[i]] for i in range(i1, i2)]
                 removed += i2 - i1
             if tag in ("replace", "insert"):
-                rows += [["+", None, j + 1, new[j]] for j in range(j1, j2)]
+                rows += [["+", None, start + j + 1, b_mid[j]] for j in range(j1, j2)]
                 added += j2 - j1
         if rows_out + len(rows) > MAX_DIFF_ROWS:
             cut = True

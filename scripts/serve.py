@@ -2442,6 +2442,9 @@ HISTORY: dict = {"dir": None}  # None: .latex-history beside build.CACHE_DIR
 ROLE_NAMES = {"owner": "Owner", "edit": "Editor", "view": "Viewer"}
 HISTORY_LIMIT = (20, 60.0)  # labels and restores a shared role may make per window
 REVIEW_LIMIT = (120, 60.0)  # comments, suggestions and decisions per window
+HISTORY_READ_LIMIT = (120, 60.0)  # history lists, versions and diffs a shared role may read per window
+FS_LIMIT = (60, 60.0)  # file tree changes a shared role may make per window
+PUT_LIMIT = (900, 60.0)  # saves a shared role may make per window (every editor of the link together)
 MAX_LABEL = 120
 RESTORE_GRACE = 120.0  # seconds a restore applied through a room has to reach the disk
 
@@ -2463,9 +2466,17 @@ def store_allows(size: int) -> bool:
         return False
 
 
+def store_room() -> int | None:
+    """Bytes the project may still grow by (None: no quota), measured once per history write."""
+    if not QUOTA["bytes"]:
+        return None
+    with WRITE_LOCK:
+        return max(0, QUOTA["bytes"] - folder_bytes(QUOTA["area"]))
+
+
 def history_store(name: str) -> history.Store:
     cap = min(history.MAX_BYTES, QUOTA["bytes"] // 4) if QUOTA["bytes"] else history.MAX_BYTES
-    return history.Store(history_folder(name), cap, store_allows)
+    return history.Store(history_folder(name), cap, store_room)
 
 
 def review_store(name: str) -> review.Review:
@@ -2476,10 +2487,17 @@ def author_name(role: str, user: str | None, client: str | None = None) -> str:
     """Display name: the account's behind the gateway, else what the client said in hello."""
     if user:
         return user.partition(";")[2] or "Someone"
-    record = CLIENTS.get(client or "")
-    if record and record["role"] == role and record.get("name"):
+    record = CLIENTS.get(client or "") if trusted_client(client, role, user) else None
+    if record and record.get("name"):
         return record["name"]
     return ROLE_NAMES.get(role, role)
+
+
+def trusted_client(client: str | None, role: str, user: str | None) -> str | None:
+    """A ?cid= from a request, only if it is bound to this caller's role and account (presence shows client ids)."""
+    with COLLAB_LOCK:
+        record = CLIENTS.get(client or "")
+        return client if record and record["role"] == role and record.get("user") == user else None
 
 
 def remember(name: str, rel: str, text: str | None, authors=(), kind: str = "auto", label: str | None = None) -> None:
@@ -2610,7 +2628,7 @@ def history_diff(name: str, role: str, vid, path: str | None, against: str) -> d
     return {"path": path, "id": found["id"], "against": "previous" if against == "previous" else "current", **result}
 
 
-def history_label(name: str, label, author: str) -> dict:
+def history_label(name: str, label, author: str, role: str = "owner") -> dict:
     """Name the project as it is now: every text file's current text goes into the label's own manifest."""
     if not isinstance(label, str) or not label.strip() or len(label) > MAX_LABEL:
         raise ApiError(f"Give the version a name (up to {MAX_LABEL} characters).", 400)
@@ -2622,9 +2640,11 @@ def history_label(name: str, label, author: str) -> dict:
             continue  # too large or not UTF-8: not something the editor versions
         remember_disk(name, path)
     try:
-        vid = history_store(name).label(label.strip(), [author], texts)
+        vid = history_store(name).label(label.strip(), [author], texts, role=role)
+    except history.Refused as exc:
+        raise ApiError(f"{exc} No more can be named.", 409)
     except history.Full:
-        raise ApiError("This project is over its quota, so no version can be saved. Delete files first.", 507)
+        raise ApiError("No version can be saved: the history is full or the project is over its quota.", 507)
     except (OSError, sqlite3.Error) as exc:
         raise ApiError(f"Could not save the version: {exc}", 500)
     BUS.publish("history", {"doc": name})
@@ -2728,7 +2748,10 @@ def review_list(name: str, role: str, user: str | None, key) -> dict:
         who = reviewer(role, user, {"key": key})["key"]
     except ApiError:
         who = None
-    data = review_store(name).load()
+    try:
+        data = review_store(name).load()
+    except review.ReviewError as exc:
+        raise ApiError(str(exc), exc.status)
     keep = (lambda i: True) if role == "owner" else (lambda i: not is_rc(i.get("path") or ""))
     return {"threads": [review_view(t, who) for t in data["threads"] if keep(t)],
             "suggestions": [review_view(s, who) for s in data["suggestions"] if keep(s)],
@@ -2881,6 +2904,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
             scoped(doc)
+            if path.startswith("/api/history") and not rate_ok("history-read", *HISTORY_READ_LIMIT):
+                raise ApiError("Too many history requests; wait a moment.", 429)  # diffs cost CPU
         elif path == "/forward" and "quiet" in query:
             return  # Checked again once the target document is known.
         else:
@@ -2895,6 +2920,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
     elif method == "POST" and path == "/api/fs":
         need_edit()
         scoped(doc)
+        if not rate_ok("fs", *FS_LIMIT):  # each change is a version; bursts would flood the history
+            raise ApiError("Too many file changes; wait a moment.", 429)
         if any(is_rc((query.get(key) or [""])[0]) for key in ("path", "to")):
             raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
     elif method == "POST" and path == "/api/upload":
@@ -2954,6 +2981,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
     elif method == "PUT" and path == "/api/file":
         need_edit()
         scoped(doc)
+        if not rate_ok("put", *PUT_LIMIT):  # autosave is at most one save a second per person
+            raise ApiError("Too many saves; wait a moment.", 429)
         if posixpath.basename((query.get("path") or [""])[0]).lower() in RC_NAMES:
             raise ApiError("This file configures the build and cannot be edited through a shared link.", 403)
     else:
@@ -3133,7 +3162,7 @@ class Handler(BaseHTTPRequestHandler):
             history_after_fs(name, op, rel, to, touched, author_name(self.role, self.user, query.get("cid", [""])[0]))
             self.json(result)
         elif url.path == "/api/history/label" and name in DOCS:
-            self.json(history_label(name, self.body().get("label"), self.author(query)))
+            self.json(history_label(name, self.body().get("label"), self.author(query), self.role))
         elif url.path == "/api/history/restore" and name in DOCS:
             data = self.body()
             self.json(history_restore(name, self.role, data.get("id"), data.get("path") or None, self.author(query)))
@@ -3219,7 +3248,8 @@ class Handler(BaseHTTPRequestHandler):
         result = write_text_file(
             root, query.get("path", [""])[0], data.get("text"), data.get("base"), data.get("eol", "\n"),
         )
-        doc, rel, cid = query["doc"][0], query.get("path", [""])[0], str(query.get("cid", [""])[0])[:64] or None
+        doc, rel = query["doc"][0], query.get("path", [""])[0]
+        cid = trusted_client(str(query.get("cid", [""])[0])[:64] or None, self.role, self.user)
         note_write(doc, rel, data["text"], result["version"], cid)
         remember(doc, rel, data["text"], save_authors(doc, rel, cid, self.author(query)))
         self.json(result)

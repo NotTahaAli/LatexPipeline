@@ -26,6 +26,8 @@ MAX_INSERT = 20000  # a suggestion's new text
 MAX_QUOTE = 20000  # the anchored text
 MAX_CONTEXT = 64
 MAX_OFFSET = 4 * 1024 * 1024
+MAX_FILE = 16 * 1024 * 1024  # the whole JSON file, rewritten on every change
+CLAIM_TTL = 600.0  # seconds an accepted suggestion can be released (its edit could not be applied)
 LOCK = threading.Lock()  # ponytail: one lock for every document's file; review writes are rare and tiny
 
 
@@ -60,16 +62,35 @@ class Review:
         self.allow = allow or (lambda size: True)  # allow(new bytes) -> bool, e.g. a project quota
 
     def load(self) -> dict:
+        with LOCK:  # never half a file from a concurrent save (os.replace on Windows)
+            return self._load()
+
+    def _load(self) -> dict:
+        """The stored data. Missing: empty. Unreadable: an error, never "empty" (the next save would wipe it).
+        Not valid JSON: moved aside to <name>.bad-<time> and started afresh, so nothing is overwritten."""
         try:
-            data = json.loads(self.path.read_text("utf-8"))
-            if isinstance(data, dict):
-                return {"threads": list(data.get("threads") or []), "suggestions": list(data.get("suggestions") or [])}
-        except (OSError, ValueError):
-            pass
-        return {"threads": [], "suggestions": []}
+            raw = self.path.read_text("utf-8")
+        except FileNotFoundError:
+            return {"threads": [], "suggestions": [], "claimed": []}
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ReviewError(f"Could not read the review data: {exc}", 500)
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            try:
+                os.replace(self.path, self.path.with_name(f"{self.path.name}.bad-{int(time.time())}"))
+            except OSError as exc:
+                raise ReviewError(f"The review data is damaged and could not be moved aside: {exc}", 500)
+            return {"threads": [], "suggestions": [], "claimed": []}
+        return {key: list(data.get(key) or []) for key in ("threads", "suggestions", "claimed")}
 
     def _save(self, data: dict) -> None:
         raw = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > MAX_FILE:
+            raise ReviewError("This document holds as many comments and suggestions as it can; resolve or delete "
+                              "some first.", 413)
         try:
             old = self.path.stat().st_size
         except OSError:
@@ -96,8 +117,9 @@ class Review:
         """
         now = time.time() if now is None else now
         with LOCK:
-            data = self.load()
+            data = self._load()
             threads, suggestions = data["threads"], data["suggestions"]
+            data["claimed"] = [c for c in data["claimed"] if now - c.get("claimed", 0) < CLAIM_TTL]
 
             def thread(tid) -> dict:
                 found = next((t for t in threads if t.get("id") == tid), None)
@@ -151,15 +173,24 @@ class Review:
                         "author": who["key"], "name": who["name"], "time": now}
                 suggestions.append(item)
                 result = {"item": item}
-            elif op in ("accept", "reject"):
+            elif op in ("accept", "reject", "release"):
                 ids = args.get("ids")
                 if not isinstance(ids, list) or not ids or len(ids) > MAX_SUGGESTIONS:
                     raise ReviewError("Bad suggestion list.")
-                removed = [s for s in suggestions if s.get("id") in ids]
-                if not removed:
-                    raise ReviewError("Those suggestions were already accepted or rejected.", 409)
-                data["suggestions"] = [s for s in suggestions if s not in removed]
-                result = {"removed": removed}
+                if op == "release":  # The accepted edit could not be applied: the claimer puts them back as they were.
+                    back = [c for c in data["claimed"]
+                            if c.get("item", {}).get("id") in ids and c.get("by") == who["key"]]
+                    data["claimed"] = [c for c in data["claimed"] if c not in back]
+                    suggestions.extend(c["item"] for c in back)
+                    result = {"released": len(back)}
+                else:
+                    removed = [s for s in suggestions if s.get("id") in ids]
+                    if not removed:
+                        raise ReviewError("Those suggestions were already accepted or rejected.", 409)
+                    data["suggestions"] = [s for s in suggestions if s not in removed]
+                    if op == "accept":  # Claimed once: whoever gets here first applies the edit.
+                        data["claimed"] += [{"item": s, "by": who["key"], "claimed": now} for s in removed]
+                    result = {"removed": removed}
             elif op == "reanchor":
                 items = args.get("items")
                 if not isinstance(items, list) or len(items) > MAX_THREADS + MAX_SUGGESTIONS:
@@ -169,7 +200,10 @@ class Review:
                 for entry in items:
                     target = by_id.get(entry.get("id")) if isinstance(entry, dict) else None
                     if target is not None:
-                        target["anchor"] = anchor(entry.get("anchor"))
+                        spot = anchor(entry.get("anchor"))
+                        if len(spot["quote"]) > len(target["anchor"]["quote"]):
+                            continue  # an anchor may move or shrink, never grow (the file is rewritten each time)
+                        target["anchor"] = spot
                         moved += 1
                 result = {"moved": moved}
             else:
@@ -180,7 +214,7 @@ class Review:
     def rename(self, old: str, new: str) -> bool:
         """Items on old (a file, or everything below a folder) follow it to new. True when anything moved."""
         with LOCK:
-            data = self.load()
+            data = self._load()
             moved = False
             for item in [*data["threads"], *data["suggestions"]]:
                 path = item.get("path") or ""
