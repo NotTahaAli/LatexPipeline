@@ -28,14 +28,13 @@ import grammar
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-opus-5-5"
-MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")  # offered in the UI; any claude-* id works
-MODEL_NAME = re.compile(r"claude-[a-z0-9][a-z0-9.-]{0,60}")
+MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")  # the only ones accepted (effort + schema)
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-sonnet-5-5"}  # server-side fallback when the model declines
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 NOTICE = "The AI assistant sends the text you ask about to Anthropic (api.anthropic.com)."
 TASKS = ("explain", "rewrite", "shorten", "grammar", "translate", "write", "ask")
 SELECTION_TASKS = ("rewrite", "shorten", "grammar", "translate")
-MAX_TOKENS = 8000  # per reply, thinking included
+MAX_TOKENS = 16_000  # per reply, thinking included
 MAX_BODY = 1_000_000  # bytes of one request from the editor
 MAX_FILE_CHARS = 120_000
 MAX_FILES = 3
@@ -46,10 +45,11 @@ MAX_LOG = 8_000
 MAX_HISTORY = 6
 MAX_OUTLINE = 300
 WINDOW = (40, 25)  # lines before and after an error line the model sees
-RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # serve.RC_NAMES: never edited for a non-owner
-# New LaTeX that could run programs or write files. Shown nowhere: an edit or text holding it is dropped.
-UNSAFE = re.compile(r"\\(?:write18|directlua|latelua|luaexec|luadirect|openout|immediate\s*\\write|ShellEscape)|"
-                    r"\\input\s*\{?\s*\||shell-?escape", re.I)
+RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # serve.RC_NAMES: never sent and never edited, for anyone
+# New LaTeX that could run programs or write files: an edit or text holding it is dropped. Best effort only (TeX can
+# spell anything indirectly); the real guards are the click before applying and the build restrictions.
+UNSAFE = re.compile(r"\\write\s*1?8\b|directlua|latelua|luaexec|luadirect|luacode|\\openout|ShellEscape|"
+                    r"\\input\s*\{?\s*[\"']?\||shell-?escape", re.I)
 LIMITER = grammar.Limiter(requests=20, size=10 ** 12)  # requests per minute from this process, every user together
 SETTINGS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "latex-pipeline" / "ai.json"
 SCHEMA = {
@@ -96,6 +96,7 @@ class AiError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
+        self.usage = {"input": 0, "output": 0}  # tokens billed before the error (see ask)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ def load_settings(path: Path | None = None) -> dict:
     model = found.get("model")
     key = found.get("key")
     return {"enabled": found.get("enabled") is True, "share": found.get("share") is True,
-            "model": model if isinstance(model, str) and MODEL_NAME.fullmatch(model) else DEFAULT_MODEL,
+            "model": model if model in MODELS else DEFAULT_MODEL,
             "key": key if isinstance(key, str) and key else None}
 
 
@@ -152,8 +153,8 @@ def check_key(key) -> str:
 
 
 def check_model(model) -> str:
-    if not (isinstance(model, str) and MODEL_NAME.fullmatch(model)):
-        raise AiError("The model must be a Claude model id such as " + DEFAULT_MODEL + ".")
+    if model not in MODELS:
+        raise AiError("The model must be one of " + ", ".join(MODELS) + ".")
     return model
 
 
@@ -166,7 +167,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # The key header must never follow a redirect to another host.
 
 
-def post_json(url: str, body: dict, headers: dict, timeout: float = 120.0) -> dict:
+def post_json(url: str, body: dict, headers: dict, timeout: float = 300.0) -> dict:
     """POST JSON to the Anthropic API and return its JSON reply. The only network call; tests replace it."""
     request = urllib.request.Request(url, json.dumps(body).encode("utf-8"), {
         "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "latex-pipeline-ai", **headers})
@@ -216,18 +217,25 @@ def _files(data: dict, need: int) -> list[dict]:
         path = _text(item, "path", 500, True)
         if path.startswith(("/", "\\")) or ".." in path.replace("\\", "/").split("/") or "\x00" in path:
             raise AiError("File paths are relative to the document.")
+        if is_rc(path):
+            raise AiError("Build configuration files are never sent to the assistant.")
         text = _text(item, "text", MAX_FILE_CHARS)
         line = item.get("line")
         line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
         start, end = 0, len(text)
         if line is not None:
             starts = [0] + [m.end() for m in re.finditer("\n", text)]
+            line = min(line, len(starts))  # a log can name a line past the end of the file
             first, last = max(1, line - WINDOW[0]), min(len(starts), line + WINDOW[1])
             start, end = starts[first - 1], starts[last] if last < len(starts) else len(text)
         out.append({"path": path, "text": text, "line": line, "start": start, "end": end})
     if len({f["path"] for f in out}) != len(out):
         raise AiError("A file is listed twice.")
     return out
+
+
+def is_rc(path: str) -> bool:
+    return path.replace("\\", "/").rsplit("/", 1)[-1].lower() in RC_NAMES
 
 
 def _file_block(f: dict) -> str:
@@ -303,7 +311,17 @@ def request_body(prompt: str, model: str, task: str) -> tuple[dict, dict]:
 # Reply: the model's output is untrusted
 # ---------------------------------------------------------------------------
 
-def parse_reply(reply: dict, task: str, files: list[dict], owner: bool) -> dict:
+def usage_of(reply) -> dict:
+    """Billed tokens of a reply; with a server-side fallback, of every model that ran (usage.iterations)."""
+    usage = reply.get("usage") if isinstance(reply, dict) and isinstance(reply.get("usage"), dict) else {}
+    parts = [u for u in usage.get("iterations") or [] if isinstance(u, dict)] or [usage]
+
+    def total(key: str) -> int:
+        return sum(u[key] for u in parts if isinstance(u.get(key), int) and not isinstance(u.get(key), bool))
+    return {"input": total("input_tokens"), "output": total("output_tokens")}
+
+
+def parse_reply(reply: dict, task: str, files: list[dict]) -> dict:
     if not isinstance(reply, dict):
         raise AiError("Anthropic sent an unexpected reply.", 502)
     stop = reply.get("stop_reason")
@@ -331,11 +349,10 @@ def parse_reply(reply: dict, task: str, files: list[dict], owner: bool) -> dict:
             notes.append("A malformed edit was dropped.")
             continue
         f = by_path.get(edit["file"])
-        name = edit["file"].replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if f is None:
+        if is_rc(edit["file"]):
+            notes.append(f"An edit to {edit['file'][:80]!r} was dropped: build configuration is never edited here.")
+        elif f is None:
             notes.append(f"An edit to {edit['file'][:80]!r} was dropped: that file was not sent.")
-        elif name in RC_NAMES and not owner:
-            notes.append(f"An edit to {edit['file']} was dropped: build configuration is owner-only.")
         elif UNSAFE.search(edit["new"]) and not UNSAFE.search(edit["old"]):
             notes.append("An edit that could run programs or write files was dropped.")
         elif not edit["old"] or edit["old"] == edit["new"] or len(edit["new"]) > 20_000:
@@ -349,14 +366,13 @@ def parse_reply(reply: dict, task: str, files: list[dict], owner: bool) -> dict:
             edits.append({"file": f["path"], "from": grammar.to_utf16(f["text"], at),
                           "to": grammar.to_utf16(f["text"], at + len(edit["old"])),
                           "old": edit["old"], "new": edit["new"]})
-    usage = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
     return {"answer": out["answer"][:20_000], "text": text, "edits": edits[:10], "notes": notes,
-            "model": str(reply.get("model") or "")[:80],
-            "usage": {"input": int(usage.get("input_tokens") or 0), "output": int(usage.get("output_tokens") or 0)}}
+            "model": str(reply.get("model") or "")[:80], "usage": usage_of(reply)}
 
 
-def ask(data: dict, *, key: str, model: str, owner: bool) -> dict:
-    """Validate the editor's request, ask the model once, and return the checked reply."""
+def ask(data: dict, *, key: str, model: str) -> dict:
+    """Validate the editor's request, ask the model once, and return the checked reply. An AiError raised after the
+    call carries the billed tokens in .usage: a refusal, a cut-off or a malformed answer still costs."""
     task, prompt, files = build_prompt(data)
     try:
         LIMITER.acquire(1, max_wait=0)
@@ -364,4 +380,8 @@ def ask(data: dict, *, key: str, model: str, owner: bool) -> dict:
         raise AiError("Too many AI requests on this server; wait a minute.", 429)
     body, headers = request_body(prompt, model, task)
     reply = post_json(API_URL, body, {"x-api-key": key, "anthropic-version": API_VERSION, **headers})
-    return parse_reply(reply, task, files, owner)
+    try:
+        return parse_reply(reply, task, files)
+    except AiError as exc:
+        exc.usage = usage_of(reply)
+        raise

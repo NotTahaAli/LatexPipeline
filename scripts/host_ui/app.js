@@ -444,7 +444,7 @@ async function adminPage() {
     el("tbody", {}, a.usage.map((r) => el("tr", {}, el("td", { className: "mono", textContent: r.email || "(deleted)" }), el("td", { textContent: r.workspace || "(deleted)" }),
       el("td", { textContent: r.requests }), el("td", { className: "mono", textContent: `${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}` }),
       el("td", { className: "mute", textContent: r.last_day }))))));
-  const aiLead = a.enabled ? `On, model ${a.model}. At most ${a.daily_per_user} requests per person and ${a.daily_per_workspace} per workspace a day. Set in config.toml.`
+  const aiLead = a.enabled ? `On, model ${a.model}. At most ${a.daily_per_user} requests (${a.daily_tokens_per_user.toLocaleString()} tokens) per person, ${a.daily_per_workspace} per workspace and ${a.daily_total} in all a day. Set in config.toml.`
     : a.configured ? "Enabled in config.toml, but the API key is missing (api_key_env)." : "Off. The operator turns it on in config.toml ([ai]).";
   const sect = (id, title, lead, ...body) => el("section", { className: "adm", id: "s-" + id, ariaLabel: title },
     el("h2", { textContent: title, tabIndex: -1 }), lead ? el("p", { className: "lead", textContent: lead }) : null, ...body);

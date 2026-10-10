@@ -1580,17 +1580,28 @@ AI_GUEST_CAP = 100  # requests from shared links per server run
 AI: dict = {"guest_used": 0}
 
 
+def ai_sandboxed() -> bool:
+    """Builds run under bubblewrap. Without it, Lua code from an edit link (LuaLaTeX stays allowed while sharing)
+    can read the key: the settings file, and /proc/<pid>/environ still holds a key popped from os.environ."""
+    try:
+        return build.sandbox.enabled()
+    except OSError:
+        return False
+
+
 def ai_info(role: str = "owner") -> dict:
-    """What the editor may show. The key never leaves this process; only the owner learns where it comes from."""
+    """What the editor may show. The key is never sent; only the owner learns where it comes from."""
     saved = ai.load_settings()
-    on = bool(saved["enabled"] and (ai.env_key() or saved["key"]) and not GATEWAY["secret"])
-    allowed = on and (role == "owner" or (role == "edit" and saved["share"]))
+    key = ai.env_key() or saved["key"]
+    on = bool(saved["enabled"] and key and not GATEWAY["secret"])
+    share = saved["share"] and ai_sandboxed()  # guests only when their LaTeX cannot read the key
+    allowed = on and (role == "owner" or (role == "edit" and share))
     info = {"enabled": allowed, "model": saved["model"], "notice": ai.NOTICE,
             "reason": None if allowed else "View-only links cannot use the assistant." if role == "view"
             else "The owner has not allowed the assistant for shared links." if on
             else "The AI assistant is off. The owner can turn it on in the Assistant panel."}
     if role == "owner":
-        info.update(on=saved["enabled"], share=saved["share"], models=list(ai.MODELS),
+        info.update(on=saved["enabled"], share=share, models=list(ai.MODELS), sandboxed=ai_sandboxed(),
                     key="environment" if ai.env_key() else "settings" if saved["key"] else None)
     return info
 
@@ -1605,7 +1616,7 @@ def ai_run(role: str, data: dict) -> dict:
         AI["guest_used"] += 1
     saved = ai.load_settings()
     try:
-        return ai.ask(data, key=ai.env_key() or saved["key"], model=saved["model"], owner=role == "owner")
+        return ai.ask(data, key=ai.env_key() or saved["key"], model=saved["model"])
     except ai.AiError as exc:
         raise ApiError(str(exc), exc.status)
 
@@ -1617,6 +1628,9 @@ def ai_settings(data: dict) -> dict:
         if "enabled" in data:
             saved["enabled"] = data["enabled"] is True
         if "share" in data:
+            if data["share"] is True and not ai_sandboxed():
+                raise ApiError("Shared links can use the assistant only with sandboxed builds (serve.py --sandbox): "
+                               "otherwise LuaLaTeX from an edit link could read your API key.", 409)
             saved["share"] = data["share"] is True
         if "model" in data:
             saved["model"] = ai.check_model(data["model"])
