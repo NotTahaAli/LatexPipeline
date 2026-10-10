@@ -52,6 +52,7 @@ import build
 import grammar
 import hints
 import history
+import mcp_tools
 import preview
 import review
 import share_links as named
@@ -3247,6 +3248,10 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             warm = False
         if not warm and not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many builds; wait a moment.", 429)  # the first preview runs a full build
+    elif method == "POST" and path == "/api/mcp":
+        scoped(doc)  # One MCP tool call from host.py (hosted AI clients); each tool checks the role itself.
+        if not rate_ok("mcp", 120, 60.0):
+            raise ApiError("Too many tool calls; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -3496,6 +3501,8 @@ class Handler(BaseHTTPRequestHandler):
             box["doc"] = found
             broadcast("forward", box)
             self.json(box)
+        elif url.path == "/api/mcp" and name in DOCS and GATEWAY["secret"]:  # behind host.py only
+            self.json(mcp_tools.worker_call(sys.modules[__name__], name, self.role, self.user, self.body()))
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/preview" and name in DOCS:

@@ -31,6 +31,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 * [Large documents](#large-documents) and [benchmarks](#benchmarks)
 * [VS Code](#vs-code)
 * [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds)
+* [Use with AI clients (MCP)](#use-with-ai-clients-mcp): Claude, ChatGPT, Codex, Cursor, VS Code, Windsurf, Gemini CLI with your own subscription
 * [Hosting on a VPS](#hosting-on-a-vps) (accounts, workspaces, sign-in providers)
 * [Lint and CI reports](#lint-and-ci-reports)
 * [GitHub Actions](#github-actions)
@@ -213,6 +214,7 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 * The key: `ANTHROPIC_API_KEY` in the environment of `serve.py` (taken out of `os.environ` at start, so builds do not inherit it), or pasted into the settings, which stores it in `~/.config/latex-pipeline/ai.json` (or `$XDG_CONFIG_HOME`), mode 600, outside every project. The server never sends it to a browser or over the co-editing channel. It is still on this computer: without `--sandbox`, code that runs in a build as you (LuaLaTeX from an edit link while sharing) can read that file, or the original environment in `/proc`. The Share dialog says so when a key is set.
 * Limits: at most 20 requests a minute for the whole server, replies of at most 16,000 tokens (thinking included), files up to 120,000 characters. Only the three models above are accepted.
 * Answers stream: the explanation appears as the model writes it (`POST /api/ai?stream=1`, NDJSON lines; the gateway streams them itself when hosted), and the diff and Apply buttons only once the whole reply has been checked. **Stop** ends the request, and the server closes the connection to Anthropic at once (tokens already generated are still billed). A refused or cut-off answer replaces the partial text with the error. If the stream cannot start (a proxy or tunnel that refuses it), the editor asks again without streaming; a tunnel that buffers shows the answer at the end.
+* It needs an API key: a Claude subscription cannot be used here. With a subscription, connect Claude to the [MCP server](#use-with-ai-clients-mcp) instead.
 
 **Editing together.** Everyone who opens the same document edits it live (Yjs): you see each other's cursors and selections with names and colours, and a stack of avatars in the top bar opens the list of people. The server only relays the changes. One editor per file, the "leader", saves to disk through the normal atomic save; if the leader leaves, another takes over. If you change a file outside the editor (git, vim) while it is open, the change is merged into the shared text instead of overwriting anyone's typing. If the connection drops, you can keep typing; the edits merge when it returns, over WebSocket or the long-poll fallback.
 
@@ -259,6 +261,81 @@ On Linux, `build.py --sandbox` or `serve.py --sandbox` (both set `LATEX_SANDBOX=
 * Not available: `~/texmf` (personal packages) and files outside the document's directory (`\input{../shared/x}`); your `~/.latexmkrc` is not read.
 
 If `LATEX_SANDBOX=bwrap` and bubblewrap is missing or cannot create namespaces (some containers disable unprivileged user namespaces), every build fails with a message saying so; nothing ever runs unsandboxed. Any other value than `bwrap` (or empty) is refused too. Each sandboxed run costs about 10 ms to start (bwrap), plus about 0.1 s once per `build.py` process for the checks: `files/test` builds in 0.53 s instead of 0.44 s, and `bench/sample-report` (303 pages, 25 figure jobs) in 52 s either way. CI does not sandbox (it builds only the repository's own documents); `synctex`, `texcount`, veraPDF and pandoc (owner-only) run outside it.
+
+---
+
+## Use with AI clients (MCP)
+
+Work on your documents from the AI app you already pay for: Claude (claude.ai, Desktop, mobile, Claude Code), ChatGPT, OpenAI Codex, Cursor, VS Code with GitHub Copilot, Windsurf or Gemini CLI. They talk to this project over the Model Context Protocol (MCP), and the model, its usage and its billing are your plan's. Two servers:
+
+* **Local**, `python scripts/mcp_server.py` (stdio): the documents in this repository, on your computer.
+* **Hosted**, `https://<your server>/mcp` (Streamable HTTP with OAuth sign-in): projects on a `host.py` server, see [AI clients on a hosted server](#ai-clients-mcp).
+
+**Subscription or API key.** The editor's own AI assistant calls the Anthropic API and needs an API key (billed per token). A Claude subscription (Pro, Max, Team, Enterprise) cannot pay for those calls, and this project never uses a subscription's sign-in to call the API. To use a subscription, connect Claude (or another app) to the MCP server: the app runs the model under your plan and calls the tools here.
+
+**Tools.** All take a `project` (from `list_projects`) except the first three. Paths are relative to the document folder; nothing outside it is reachable.
+
+| Tool | Does | Needs |
+|---|---|---|
+| `list_projects`, `search`, `fetch` | projects you can use; word search over all of them (ChatGPT's deep research and company knowledge need exactly `search` and `fetch`); one file by search id | read |
+| `list_files`, `read_file`, `grep` | files; a file or a line range; lines containing text | read |
+| `outline`, `references`, `lint` | headings with file, line and word counts; labels, `.bib` entries, missing and unused citations, `\ref` to unknown labels; lint findings | read |
+| `build_status`, `list_reviews` | last build: ok, pages, errors with file, line, log excerpt and a plain-language hint, the end of the log; open comments and suggestions | read |
+| `render_page` | a PDF page as a PNG (by number, or the page showing a source line through SyncTeX; the chapter preview with `chapter`) | read |
+| `edit_file`, `write_file`, `rename_file`, `delete_file` | exact text replacement (must match once, or `replace_all`); create or replace a file; rename; delete | write |
+| `build`, `preview_chapter` | build now and return the report; typeset one chapter (`--focus`) | write |
+| `add_comment`, `add_suggestion` | a comment thread on quoted text; a suggested replacement that people accept or reject in the editor | review |
+
+Accepting or rejecting suggestions is not a tool: people decide. Changes take the editor's save path: atomic write, the version history records them (author "*client* (MCP)" locally, "*you* via *client*" hosted), open editors reload. A file someone has open in the hosted editor is not written: the tool says so and the model can use `add_suggestion` instead. Results are capped (100,000 characters of text, PNGs up to 2 MB, at most 500 list items); schemas are flat (strings, integers, booleans), so every client accepts them. Pages render with `pdftoppm` (poppler-utils) or else `mutool`; with neither, `render_page` says so and the rest works.
+
+The protocol is MCP revision 2026-07-28 (each request carries its version, `server/discover`, no sessions) and, for the clients most apps ship today, the `initialize` handshake of 2025-11-25, 2025-06-18 and 2025-03-26. Only tools are offered (no resources, prompts or sampling); no session ids are issued.
+
+### Local server
+
+```bash
+python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox]
+```
+
+It runs as you, like `serve.py` without sharing: builds use the documents' `build.toml` and `latexmkrc`, and the tools may change those files too. Point it only at documents you trust, or add `--sandbox` (Linux, bubblewrap, as in [Sandboxed builds](#sandboxed-builds)). `--read-only` offers only the tools that read. `DOC` and `--source` select documents like `serve.py`. stdout carries only the protocol; progress and errors go to stderr. If `serve.py` is running, its editor picks up the change on disk; a file open there that you also change through MCP shows the usual "changed on disk" conflict instead of being overwritten.
+
+Use absolute paths (on Windows `python` and `C:\\path\\to\\LatexPipeline\\scripts\\mcp_server.py` in JSON). In each snippet `/path/to/LatexPipeline` is your clone.
+
+* **Claude Code**: `claude mcp add latex -- python3 /path/to/LatexPipeline/scripts/mcp_server.py` (add `-s project` to share it in `.mcp.json`).
+* **Claude Desktop**: Settings > Developer > Edit Config opens `claude_desktop_config.json` (macOS `~/Library/Application Support/Claude/`, Windows `%APPDATA%\Claude\`):
+  ```json
+  {"mcpServers": {"latex": {"command": "python3", "args": ["/path/to/LatexPipeline/scripts/mcp_server.py"]}}}
+  ```
+* **Cursor** (`~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`) and **Gemini CLI** (`~/.gemini/settings.json` or `.gemini/settings.json`): the same `mcpServers` object as Claude Desktop.
+* **VS Code** (Copilot agent mode; `.vscode/mcp.json` in the workspace, or "MCP: Add Server"):
+  ```json
+  {"servers": {"latex": {"type": "stdio", "command": "python3", "args": ["${workspaceFolder}/scripts/mcp_server.py"]}}}
+  ```
+* **OpenAI Codex CLI** (`~/.codex/config.toml`):
+  ```toml
+  [mcp_servers.latex]
+  command = "python3"
+  args = ["/path/to/LatexPipeline/scripts/mcp_server.py"]
+  ```
+* **ChatGPT** connects only to remote servers: use the hosted mode.
+
+### Connect from other AI clients
+
+The hosted endpoint works with any client that speaks Streamable HTTP and OAuth 2.1 with dynamic client registration, which is what each app below does when you give it the URL; your browser then opens this server's sign-in and consent pages. Replace `https://latex.example.org` with your `public_url`.
+
+| Client | Remote setup |
+|---|---|
+| claude.ai, Claude Desktop, Claude mobile | Settings > Connectors > Add custom connector, URL `https://latex.example.org/mcp` (Team and Enterprise: an owner adds it under organization settings first). Redirect `https://claude.ai/api/mcp/auth_callback`. |
+| Claude Code | `claude mcp add --transport http latex https://latex.example.org/mcp`, then `/mcp` to sign in (loopback redirect). |
+| ChatGPT | Settings > Apps & Connectors > Advanced > Developer mode, then Create: the URL, authentication OAuth. Redirect `https://chatgpt.com/connector_platform_oauth_redirect` (needs the `iss` parameter, which this server sends). |
+| OpenAI Codex CLI | `~/.codex/config.toml`: `[mcp_servers.latex]` with `url = "https://latex.example.org/mcp"`, then `codex mcp login latex`. |
+| Cursor | `{"mcpServers": {"latex": {"url": "https://latex.example.org/mcp"}}}` in `mcp.json`; Cursor signs in when you enable it (redirect `cursor://anysphere.cursor-mcp/oauth/callback` or loopback, depending on the version). |
+| VS Code | `{"servers": {"latex": {"type": "http", "url": "https://latex.example.org/mcp"}}}` in `.vscode/mcp.json`; sign-in through loopback (`http://127.0.0.1:33418/`) or `https://vscode.dev/redirect`. |
+| Windsurf | `{"mcpServers": {"latex": {"serverUrl": "https://latex.example.org/mcp"}}}` in `~/.codeium/windsurf/mcp_config.json`. |
+| Gemini CLI | `{"mcpServers": {"latex": {"httpUrl": "https://latex.example.org/mcp"}}}` in `settings.json`, then `/mcp auth latex` (loopback redirect). |
+
+Redirect URIs the server accepts at registration: any `https` URL, `http` to `127.0.0.1`, `[::1]` or `localhost` on any port (RFC 8252; the port is ignored when matching), and private-use app schemes such as `cursor://` or `vscode://` (not `javascript:`, `data:`, `file:` and the like). Nothing above is specific to one vendor.
+
+What was tested: the MCP Inspector CLI (`npx @modelcontextprotocol/inspector --cli`) against the local server (`tools/list`, `tools/call`) and against the hosted endpoint with a bearer token (`tools/list`, `list_projects`, `build`, `read_file`); `tests/mcp_e2e.py` plays a client through the whole hosted flow in Chromium (discovery, registration, sign-in with two-step code, consent, PKCE, refresh, MCP calls, disconnect); `tests/test_mcp.py` and `tests/test_host.py` cover the protocol, tools and OAuth rules. The per-app setups in the two lists above follow each vendor's current documentation and were not run against the real apps here (they need accounts and desktop apps); `claude mcp add` was checked to write the configuration shown.
 
 ---
 
@@ -395,11 +472,38 @@ daily_total = 2000                   # requests for the whole server per day: th
 daily_tokens_per_user = 1000000      # input + output tokens per person per day
 ```
 
-The gateway answers `/p/<project>/api/ai` itself and makes the call to Anthropic; the project's worker never sees the key or the request (workers get a minimal environment, and the key is taken out of the gateway's own environment at start). Editors may use it, viewers may not. Every request counts against the request limits before it is sent, and its tokens (all models, if a refused request fell back to another) are recorded afterwards, failed ones included (a refusal or a cut-off answer is billed too). A request Anthropic did not bill (unreachable, an HTTP error before an answer, a bad request) is given back and does not use up the daily count. Streamed answers are relayed by the gateway; when the browser stops one, the tokens reported so far are recorded. With open sign-up every account gets its own workspace, so `daily_total` is what caps spending. The site admin page shows requests and tokens per person and workspace for the last 30 days. Usage is billed to the operator's key, and members' text is sent to Anthropic, so tell your users.
+The gateway answers `/p/<project>/api/ai` itself and makes the call to Anthropic; the project's worker never sees the key or the request (workers get a minimal environment, and the key is taken out of the gateway's own environment at start). Editors may use it, viewers may not. Every request counts against the request limits before it is sent, and its tokens (all models, if a refused request fell back to another) are recorded afterwards, failed ones included (a refusal or a cut-off answer is billed too). A request Anthropic did not bill (unreachable, an HTTP error before an answer, a bad request) is given back and does not use up the daily count. Streamed answers are relayed by the gateway; when the browser stops one, the tokens reported so far are recorded. With open sign-up every account gets its own workspace, so `daily_total` is what caps spending. The site admin page shows requests and tokens per person and workspace for the last 30 days. Usage is billed to the operator's key, and members' text is sent to Anthropic, so tell your users. Members who have their own Claude, ChatGPT or other AI subscription can use it through [MCP](#ai-clients-mcp) instead, at no cost to the operator.
 
 ### Zotero
 
 Each person brings their own Zotero key: Account > Zotero takes the library type and ID, an optional collection key, BibTeX or BibLaTeX, and a read-only API key. The key is stored in `host.db` (table `zotero_settings`, plain text like the rest of the database, which is mode 600), never shown again (`has_key` only) and never given to a worker. In a project, editors who saved a key get References > More > "Sync from Zotero...": the gateway answers `/p/<project>/api/zotero` and `/api/zotero/preview` itself, fetches with that person's key and compares with the `.bib` text the editor sends; applying the chosen entries is a network-free splice in the worker as usual. Viewers cannot sync; each account has 10 previews per 10 minutes, and the server makes at most 120 requests a minute to Zotero in all. Better BibTeX (Zotero on your own computer) is local only.
+
+### AI clients (MCP)
+
+Off unless the operator enables it in `config.toml`:
+
+```toml
+[mcp]
+enabled = true
+calls_per_minute = 60              # tool calls per connected client
+registrations_per_ip_hour = 20     # new client registrations per address
+max_clients = 5000                 # registered clients kept at most (unused ones go after a day)
+```
+
+Members then add `https://latex.example.org/mcp` to their AI app (snippets in [Connect from other AI clients](#connect-from-other-ai-clients)). The app finds the sign-in through `/.well-known/oauth-protected-resource` (RFC 9728) and `/.well-known/oauth-authorization-server` (RFC 8414), registers itself at `/oauth/register` (RFC 7591), and opens `/oauth/authorize` in the browser. The person signs in as usual (password and two-step code, or a sign-in provider) and sees a consent page: the app's name (chosen by the app, so the page also says where it returns: `claude.ai`, or "an app on your computer" with a warning for loopback and app-scheme redirects), what it may do (read; change files and run builds; add comments and suggestions), and which workspaces (all their projects, also later ones) or single projects. Only workspaces the person is a member of are offered.
+
+Every tool call runs with the person's current role in that workspace, narrowed by the grant: a viewer never writes even with the write permission, and leaving a workspace ends access to it at once. `list_projects`, `search` and `fetch` read the project folders in the gateway; every other tool is forwarded to the project's worker (`POST /api/mcp`, with `X-Host-Role` and `X-Host-User` like the editor's requests), so files, history, review, quotas and the bubblewrap sandbox (builds and `render_page`'s `pdftoppm`) work exactly as in the editor. Changes appear in the history as "*name* via *app*". Changes, builds, comments, connections, refusals, revocations and token reuse go to the audit log (`mcp_tool`, `mcp_authorized`, ...).
+
+The account page lists the connected apps (where they return, permissions, projects, last use) with Disconnect, which ends a connection at once. An app's own "disconnect" usually calls `/oauth/revoke`, which does the same.
+
+Security details:
+
+* OAuth 2.1 authorization code with PKCE (S256 only), public clients only (`token_endpoint_auth_method` `none`; a Basic header's client id is accepted, its secret ignored). Codes last 2 minutes and work once; a second use revokes the connection. Every redirect carries `state` and `iss` (RFC 9207).
+* Access tokens last an hour and are bound to `<public_url>/mcp` (RFC 8707 `resource`; another resource is `invalid_target`, a token for another one is refused). Refresh tokens last 30 days and rotate on every use; presenting an old one revokes the connection. Tokens are random and only their SHA-256 is stored.
+* `/mcp` takes only `Authorization: Bearer` (cookies are ignored), answers `401` with `WWW-Authenticate: Bearer resource_metadata=...` and `403 insufficient_scope` for a tool outside the grant, refuses a request whose `Origin` is another site, and is stateless: no `Mcp-Session-Id`, no SSE stream (`GET` is `405`). Workers never see tokens.
+* Registration is open by design (that is how the apps connect) but rate limited per address and capped in number; unused registrations are deleted after a day. Client ID Metadata Documents (the newer alternative to registration) are not supported, because the gateway would have to fetch URLs that anyone names; every app listed falls back to registration.
+* Tokens survive a password change: disconnect apps on the account page. Disabling an account or removing a member ends them.
+* The model and the app are untrusted: they get nothing a person with the same role could not do in the editor, never change `build.toml` or `latexmkrc` (only the local owner can, with the local server), never accept suggestions, and their tool results are capped.
 
 ### TLS with Caddy, and systemd
 
@@ -490,6 +594,8 @@ uvx ruff check scripts tests            # lint: rules in pyproject.toml
 The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, ruff (pinned version) and the editor's co-editing check (`node tests/collab_check.mjs scripts/serve_ui/collab.js`) on Ubuntu, and the `requirements.txt` check. It runs when `scripts/`, `tests/` or the Python project files change.
 
 The hosted mode has a browser end-to-end check, run by hand (needs LaTeX, bubblewrap and Chromium for Playwright; the editor loads its libraries from CDNs): `uv run --no-project --with playwright==1.56.0 python tests/host_e2e.py`. It signs in with two-step codes, invites editors and a viewer, builds and co-edits a project, checks workspace isolation, sign-out and session expiry, and runs axe-core on every host page in both themes and at phone width.
+
+AI clients over MCP have one as well: `uv run --no-project --with playwright==1.56.0 python tests/mcp_e2e.py [--insecure-no-sandbox] [--chromium PATH]` registers a client, signs in with a two-step code, consents, exchanges the code with PKCE, builds, reads, edits and renders a page over MCP, rotates the refresh token, and disconnects on the account page, with axe-core on the consent and account pages (both themes, phone width).
 
 The editor's live preview has one too: `uv run --no-project --with playwright==1.56.0 python tests/preview_e2e.py [--chromium PATH] [--axe PATH]` (needs LaTeX and a full build of `bench/sample-report`). It types into a chapter five times, measures keystroke to spliced pages, checks the new word is in them, that the scroll position stays and that a newer keystroke aborts the preview in flight, runs axe-core in both themes, and restores the file.
 

@@ -63,7 +63,8 @@ function form(fields, submitText, fn, cls = "") {
 
 // page("Title", ...kids) or page({ title, eyebrow, lead, actions, layout, side }, ...kids). Layouts: "" (heading over the
 // content), auth (title page beside the form), solo (one card in the middle), split, narrowpage; side: a menu on the left.
-function page(opts, ...kids) {
+function page(opts, ...all) {
+  const kids = all.filter((k) => k != null);
   const o = typeof opts === "string" ? { title: opts } : opts;
   document.title = `${o.title} · ${info.site || "LaTeX Studio"}`;
   const h1 = el("h1", { textContent: o.title, tabIndex: -1 });
@@ -143,7 +144,10 @@ function codePage(after) {
     el("p", {}, button("Back to sign in", async () => { try { await api("/api/logout", "POST"); } finally { await loadMe(); go("#login"); } }, "link")));
 }
 
-const afterLogin = () => { const next = sessionStorage.getItem("next"); sessionStorage.removeItem("next"); if (next?.startsWith("/p/")) location.href = next; else go("#home"); };
+const afterLogin = () => {
+  const next = sessionStorage.getItem("next"); sessionStorage.removeItem("next");
+  if (next?.startsWith("/p/")) location.href = next; else go(next?.startsWith("#oauth=") ? next : "#home");
+};
 
 function loginPage(error) {
   const box = msgBox();
@@ -381,7 +385,64 @@ async function accountPage() {
     sect("Two-step sign-in", "A code from an authenticator app at every sign-in.", twoStep),
     providers,
     sect("Password", "Changing it signs out your other sessions.", password),
-    sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero));
+    sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero),
+    await aiClientsSection(sect));
+}
+
+// ---- AI clients (MCP): consent and connected apps ---------------------------------------------------------------
+const scopeName = { read: "Read", write: "Edit and build", review: "Comment and suggest" };
+
+async function aiClientsSection(sect) {
+  let data;
+  try { data = await api("/api/oauth/grants"); } catch (err) { if (err.status === 404) return null; throw err; }
+  const list = data.grants.length ? el("ul", { className: "list" }, data.grants.map((g) => el("li", {},
+    el("span", { className: "grow" }, el("span", { className: "who", textContent: g.client }),
+      el("span", { className: "mute", textContent: ` · returns to ${g.returns_to}` }),
+      el("span", { className: "hint block", textContent: `${[...g.workspaces.map((w) => `${w} (all projects)`), ...g.projects].join(", ") || "No projects"} · connected ${when(g.created)} · ${g.used ? `last used ${when(g.used)}` : "not used yet"}` })),
+    g.scopes.map((s) => el("span", { className: "tag" + (s === "read" ? "" : " info"), textContent: scopeName[s] || s })),
+    button("Disconnect", async () => {
+      if (!confirm(`Disconnect ${g.client}? It loses access at once.`)) return;
+      try { await api(`/api/oauth/grants/${g.id}`, "DELETE"); announce(`${g.client} disconnected.`); accountPage(); } catch (err) { alert(err.message); }
+    }, "btn ghost danger", { ariaLabel: `Disconnect ${g.client}` }))))
+    : el("p", { className: "empty", textContent: "No AI client is connected." });
+  return sect("AI clients", `Claude, ChatGPT, Cursor, VS Code and other apps you connected over MCP. They act as you, within what you allowed. To connect one, add ${data.endpoint} as a remote MCP server (a custom connector) in the app.`, list);
+}
+
+async function consentPage(id) {
+  const r = await api(`/api/oauth/requests/${encodeURIComponent(id)}`);
+  const box = msgBox();
+  const scopes = el("fieldset", { className: "card" }, el("legend", { className: "eyebrow", textContent: "It may" }),
+    r.scopes.map((s) => el("label", { className: "check" }, input("scope", "checkbox", { value: s.id, checked: true, disabled: s.id === "read" }), s.text)));
+  const projectBoxes = [];
+  const spaces = el("fieldset", { className: "card" }, el("legend", { className: "eyebrow", textContent: "On these projects" }),
+    r.workspaces.length ? r.workspaces.map((ws) => {
+      const kids = ws.projects.map((p) => { const b = input("project", "checkbox", { value: p.id }); projectBoxes.push(b); return el("li", {}, el("label", { className: "check" }, b, p.name)); });
+      const all = input("tenant", "checkbox", { value: ws.id });
+      all.onchange = () => { for (const b of kids.map((li) => li.querySelector("input"))) { b.disabled = all.checked; if (all.checked) b.checked = true; } };
+      return el("div", { className: "consent-ws" }, el("label", { className: "check" }, all,
+        el("span", {}, el("b", { textContent: ws.name }), " · all its projects, also new ones",
+          ws.role === "viewer" ? el("span", { className: "tag warn", textContent: "Viewer: read only" }) : null)),
+        kids.length ? el("ul", { className: "consent-projects" }, kids) : el("p", { className: "hint", textContent: "No projects yet." }));
+    }) : el("p", { className: "empty", textContent: "You are not a member of any workspace yet." }));
+  const decide = async (allow) => {
+    const values = { allow, scopes: [...scopes.querySelectorAll("input:checked")].map((b) => b.value),
+      tenants: [...spaces.querySelectorAll("input[name=tenant]:checked")].map((b) => b.value),
+      projects: projectBoxes.filter((b) => b.checked && !b.disabled).map((b) => b.value) };
+    if (allow && !values.tenants.length && !values.projects.length) return show(box, "Choose at least one workspace or project.");
+    try {
+      const res = await api(`/api/oauth/requests/${encodeURIComponent(id)}`, "POST", values);
+      page({ title: allow ? "Connected" : "Not connected", eyebrow: r.client, layout: "solo" },
+        el("p", { textContent: `Returning to ${r.returns_to}. You can close this tab if nothing happens.` }));
+      location.href = res.redirect;
+    } catch (err) { show(box, err.message); }
+  };
+  page({ title: "Connect an AI client", eyebrow: "Authorization", layout: "narrowpage" },
+    el("div", { className: "card" }, el("p", {}, el("b", { textContent: r.client }), ` wants to work on your LaTeX projects at ${r.site} as you (${me.email}).`),
+      el("p", { className: "hint", textContent: `The app chose this name itself. After you decide you return to ${r.returns_to}.` }),
+      r.native ? el("p", { className: "msg err", textContent: `This app runs on a computer, not a website. Only continue if you started connecting it yourself just now.` }) : null),
+    box, scopes, spaces,
+    el("p", { className: "hint", textContent: "It can do no more than your own role allows in each workspace. Disconnect it any time on your account page." }),
+    el("div", { className: "row" }, button("Allow", () => decide(true), "btn primary"), button("Deny", () => decide(false), "btn ghost")));
 }
 
 // ---- site admin ------------------------------------------------------------------------------------------------
@@ -497,10 +558,13 @@ async function route() {
     if (p.has("invite")) return await invitePage(p.get("invite"));
     if (p.has("reset")) return resetPage(p.get("reset"));
     if (p.has("error")) { history.replaceState(null, "", "#login"); return loginPage(p.get("error").slice(0, 300)); }  // shown as text only
+    if (p.has("oauth-error")) return errorPage("Cannot connect the app", p.get("oauth-error").slice(0, 300));
+    if (p.has("oauth") && !me) { sessionStorage.setItem("next", "#oauth=" + p.get("oauth")); return loginPage(); }
     if (hash === "signup") return me ? go("#home") : signupPage();
     if (!me) return loginPage();
     if (sessionStorage.getItem("next")) return afterLogin();
     if (hash === "account") return await accountPage();
+    if (p.has("oauth")) return await consentPage(p.get("oauth"));
     if (hash.startsWith("admin/") && main.dataset.page === "admin") return adminSection(hash.slice(6));
     if ((hash === "admin" || hash.startsWith("admin/")) && me.site_admin) return await adminPage();
     if (hash.startsWith("t/")) return await tenantPage(hash.slice(2));

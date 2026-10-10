@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import host_mcp
 import zotero
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -70,6 +71,7 @@ CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
+    "mcp": {},
 }
 AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
                      "daily_per_user": 50, "daily_per_workspace": 500, "daily_total": 2000,
@@ -115,7 +117,7 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # daily_per_workspace = 500            # requests per workspace per day
 # daily_total = 2000                   # requests for the whole server per day (the spending cap)
 # daily_tokens_per_user = 1000000      # input + output tokens per person per day
-"""
+""" + host_mcp.CONFIG_TEMPLATE
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
 SETTING_DEFAULTS: dict = {
@@ -180,6 +182,7 @@ def load_config(data: Path) -> dict:
     for key in ("daily_per_user", "daily_per_workspace", "daily_total", "daily_tokens_per_user"):
         if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
             raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
+    host_mcp.check_config(config, path)
     return config
 
 
@@ -250,6 +253,27 @@ MIGRATIONS = [
     CREATE TABLE zotero_settings(
         user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, library_type TEXT NOT NULL,
         library_id TEXT NOT NULL, collection TEXT NOT NULL, format TEXT NOT NULL, api_key TEXT);
+    """,
+    # AI clients over MCP (host_mcp.py): OAuth clients (RFC 7591), pending authorizations, grants, codes, tokens.
+    """
+    CREATE TABLE oauth_clients(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, redirect_uris TEXT NOT NULL, created REAL NOT NULL, ip TEXT);
+    CREATE TABLE oauth_requests(
+        id_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+        redirect_uri TEXT NOT NULL, state TEXT, challenge TEXT NOT NULL, scope TEXT NOT NULL, created REAL NOT NULL);
+    CREATE TABLE oauth_grants(
+        id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE, scope TEXT NOT NULL,
+        tenants TEXT NOT NULL, projects TEXT NOT NULL, created REAL NOT NULL, used REAL);
+    CREATE INDEX oauth_grants_user ON oauth_grants(user_id);
+    CREATE TABLE oauth_codes(
+        code_hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+        redirect_uri TEXT NOT NULL, challenge TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE oauth_tokens(
+        token_hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('access', 'refresh')), resource TEXT NOT NULL, expires REAL NOT NULL,
+        used REAL);
+    CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
     """,
 ]
 
@@ -1179,6 +1203,8 @@ class Handler(BaseHTTPRequestHandler):
             self.ip = self.client_ip()
             self.ip_group = ip_key(self.ip)
             self.session = self.load_session()
+            if host_mcp.endpoint(self, url.path):  # /mcp, /oauth/*, /.well-known/oauth-*: no cookies, no CSRF
+                return
             if url.path.startswith("/p/"):
                 self.project_proxy(url.path, url.query)
                 return
@@ -2402,6 +2428,9 @@ def api_unlink(h: Handler, name: str) -> None:
     h.ok()
 
 
+host_mcp.install(sys.modules[__name__])  # the consent and connected-clients API
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2414,6 +2443,7 @@ def housekeeping(stop: threading.Event) -> None:
             APP.db.run("DELETE FROM sessions WHERE expires < ?", now)
             APP.db.run("DELETE FROM resets WHERE expires < ?", now)
             APP.db.run("DELETE FROM oauth_flows WHERE created < ?", now - 900)
+            host_mcp.cleanup()
         except Exception:  # noqa: BLE001 - keep reaping.
             traceback.print_exc()
 
