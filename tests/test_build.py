@@ -386,6 +386,39 @@ class CiReportCellTests(unittest.TestCase):
         self.assertTrue(row.startswith("| weird\\|name | **failed** |"))
 
 
+class NewTemplateTests(unittest.TestCase):
+    FILES = {
+        "article": {"main.tex"},
+        "report": {"main.tex", "refs.bib", "build.toml", "figures/README.txt", "chapters/introduction.tex",
+                   "chapters/methods.tex", "chapters/conclusion.tex"},
+        "beamer": {"main.tex"},
+        "letter": {"main.tex"},
+    }
+
+    def test_each_template_writes_its_files_and_never_overwrites(self):
+        for template, expected in self.FILES.items():
+            with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(build.new_document("doc", template), 0)
+                folder = root / "files" / "doc"
+                self.assertEqual({p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}, expected)
+                self.assertEqual(build.new_document("doc", template), 1)
+
+    def test_article_is_unchanged(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            build.new_document("a_b")
+            text = (root / "files" / "a_b" / "main.tex").read_text(encoding="utf-8")
+            self.assertEqual(text, build.NEW_TEMPLATE % {"title": "a\\_b"})
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("bibtex"), "needs latexmk and bibtex")
+    def test_report_template_builds(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            build.new_document("rep", "report")
+            main = root / "files" / "rep" / "main.tex"
+            report, text = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertNotIn("Citation `knuth84' undefined", text)
+
+
 if __name__ == "__main__":
     unittest.main()
 

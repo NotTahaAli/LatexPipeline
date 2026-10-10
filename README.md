@@ -61,6 +61,7 @@ python scripts/build.py --force          # rebuild everything (latexmk -g, even 
 python scripts/build.py -j 2             # build two documents at a time (default: CPU count, up to 8)
 python scripts/build.py "FP-123 Report"  # build only that document (or a glob such as "reports/*")
 python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
+python scripts/build.py --new Thesis --template report   # also: beamer, letter (default: article)
 python scripts/build.py --watch --open   # keep running, rebuild on every save, open each PDF after its first build
 python scripts/build.py --list           # show discovered documents and whether they are up to date
 python scripts/build.py --clean          # delete out/ and .latex-cache/

@@ -1368,9 +1368,84 @@ LATEX_SPECIAL = {
 }
 
 
-def new_document(name: str) -> int:
+# Extra templates: {relative file: text}. "article" is NEW_TEMPLATE above; %(title)s is filled in main.tex only.
+TEMPLATES = {
+    "report": {
+        "main.tex": r"""\documentclass[11pt]{report}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+
+\title{%(title)s}
+\author{Author}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\input{chapters/introduction}
+\input{chapters/methods}
+\input{chapters/conclusion}
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
+""",
+        "chapters/introduction.tex": "\\chapter{Introduction}\n\nPrior work~\\cite{knuth84} goes here.\n",
+        "chapters/methods.tex": "\\chapter{Methods}\n\nDescribe the approach.\n",
+        "chapters/conclusion.tex": "\\chapter{Conclusion}\n\nSummarise the results.\n",
+        "refs.bib": "@book{knuth84,\n  author    = {Donald E. Knuth},\n  title     = {The {TeXbook}},\n"
+                    "  publisher = {Addison-Wesley},\n  year      = {1984}\n}\n",
+        "figures/README.txt": "Put figures here (png, jpg, pdf); \\includegraphics{name} finds them.\n",
+        "build.toml": '# engine = "xelatex"\n# timeout = 600\n# externalize = false\n# lang = "en-US"\n',
+    },
+    "beamer": {
+        "main.tex": r"""\documentclass{beamer}
+
+\title{%(title)s}
+\author{Author}
+\date{\today}
+
+\begin{document}
+
+\frame{\titlepage}
+
+\begin{frame}{Outline}
+  \begin{itemize}
+    \item First point
+    \item Second point
+  \end{itemize}
+\end{frame}
+
+\end{document}
+""",
+    },
+    "letter": {
+        "main.tex": r"""\documentclass{letter}
+\signature{Your name}
+\address{Your address}
+
+\begin{document}
+
+\begin{letter}{Recipient\\Address}
+\opening{Dear Sir or Madam,}
+
+Body of the letter (%(title)s).
+
+\closing{Yours sincerely,}
+\end{letter}
+
+\end{document}
+""",
+    },
+}
+
+
+def new_document(name: str, template: str = "article") -> int:
     """
-    Create files/<name>/main.tex from NEW_TEMPLATE. Never overwrites.
+    Create files/<name>/main.tex (plus companion files for some templates). Never overwrites.
     """
     path = Path(name)
 
@@ -1384,10 +1459,13 @@ def new_document(name: str) -> int:
         error(f"Already exists: {display(target)}")
         return 1
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-
     title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
-    target.write_text(NEW_TEMPLATE % {"title": title}, encoding="utf-8")
+    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
+
+    for rel, text in files.items():
+        out = target.parent / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text % {"title": title} if rel == "main.tex" else text, encoding="utf-8")
 
     info(f"Created: {display(target)}")
     return 0
@@ -1427,6 +1505,13 @@ def parse_args() -> argparse.Namespace:
         "--new",
         metavar="NAME",
         help="Create files/NAME/main.tex from a template and exit.",
+    )
+
+    parser.add_argument(
+        "--template",
+        choices=["article", "report", "beamer", "letter"],
+        default="article",
+        help="Template for --new (default article; report adds chapters/, refs.bib, figures/, build.toml).",
     )
 
     parser.add_argument(
@@ -1591,7 +1676,7 @@ def main() -> int:
         return 0
 
     if args.new is not None:
-        return new_document(args.new)
+        return new_document(args.new, args.template)
 
     documents = find_documents()
 
