@@ -13,6 +13,7 @@ on:
       - "scripts/publish_release.py"
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
+      - ".github/texlive-packages.txt"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -25,6 +26,7 @@ on:
       - "scripts/publish_release.py"
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
+      - ".github/texlive-packages.txt"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -45,6 +47,36 @@ jobs:
           uv export --quiet --no-hashes --no-emit-project -o requirements.txt
           git diff --exit-code requirements.txt
 
+  # Runs beside `build`, which never waits for it: on a cache miss it installs TeX Live
+  # from tug.org and saves ~/texlive for the next run. Bump `v1` in both keys to refresh.
+  texlive-cache:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/texlive-packages.txt
+          sparse-checkout-cone-mode: false
+      - name: Look up the cache
+        id: tl
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          lookup-only: true
+      - name: Install TeX Live
+        if: steps.tl.outputs.cache-hit != 'true'
+        uses: zauguin/install-texlive@6671d0c62046c7e349fe154d5208fe746b07e037 # v4.4.0
+        with:
+          package_file: .github/texlive-packages.txt
+          cache: false
+      - name: Save the cache
+        if: steps.tl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -60,16 +92,50 @@ jobs:
         with:
           fetch-depth: 0  # --changed-since needs history.
 
-      # TeX Live from tug.org under ~/texlive, cached (about 12 s when the cache hits,
-      # against about 60 s for apt). Keep these packages in step with the apt list in README.md.
-      # A new TeX Live release changes the install; set `cache_version` to force a fresh tree.
-      - name: Install LaTeX
-        uses: zauguin/install-texlive@6671d0c62046c7e349fe154d5208fe746b07e037 # v4.4.0
+      # TeX Live from the cache saved by the texlive-cache job (about 12 s). On a miss,
+      # trimmed apt (about 70 s) so this run isn't held up; texlive-cache fills the cache meanwhile.
+      # Keep the apt list in step with README.md and .github/texlive-packages.txt.
+      - name: Restore TeX Live cache
+        id: tl
+        uses: actions/cache/restore@v6
         with:
-          packages: >
-            scheme-basic collection-latexrecommended collection-latexextra collection-fontsrecommended
-            collection-mathscience collection-plaingeneric collection-binextra collection-xetex
-            collection-luatex latexmk chktex texcount latexdiff
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+
+      - name: Use cached TeX Live
+        if: steps.tl.outputs.cache-hit == 'true'
+        run: |
+          echo "$HOME/texlive/bin/x86_64-linux" >> "$GITHUB_PATH"
+          echo "TeX Live: cache hit (\`${{ steps.tl.outputs.cache-matched-key }}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install LaTeX with apt (cache miss)
+        if: steps.tl.outputs.cache-hit != 'true'
+        run: |
+          echo "TeX Live: cache miss, installed with apt" >> "$GITHUB_STEP_SUMMARY"
+          sudo tee /etc/dpkg/dpkg.cfg.d/01-nodoc >/dev/null <<'CFG'
+          path-exclude /usr/share/doc/*
+          path-include /usr/share/doc/*/copyright
+          path-exclude /usr/share/man/*
+          path-exclude /usr/share/info/*
+          path-exclude /usr/share/locale/*
+          CFG
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          # Skip tex-common's "build every format" trigger; build the four we use below.
+          for f in fmtutil fmtutil-sys; do
+            sudo dpkg-divert --local --rename --add /usr/bin/$f
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/bin/$f >/dev/null
+            sudo chmod +x /usr/bin/$f
+          done
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
+            latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
+            texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff
+          for f in fmtutil fmtutil-sys; do
+            sudo rm -f /usr/bin/$f
+            sudo dpkg-divert --remove --rename /usr/bin/$f
+          done
+          for f in pdflatex xelatex lualatex latex; do sudo fmtutil-sys --byfmt $f; done
 
       # latexmk's working files from the previous run, so an edit reruns only
       # the LaTeX passes it needs. A new key per run keeps the newest cache.

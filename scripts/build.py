@@ -51,6 +51,7 @@ GLOBAL_INPUTS = (
     "scripts/publish_release.py",
     "scripts/ci_report.py",
     ".github/workflows/build-pdf.yml",
+    ".github/texlive-packages.txt",
 )
 
 LATEXMK_ARGS = [
