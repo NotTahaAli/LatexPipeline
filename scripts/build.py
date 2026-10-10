@@ -523,7 +523,7 @@ CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", 
 # Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
 DEFAULT_TIMEOUT = 600
 TIMEOUT_RANGE = (10, 7200)
-PDFA_LEVEL = re.compile(r"^(?:a-)?([123][abu])$")
+PDFA_LEVEL = re.compile(r"^(?:a-)?([123][abu]|4[ef]?)$")
 
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
 LATEX_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<message>\S.*)$")
@@ -627,8 +627,21 @@ def read_settings(main_tex: Path) -> dict:
 
 # \DocumentMetadata keys for tagging: the kernel has tagging=on from 2025-06-01; TeX Live 2023 to 2025
 # (kernel 2023-11 on) has the same through testphase. Older kernels cannot tag, so the build goes on untagged.
+# PDF/A-4 (PDF 2.0) is taken from the 2025-06-01 kernel on.
 TAGGING_NEW = "2025-06-01"
 TAGGING_OLD = "2023-11-01"
+
+# pdfTeX before TeX Live 2025 (pdftexspace.tfm says 0.334249, the font program 333) writes the interword space
+# glyph that tagging adds with a width veraPDF rejects; the old "dummy-space" font is consistent. \pdfspacefont
+# exists from pdfTeX 1.40.25; a TeX Live tree with the fixed metrics keeps the default font.
+SPACE_FONT_FIX = (r"\ifdefined\pdfspacefont\font\ltxspacetest=pdftexspace \relax "
+                  r"\ifdim\fontcharwd\ltxspacetest 32>3.335pt \pdfspacefont{dummy-space}\fi\fi")
+# PDF/A-1, A-2 and A-4 (without f) forbid embedded files that are not PDF/A. The tagging kernel attaches the
+# TeX source of formulas and two CSS files (allowed in A-3 and A-4f); each key is set only if tagpdf has it.
+NO_ATTACHED_FILES = (r"\ifdefined\tagpdfsetup\ExplSyntaxOn"
+                     r"\bool_if_exist:NT\g__tag_css_bool{\tagpdfsetup{attach-css=false}}"
+                     r"\bool_if_exist:NT\l__tag_math_texsource_AF_bool{\tagpdfsetup{math/tex/AF=false}}"
+                     r"\ExplSyntaxOff\fi")
 
 
 def document_metadata(settings: dict) -> str:
@@ -636,10 +649,9 @@ def document_metadata(settings: dict) -> str:
     level, tagged = settings["pdfa"], settings["tagged"]
     if not level and not tagged:
         return ""
-    base = f"lang={settings['lang']}"
+    lang = f"lang={settings['lang']}"
     extras = []
     if level:
-        base = f"pdfstandard={level},{base}"
         extras = [
             # veraPDF: xcolor's cmyk colours break PDF/A with the RGB OutputIntent, and pdfTeX
             # writes no ToUnicode for symbol glyphs (CMEX) without the glyph name maps.
@@ -650,23 +662,41 @@ def document_metadata(settings: dict) -> str:
             # PDF/A-1 forbids object streams.
             extras.append(r"\ifdefined\pdfobjcompresslevel\pdfobjcompresslevel=0 \fi"
                           r"\ifdefined\pdfvariable\pdfvariable objcompresslevel=0 \fi")
+
+    def metadata(*standards: str, tail: str = "") -> str:
+        names = standards[0] if len(standards) == 1 else "{" + ",".join(standards) + "}"
+        return f"\\DocumentMetadata{{pdfstandard={names},{lang}{tail}}}"
+
+    def warning(need: str) -> str:
+        what = "tagged = true" if tagged else f"pdfa = {level}"
+        return rf"\typeout{{WARNING: {what} needs LaTeX {need} or newer; not applied.}}"
+
+    pdf2 = bool(level) and level.startswith("a-4")  # PDF 2.0: PDF/UA-2
     if not tagged:
-        return f"\\DocumentMetadata{{{base}}}" + "".join(extras)
-    ua = "" if level else "pdfstandard=ua-1,"  # PDF/UA-1 identification (a list of standards needs a newer kernel)
-    # Kernel 2025-06 documents the list form "pdfstandard={a-2a,ua-1}"; TeX Live 2023 rejects it.
-    new = (f"\\DocumentMetadata{{{base.replace(level, '{' + level + ',ua-1}', 1) if level else ua + base},tagging=on}}")
-    old = f"\\DocumentMetadata{{{ua}{base},testphase={{phase-III,firstaid}}}}"
-    warning = (r"\typeout{WARNING: tagged = true needs LaTeX " + TAGGING_OLD
-               + r" or newer; building an untagged PDF.}")
+        if pdf2:
+            return (rf"\IfFormatAtLeastTF{{{TAGGING_NEW}}}{{{metadata(level)}}}{{{warning(TAGGING_NEW)}}}"
+                    + "".join(extras))
+        return metadata(level) + "".join(extras)
+    # Kernel 2025-06 takes the list "pdfstandard={a-2a,ua-1}" (LaTeX News 41); the testphase of TeX Live 2023
+    # to 2025 takes one standard, so a PDF/A + tagged file carries no PDF/UA identification there.
+    ua = "ua-2" if pdf2 else "ua-1"
+    new = metadata(level, ua, tail=",tagging=on") if level else metadata(ua, tail=",tagging=on")
+    if pdf2:
+        old = warning(TAGGING_NEW)
+    else:
+        phase = metadata(level or ua, tail=",testphase={phase-III,firstaid}")
+        old = rf"\IfFormatAtLeastTF{{{TAGGING_OLD}}}{{{phase}}}{{{warning(TAGGING_OLD)}}}"
     return (
-        rf"\IfFormatAtLeastTF{{{TAGGING_NEW}}}{{{new}}}{{\IfFormatAtLeastTF{{{TAGGING_OLD}}}{{{old}}}{{{warning}}}}}"
+        rf"\IfFormatAtLeastTF{{{TAGGING_NEW}}}{{{new}}}{{{old}}}"
         # A tagged PDF/UA file must show its title (set pdftitle with \hypersetup in the document).
-        r"\PassOptionsToPackage{pdfdisplaydoctitle=true}{hyperref}" + "".join(extras)
+        r"\PassOptionsToPackage{pdfdisplaydoctitle=true}{hyperref}" + SPACE_FONT_FIX
+        + (NO_ATTACHED_FILES if level and (level[2] in "12" or level == "a-4") else "")
+        + "".join(extras)
     )  # one -usepretex argument: no newlines
 
 
-def tagged_check(pdf: Path) -> str:
-    """Does the PDF carry a structure tree? Returns a one-line note."""
+def pdf_text(pdf: Path) -> bytes:
+    """The PDF with its object streams inflated, so the catalog and the XMP can be searched."""
     data = pdf.read_bytes()
     streams = [data]
     for chunk in re.findall(rb"stream\r?\n(.*?)endstream", data, re.DOTALL):  # object streams hide the catalog
@@ -674,9 +704,23 @@ def tagged_check(pdf: Path) -> str:
             streams.append(zlib.decompress(chunk))
         except zlib.error:
             pass
-    text = b"\n".join(streams)
+    return b"\n".join(streams)
+
+
+def xmp_part(text: bytes, name: str) -> int:
+    """The part number in the XMP identification (name "pdfaid" or "pdfuaid"), or 0."""
+    match = re.search(rb"<%s:part>(\d)</%s:part>|%s:part=\"(\d)\"" % ((name.encode(),) * 3), text)
+    return int(match.group(1) or match.group(2)) if match else 0
+
+
+def tagged_check(pdf: Path) -> str:
+    """Does the PDF carry a structure tree and a PDF/UA identification? Returns a one-line note."""
+    text = pdf_text(pdf)
     if b"/StructTreeRoot" in text and b"/MarkInfo" in text:
-        return "Tagged PDF: structure tree present."
+        if xmp_part(text, "pdfuaid"):
+            return "Tagged PDF: structure tree present."
+        return (f"Tagged PDF: structure tree present, but no PDF/UA identification in the XMP "
+                f"(a list with pdfa needs LaTeX {TAGGING_NEW}), so PDF/UA is not validated.")
     return ("Tagged PDF requested, but the PDF has no structure tree: tagging needs LaTeX "
             f"{TAGGING_OLD} or newer (see the LaTeX log).")
 
@@ -686,39 +730,32 @@ def pdfa_check(pdf: Path, level: str, validate: bool = True, tagged: bool = Fals
     A cheap look, not validation (use veraPDF for that): does the PDF carry
     the XMP pdfaid declaration and an OutputIntent? Returns a one-line note.
     """
-    data = pdf.read_bytes()
-    streams = [data]
-    for chunk in re.findall(rb"stream\r?\n(.*?)endstream", data, re.DOTALL):  # object streams hide the catalog
-        try:
-            streams.append(zlib.decompress(chunk))
-        except zlib.error:
-            pass
-    text = b"\n".join(streams)
-    part = re.search(rb"<pdfaid:part>(\d)</pdfaid:part>|pdfaid:part=\"(\d)\"", text)
+    text = pdf_text(pdf)
     missing = []
-    if not part:
+    if not xmp_part(text, "pdfaid"):
         missing.append("XMP pdfaid")
     if b"/OutputIntents" not in text:
         missing.append("OutputIntent")
     if missing:
-        return f"PDF/A {level} requested, but the PDF has no {' or '.join(missing)} (needs LaTeX 2023-06 or newer)."
+        need = TAGGING_NEW if level.startswith("a-4") else "2023-06"
+        return f"PDF/A {level} requested, but the PDF has no {' or '.join(missing)} (needs LaTeX {need} or newer)."
     verapdf = shutil.which("verapdf") if validate else None
     if verapdf is not None and os.name == "nt" and verapdf.lower().endswith((".bat", ".cmd")) and "%" in str(pdf):
         return f"PDF/A {level}: veraPDF skipped (a .bat launcher cannot take '%' in the path); run veraPDF manually."
     if verapdf is None:
         return (f"PDF/A {level}: XMP pdfaid and OutputIntent present "
                 "(not validated; install veraPDF to check conformance).")
-    return verapdf_note(verapdf, pdf, level, tagged)
+    return verapdf_note(verapdf, pdf, level, xmp_part(text, "pdfuaid") if tagged else 0)
 
 
-def verapdf_note(verapdf: str, pdf: Path, level: str, tagged: bool = False) -> str:
+def verapdf_note(verapdf: str, pdf: Path, level: str | None, ua: int = 0) -> str:
     """
-    Validate with veraPDF (on PATH): a one-line pass, or fail with the broken rules. A tagged
-    file is also checked as PDF/UA-1 (level "ua-1" checks only that).
+    Validate with veraPDF (on PATH): a one-line pass, or fail with the broken rules. level is the PDF/A
+    level or None; ua is the PDF/UA part the file declares (0: none), checked as flavour ua1 or ua2.
     """
-    checks = [] if level == "ua-1" else [(level.removeprefix("a-"), f"PDF/A {level}")]
-    if tagged:
-        checks.append(("ua1", "PDF/UA-1"))
+    checks = [(level.removeprefix("a-"), f"PDF/A {level}")] if level else []
+    if ua:
+        checks.append((f"ua{ua}", f"PDF/UA-{ua}"))
     notes = []
     for flavour, label in checks:
         try:
@@ -1058,8 +1095,9 @@ def build_document(
                         notes.append(tagged_check(output_pdf))
                         say(notes[-1])
                         verapdf = shutil.which("verapdf") if validate and not settings["pdfa"] else None
-                        if verapdf and "structure tree present" in notes[-1]:
-                            notes.append(verapdf_note(verapdf, output_pdf, "ua-1", True))
+                        ua = xmp_part(pdf_text(output_pdf), "pdfuaid")
+                        if verapdf and ua and "structure tree present" in notes[-1]:
+                            notes.append(verapdf_note(verapdf, output_pdf, None, ua))
                             say(notes[-1])
                 except OSError as exc:
                     errors.append(f"Could not copy generated PDF: {exc}")

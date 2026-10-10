@@ -248,15 +248,72 @@ class ReadSettingsTests(unittest.TestCase):
     def test_tagged_check_and_ua_flavour(self):
         with fake_repo() as root:
             pdf = root / "a.pdf"
-            pdf.write_bytes(b"%PDF-1.7\n/MarkInfo<</Marked true>>/StructTreeRoot 5 0 R\n")
-            self.assertIn("present", build.tagged_check(pdf))
+            tree = b"%PDF-1.7\n/MarkInfo<</Marked true>>/StructTreeRoot 5 0 R\n"
+            pdf.write_bytes(tree + b"<pdfuaid:part>1</pdfuaid:part>\n")
+            self.assertEqual(build.tagged_check(pdf), "Tagged PDF: structure tree present.")
+            pdf.write_bytes(tree)  # TeX Live 2023 to 2025 with pdfa: tagged, but no PDF/UA identification
+            self.assertIn("PDF/UA is not validated", build.tagged_check(pdf))
             pdf.write_bytes(b"%PDF-1.7\n")
             self.assertIn("no structure tree", build.tagged_check(pdf))
         done = subprocess.CompletedProcess([], 0, stdout='<validationReport isCompliant="true">', stderr="")
-        with mock.patch.object(build.subprocess, "run", return_value=done) as call:
-            note = build.verapdf_note("verapdf", Path("a.pdf"), "a-2a", tagged=True)
-        self.assertEqual([c[0][0][4] for c in call.call_args_list], ["2a", "ua1"])
-        self.assertEqual(note, "PDF/A a-2a: veraPDF passed. PDF/UA-1: veraPDF passed.")
+        for level, ua, flavours, expected in (
+                ("a-2a", 1, ["2a", "ua1"], "PDF/A a-2a: veraPDF passed. PDF/UA-1: veraPDF passed."),
+                ("a-4f", 2, ["4f", "ua2"], "PDF/A a-4f: veraPDF passed. PDF/UA-2: veraPDF passed."),
+                (None, 1, ["ua1"], "PDF/UA-1: veraPDF passed."),
+                ("a-2b", 0, ["2b"], "PDF/A a-2b: veraPDF passed.")):
+            with self.subTest(level=level, ua=ua), \
+                    mock.patch.object(build.subprocess, "run", return_value=done) as call:
+                note = build.verapdf_note("verapdf", Path("a.pdf"), level, ua)
+            self.assertEqual([c[0][0][4] for c in call.call_args_list], flavours)
+            self.assertEqual(note, expected)
+
+    def test_pdf_a4_is_pdf_ua2_and_needs_the_new_kernel(self):
+        for value, level in (("4f", "a-4f"), ("a-4e", "a-4e"), ("4", "a-4")):
+            self.assertEqual(self.settings(self.PLAIN, f'pdfa = "{value}"\n')["pdfa"], level)
+        self.assertConfigError(self.PLAIN, 'pdfa = "4b"\n')
+        tagged = build.document_metadata(self.settings(self.PLAIN, 'tagged = true\npdfa = "4f"\n'))
+        self.assertIn(r"\DocumentMetadata{pdfstandard={a-4f,ua-2},lang=en-US,tagging=on}", tagged)
+        self.assertNotIn("testphase", tagged)  # the testphase cannot do PDF 2.0
+        self.assertIn("WARNING: tagged = true needs LaTeX 2025-06-01", tagged)
+        untagged = build.document_metadata(self.settings(self.PLAIN, 'pdfa = "4f"\n'))
+        self.assertTrue(untagged.startswith(r"\IfFormatAtLeastTF{2025-06-01}{\DocumentMetadata{pdfstandard=a-4f,"))
+        self.assertIn("WARNING: pdfa = a-4f needs LaTeX 2025-06-01", untagged)
+        self.assertNotIn("\n", tagged + untagged)
+
+    def test_tagged_pretex_workarounds(self):
+        def meta(toml):
+            return build.document_metadata(self.settings(self.PLAIN, toml))
+        # Interword-space font: every tagged build, never an untagged one.
+        self.assertIn("pdfspacefont{dummy-space}", meta("tagged = true\n"))
+        self.assertNotIn("pdfspacefont", meta('pdfa = "2b"\n'))
+        # Attached files: tagged PDF/A-1, A-2 and A-4 (without f) only; A-3 and A-4f allow them.
+        for level, attached in (("2a", False), ("2b", False), ("3a", True), ("4f", True), ("4", False)):
+            with self.subTest(level=level):
+                self.assertEqual("attach-css=false" in meta(f'tagged = true\npdfa = "{level}"\n'), not attached)
+        self.assertNotIn("attach-css", meta("tagged = true\n"))
+        self.assertNotIn("attach-css", meta('pdfa = "2b"\n'))
+
+    def test_xmp_part(self):
+        self.assertEqual(build.xmp_part(b"<pdfuaid:part>2</pdfuaid:part>", "pdfuaid"), 2)
+        self.assertEqual(build.xmp_part(b'x pdfaid:part="3" y', "pdfaid"), 3)
+        self.assertEqual(build.xmp_part(b"<pdfaid:part>2</pdfaid:part>", "pdfuaid"), 0)
+        self.assertEqual(build.xmp_part(b"", "pdfaid"), 0)
+
+    def test_pdfa_check_validates_the_declared_ua_part(self):
+        with fake_repo() as root, mock.patch.object(build.shutil, "which", return_value="verapdf"), \
+                mock.patch.object(build, "verapdf_note", return_value="ran") as note:
+            pdf = root / "a.pdf"
+            head = b"%PDF-2.0\n<pdfaid:part>4</pdfaid:part>\n/OutputIntents [1 0 R]\n"
+            pdf.write_bytes(head + b"<pdfuaid:part>2</pdfuaid:part>\n")
+            build.pdfa_check(pdf, "a-4f", True, True)
+            self.assertEqual(note.call_args[0][2:], ("a-4f", 2))
+            build.pdfa_check(pdf, "a-4f", True, False)  # not tagged: PDF/A only
+            self.assertEqual(note.call_args[0][2:], ("a-4f", 0))
+            pdf.write_bytes(head)  # tagged, but TeX Live 2023 to 2025 left out the PDF/UA identification
+            build.pdfa_check(pdf, "a-4f", True, True)
+            self.assertEqual(note.call_args[0][2:], ("a-4f", 0))
+            pdf.write_bytes(b"%PDF-2.0\n")
+            self.assertIn("needs LaTeX 2025-06-01", build.pdfa_check(pdf, "a-4f"))
 
     def test_tagged_pdfa_list_form_on_new_kernels(self):
         meta = build.document_metadata(self.settings(self.PLAIN, 'tagged = true\npdfa = "2a"\n'))

@@ -15,6 +15,8 @@ on:
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - ".github/texlive-packages.txt"
+      - "tests/fixtures/tagged/**"
+      - "tests/tagged_check.py"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -29,6 +31,8 @@ on:
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - ".github/texlive-packages.txt"
+      - "tests/fixtures/tagged/**"
+      - "tests/tagged_check.py"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -78,6 +82,52 @@ jobs:
         with:
           path: ~/texlive
           key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+
+  # PDF/A, PDF/UA and tagged-PDF check: the fixtures in tests/fixtures/tagged are built on the cached tug.org
+  # TeX Live (kernel 2025-06 or newer) and validated with a pinned veraPDF (tests/tagged_check.py). It runs
+  # beside `build`, which never waits for it and publishes either way; without a TeX Live cache it is skipped.
+  tagged-pdf:
+    runs-on: ubuntu-latest
+    needs: texlive-cache
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Restore TeX Live cache
+        id: tl
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+      - name: No TeX Live cache yet
+        if: steps.tl.outputs.cache-hit != 'true'
+        run: echo "::notice::tagged-pdf skipped, the TeX Live cache is not saved yet (texlive-cache fills it)."
+      - name: Restore veraPDF
+        if: steps.tl.outputs.cache-hit == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/verapdf
+          key: verapdf-1.28.2-v1
+      - name: Tagged PDF, PDF/A and PDF/UA with veraPDF
+        if: steps.tl.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p ~/verapdf
+          jar=~/verapdf/greenfield-apps.jar
+          if [ ! -f "$jar" ]; then
+            curl -fsSL --retry 3 -o "$jar" https://repo1.maven.org/maven2/org/verapdf/apps/greenfield-apps/1.28.2/greenfield-apps-1.28.2.jar
+          fi
+          echo "687d4d8bcfec48c9f7e931cf78ed061f1eeccfba55d4cdc000ba9b4d8aa46ce6  $jar" | sha256sum -c -
+          printf '#!/bin/sh\nexec java -cp "%s" org.verapdf.apps.GreenfieldCliWrapper "$@"\n' "$jar" > ~/verapdf/verapdf
+          chmod +x ~/verapdf/verapdf
+          export PATH="$HOME/texlive/bin/x86_64-linux:$HOME/verapdf:$PATH"
+          verapdf --version | head -1
+          pdflatex --version | head -1
+          python3 tests/tagged_check.py
+      - uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: tagged-pdf-logs
+          path: out/
+          if-no-files-found: ignore
 
   build:
     runs-on: ubuntu-latest

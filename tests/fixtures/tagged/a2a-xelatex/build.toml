@@ -1,0 +1,3 @@
+engine = "xelatex"
+tagged = true
+pdfa = "2a"
