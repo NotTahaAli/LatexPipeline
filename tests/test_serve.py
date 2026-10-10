@@ -1308,6 +1308,12 @@ class LogWarnings(ServerCase):
         rerun = next(w for w in found if w["kind"] == "rerun")
         self.assertEqual((rerun["file"], rerun["line"], rerun["level"]), (None, None, "info"))
 
+    def test_a_paragraph_that_ends_in_the_next_file_is_blamed_on_the_file_it_began_in(self):
+        log = ("===== LaTeX log (main.log) =====\n(./main.tex (./Chapters/one.tex) (./Chapters/two.tex\n"
+               "Overfull \\hbox (9.0pt too wide) in paragraph at lines 7--1\n[]\n\n)")
+        box = serve.parse_warnings(log, self.root)[0]
+        self.assertEqual((box["file"], box["line"]), ("Chapters/one.tex", 7))
+
     def test_bibtex_warnings_are_listed_and_files_cannot_escape_the_document(self):
         found = serve.parse_warnings(self.LOG, self.root)
         bib = [w for w in found if w["kind"] == "bibtex"]
@@ -1325,6 +1331,20 @@ class LogWarnings(ServerCase):
         self.log.unlink()
         self.assertEqual(self.request("GET", "/api/warnings?doc=demo")[1], {"warnings": []})
         self.assertEqual(self.request("GET", "/api/warnings?doc=nope")[0], 404)
+
+    def test_remember_build_merges_into_the_report_without_dropping_other_documents(self):
+        report = self.root / "report"
+        report.mkdir()
+        (report / "build-report.json").write_text(json.dumps({"documents": [
+            {"name": "other", "seconds": 1}, {"name": "demo", "seconds": 2}]}), encoding="utf-8")
+        with mock.patch.object(build, "OUT_DIR", report):
+            serve.remember_build({"name": "demo", "seconds": 9.5})
+            docs = json.loads((report / "build-report.json").read_text())["documents"]
+            names = {d["name"]: d["seconds"] for d in docs}
+            self.assertEqual(names, {"other": 1, "demo": 9.5})
+            (report / "build-report.json").write_text("garbage", encoding="utf-8")
+            serve.remember_build({"name": "demo", "seconds": 3})
+            self.assertEqual(json.loads((report / "build-report.json").read_text())["documents"][0]["seconds"], 3)
 
     def test_saved_result_restores_pages_warnings_and_time_after_a_restart(self):
         pdf = self.root / "main.pdf"

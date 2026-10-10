@@ -144,6 +144,7 @@
   <div class="drawer-bar">
     <div class="side-tabs" role="tablist" aria-label="Drawer">
       <button role="tab" id="dtab-problems" aria-controls="dpanel-problems" aria-selected="true"><svg class="ic"><use href="#i-alert"/></svg>Problems <span id="problemCount" class="count"></span></button>
+      <button role="tab" id="dtab-warnings" aria-controls="dpanel-warnings" aria-selected="false"><svg class="ic"><use href="#i-alert"/></svg>Warnings <span id="warnCount" class="count"></span></button>
       <button role="tab" id="dtab-lint" aria-controls="dpanel-lint" aria-selected="false">Lint <span id="lintCount" class="count"></span></button>
       <button role="tab" id="dtab-log" aria-controls="dpanel-log" aria-selected="false"><svg class="ic"><use href="#i-log"/></svg>Log</button>
     </div>
@@ -151,6 +152,10 @@
     <button class="icon" id="drawerClose" aria-label="Close panel" title="Close (Esc)"><svg class="ic"><use href="#i-x"/></svg></button>
   </div>
   <div id="dpanel-problems" role="tabpanel" aria-labelledby="dtab-problems"><ul id="problems" class="plist"></ul></div>
+  <div id="dpanel-warnings" role="tabpanel" aria-labelledby="dtab-warnings" hidden>
+    <div id="warnFilter" class="wfilter" role="group" aria-label="Show warnings of kind"></div>
+    <ul id="warnList" class="plist"></ul>
+  </div>
   <div id="dpanel-lint" role="tabpanel" aria-labelledby="dtab-lint" hidden><ul id="lintList" class="plist"></ul></div>
   <div id="dpanel-log" tabindex="0" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
 </section>

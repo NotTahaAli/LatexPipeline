@@ -518,6 +518,13 @@ function tickBuild() {
 }
 let buildSeen = Date.now() / 1000;
 
+// The badge counts what the Warnings tab lists (boxes included) once that is loaded, else the build's own count.
+function showWarnBadge(d = docs[cur]) {
+  if (!d) return;
+  const n = warnLoaded === cur + ":" + (d.finished || "") ? warnings.filter((w) => w.level !== "info").length : d.warnings;
+  $("warnBadge").hidden = !n; $("warnBadge").textContent = `${n} warning${n === 1 ? "" : "s"}`;
+}
+
 function renderStatus() {
   const d = docs[cur]; if (!d) return;
   announce(d);
@@ -531,8 +538,8 @@ function renderStatus() {
   $("status").title = [d.finished && "Finished " + new Date(d.finished * 1000).toLocaleTimeString(), d.status === "failed" && d.version && "Showing last good PDF", "Click for problems and log"].filter(Boolean).join(". ");
   const errs = d.errors.length || (d.status === "failed" ? 1 : 0);
   $("errBadge").hidden = !errs; $("errBadge").textContent = `${errs} error${errs === 1 ? "" : "s"}`;
-  $("warnBadge").hidden = !d.warnings; $("warnBadge").textContent = `${d.warnings} warning${d.warnings === 1 ? "" : "s"}`;
-  $("warnBadge").title = "Show the build log, where LaTeX lists its warnings";
+  showWarnBadge(d);
+  $("warnBadge").title = "Show the warnings from the build";
   $("problemCount").textContent = errs || "";
   const key = d.status === "failed" ? d.finished : null;
   if (key && key !== lastErrKey) { lastErrKey = key; setDrawer(true, "problems"); }   // New failure: show it once.
@@ -589,7 +596,7 @@ function renderProblems() {
       [...(excerpt ? [el("pre", { textContent: excerpt })] : []), logLink.cloneNode(true)], true));
   }
   if (!list.length) list.push(el("li", { className: "none" }, el("span", { className: "ok-mark", textContent: "No errors" }), el("span", { className: "mute", textContent: d.status === "building" ? " Building..." : " in the last build." }),
-    ...(d.warnings ? [" ", el("button", { className: "link", textContent: `See ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"} in the log`, onclick: () => setDrawer(true, "log") })] : [])));
+    ...(d.warnings ? [" ", el("button", { className: "link", textContent: `See ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"}`, onclick: () => setDrawer(true, "warnings") })] : [])));
   $("problems").replaceChildren(...list);
 }
 
@@ -604,6 +611,38 @@ async function loadLint() {
   } catch (e) { $("lintList").replaceChildren(el("li", { className: "none", textContent: e.message })); }
 }
 
+// Warnings parsed from the LaTeX log on the server; kinds are filterable, each row jumps to its source line.
+const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"]];
+const warnGroup = (w) => w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
+let warnings = [], warnFilter = "all", warnKey = null, warnLoaded = null;
+function renderWarnings() {
+  const real = warnings.filter((w) => w.level !== "info").length;
+  $("warnCount").textContent = real || "";
+  showWarnBadge();
+  $("warnFilter").replaceChildren(...WARN_KINDS.map(([id, label]) => {
+    const n = id === "all" ? warnings.length : warnings.filter((w) => warnGroup(w) === id).length;
+    const b = el("button", { type: "button", className: "chip", textContent: `${label} ${n}`, disabled: id !== "all" && !n, onclick: () => { warnFilter = id; renderWarnings(); } });
+    b.setAttribute("aria-pressed", String(warnFilter === id));
+    return b;
+  }));
+  const shown = warnings.filter((w) => warnFilter === "all" || warnGroup(w) === warnFilter);
+  $("warnList").replaceChildren(...(shown.length ? shown.map((w) => {
+    const where = w.file ? whereLink(w.file, w.line) : el("span", { className: "where mute", textContent: w.source });
+    const more = [...(w.hint ? [el("div", { className: "hint", textContent: w.hint })] : []), ...(w.excerpt && w.excerpt !== w.message ? [el("pre", { textContent: w.excerpt })] : [])];
+    if (!more.length) more.push(el("span", { className: "mute", textContent: `${w.source}${w.file ? ` - ${w.file}:${w.line}` : ""}` }));
+    return disclosure([el("span", { className: "sev " + w.level }), el("span", { className: "msg", textContent: w.message }), where], more);
+  }) : [el("li", { className: "none" }, el("span", { className: "ok-mark", textContent: "No warnings" }), el("span", { className: "mute", textContent: " in the last build." }))]));
+}
+async function loadWarnings() {
+  const key = cur + ":" + (docs[cur]?.finished || "");
+  if (key === warnKey) return;
+  warnKey = key;
+  try { warnings = (await api.warnings(cur)).warnings; } catch { warnings = []; }
+  if (warnKey !== key) return;   // Another build or document came in meanwhile.
+  warnLoaded = key;
+  renderWarnings();
+}
+
 async function loadLog() {
   try { $("logText").textContent = await (await fetch(api.logUrl(cur))).text(); } catch { $("logText").textContent = "No log yet."; }
 }
@@ -612,18 +651,19 @@ function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
   $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
   for (const b of ["status", "errBadge"]) $(b).setAttribute("aria-expanded", String(open));
-  for (const n of ["problems", "lint", "log"]) {
+  for (const n of ["problems", "warnings", "lint", "log"]) {
     $("dtab-" + n).setAttribute("aria-selected", String(ui.drawerTab === n));
     $("dpanel-" + n).hidden = ui.drawerTab !== n;
   }
+  if (open && ui.drawerTab === "warnings") loadWarnings();
   if (open && ui.drawerTab === "lint") loadLint();
   if (open && ui.drawerTab === "log") loadLog();
 }
-for (const n of ["problems", "lint", "log"]) $("dtab-" + n).onclick = () => setDrawer(true, n);
+for (const n of ["problems", "warnings", "lint", "log"]) $("dtab-" + n).onclick = () => setDrawer(true, n);
 const toggleDrawer = () => setDrawer(!ui.drawer);
 $("status").onclick = toggleDrawer;
 $("errBadge").onclick = () => setDrawer(true, "problems");
-$("warnBadge").onclick = () => setDrawer(true, "log");
+$("warnBadge").onclick = () => setDrawer(true, "warnings");
 $("drawerClose").onclick = () => setDrawer(false);
 
 // ---- sidebar toggles ----------------------------------------------------------------------------------
@@ -729,6 +769,7 @@ const COMMANDS = [
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
+  { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
@@ -796,7 +837,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "-", "problems", "lint", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
+  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
@@ -961,6 +1002,7 @@ channel.on("state", (data) => {
   lastStatus = docs[cur].status;
   renderStatus();
   if (docs[cur].version !== pdfView.version) loadPdf();
+  loadWarnings();   // Cheap: it fetches only when a build finished since the last look.
   if (wasBuilding && lastStatus !== "building") { loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
 });
 let lastStatus = null, booted = false;
@@ -982,7 +1024,8 @@ async function pick(name) {
   $("doc").value = name;
   tabs.clear(); active = null; files = []; outlineData = null; refs = { labels: {}, bib: {} };
   pdfView.version = null;
-  renderStatus(); loadPdf(); await loadFiles(); await restoreTabs();
+  warnKey = warnLoaded = null; warnings = []; renderWarnings();
+  renderStatus(); loadPdf(); loadWarnings(); await loadFiles(); await restoreTabs();
 }
 
 async function restoreTabs() {

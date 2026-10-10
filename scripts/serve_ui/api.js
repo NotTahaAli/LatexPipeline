@@ -25,6 +25,7 @@ export const api = {
   shareRegenerate: () => call("api/share/regenerate", { method: "POST" }),
   outline: (doc) => call(`api/outline?${qs({ doc })}`),
   refs: (doc) => call(`api/refs?${qs({ doc })}`),
+  warnings: (doc) => call(`api/warnings?${qs({ doc })}`),
   lint: (doc) => call(`api/lint?${qs({ doc })}`),
   health: () => call("api/health"),
   rebuild: (doc) => call(`rebuild?${qs({ doc })}`, { method: "POST" }),

@@ -304,6 +304,19 @@ def saved_result(name: str, main_tex: Path) -> dict:
     return result
 
 
+def remember_build(entry: dict) -> None:
+    """Keep this build's summary in out/build-report.json beside the other documents', for saved_result()."""
+    try:
+        old = json.loads((build.OUT_DIR / "build-report.json").read_text("utf-8"))["documents"]
+        entries = [e for e in old if isinstance(e, dict) and e.get("name") != entry["name"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        entries = []
+    try:
+        build.write_report([*entries, entry])
+    except OSError:
+        pass
+
+
 def fresh_state(name: str, main_tex: Path) -> dict:
     return {
         "name": name, "status": "idle", "ok": None, "seconds": None, "pages": None, "warnings": 0,
@@ -361,6 +374,7 @@ def parse_warnings(log_text: str, root: Path | None = None) -> list[dict]:
     found: list[dict] = []
     seen: set[tuple] = set()
     stack: list[str | None] = []
+    closed: str | None = None  # the .tex file TeX finished reading last
     for match in _WARNING_TOKEN.finditer(latex_section(log_text)):
         if match.group("open") is not None:
             name = match.group("open")
@@ -368,7 +382,7 @@ def parse_warnings(log_text: str, root: Path | None = None) -> list[dict]:
             continue
         if match.group("warn") is None:
             if stack:
-                stack.pop()
+                closed = stack.pop() or closed
             continue
         rows = match.group("warn").split("\n")
         first = rows[0]
@@ -389,6 +403,9 @@ def parse_warnings(log_text: str, root: Path | None = None) -> list[dict]:
                 kind = "package" if head.startswith(("Package", "Class", "Module")) else "latex"
         at = re.search(r"\blines? (\d+)" if box else r"on input line (\d+)", first if box else message)
         file = stack[-1] if stack else None  # A warning raised while a package file is open names that file's lines.
+        span = re.search(r"\blines (\d+)--(\d+)", first) if box else None
+        if span and int(span.group(2)) < int(span.group(1)):
+            file = closed  # The paragraph began in the file that just ended and was closed by the next one.
         file = doc_relative(root, file[2:] if file and file.startswith("./") else file) if root else None
         line = int(at.group(1)) if at and file else None
         file = file if line else None  # No line: nothing to jump to.
@@ -427,6 +444,7 @@ def run_build(main_tex: Path, latexmk: str, force: bool) -> None:
     name = build.doc_name(main_tex)
     publish(name, status="building", started=time.time())
     entry, _ = build.build_safely(main_tex, latexmk, False, force)
+    remember_build(entry)
     try:
         log_text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
     except OSError:
