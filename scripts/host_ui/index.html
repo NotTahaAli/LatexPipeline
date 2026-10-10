@@ -1,5 +1,27 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>LaTeX Studio</title></head>
-<body><main><h1>LaTeX Studio</h1></main></body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LaTeX Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230969da'/%3E%3Cpath d='M7 7h10M12 7v10' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="ui/style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header id="top">
+  <a id="brand" class="brand" href="#home"><span class="logo" aria-hidden="true">T</span><span id="site">LaTeX Studio</span></a>
+  <nav id="nav" aria-label="Main" hidden>
+    <a href="#home" data-nav="home">Projects</a>
+    <a href="#account" data-nav="account">Account</a>
+    <a href="#admin" data-nav="admin" id="adminLink" hidden>Site admin</a>
+  </nav>
+  <span class="spacer"></span>
+  <button id="theme" class="btn" type="button" aria-pressed="false">Dark theme</button>
+  <button id="logout" class="btn" type="button" hidden>Sign out</button>
+</header>
+<div id="status" class="sr" role="status" aria-live="polite"></div>
+<main id="main" tabindex="-1"></main>
+<script type="module" src="ui/app.js"></script>
+</body>
 </html>
