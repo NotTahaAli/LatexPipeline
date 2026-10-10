@@ -262,6 +262,8 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 
 The last two optimizations were measured on a busier machine (median of 3): `--force` 87 s to 55 s (figures 35 s to 14 s), a text edit in a file holding a figure 23 s to 13 s, other text edits unchanged at 13 s (one LaTeX pass).
 
+How this compares with plain latexmk, an Overleaf-style build, a naive pdflatex/bibtex script, arara and Tectonic (including where plain latexmk wins) is in [docs/benchmarks.md](docs/benchmarks.md).
+
 Not adopted, because they did not pay off: a precompiled preamble format (saves about 1.2 s of a 12 s pass, changed the page count out of the box and hides the class from `-recorder`), `-draftmode` or `\pdfcompresslevel=0` for intermediate passes and dropping SyncTeX (no gain above the 1 s noise), parallel BibTeX (the ten units take 0.2 s together), and splicing separately built chapters into the full PDF (needs a PDF library; `pdfunite` drops the outline and breaks cross-chapter links).
 
 ---
