@@ -608,7 +608,13 @@ async function loadPdf() {
   $("empty").hidden = true;
   window.__loadStart = performance.now();
   const version = wantedVersion();
+  const switching = !!f !== !!pdfView.focused, top = pdfView.viewer.scrollTop;
   await pdfView.load(api.pdfUrl(cur, f ? f.version : d.version, !!f), version);
+  if (switching) {   // Chapter preview opens at its first page; the full PDF comes back where you were reading.
+    if (f) pdfView.fullTop = top;
+    pdfView.viewer.scrollTop = f ? 0 : pdfView.fullTop || 0;
+  }
+  pdfView.focused = !!f;
   if (pdfView.fitMode) pdfView.fit();
 }
 
@@ -719,18 +725,25 @@ function tickBuild() {
   const elapsed = Math.max(0, Date.now() / 1000 - (d.started || buildSeen));
   $("label").textContent = `Building ${fmtSecs(elapsed)}`;
   $("info").textContent = d.seconds ? `· last took ${fmtSecs(d.seconds)}` : "";
+  $("status").title = statusTitle(d, elapsed);
   bar.hidden = false;
   bar.firstElementChild.style.width = d.seconds ? Math.min(95, (elapsed / d.seconds) * 100) + "%" : "";
   bar.classList.toggle("indeterminate", !d.seconds);
   const e = $("emptyTime"); if (e) e.textContent = fmtSecs(elapsed);
 }
 let buildSeen = Date.now() / 1000;
+const statusTitle = (d, elapsed) => d.status === "building"
+  ? `Building... ${fmtSecs(elapsed)}${d.seconds ? ` (last build took ${fmtSecs(d.seconds)})` : ""}. Click for problems and log`
+  : [d.finished && "Finished " + new Date(d.finished * 1000).toLocaleTimeString(), d.status === "failed" && d.version && "Showing last good PDF", "Click for problems and log"].filter(Boolean).join(". ");
 
 // The badge counts what the Warnings tab lists (boxes included) once that is loaded, else the build's own count.
 function showWarnBadge(d = docs[cur]) {
   if (!d) return;
   const n = warnLoaded === cur + ":" + (d.finished || "") ? warnings.filter((w) => w.level !== "info").length : d.warnings;
   $("warnBadge").hidden = !n; $("warnBadge").textContent = `${n} warning${n === 1 ? "" : "s"}`;
+  const errs = d.errors.length || (d.status === "failed" ? 1 : 0), chip = $("probChip");   // Phones show this one chip instead of both badges.
+  chip.hidden = !errs && !n; chip.className = "badge " + (errs ? "bad" : "warn"); chip.textContent = errs + n;
+  chip.setAttribute("aria-label", [errs && `${errs} error${errs === 1 ? "" : "s"}`, n && `${n} warning${n === 1 ? "" : "s"}`].filter(Boolean).join(", ") + ". Show problems");
 }
 
 function renderStatus() {
@@ -743,7 +756,7 @@ function renderStatus() {
   if (d.seconds != null) bits.push(d.seconds + "s");
   $("info").textContent = bits.length ? "· " + bits.join(" · ") : "";
   if (d.status === "building") { if (!buildTimer) { buildSeen = Date.now() / 1000; buildTimer = setInterval(tickBuild, 1000); } tickBuild(); } else tickBuild();
-  $("status").title = [d.finished && "Finished " + new Date(d.finished * 1000).toLocaleTimeString(), d.status === "failed" && d.version && "Showing last good PDF", "Click for problems and log"].filter(Boolean).join(". ");
+  $("status").title = statusTitle(d, Math.max(0, Date.now() / 1000 - (d.started || buildSeen)));
   const errs = d.errors.length || (d.status === "failed" ? 1 : 0);
   $("errBadge").hidden = !errs; $("errBadge").textContent = `${errs} error${errs === 1 ? "" : "s"}`;
   showWarnBadge(d);
@@ -979,6 +992,7 @@ const toggleDrawer = () => setDrawer(!ui.drawer);
 $("status").onclick = toggleDrawer;
 $("errBadge").onclick = () => setDrawer(true, "problems");
 $("warnBadge").onclick = () => setDrawer(true, "warnings");
+$("probChip").onclick = () => setDrawer(true, $("errBadge").hidden ? "warnings" : "problems");
 $("drawerClose").onclick = () => setDrawer(false);
 
 // ---- sidebar toggles ----------------------------------------------------------------------------------
@@ -1178,15 +1192,18 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "references", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
-  m.replaceChildren(...entries.map((id) => {
-    if (id === "-") return el("hr");
-    const c = COMMANDS.find((x) => x.id === id);
-    const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
-    if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
-    return b;
-  }));
+  const groups = [["Panels", ["files", "outline", "references"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]],
+    ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
+    ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
+  m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
+    el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
+      const c = COMMANDS.find((x) => x.id === id);
+      const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
+      if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
+      return b;
+    })), "mg" + g)));
 }
+const withLabel = (n, id) => (n.setAttribute("aria-labelledby", id), n);
 function closeMenu() { $("moreMenu").hidden = true; $("moreBtn").setAttribute("aria-expanded", "false"); }
 $("moreBtn").onclick = (e) => {
   e.stopPropagation();

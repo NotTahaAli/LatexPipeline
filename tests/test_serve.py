@@ -775,6 +775,16 @@ class ShareHttp(SharedState, ServerCase):
             hdrs["Cookie"] = f"{serve.cookie_name()}={self.tokens[role]}"
         return self.request(method, path, body, hdrs)
 
+    def test_401_is_a_styled_page_for_browsers_and_plain_for_api_clients(self):
+        status, page = self.get("GET", "/", headers={"Accept": "text/html,application/xhtml+xml"})
+        self.assertEqual(status, 401)
+        self.assertIn(b"prefers-color-scheme:dark", page)
+        self.assertNotIn(b"<script", page)
+        self.assertNotIn(b"http", page)  # no external resources
+        plain = b"Unauthorized: open the full share link you were sent."
+        self.assertEqual(self.get("GET", "/", headers={"Accept": "*/*"})[1], plain)
+        self.assertEqual(self.get("GET", "/api/health", headers={"Accept": "text/html"})[1], plain)
+
     def test_every_endpoint_needs_a_token(self):
         for path in ("/", "/ui/app.js", "/api/health", "/api/config", "/api/file?doc=demo&path=main.tex", "/api/poll",
                      "/pdf/demo", "/events"):

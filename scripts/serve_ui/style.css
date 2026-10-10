@@ -60,6 +60,9 @@ select#doc{max-width:200px;font-weight:600}
 .menu button:hover,.menu button:focus-visible{background:var(--acc-bg);color:var(--acc-fg)}
 .menu .keys{margin-left:auto;color:var(--mute);font-size:12px}
 .menu hr{border:0;border-top:1px solid var(--line);margin:4px 0}
+.menu .mgroup+.mgroup{border-top:1px solid var(--line);margin-top:4px;padding-top:2px}
+.menu .mlabel{padding:4px 9px 2px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--mute)}
+#probChip{display:none}
 
 /* Role chip, first-run tips */
 .role{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--warn-bg);color:var(--warn);white-space:nowrap}
@@ -317,6 +320,7 @@ kbd{font:12px var(--mono);background:var(--panel2);border:1px solid var(--line);
 @media(max-width:700px){
   #work{flex-direction:column}#editorPane{flex:1 1 50%;min-height:0}#pdfPane{flex:1 1 50%;min-height:0}#splitter{display:none}
   #topbar{gap:6px;padding:6px 8px;flex-wrap:wrap}#topbar button{flex:none}#visualBtn,#shareBtn:not(.on){display:none}.menu{position:fixed;left:8px;right:8px;top:52px;min-width:0;max-height:calc(100vh - 60px);overflow:auto}.brand{display:none}select#doc{max-width:104px}.badge{white-space:nowrap}
+  #errBadge,#warnBadge{display:none!important}#probChip:not([hidden]){display:inline-flex;align-items:center}.avatars .av:nth-child(n+2){display:none}#topbar{flex-wrap:nowrap}
 }
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
