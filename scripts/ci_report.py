@@ -183,9 +183,11 @@ def diff_section(diff_dir: Path) -> list[str]:
     documents = report.get("documents", {})
     if not documents:
         lines.append("No changed document to compare.")
+    url = os.environ.get("DIFF_ARTIFACT_URL")
+    artifact = f"[`diff-pdfs`]({url})" if url else "`diff-pdfs`"
     for name, result in documents.items():
         if result["ok"]:
-            lines.append(f"- `{name}`: compiled, see the `diff-pdfs` artifact.")
+            lines.append(f"- `{name}`: compiled, download {artifact}.")
         else:
             error = result.get("error", "unknown error")
             lines.append(f"- `{name}`: failed ({error}).")

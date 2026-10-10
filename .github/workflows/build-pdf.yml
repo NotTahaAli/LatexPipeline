@@ -194,6 +194,7 @@ jobs:
         run: python3 scripts/ci_report.py diff --base "$BASE_SHA" --out "$RUNNER_TEMP/diff-pdfs"
 
       - name: Upload latexdiff PDFs
+        id: diff-artifact
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         continue-on-error: true
         uses: actions/upload-artifact@v7
@@ -208,6 +209,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          DIFF_ARTIFACT_URL: ${{ steps.diff-artifact.outputs.artifact-url }}
         run: python3 scripts/ci_report.py pr-comment --diff-dir "$RUNNER_TEMP/diff-pdfs"
 
       # Keep the `pdfs` release holding the latest PDF of every document.
