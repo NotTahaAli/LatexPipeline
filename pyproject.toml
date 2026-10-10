@@ -3,7 +3,22 @@ name = "latex-pipeline"
 version = "0.1.0"
 description = "Build tooling for the LaTeX documents."
 requires-python = ">=3.9"
-dependencies = []
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "tomli>=2.5.0 ; python_full_version < '3.11'",
+]
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# The existing scripts raise inside except blocks without "from"; revisit when they change.
+ignore = ["B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/publish_release.py" = ["EXE001"]

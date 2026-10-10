@@ -1,0 +1,65 @@
+\section{Analysis and Validation}\label{sec:aAs3}
+\kant[8-11]
+
+This section builds on the material in \cref{app:A}, \cref{ch:8} and the prior work of \citet{appx-13}; see also \citep{appx-11,appx-10}.
+
+\begin{equation}\label{eq:aAs3-a}
+  \hat{\theta} = \arg\min_{\theta\in\Theta}\; \frac{1}{n}\sum_{i=1}^{n}\ell\bigl(y_i, g_\theta(x_i)\bigr) + \lambda\lVert\theta\rVert_2^2 .
+\end{equation}
+Under standard regularity conditions the estimator is consistent, and its error satisfies
+\begin{equation}\label{eq:aAs3-b}
+  \mathbb{E}\lVert\hat\theta-\theta^\star\rVert^2 \le \frac{C\,\sigma^2 d}{n} + \lambda^2\lVert\theta^\star\rVert^2 .
+\end{equation}
+
+Equations~\eqref{eq:aAs3-a} and~\eqref{eq:aAs3-b} are used throughout the remainder of this section.
+
+\kant[5-10]
+
+\subsection{Quantitative behaviour}\label{sec:aAs3-q}
+Results are collected in \cref{tab:aAs3}. Similar trends were reported in~\citep{appx-14,appx-7}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{aAs3}.}\label{tab:aAs3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{87.2} & \SI{5.93}{\milli\second} & \num{8.553e-5} \\
+Beta & \num{3.0} & \SI{9.69}{\milli\second} & \num{2.445e-3} \\
+Gamma & \num{56.0} & \SI{6.86}{\milli\second} & \num{8.756e-3} \\
+Delta & \num{74.8} & \SI{6.61}{\milli\second} & \num{2.704e-3} \\
+Epsilon & \num{70.9} & \SI{7.87}{\milli\second} & \num{3.344e-3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[102-103]
+
+\subsection{Implementation notes}\label{sec:aAs3-i}
+The core routine is shown in \cref{lst:aAs3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{appx-3}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for aAs3.},label={lst:aAs3}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\kant[9-11]
+\begin{theorem}\label{thm:aAs3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:aAs3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[24-24]

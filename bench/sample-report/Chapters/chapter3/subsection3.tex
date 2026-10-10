@@ -1,0 +1,72 @@
+\section{Analysis and Validation (Problem Formulation)}\label{sec:c3s3}
+\kant[1-12]
+
+This section builds on the material in \cref{sec:c3s2}, \cref{ch:4} and the prior work of \citet{ch3-13}; see also \citep{ch3-3,ch3-9}.
+
+\begin{equation}\label{eq:c3s3-a}
+  \frac{\partial u}{\partial t} = \nabla\cdot\bigl(D(\mathbf{x})\nabla u\bigr) + f(u),\qquad u(\mathbf{x},0)=u_0(\mathbf{x}).
+\end{equation}
+Discretising in space with $N$ degrees of freedom yields the semi-discrete system
+\begin{align}\label{eq:c3s3-b}
+  \mathbf{M}\dot{\mathbf{u}} &= -\mathbf{K}\mathbf{u} + \mathbf{F}(\mathbf{u}),\\
+  \mathbf{u}(0) &= \mathbf{u}_0 \in \mathbb{R}^{N}.
+\end{align}
+
+Equations~\eqref{eq:c3s3-a} and~\eqref{eq:c3s3-b} are used throughout the remainder of this section.
+
+\kant[2-12]
+
+\subsection{Quantitative behaviour}\label{sec:c3s3-q}
+Results are collected in \cref{tab:c3s3}. Similar trends were reported in~\citep{ch3-11,ch3-7}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c3s3}.}\label{tab:c3s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{52.9} & \SI{5.01}{\milli\second} & \num{8.676e-3} \\
+Beta & \num{60.2} & \SI{7.00}{\milli\second} & \num{6.348e-4} \\
+Gamma & \num{49.9} & \SI{3.84}{\milli\second} & \num{6.118e-3} \\
+Delta & \num{15.3} & \SI{7.77}{\milli\second} & \num{8.897e-4} \\
+Epsilon & \num{42.2} & \SI{8.96}{\milli\second} & \num{6.119e-3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[82-83]
+
+\subsection{Implementation notes}\label{sec:c3s3-i}
+The core routine is shown in \cref{lst:c3s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{ch3-14}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c3s3.},label={lst:c3s3}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\lipsum[85-85]
+\begin{theorem}\label{thm:c3s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c3s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.45\linewidth]{mandel.png}
+\caption{Raster/vector asset \texttt{mandel.png} included from the figures directory.}\label{fig:c3s3-i0}
+\end{figure}
+
+\lipsum[105-105]

@@ -1,0 +1,46 @@
+\documentclass{FastFyp}
+\graphicspath{{Figures/}}
+\title{Accelerated Numerical Methods for Large-Scale Sensing Systems}
+\author{Jane Q. Student}
+\university{University of Example}
+\department{Department of Engineering Mathematics}
+\degree{BEng (Hons) Computational Engineering}
+\supervisor{Prof.\ A.\ N.\ Other}
+\studentid{20231234}
+\date{May 2024}
+\usepackage{lipsum}
+\usepackage{kantlipsum}
+
+\begin{document}
+\frontmatter
+\maketitlepage
+\begin{declaration}
+I hereby declare that this report is my own work and that all sources have been acknowledged.
+\end{declaration}
+\begin{acknowledgements}
+\lipsum[1]
+\end{acknowledgements}
+\fypinput{abs}{Chapters/front-abstract}
+\fypinput{sum}{Chapters/front-summary}
+\input{review}
+\tableofcontents
+\listoffigures
+\listoftables
+
+\mainmatter
+\bibliographystyle{plainnat}
+\fypinput{ch1}{Chapters/ch1}
+\fypinput{ch2}{Chapters/ch2}
+\fypinput{ch3}{Chapters/chapter3/chapter3}
+\fypinput{ch4}{Chapters/chapter4/chapter4}
+\fypinput{ch5}{Chapters/chapter5/chapter5}
+\fypinput{ch6}{Chapters/chapter6/chapter6}
+\input{Chapters/chapter7/chapter7}
+\input{Chapters/chapter8/chapter8}
+\input{Chapters/chapter9/chapter9}
+\input{Chapters/chapter10/chapter10}
+\fypinput{appx}{Chapters/appendices}
+
+\backmatter
+\bibliography{fypbib}
+\end{document}

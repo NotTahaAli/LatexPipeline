@@ -1,0 +1,8 @@
+{"status": "ok", "message-type": "work", "message-version": "1.0.0", "message": {
+ "DOI": "10.1000/xyz_123", "type": "journal-article", "publisher": "Example Press & Co.",
+ "title": ["Deep <i>Learning</i> &amp; Beyond: A 100% Study"], "subtitle": [],
+ "container-title": ["Journal of Examples"], "volume": "12", "issue": "3", "page": "123-145",
+ "issued": {"date-parts": [[2019, 5, 2]]},
+ "author": [{"given": "Ada", "family": "Lovelace", "sequence": "first"},
+            {"given": "Alan", "family": "Turing", "sequence": "additional"},
+            {"name": "The {Example} Consortium", "sequence": "additional"}]}}

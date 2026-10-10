@@ -1,0 +1,5 @@
+# TeX Live packages for CI (zauguin/install-texlive package_file); the cache key hashes this file.
+# Keep in step with the apt list in README.md and the trimmed apt step in build-pdf.yml.
+scheme-basic collection-latexrecommended collection-latexextra collection-fontsrecommended
+collection-mathscience collection-plaingeneric collection-binextra collection-xetex
+collection-luatex latexmk chktex texcount latexdiff biblatex biber
