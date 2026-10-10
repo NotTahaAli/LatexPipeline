@@ -7,11 +7,11 @@ const DELAY = 700;   // ms of quiet before a preview starts
 export class LivePreview {
   /**
    * view: the PdfView. opts: doc() current document, tab() {path, text} of the file being typed or null,
-   * enabled() whether to run now, onState({busy, error, seconds}) for the status line.
+   * enabled() whether to run now, onState({busy, error, seconds, wait, saved, done}) for the status line.
    */
   constructor(view, opts) {
     this.view = view; this.opts = opts;
-    this.timer = null; this.ctl = null; this.last = null; this.labels = new WeakMap();
+    this.timer = null; this.ctl = null; this.last = null; this.labels = new WeakMap(); this.waiting = null;
     this.cid = Math.random().toString(36).slice(2, 10);   // A newer preview of this page stops its older one on the server.
   }
 
@@ -36,6 +36,13 @@ export class LivePreview {
       if (!(res.headers.get("Content-Type") || "").startsWith("application/pdf")) {
         const data = await res.json().catch(() => ({}));
         if (data.cancelled || ctl.signal.aborted) return;
+        if (data.status === "same") { this.drop(); this.opts.onState({ busy: false, same: true }); return; }
+        if (data.status === "preamble" || data.status === "rebuild") {
+          // The preamble (or main.tex's chapter list) changed: no preview can be trusted until the full build has run.
+          this.drop(); this.waiting = data.status;
+          this.opts.onState({ busy: false, wait: data.status, saved: data.saved });
+          return;
+        }
         const first = data.errors?.[0];
         this.opts.onState({ busy: false, error: data.error || (first ? `${first.file}:${first.line}: ${first.message}` : "The preview failed."), off: res.status === 409 });
         return;
@@ -48,11 +55,14 @@ export class LivePreview {
       if (ctl.signal.aborted || doc !== this.opts.doc()) return;
       this.last = { doc, pdf, meta };
       await this.apply();
-      this.opts.onState({ busy: false, seconds: meta.seconds, warm: meta.warm });
+      this.opts.onState({ busy: false, seconds: meta.seconds, warm: meta.warm, passes: meta.passes });
     } catch (e) {
       if (e.name !== "AbortError") this.opts.onState({ busy: false, error: e.message });
     } finally { if (this.ctl === ctl) this.ctl = null; }
   }
+
+  /** Show the full PDF again (the last preview is out of date). */
+  drop() { if (this.last) { this.last = null; this.view.setSplice(null); } }
 
   async pageLabels(pdf) {
     if (!this.labels.has(pdf)) this.labels.set(pdf, await pdf.getPageLabels().catch(() => null));
@@ -60,24 +70,32 @@ export class LivePreview {
   }
 
   /**
-   * Splice the last preview over its chapter: its first page label (hyperref writes them) is found in the full PDF,
-   * and the chapter ends at the page the full build recorded. Without labels the preview is shown on its own.
+   * Splice the last preview over its pages of the full PDF: the pages the full build had shipped when the chapter
+   * started and ended (meta.pages.first/last, 0-based; last = first - 1 inserts), else the preview's first page
+   * label (hyperref) looked up in the full PDF up to the page the build recorded at its end. Failing both, the
+   * preview is shown on its own.
    */
   async apply() {
     const last = this.last, view = this.view;
     if (!last || !view.pdf || last.doc !== this.opts.doc()) return;
-    const full = await this.pageLabels(view.pdf), mine = await this.pageLabels(last.pdf);
+    const pages = last.meta.pages || {}, total = view.pdf.numPages;
     let from = -1, to = -1;
-    if (full && mine) {
-      from = full.indexOf(mine[0]);
-      to = from < 0 ? -1 : full.indexOf(String(last.meta.pages?.end ?? ""), from);
+    if (pages.first != null && pages.first <= total) {
+      from = pages.first; to = Math.min(pages.last ?? total - 1, total - 1);
+    } else {
+      const full = await this.pageLabels(view.pdf), mine = await this.pageLabels(last.pdf);
+      if (full && mine) {
+        from = full.indexOf(mine[0]);
+        to = from < 0 ? -1 : full.indexOf(String(pages.end ?? ""), from);
+      }
     }
-    if (from < 0 || to < from) { from = 0; to = view.pdf.numPages - 1; }
+    if (from < 0 || to < from - 1) { from = 0; to = total - 1; }
     view.setSplice({ doc: last.pdf, from, count: to - from + 1 });
   }
 
   /** A new full PDF was loaded: keep showing the preview only if it was typeset after that build started. */
   async afterLoad(buildStarted) {
+    if (this.waiting) { this.waiting = null; this.opts.onState({ busy: false, done: true }); }
     if (this.last && this.last.meta.t > (buildStarted || 0)) await this.apply();
     else this.last = null;
   }

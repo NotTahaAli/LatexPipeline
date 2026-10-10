@@ -1993,8 +1993,8 @@ class LivePreviewApi(ServerCase):
         return self.request("POST", "/api/preview?doc=demo&cid=c1", {"path": rel, "text": text})
 
     def test_only_chapter_files_of_the_document(self):
-        for rel, status in (("main.tex", 400), ("build.toml", 400), ("notes.txt", 400), ("../x.tex", 400),
-                            ("Chapters/none.tex", 404), (None, 400)):
+        for rel, status in (("build.toml", 400), ("notes.txt", 400), ("../x.tex", 400),
+                            ("Chapters/none.tex", 404), ("x.sty", 404), (None, 400)):
             with self.subTest(rel=rel):
                 self.assertEqual(self.post(rel)[0], status)
         bad = {"path": "Chapters/one.tex", "text": 3}
@@ -2019,6 +2019,26 @@ class LivePreviewApi(ServerCase):
         self.assertTrue(reply["errors"][0]["hint"])
         self.warm.compile.side_effect = serve.preview.PreviewError("not a chapter")
         self.assertEqual(self.post("Chapters/one.tex"), (409, {"error": "not a chapter"}))
+
+    def test_statuses_without_a_pdf_come_back_as_json(self):
+        self.warm.compile.return_value = {"ok": False, "pdf": None, "log": "", "errors": [], "status": "preamble",
+                                          "saved": False}
+        status, reply = self.post("main.tex", "\\documentclass{book}")
+        self.assertEqual((status, reply["status"], reply["saved"]), (200, "preamble", False))
+        self.warm.compile.assert_called_with("c1", "main.tex", "\\documentclass{book}")
+
+    def test_double_click_on_a_live_preview_page_names_the_file_being_typed(self):
+        pdf = self.root / "p.pdf"
+        found = (pdf, {"pgfwarm-ov0.tex": "Chapters/one.tex"})
+        fields = {"Input": "/cache/p1/pgfwarm-ov0.tex", "Line": "7"}
+        with mock.patch.object(serve.preview, "sync_files", return_value=found), \
+                mock.patch.object(serve, "synctex", return_value=fields) as run:
+            status, reply = self.request("GET", "/synctex/edit?doc=demo&page=2&x=10&y=20&preview=c1")
+        self.assertEqual((status, reply["rel"], reply["line"]), (200, "Chapters/one.tex", 7))
+        self.assertEqual(run.call_args[0][3], pdf)  # The preview's own PDF and SyncTeX file, not the full build's.
+        with mock.patch.object(serve.preview, "sync_files", return_value=None):
+            status, reply = self.request("GET", "/synctex/edit?doc=demo&page=2&x=10&y=20&preview=gone")
+        self.assertIn("no SyncTeX data", reply["error"])
 
 
 class FocusPreview(ServerCase):

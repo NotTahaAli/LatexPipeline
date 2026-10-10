@@ -661,21 +661,28 @@ async function loadPdf() {
 const liveOff = new Set();   // files the server said cannot be previewed live, until the next full PDF
 const live = new LivePreview(pdfView, {
   doc: () => cur,
-  tab: () => isChapter(active) ? { path: active.path, text: view.state.doc.toString() } : null,
-  enabled: () => settings.live && !readOnly && !shownFocus() && isChapter(active) && !liveOff.has(cur + ":" + active.path),
+  tab: () => isLive(active) ? { path: active.path, text: view.state.doc.toString() } : null,
+  enabled: () => settings.live && !readOnly && !shownFocus() && isLive(active) && !liveOff.has(cur + ":" + active.path),
   onState: (st) => {
     const node = $("liveState");
-    if (st.off) { if (active) liveOff.add(cur + ":" + active.path); node.hidden = true; return; }   // Not a chapter, no full build yet, ...
+    if (st.off || st.done) { if (st.off && active) liveOff.add(cur + ":" + active.path); node.hidden = true; return; }   // Not a chapter, no full build yet, ...; done: the full PDF is back
     node.hidden = false;
-    node.classList.toggle("busy", !!st.busy); node.classList.toggle("bad", !!st.error);
-    node.textContent = st.busy ? "Live: typesetting" : st.error ? "Live: error" : `Live: ${st.seconds.toFixed(1)} s`;
-    node.title = st.error || (st.busy ? "Typesetting the chapter you are editing" : `Chapter typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}; the full PDF follows on save`);
+    node.classList.toggle("busy", !!st.busy || !!st.wait); node.classList.toggle("bad", !!st.error);
+    // wait: the preamble (or main.tex's \input list) changed, so previews pause until the full build after the save.
+    const what = st.wait === "preamble" ? "preamble" : "document";
+    node.textContent = st.busy ? "Live: typesetting" : st.error ? "Live: error" : st.wait ? (st.saved ? `Live: rebuilding ${what}` : `Live: ${what} changed, rebuilds on save`)
+      : st.same ? "Live: as built" : `Live: ${st.seconds.toFixed(1)} s`;
+    node.title = st.error || (st.busy ? "Typesetting the part you are editing"
+      : st.wait ? `${st.wait === "preamble" ? "The preamble, a class or a package" : "The chapters main.tex reads"} changed: the live preview pauses until the full build${st.saved ? " now running" : " that follows the save"} has finished`
+      : st.same ? "main.tex is as the full PDF shows it"
+      : `Typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}${st.passes > 1 ? `, ${st.passes} passes for new labels or citations` : ""}; the full PDF follows on save`);
   },
 });
 
 // ---- chapter preview: build only the chapter being edited; the chip says so and leads back to the full PDF ----------
 let focusView = null;   // {path} while the person asked for a chapter preview of that file
 const isChapter = (tab) => tab?.kind === "text" && tab.path.endsWith(".tex") && tab.path !== "main.tex";
+const isLive = (tab) => tab?.kind === "text" && /\.(tex|cls|sty)$/.test(tab.path);   // main.tex and the preamble's files too
 async function exportDocx() {
   toast(el("span", { textContent: "Converting to DOCX with pandoc..." }));
   try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
@@ -744,9 +751,8 @@ const toCursor = () => !onFocusPdf() && active?.kind === "text" && forwardSearch
 async function inverse(e) {
   const page = e.target.closest(".page"); if (!page || onFocusPdf()) return;
   const r = page.getBoundingClientRect(), z = pdfView.zoom, n = pdfView.fullPage(+page.dataset.i);
-  if (n == null) { toast(el("span", { textContent: "This page is a live preview. The jump works once the full PDF is back (after the build)." })); return; }
-  try {
-    const res = await api.inverse(cur, n, (e.clientX - r.left) / z, (e.clientY - r.top) / z);
+  try {   // A page of a live preview: its own SyncTeX data, whose typed text stands for the file being edited.
+    const res = await api.inverse(cur, n ?? pdfView.source(+page.dataset.i)[1], (e.clientX - r.left) / z, (e.clientY - r.top) / z, n == null ? live.cid : null);
     const link = el("a", { href: res.link, textContent: "Open in VS Code" });
     toast(el("span", { textContent: `${res.rel || res.file}:${res.line}  ` }), link);
     if (settings.inverse === "vscode" || !res.rel) location.href = res.link; else await openFile(res.rel, res.line);

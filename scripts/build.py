@@ -934,13 +934,12 @@ def build_document(
             try:
                 process = subprocess.Popen(
                     **sandbox.spawn(command, main_tex.parent, build_dir, {**os.environ, **LATEX_LOG_ENV, **epoch},
-                                    settings["timeout"]),
+                                    settings["timeout"], new_group=True),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
-                    **NEW_GROUP,
                 )
             except OSError as exc:
                 errors.append(f"Could not execute {command[0]}: {exc}")
@@ -1225,7 +1224,9 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
         if path.suffix in {".aux", ".bbl", ".toc", ".lof", ".lot", ".out"}:
             shutil.copy2(path, focus_dir / path.name)
 
-    pretex = accel.write_inject(focus_dir, main_tex.parent, "_focus.tex", accel.focus_tex(entries, keep, first))
+    bump = accel.next_page(entries[first], main_tex.parent) if entries else 0  # see accel.next_page
+    focus = accel.focus_tex(entries, keep, first, bump)
+    pretex = accel.write_inject(focus_dir, main_tex.parent, "_focus.tex", focus)
     command = [
         settings["engine"], "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
         f"-output-directory={focus_dir}", f"-jobname={main_tex.stem}",

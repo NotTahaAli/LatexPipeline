@@ -43,7 +43,19 @@ Edit-to-PDF latency of the editor's live preview (`scripts/preview.py`): one wor
 | `Chapters/chapter5` (20 pages, edit in `subsection1.tex`) | 2.02 s | **0.69 s** (min 0.64) |
 | `Chapters/chapter3` (22 pages, 2 pgfplots figures, edit in `subsection3.tex`) | 3.14 s | **0.81 s** (min 0.74) |
 
-In the browser, keystroke to spliced pages is the request time plus the 700 ms pause and about 0.1 to 0.2 s of PDF.js work (`tests/preview_e2e.py`, chapter 3, with the autosave's full builds running alongside: 1.76 s median at load 0.8 to 1.6, 2.27 s at load 3). TeXpresso, measured the same way on its own protocol: 0.62 s median for an edit near the page it shows, but no PDF output (see realtime.md).
+Edits the preview used to get wrong, measured in-process (`Warm.compile`, median of 5 after one warm-up, chapter 5) on a machine shared with other jobs (load 2.7 to 4.1); the first column is the code before these changes (load 1.8 to 3.0), which answered as fast but printed `??` / `(?)`:
+
+| edit in `Chapters/chapter5/subsection1.tex` | before | after |
+|---|---|---|
+| one word (one pass, unchanged path) | 0.80 s | 0.74 s |
+| new `\section` + `\label` + `\ref` to it | 0.74 s, prints `??` | **1.54 s**, resolved (2 passes) |
+| `\citep` of a key in the chapter's `.bib` that the full build never cited | 0.70 s, prints `(?)` | **2.20 s**, resolved (BibTeX + 3 passes) |
+| chapter 3 (2 pgfplots figures), one word | 1.29 s (noisy, load 2.6) | 0.80 s |
+| `main.tex`, a `\chapter` and a line of text between chapters 7 and 8 | not previewed | **0.2 to 0.4 s** (3 runs; the region alone, one page) |
+
+A pass costs what the chapter costs to typeset (0.7 to 0.9 s here); after the first preview that needed one, a second waiting process is kept so the extra passes do not wait for a preamble to load. With a forced full build (25 figure jobs on 4 workers, then latexmk) running alongside, previews of chapter 5 every 1.5 s took 0.90 / 0.77 s median (max 1.39 / 1.03 s) with full builds niced and figure jobs held back while a preview typesets, against 0.85 / 0.76 s median (max 2.05 / 1.43 s) without (two runs each, load 2.7 to 5.9): the median does not move within this machine's noise, the worst previews are 0.4 to 0.7 s shorter, and the full build takes 5 to 9 s longer (54 to 67 s against 49 to 58 s). With an ordinary incremental build alongside the medians were 0.70 / 0.77 s against 0.86 / 0.75 s, also noise.
+
+In the browser, keystroke to spliced pages is the request time plus the 700 ms pause and about 0.1 to 0.2 s of PDF.js work (`tests/preview_e2e.py`, chapter 3, with the autosave's full builds running alongside: 1.76 s median at load 0.8 to 1.6, 2.27 s at load 3; after these changes 1.77 s median, min 1.67, at load 2.7 to 3.5). TeXpresso, measured the same way on its own protocol: 0.62 s median for an edit near the page it shows, but no PDF output (see realtime.md).
 
 ## Where we win, tie and lose
 

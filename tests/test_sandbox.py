@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -31,11 +32,39 @@ class CommandTests(unittest.TestCase):
         self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)  # 300 MB > 256 MB cap
 
     def test_off_by_default_and_unknown_values_refused(self):
-        with mock.patch.dict(os.environ, {"LATEX_SANDBOX": ""}):
+        with mock.patch.dict(os.environ, {"LATEX_SANDBOX": ""}), mock.patch.object(sandbox, "LOW_UNTIL", 0.0):
             self.assertEqual(sandbox.spawn(["pdflatex", "x"], Path("/d"), Path("/b")),
                              {"args": ["pdflatex", "x"], "cwd": Path("/d"), "env": None})
         with mock.patch.dict(os.environ, {"LATEX_SANDBOX": "yes"}), self.assertRaises(sandbox.SandboxError):
             sandbox.spawn(["pdflatex"], Path("/d"), Path("/b"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX niceness")
+    def test_runs_below_normal_priority_while_live_previews_are_in_use(self):
+        code = ["-c", "import os; print(os.nice(0))"]
+        base = os.nice(0)
+
+        def niceness(**options):
+            spec = sandbox.spawn([sys.executable, *code], Path.cwd(), Path("/b"), **options)
+            return int(subprocess.run(**spec, capture_output=True, text=True, check=True).stdout)
+
+        with mock.patch.dict(os.environ, {"LATEX_SANDBOX": ""}), mock.patch.object(sandbox, "LOW_UNTIL", 0.0):
+            self.assertEqual(niceness(), base)
+            with mock.patch.object(sandbox, "LOW_UNTIL", time.monotonic() + 60):
+                self.assertEqual(niceness(), min(19, base + sandbox.NICE))  # A full build or figure job.
+                self.assertEqual(niceness(urgent=True), base)  # The preview itself.
+            self.assertTrue(sandbox.spawn(["x"], Path("/d"), Path("/b"), new_group=True)["start_new_session"])
+
+    def test_figure_jobs_wait_while_a_live_preview_typesets(self):
+        sandbox.preview_running(1)
+        try:
+            began = time.monotonic()
+            sandbox.wait_turn(0.3)
+            self.assertGreaterEqual(time.monotonic() - began, 0.29)  # held back, but never for long
+        finally:
+            sandbox.preview_running(-1)
+        began = time.monotonic()
+        sandbox.wait_turn(5)
+        self.assertLess(time.monotonic() - began, 0.1)
 
     @unittest.skipIf(sandbox.resource is None, "the sandbox is Linux-only (no resource module here)")
     def test_wrapped_command_env_and_limits(self):
