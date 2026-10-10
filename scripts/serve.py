@@ -2883,6 +2883,7 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1, this machine only).")
     parser.add_argument("--source", metavar="DIR", help="Directory holding the documents (default: files/).")
     parser.add_argument("--no-open", action="store_true", help="Do not open a browser.")
+    parser.add_argument("--sandbox", action="store_true", help="Run LaTeX under bubblewrap (LATEX_SANDBOX=bwrap).")
     parser.add_argument("--editor", default="vscode", help="URL scheme for source links (vscode, cursor, ...).")
     parser.add_argument(
         "--share", nargs="?", const="auto", choices=PROVIDER_CHOICES, metavar="PROVIDER",
@@ -2911,6 +2912,8 @@ def main() -> int:
         build.error(f"No document matches: {', '.join(unknown)}")
         return 2
 
+    if args.sandbox:
+        os.environ[build.sandbox.VARIABLE] = "bwrap"
     latexmk = build.check_latex()
     SETTINGS["editor"] = args.editor
     SETTINGS["latexmk"] = latexmk

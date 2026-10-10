@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
+import sandbox
+
 # Runs before \begin{document}'s own hooks, which is the last moment tikz's
 # external library may still be switched on. "list and make" needs no shell escape:
 # the main run lists the figures, and the Python side compiles them (no make needed).
@@ -406,12 +408,14 @@ class Figures:
                 shutil.copy(work / f"{self.stem}.aux", made(".aux"))
             try:
                 subprocess.run(
-                    self.figure_command(name, work, skip), cwd=self.main_tex.parent,
-                    env=self.env, stdin=subprocess.DEVNULL, timeout=1800,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **sandbox.spawn(self.figure_command(name, work, skip), self.main_tex.parent, self.build_dir,
+                                    self.env, work=work),
+                    stdin=subprocess.DEVNULL, timeout=1800, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return f"{name}: {exc}"
+            finally:
+                sandbox.scrub(work)
             if made(".pdf").exists():
                 for suffix in (".pdf", ".dpth"):
                     if made(suffix).exists():

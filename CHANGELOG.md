@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Added
 
+- **Sandboxed builds** (Linux): `build.py --sandbox`, `serve.py --sandbox` or `LATEX_SANDBOX=bwrap` run every LaTeX process (latexmk, figure jobs, `--focus`) under bubblewrap: no network, read-only system, TeX tree and document directory, writable build directory only, minimal environment, CPU/memory/file-size limits. A missing or broken bwrap fails the build instead of running unsandboxed. About 10 ms per run.
 - Optional DOCX export with pandoc: `build.py --docx` writes `out/<name>.docx`; "Export DOCX" in the editor's More menu (owner only, hidden without pandoc). Never published to the release.
 - `build.py --new NAME --template {article,report,beamer,letter}`; `report` creates chapters, `refs.bib`, `figures/` and a commented `build.toml`.
 - **Offline editor**: `python scripts/vendor_ui.py` copies the pinned PDF.js, CodeMirror, KaTeX and Yjs files into `scripts/serve_ui/vendor/` (git-ignored); `serve.py` then serves them itself and the CSP drops the CDNs.
