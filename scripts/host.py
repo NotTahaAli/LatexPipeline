@@ -53,6 +53,11 @@ import build
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UI_DIR = SCRIPT_DIR / "host_ui"
+FONTS_DIR = SCRIPT_DIR / "fonts"
+FONT_TYPES = {"newsreader.woff2": "font/woff2", "newsreader-italic.woff2": "font/woff2",
+              "source-sans-3.woff2": "font/woff2", "ibm-plex-mono-400.woff2": "font/woff2",
+              "ibm-plex-mono-500.woff2": "font/woff2", "OFL.txt": "text/plain; charset=utf-8",
+              "fonts.css": "text/css; charset=utf-8"}
 SERVE = SCRIPT_DIR / "serve.py"
 
 # ---------------------------------------------------------------------------
@@ -906,8 +911,8 @@ PROXY_TIMEOUT = 75.0  # longer than serve.py's 25 s long-poll
 WS_IDLE = 120.0  # the editor pings every 20 s
 DEVICE_SECONDS = 365 * 86400  # a known-device cookie lasts this long
 RECHECK = 15.0  # an open WebSocket re-checks the session and role this often
-CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
-       "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; "
+       "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 # Request headers passed to a worker; everything else (Cookie, Authorization, X-Host-*, X-Forwarded-*) stays here.
 FORWARD = ("Host", "Origin", "Content-Type", "Content-Length", "Accept", "Accept-Language", "User-Agent",
            "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "If-None-Match")
@@ -1331,6 +1336,14 @@ def page_index(h: Handler) -> None:
 @route("GET", r"/ui/([^/]+)", "anon")
 def page_static(h: Handler, name: str) -> None:
     h.static(name)
+
+
+@route("GET", r"/fonts/([^/]+)", "anon")
+def page_font(h: Handler, name: str) -> None:
+    target = FONTS_DIR / name
+    if name not in FONT_TYPES or not target.is_file():  # an exact allow-list: no traversal, no other files
+        raise HttpError(404, "Not found.")
+    h.send(200, target.read_bytes(), FONT_TYPES[name])
 
 
 # --- session API ------------------------------------------------------------------------------------------------
