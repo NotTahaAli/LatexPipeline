@@ -31,6 +31,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 * [Large documents](#large-documents) and [benchmarks](#benchmarks)
 * [VS Code](#vs-code)
 * [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds)
+* [Hosting on a VPS](#hosting-on-a-vps) (accounts, workspaces, sign-in providers)
 * [Lint and CI reports](#lint-and-ci-reports)
 * [GitHub Actions](#github-actions)
 * [Tests and lint](#tests-and-lint)
@@ -278,6 +279,115 @@ python scripts/build.py --source bench sample-report
 
 ---
 
+## Hosting on a VPS
+
+`scripts/host.py` turns the editor into a multi-user site: accounts, workspaces (organisations) with admin, editor and viewer members, projects, and sign-in with a password (plus optional two-step codes), Google or any OIDC provider, or GitHub. Standard library only, Python 3.9+. **Serving runs on Linux only**: every build runs under [bubblewrap](#sandboxed-builds), and `host.py serve` refuses to start when `bwrap --unshare-all --ro-bind / / true` fails.
+
+How it works: `host.py` is the only thing that faces the network (behind a TLS proxy). It owns logins, sessions, workspaces and projects, and serves the account and admin pages. Each open project gets its own worker, `serve.py --gateway`, on 127.0.0.1 with a random secret; the gateway proxies `/p/<project>/...` to it (HTTP, long-poll and WebSocket) and tells it the user's role in `X-Host-*` headers, which it strips from client requests. Workers stop after an idle timeout.
+
+What people can do:
+
+| Role | Can |
+| --- | --- |
+| Site admin (`host.py init`) | everything below in every workspace; sign-up mode, quotas, workspaces, users (disable, reset links, remove two-step), audit log |
+| Workspace admin | members and roles, invite links, plus what editors can |
+| Editor | create projects (from the `build.py` templates or a zip), edit and build them live with others, download, delete |
+| Viewer | open projects read-only, download them as a zip |
+
+Everyone except the operator is treated as untrusted: LaTeX source is code, so workers always build with the [sharing restrictions](#sharing) (`-norc`, no shell escape, paranoid reads and writes, no build-config edits from the browser) inside the sandbox. A user of another workspace gets `404` for every URL of a project.
+
+### Install and first start
+
+```bash
+sudo apt-get install bubblewrap latexmk texlive-latex-extra texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex
+sudo useradd --system --create-home --home-dir /var/lib/latex-host latexhost
+sudo -u latexhost git clone https://github.com/NotTahaAli/LatexPipeline /var/lib/latex-host/app
+sudo -u latexhost LP_ADMIN_EMAIL=you@example.org LP_ADMIN_PASSWORD='a long password' \
+     python3 /var/lib/latex-host/app/scripts/host.py init --data /var/lib/latex-host/data
+sudoedit /var/lib/latex-host/data/config.toml        # public_url = "https://latex.example.org", trust_proxy = true
+```
+
+`init` creates the data directory (mode 700), `config.toml`, the database and the first site admin (from `LP_ADMIN_EMAIL`, `LP_ADMIN_PASSWORD`, `LP_ADMIN_NAME`, or asks). Run it again with the email of an existing account to make it a site admin and print a one-time password reset link; that is the way back in if the last admin is locked out. Python 3.9 and 3.10 need `pip install tomli` for `config.toml`.
+
+`config.toml` (only the operator edits it; restart after changes):
+
+| Key | Default | |
+| --- | --- | --- |
+| `public_url` | `http://localhost:8080` | The address people open. `https://` turns on `Secure` `__Host-` cookies and HSTS. Requests for any other host name are refused. |
+| `listen`, `port` | `127.0.0.1`, `8080` | Where `host.py` listens. Keep loopback and put the TLS proxy in front. |
+| `trust_proxy` | `false` | `true` behind a proxy on this machine: client addresses (for login throttling and the audit log) come from `X-Forwarded-For`. |
+| `site_name` | `LaTeX Studio` | Page titles and the authenticator app label. |
+| `session_days`, `session_idle_hours` | `14`, `12` | A login lasts at most this long, and ends after this long without a request. |
+| `[providers.<name>]` | none | Sign-in providers, see below. |
+
+Site settings live in the database and are changed on the Site admin page: sign-up (`invite_only` by default; `open`, where each new person gets their own workspace; or `open_domains`, which needs a provider that confirms the email), linking providers to existing accounts by email, projects per workspace, megabytes per project, open projects on the server and per workspace (each worker builds one document at a time, so this also caps concurrent builds), idle timeout and build time limit.
+
+### Sign-in providers
+
+Register `<public_url>/auth/<name>/callback` as the redirect URI with the provider, then:
+
+```toml
+[providers.google]
+type = "oidc"                                 # any OpenID Connect issuer: Google, Microsoft, Keycloak, Authentik, ...
+label = "Google"
+issuer = "https://accounts.google.com"        # exactly as the issuer's discovery document says
+client_id = "1234.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_CLIENT_SECRET"    # read from the environment (or client_secret = "..." in the file)
+
+[providers.github]
+type = "github"
+label = "GitHub"
+client_id = "Iv1.abc"
+client_secret_env = "GITHUB_CLIENT_SECRET"
+```
+
+Sign-in uses the authorization code flow with PKCE, a state bound to the browser and (OIDC) a nonce; the ID token comes straight from the token endpoint over verified TLS and its issuer, audience, expiry and nonce are checked. Only verified email addresses are accepted (GitHub: the verified primary one). A provider account is linked to an existing account from that account's page ("Connect"), or automatically when the site admin allows it and the existing account's email is confirmed (it signed up through a provider or an invite sent to that address); a password account is never taken over by someone who merely owns the same address at a provider. Two-step sign-in still applies.
+
+### TLS with Caddy, and systemd
+
+`/etc/caddy/Caddyfile` (Caddy gets and renews the certificate; WebSockets and long requests pass through):
+
+```caddyfile
+latex.example.org {
+    encode gzip
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+`/etc/systemd/system/latex-host.service`:
+
+```ini
+[Unit]
+Description=LaTeX Studio (host.py)
+After=network-online.target
+
+[Service]
+User=latexhost
+WorkingDirectory=/var/lib/latex-host
+ExecStart=/usr/bin/python3 /var/lib/latex-host/app/scripts/host.py serve --data /var/lib/latex-host/data
+EnvironmentFile=-/etc/latex-host.env
+Restart=on-failure
+# The sandbox sets CPU, memory and file-size limits per LaTeX run but no process limit: cap it here.
+TasksMax=512
+MemoryMax=8G
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/latex-host/data
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Put provider secrets in `/etc/latex-host.env` (mode 600), for example `GOOGLE_CLIENT_SECRET=...`. Workers get a minimal environment (never these secrets), and LaTeX inside the sandbox an even smaller one. `sudo systemctl enable --now latex-host caddy`. bubblewrap needs unprivileged user namespaces (on by default on Debian and Ubuntu; Ubuntu 24.04's AppArmor rule allows `bwrap`).
+
+`--insecure-no-sandbox` runs without bubblewrap (and on any OS) for development only: it prints a warning, and the admin page says so. Never use it on a server people can reach.
+
+### Backups and data
+
+Everything is in the data directory: `host.db` (sqlite, WAL), `config.toml` and `projects/<workspace>/<project>/<name>/` (the document folder; `.out/`, `.cache/` and `.home/` beside it are regenerated). Back up with `sqlite3 host.db ".backup host-backup.db"` (safe while running) plus the `projects/` tree, for example nightly with `restic` or `rsync`. To restore, stop the service, put both back, start it. Upgrades: `git pull` and restart; the database schema migrates itself (the version is in its `schema_version` table).
+
 ## Lint and CI reports
 
 `scripts/ci_report.py` (standard library only; CI-only apart from local use) reads `out/build-report.json`:
@@ -305,6 +415,8 @@ uvx ruff check scripts tests            # lint: rules in pyproject.toml
 ```
 
 The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, ruff (pinned version) and the editor's co-editing check (`node tests/collab_check.mjs scripts/serve_ui/collab.js`) on Ubuntu, and the `requirements.txt` check. It runs when `scripts/`, `tests/` or the Python project files change.
+
+The hosted mode has a browser end-to-end check, run by hand (needs LaTeX, bubblewrap and Chromium for Playwright; the editor loads its libraries from CDNs): `uv run --no-project --with playwright==1.56.0 python tests/host_e2e.py`. It signs in with two-step codes, invites editors and a viewer, builds and co-edits a project, checks workspace isolation, sign-out and session expiry, and runs axe-core on every host page in both themes and at phone width.
 
 ---
 
