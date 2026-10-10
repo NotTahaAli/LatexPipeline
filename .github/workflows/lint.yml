@@ -34,6 +34,9 @@ jobs:
       # Rules and target version come from [tool.ruff] in pyproject.toml.
       - name: Ruff check
         run: uvx ruff@0.16.8 check scripts tests
+      # The editor's co-editing decisions that protect data (leader takeover, deleted files).
+      - name: Collab check
+        run: node tests/collab_check.mjs scripts/serve_ui/collab.js
 
   unittest:
     strategy:

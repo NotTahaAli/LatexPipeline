@@ -919,7 +919,8 @@ VALUE_KEYS = {
     "e", "r", "latexoption", "pretex", "usepretex", "cnf-line", "outdir", "output-directory", "auxdir",
     "aux-directory", "jobname",
 }
-LUA_MESSAGE = "LuaLaTeX is disabled while sharing (it can run code)."
+# The owner chose to allow LuaLaTeX while sharing: Lua can still write files (io.open), so an edit
+# link to a LuaLaTeX document can run code. The Share dialog (app.js) says so.
 
 
 def is_rc(path: str) -> bool:
@@ -989,11 +990,9 @@ _READ_SETTINGS = build.read_settings
 
 
 def guarded_read_settings(main_tex: Path) -> dict:
-    """build.read_settings, but while sharing: no LuaLaTeX, shell escape, rc files or latexmk_args that run code."""
+    """build.read_settings, but while sharing: no shell escape, rc files or latexmk_args that run code."""
     settings = _READ_SETTINGS(main_tex)
     if SHARE["on"]:
-        if settings["engine"] == "lualatex":
-            raise build.ConfigError(f"{main_tex.parent.name}: {LUA_MESSAGE}")
         bad = [arg for arg in settings["latexmk_args"] if unsafe_latexmk_arg(arg)]
         if bad:
             raise build.ConfigError(f"{main_tex.parent.name}/build.toml: {bad[0]!r} is not allowed while sharing")

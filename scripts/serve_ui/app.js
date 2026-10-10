@@ -893,7 +893,7 @@ function renderShare(info) {
     body.replaceChildren(
       el("p", { textContent: `Sharing ${info.doc || "the document"} through ${info.provider}.` }),
       linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline."),
-      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Shell escape stays off."),
+      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Shell escape stays off, but LuaLaTeX can still run code on this computer: share only with people you trust."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
       el("div", { className: "actions" },
         el("button", { type: "button", className: "btn", id: "shareRegen", textContent: "New links", title: "Revoke both links and make new ones", onclick: async () => { if (confirm("Everyone using the current links loses access. Make new links?")) { await api.shareRegenerate(); refreshShare(); } } }),

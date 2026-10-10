@@ -936,17 +936,14 @@ class SharedBuilds(SharedState):
         serve.share_disable()
         self.assertEqual({k: os.environ.get(k) for k in serve.SHARE_ENV}, before)
 
-    def test_lualatex_is_refused_by_magic_comment_and_by_build_toml(self):
+    def test_lualatex_stays_allowed_while_sharing(self):
+        # The owner's choice: allowed, with a warning in the Share dialog (app.js).
         main = self.doc(magic="% !TeX program = lualatex\n")
-        self.assertEqual(serve.build.read_settings(main)["engine"], "lualatex")  # Not sharing: allowed
         self.share_on("d")
-        with self.assertRaises(serve.build.ConfigError) as ctx:
-            serve.build.read_settings(main)
-        self.assertIn("LuaLaTeX is disabled while sharing", str(ctx.exception))
-        main = self.doc(build_toml='engine = "lualatex"\n')
-        with self.assertRaises(serve.build.ConfigError):
-            serve.build.read_settings(main)
-        self.assertEqual(serve.build.read_settings(self.doc())["engine"], "pdflatex")
+        settings = serve.build.read_settings(main)
+        self.assertEqual(settings["engine"], "lualatex")
+        self.assertFalse(settings["shell_escape"])
+        self.assertEqual(settings["latexmk_args"][0], "-norc")
 
     def test_latexmk_never_reads_rc_files_while_sharing(self):
         main = self.doc()
