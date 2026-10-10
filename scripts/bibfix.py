@@ -204,7 +204,7 @@ def edit_for(text: str, key: str, new: dict[str, str]) -> tuple[int, str] | None
     for name, value in new.items():
         shown = name.upper() if upper else name.lower()
         pad = " " * max(eq_col - len(shown), 1) if spaced and not inline else (" " if spaced else "")
-        body = '"' + value.replace('"', "''") + '"' if quote else "{" + value + "}"
+        body = '"' + value.replace('"', "''") + '"' if quote else _braced(shown, value)
         lines.append(f"{shown}{pad}={gap}{body}")
     sep = " " if inline else eol + indent
     if last is None:
@@ -224,6 +224,7 @@ def insert_fields(text: str, key: str, new: dict[str, str]) -> str:
 # applies it to its open document; every byte outside the splice, and inside it every unchanged field, stays.
 # ---------------------------------------------------------------------------
 
+MONTHS = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
 KEY = re.compile(r"[^\s,{}()\"#%'=~\\]+")
 FIELD_NAME = re.compile(r"[A-Za-z][\w:.+-]*")
 
@@ -266,8 +267,14 @@ def _body(value: str, like: str = "{") -> str:
     return "{" + value + "}"
 
 
+def _braced(name: str, value: str) -> str:
+    """{value}, except the month macros (jan..dec), which BibTeX styles expect bare."""
+    return value if name.lower() == "month" and value.lower() in MONTHS else "{" + value + "}"
+
+
 def format_entry(kind: str, key: str, fields: dict[str, str], eol: str = "\n", indent: str = "  ") -> str:
-    lines = "".join(f"{eol}{indent}{name} = {_body(value)}," for name, value in fields.items())
+    lines = "".join(f"{eol}{indent}{name} = {_braced(name, value)},"
+                    for name, value in fields.items())
     return f"@{kind}{{{key},{lines}{eol}}}"
 
 
@@ -284,9 +291,12 @@ def _field_cut(text: str, entry: Entry, field: Field) -> tuple[int, int]:
     return field.name_start, end
 
 
-def replace_entry(text: str, key: str, kind: str, new_key: str, fields: dict) -> tuple[int, int, str]:
-    """(start, end, replacement) that turns entry `key` into @kind{new_key, fields}. Raises KeyError, ValueError."""
-    entry = find_entry(text, key)
+def replace_entry(text: str, key: str, kind: str, new_key: str, fields: dict,
+                  entry: Entry | None = None) -> tuple[int, int, str]:
+    """(start, end, replacement) that turns entry `key` into @kind{new_key, fields}. Raises KeyError, ValueError.
+
+    `entry`: the parsed entry, when the caller has parsed `text` already (many replacements, one parse)."""
+    entry = entry or find_entry(text, key)
     if entry is None:
         raise KeyError(key)
     want = check_entry(kind, new_key, fields)
@@ -513,13 +523,22 @@ def suggest_for(text: str, key: str) -> dict:
 RIS_KINDS = {"JOUR": "article", "JFULL": "article", "CONF": "inproceedings", "CPAPER": "inproceedings",
              "BOOK": "book", "EBOOK": "book", "CHAP": "incollection", "THES": "phdthesis", "RPRT": "techreport"}
 RIS_TAGS = {"TI": "title", "T1": "title", "VL": "volume", "IS": "number", "PB": "publisher", "CY": "address",
-            "UR": "url", "AB": "abstract", "SN": "issn", "N1": "note"}
+            "AB": "abstract", "SN": "issn", "N1": "note"}
+
+
+RIS_MAX_RECORDS = 2000
 
 
 def from_ris(text: str) -> list[dict]:
     """[{"type", "key", "fields"}] for each TY ... ER record; keys are made unique."""
     out: list[dict] = []
+    taken: set = set()
     record: dict[str, list[str]] | None = None
+
+    def add(rec) -> None:
+        if len(out) < RIS_MAX_RECORDS:
+            out.append(_ris_entry(rec, taken))
+            taken.add(out[-1]["key"])
     for line in text.splitlines():
         match = re.match(r"^\s*([A-Z][A-Z0-9])  ?-\s?(.*)$", line)
         if not match:
@@ -527,16 +546,16 @@ def from_ris(text: str) -> list[dict]:
         tag, value = match.group(1), match.group(2).strip()
         if tag == "TY":
             if record and len(record) > 1:
-                out.append(_ris_entry(record, {e["key"] for e in out}))
+                add(record)
             record = {"TY": [value.upper()]}
         elif tag == "ER":
             if record and len(record) > 1:
-                out.append(_ris_entry(record, {e["key"] for e in out}))
+                add(record)
             record = None
         elif record is not None and value:
             record.setdefault(tag, []).append(value)
     if record and len(record) > 1:
-        out.append(_ris_entry(record, {e["key"] for e in out}))
+        add(record)
     return out
 
 
@@ -559,6 +578,8 @@ def _ris_entry(record: dict[str, list[str]], taken: set) -> dict:
         fields["year"] = years[0]
     if "SP" in record:
         fields["pages"] = tex(record["SP"][0]) + (f"--{tex(record['EP'][0])}" if "EP" in record else "")
+    if "UR" in record:
+        fields["url"] = re.sub(r"[\s{}]", "", record["UR"][0])  # raw, like the DOI: tex() would break the address
     if "DO" in record:
         fields["doi"] = clean_doi(re.sub(r"[\s{}]", "", record["DO"][0]))
     surname = re.sub(r"[^A-Za-z0-9]", "", re.split(r"[,\s]", fields.get("author", "").lstrip("{"))[0])
@@ -566,9 +587,8 @@ def _ris_entry(record: dict[str, list[str]], taken: set) -> dict:
     words = [w for w in re.findall(r"[A-Za-z]{4,}", fields.get("title", "")) if w.lower() not in skip]
     word = words[0] if words else ""
     base = surname + (years[0] if years else "") + word.capitalize() or "ref"
-    key = base
-    for i in range(26):
-        if key not in taken:
-            break
-        key = base + chr(97 + i)
+    key, i = base, 0
+    while key in taken:
+        key = base + (chr(97 + i) if i < 26 else str(i))
+        i += 1
     return {"type": kind, "key": key, "fields": fields}

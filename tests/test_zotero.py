@@ -148,6 +148,7 @@ class Fetch(Base):
 
     def test_requests_are_throttled(self):
         zotero.LIMITER.hits.extend([(zotero.LIMITER.clock(), 0)] * zotero.LIMITER.requests)
+        mock.patch.object(zotero, "WAIT", 0.0).start()
         with self.assertRaises(zotero.ZoteroError) as ctx:
             zotero.get("https://api.zotero.org/x", {})
         self.assertEqual(ctx.exception.status, 429)
@@ -159,13 +160,136 @@ class Fetch(Base):
         self.assertEqual(ctx.exception.status, 409)
         seen = {}
 
-        def fake(url, headers, local=False, timeout=20.0):
+        def fake(url, headers, local=False, timeout=20.0, limit=0):
             seen.update(url=url, local=local, headers=headers)
             return 200, {}, entry().encode()
         with mock.patch.object(zotero, "get", fake):
             result = zotero.preview("", [], True)
         self.assertTrue(seen["local"] and seen["url"].startswith("http://127.0.0.1:23119/"))
         self.assertEqual((result["source"], len(result["new"])), ("local", 1))
+
+
+class Hardening(Base):
+    """Regressions from review: limiter, sizes, speed, paging."""
+
+    def test_limiter_waits_so_a_long_sync_finishes_and_refuses_past_the_bound(self):
+        now = [0.0]
+        limiter = zotero.grammar.Limiter(requests=3, size=1, window=60.0, clock=lambda: now[0],
+                                         sleep=lambda s: now.__setitem__(0, now[0] + s))
+        mock.patch.object(zotero, "LIMITER", limiter).start()
+        reply = mock.MagicMock()
+        reply.__enter__.return_value = reply
+        reply.status, reply.headers, reply.read.return_value = 200, {}, b""
+        opener = mock.Mock()
+        opener.open.return_value = reply
+        with mock.patch.object(zotero, "_opener", return_value=opener):
+            for _ in range(7):
+                zotero.get("https://api.zotero.org/x", {})  # 7 requests through a 3-per-minute window
+            self.assertGreater(now[0], 60)
+            limiter.hits.clear()
+            limiter.hits.extend([(now[0], 0)] * 3)
+            mock.patch.object(zotero, "WAIT", 0.0).start()
+            with self.assertRaises(zotero.ZoteroError) as ctx:
+                zotero.get("https://api.zotero.org/x", {})
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_pages_sort_stably_and_an_empty_page_does_not_end_the_sync(self):
+        urls = []
+
+        def fake(url, headers, local=False, timeout=20.0, limit=0):
+            urls.append(url)
+            start = int(url.rsplit("start=", 1)[1])
+            body = b"" if start == 100 else entry(f"k{start}", doi=f"10.1/{start}").encode()
+            return 200, {"last-modified-version": "1", "total-results": "250"}, body
+        self.configure()
+        with mock.patch.object(zotero, "get", fake):
+            result = zotero.preview("", [], True)
+        self.assertEqual(len(urls), 3)
+        self.assertTrue(all("sort=dateAdded&direction=asc" in u for u in urls))
+        self.assertEqual(len(result["new"]), 2)
+
+    def test_keys_repeated_across_pages_are_renamed_not_dropped(self):
+        out = zotero.compare(entry("smith", doi="10.1/a") + entry("smith", title="Another one entirely", doi="10.1/b"), "")
+        self.assertEqual([(e["key"], e["zotero_key"], e["collision"]) for e in out["new"]],
+                         [("smith", "smith", False), ("smitha", "smith", True)])
+        self.assertEqual(out["skipped"], 0)
+
+    def test_local_export_over_the_limit_is_refused_not_truncated(self):
+        zotero.save_settings({"mode": "local"})
+        seen = {}
+
+        def fake(url, headers, local=False, timeout=20.0, limit=0):
+            seen["limit"] = limit
+            return 200, {}, b"x" * (zotero.MAX_TOTAL + 1)
+        with mock.patch.object(zotero, "get", fake), self.assertRaises(zotero.ZoteroError) as ctx:
+            zotero.preview("", [], True)
+        self.assertEqual((ctx.exception.status, seen["limit"]), (413, zotero.MAX_TOTAL))
+
+    def test_comparing_a_thousand_by_a_thousand_is_fast(self):
+        import time
+        words = ["alpha", "beta", "gamma", "delta", "omega", "sigma"]
+
+        def title(i):
+            return " ".join(words[(i >> n) % 6] for n in range(6)) + f" study number {i}"
+        local = "".join(entry(f"l{i}", title=title(i), doi="") for i in range(1000))
+        remote = "".join(entry(f"r{i}", title=title(i + 500) + " x", doi="") for i in range(1000))
+        started = time.monotonic()
+        out = zotero.compare(remote, local)
+        self.assertLess(time.monotonic() - started, 8.0)
+        self.assertEqual(len(out["new"]) + len(out["changed"]) + out["same"], 1000)
+
+    def test_same_key_without_doi_and_an_edited_title_is_an_update(self):
+        local = "@misc{k,\n  title = {Climate models for coastal planning},\n}\n"
+        remote = "@misc{k,\n  title = {Climate model ensembles: a short review},\n}\n"
+        out = zotero.compare(remote, local)
+        self.assertEqual((out["new"], [c["key"] for c in out["changed"]]), ([], ["k"]))
+        out = zotero.compare("@misc{k, title={Quantum chromodynamics lattice}}", local)  # shares nothing: another work
+        self.assertEqual((len(out["new"]), out["changed"]), (1, []))
+
+    def test_apply_is_bounded_and_fast(self):
+        import time
+        text = "".join(entry(f"e{i}", doi=f"10.1/{i}") for i in range(3000))
+        ops = [{"op": "add", "type": "misc", "key": f"n{i}", "fields": {"title": "T"}} for i in range(500)]
+        started = time.monotonic()
+        splice = zotero.apply(text, ops)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(splice["insert"].count("@misc{"), 500)
+        too_many = [{"op": "add", "type": "misc", "key": f"m{i}", "fields": {}} for i in range(zotero.MAX_OPS + 1)]
+        huge = [{"op": "add", "type": "misc", "key": "q", "fields": {"title": "x" * 20_001}}]
+        wide = [{"op": "add", "type": "misc", "key": "q", "fields": {str(i): "x" for i in range(61)}}]
+        twice = [{"op": "update", "key": "e1", "fields": {}}] * 2
+        for bad, status in ((too_many, 400), (huge, 400), (wide, 400), (twice, 400),
+                            ([{"op": "add", "type": "misc", "key": "dup", "fields": {}}] * 2, 409)):
+            with self.assertRaises(zotero.ZoteroError) as ctx:
+                zotero.apply(text, bad)
+            self.assertEqual(ctx.exception.status, status)
+
+    def test_updates_keep_their_places_when_many_are_applied_at_once(self):
+        text = "".join(entry(f"e{i}", doi=f"10.1/{i}") for i in range(5))
+        ops = [{"op": "update", "key": f"e{i}", "fields": {"year": "1999"}} for i in (4, 0, 2)]
+        splice = zotero.apply(text, ops)
+        new = text[:splice["from"]] + splice["insert"] + text[splice["to"]:]
+        years = [next(f.value for f in e.fields if f.name == "year") for e in bibfix.parse(new)]
+        self.assertEqual(years, ["1999", "2020", "1999", "2020", "1999"])
+
+    def test_month_macros_stay_bare_and_ris_urls_stay_raw(self):
+        made = bibfix.format_entry("misc", "k", {"month": "jan", "note": "jan"})
+        self.assertIn("month = jan,", made)
+        self.assertIn("note = {jan},", made)
+        text = "@misc{k,\n  title = {T}\n}\n"
+        splice = zotero.apply(text, [{"op": "update", "key": "k", "fields": {"month": "mar"}}])
+        self.assertIn("= mar", text[:splice["from"]] + splice["insert"] + text[splice["to"]:])
+        ris = "TY  - ELEC\nTI  - A page\nUR  - https://x.org/a_b?c=1&d=%20e\nER  -\n"
+        self.assertEqual(bibfix.from_ris(ris)[0]["fields"]["url"], "https://x.org/a_b?c=1&d=%20e")
+
+    def test_ris_import_is_linear_and_capped(self):
+        import time
+        ris = "TY  - JOUR\nAU  - Doe, J\nTI  - Same title\nPY  - 2001\nER  -\n" * 3000
+        started = time.monotonic()
+        entries = bibfix.from_ris(ris)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual(len(entries), bibfix.RIS_MAX_RECORDS)
+        self.assertEqual(len({e["key"] for e in entries}), len(entries))
 
 
 class Compare(unittest.TestCase):
@@ -195,8 +319,8 @@ class Compare(unittest.TestCase):
         self.assertEqual((out["changed"], out["local_only"]), ([], ["k"]))
 
     def test_unusable_remote_entries_are_counted_not_fatal(self):
-        out = zotero.compare("@article{ok, title={fine}}\n@article{bad key, title={x}}\n@article{ok, title={twice}}\n", "")
-        self.assertEqual((len(out["new"]), out["skipped"]), (1, 1))
+        out = zotero.compare("@article{ok, title={fine}}\n@article{bad, title={x}, note={a\\\\}}\n", "")
+        self.assertEqual(len(out["new"]), 2)
 
 
 class Apply(unittest.TestCase):
