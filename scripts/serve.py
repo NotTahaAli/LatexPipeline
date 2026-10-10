@@ -308,15 +308,16 @@ def saved_result(name: str, main_tex: Path) -> dict:
 
 def remember_build(entry: dict) -> None:
     """Keep this build's summary in out/build-report.json beside the other documents', for saved_result()."""
-    try:
-        old = json.loads((build.OUT_DIR / "build-report.json").read_text("utf-8"))["documents"]
-        entries = [e for e in old if isinstance(e, dict) and e.get("name") != entry["name"]]
-    except (OSError, ValueError, KeyError, TypeError):
-        entries = []
-    try:
-        build.write_report([*entries, entry])
-    except OSError:
-        pass
+    with build.REPORT_LOCK:
+        try:
+            old = json.loads((build.OUT_DIR / "build-report.json").read_text("utf-8"))["documents"]
+            entries = [e for e in old if isinstance(e, dict) and e.get("name") != entry["name"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            entries = []
+        try:
+            build.write_report([*entries, entry])
+        except OSError:
+            pass
 
 
 def fresh_state(name: str, main_tex: Path) -> dict:
@@ -748,8 +749,8 @@ def write_text_file(root: Path, rel: str, text: str, base: str | None, eol: str 
             try:
                 current = version_of(path.stat())
             except OSError:
-                current = None
-            if current is not None and current != base:
+                raise ApiError("The file was deleted or renamed on disk.", 409, deleted=True)
+            if current != base:
                 raise ApiError("The file changed on disk.", 409, current=current)
         atomic_write(path, data)
         return {"path": rel, "version": version_of(path.stat())}
@@ -792,6 +793,13 @@ def close_rooms(doc: str, rel: str, below: bool = True) -> None:
             BUS.publish("y-closed", {"room": rid})
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def fs_operation(doc: str, op, rel, to=None) -> dict:
     """Run one file tree operation in document `doc` and tell the browsers; raises ApiError."""
     root = DOCS[doc].parent
@@ -814,31 +822,45 @@ def fs_operation(doc: str, op, rel, to=None) -> dict:
                 changed.append(rel)
             close_rooms(doc, rel)
         elif op in ("rename", "delete"):
-            if rel == "main.tex":
-                raise ApiError("main.tex is the document itself and cannot be renamed or deleted.", 409)
             if not (source.exists() or source.is_symlink()):
                 raise ApiError("No such file or folder.", 404)
+            others = [d.parent.resolve() for n, d in DOCS.items() if n != doc]
+            if _same_file(source, root / "main.tex") or _same_file(source, root):
+                raise ApiError("main.tex is the document itself and cannot be renamed or deleted.", 409)
+            if any(o == source.resolve() or source.resolve() in o.parents for o in others):
+                raise ApiError("That is, or contains, another document.", 409)
             folder = source.is_dir() and not source.is_symlink()
             moved = [f["path"] for f in list_files(source)] if folder else [rel]
             moved = [rel + "/" + m if folder else m for m in moved]
-            if op == "delete":
-                if folder:
-                    shutil.rmtree(source)
+            gone = False
+            try:
+                if op == "delete":
+                    gone = True
+                    if folder:
+                        shutil.rmtree(source)
+                    else:
+                        source.unlink()
                 else:
-                    source.unlink()
-            else:
-                target = fs_path(root, to, "new name")
-                if target == source or target.is_relative_to(source):
-                    raise ApiError("A folder cannot be moved into itself.", 400)
-                if target.exists() or target.is_symlink():
-                    raise ApiError("Something with that name already exists.", 409)
-                if not target.parent.is_dir():
-                    raise ApiError("The folder you are moving into does not exist.", 404)
-                os.rename(source, target)
-                changed += [to + m[len(rel):] for m in moved]
-                close_rooms(doc, to)
-            removed += moved
-            close_rooms(doc, rel)
+                    target = fs_path(root, to, "new name")
+                    if target == source or target.is_relative_to(source):
+                        raise ApiError("A folder cannot be moved into itself.", 400)
+                    if target.exists() or target.is_symlink():
+                        raise ApiError("Something with that name already exists.", 409)
+                    if not target.parent.is_dir():
+                        raise ApiError("The folder you are moving into does not exist.", 404)
+                    tp = target.parent.resolve()
+                    if any(o == tp or o in tp.parents for o in others):
+                        raise ApiError("That folder belongs to another document.", 409)
+                    os.rename(source, target)
+                    gone = True
+                    changed += [to + m[len(rel):] for m in moved]
+                    close_rooms(doc, to)
+            except OSError as exc:
+                raise ApiError(f"Could not {op} {rel}: {exc.strerror or exc}", 500)
+            finally:
+                if gone:  # Also after a half-finished rmtree: report what may be gone.
+                    removed += [m for m in moved if not (root / m).exists()] if op == "delete" else moved
+                    close_rooms(doc, rel)
         else:
             raise ApiError("Unknown operation.", 400)
     broadcast("fs", {"doc": doc, "changed": changed, "removed": removed})

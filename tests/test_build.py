@@ -429,6 +429,37 @@ class GlobalInputsTests(unittest.TestCase):
             self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)
 
 
+class ReportAndFocusTests(unittest.TestCase):
+    def test_write_report_is_atomic(self):
+        with fake_repo() as root:
+            build.write_report([{"name": "a"}])
+            target = root / "out" / "build-report.json"
+            with mock.patch.object(build.os, "replace", side_effect=OSError("boom")), self.assertRaises(OSError):
+                build.write_report([{"name": "b"}])
+            self.assertIn('"a"', target.read_text(encoding="utf-8"))  # old report intact
+            self.assertEqual([p.name for p in (root / "out").iterdir()], ["build-report.json"])  # no temp left
+
+    def test_focus_build_times_out_instead_of_hanging(self):
+        import subprocess
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            main = write_doc(root, "d", "\\documentclass{article}")
+            cache = build.cache_dir_for(main)
+            cache.mkdir(parents=True)
+            (cache / "main.focusmap").write_text("x", encoding="utf-8")
+            seen = {}
+
+            def fake_run(*args, **kwargs):
+                seen.update(kwargs)
+                raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+            with mock.patch.object(build.accel, "read_focusmap", return_value=[]), \
+                    mock.patch.object(build.accel, "focus_selection", return_value=([], "a")), \
+                    mock.patch.object(build.accel, "focus_tex", return_value=""), \
+                    mock.patch.object(build.subprocess, "run", side_effect=fake_run):
+                self.assertFalse(build._build_focus(main, "latexmk", "a", 1))
+            self.assertTrue(seen.get("timeout"))
+
+
 @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
 class ParanoidReadsTests(unittest.TestCase):
     """serve.py builds shared documents with openin_any=p/openout_any=p, which refuse ".." paths."""

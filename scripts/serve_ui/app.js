@@ -361,7 +361,7 @@ async function saveTab(tab, opts) {
     if (tab.dirty) scheduleAutosave();
     loadFiles(); loadOutline(); if (settings.visual) loadRefs();
   } catch (e) {
-    if (e.status === 409) { tab.conflict = "changed"; showBanner(); } else tab.error = e.message;
+    if (e.status === 409) { tab.conflict = e.data?.deleted ? "deleted" : "changed"; showBanner(); } else tab.error = e.message;
   } finally { tab.saving = false; renderTabs(); showSaveState(); }
 }
 

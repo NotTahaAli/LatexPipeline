@@ -1026,9 +1026,18 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
     began = time.monotonic()
     generated = focus_dir / f"{main_tex.stem}.pdf"
     generated.unlink(missing_ok=True)
-    process = subprocess.run(
-        command, cwd=main_tex.parent, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-    )
+    try:
+        process = subprocess.run(
+            command, cwd=main_tex.parent, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+            timeout=FOCUS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:  # run() kills the child before raising.
+        error(f"{relative.as_posix()}: focus build timed out after {FOCUS_TIMEOUT}s.")
+        out_log.write_text(
+            f"Focus build of {relative.as_posix()} ({focus}): FAILED\nTimed out after {FOCUS_TIMEOUT}s.\n",
+            encoding="utf-8",
+        )
+        return False
     log_file = focus_dir / f"{main_tex.stem}.log"
     log_text = log_file.read_text(encoding="utf-8", errors="replace") if log_file.exists() else ""
     ok = process.returncode == 0 and generated.exists()
@@ -1108,6 +1117,10 @@ def build_parallel(documents: list[Path], latexmk: str, jobs: int, force: bool) 
     return results
 
 
+REPORT_LOCK = threading.RLock()  # Callers that read-modify-write build-report.json hold it.
+FOCUS_TIMEOUT = 600
+
+
 def write_report(entries: list[dict]) -> None:
     """
     Write out/build-report.json for the documents built in this run.
@@ -1116,7 +1129,13 @@ def write_report(entries: list[dict]) -> None:
 
     report = {"documents": sorted(entries, key=lambda entry: entry["name"])}
     text = json.dumps(report, indent=2) + "\n"
-    (OUT_DIR / "build-report.json").write_text(text, encoding="utf-8")
+    target = OUT_DIR / "build-report.json"
+    tmp = target.with_name(f"build-report.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def open_pdf(path: Path) -> None:

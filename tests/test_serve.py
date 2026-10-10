@@ -126,6 +126,17 @@ class AtomicWrite(TempDoc):
         serve.write_text_file(self.root, "main.tex", "mine", None)  # No base: explicit overwrite.
         self.assertEqual(path.read_text(), "mine")
 
+    def test_save_with_a_base_never_recreates_a_deleted_file(self):
+        path = self.write("main.tex", "v1")
+        loaded = serve.read_text_file(self.root, "main.tex")["version"]
+        path.unlink()
+        with self.assertRaises(serve.ApiError) as ctx:
+            serve.write_text_file(self.root, "main.tex", "mine", loaded)
+        self.assertEqual((ctx.exception.status, ctx.exception.extra), (409, {"deleted": True}))
+        self.assertFalse(path.exists())
+        serve.write_text_file(self.root, "main.tex", "mine", None)  # No base may create.
+        self.assertTrue(path.exists())
+
     def test_crlf_files_keep_their_line_endings(self):
         self.write("main.tex", "a\r\nb\r\n")
         loaded = serve.read_text_file(self.root, "main.tex")
@@ -1536,6 +1547,35 @@ class FileOps(SharedState, ServerCase):
         self.assertEqual(self.fs("delete", "refs.bib")[0], 404)
         self.assertEqual(self.fs("explode", "main.tex")[0], 400)
         self.assertTrue((self.root / "main.tex").exists())
+
+    def test_nested_documents_and_the_doc_root_are_protected(self):
+        other = self.root / "sub"
+        other.mkdir()
+        (other / "main.tex").write_text("x", encoding="utf-8")
+        with mock.patch.dict(serve.DOCS, {"demo/sub": other / "main.tex"}):
+            self.assertEqual(self.fs("delete", "sub")[0], 409)
+            self.assertEqual(self.fs("rename", "sub", "sub2")[0], 409)
+            self.assertEqual(self.fs("rename", "refs.bib", "sub/refs.bib")[0], 409)
+        self.assertTrue((other / "main.tex").exists())
+        self.assertFalse((self.root / "sub/refs.bib").exists())
+
+    def test_main_tex_is_found_by_identity_not_by_name(self):
+        alias = self.root / "alias"
+        try:
+            os.symlink(self.root / "main.tex", alias)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not available")
+        self.assertEqual(self.fs("delete", "alias")[0], 409)
+        self.assertEqual(self.fs("rename", "alias", "x.tex")[0], 409)
+        self.assertTrue((self.root / "main.tex").exists())
+
+    def test_os_errors_become_api_errors_and_rooms_close(self):
+        with mock.patch.object(serve.os, "rename", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(self.fs("rename", "refs.bib", "r.bib")[0], 500)
+        with mock.patch.object(serve.shutil, "rmtree", side_effect=PermissionError(13, "Permission denied")):
+            status, body = self.fs("delete", "Chapters")
+        self.assertEqual(status, 500)
+        self.assertIn("Permission denied", body["error"])
 
     def test_symlinks_are_removed_themselves_and_never_followed_out_of_the_document(self):
         try:
