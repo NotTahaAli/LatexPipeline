@@ -523,7 +523,8 @@ def ask_stream(data: dict, *, key: str, model: str, spent: dict | None = None):
     """ask() as a stream of events for the editor: {"type": "start"} once Anthropic answers, {"type": "delta",
     "text"} pieces of the answer, {"type": "ping"} while the model thinks, and last {"type": "done", "reply"} with
     the reply parse_reply checked; nothing else carries model output. Raises AiError like ask(). spent (a dict) holds
-    the billed tokens seen so far, also for a caller that stops early. Closing the generator closes the request."""
+    the billed tokens (MAX_TOKENS of output until the final count arrives), also for a caller that stops early.
+    Closing the generator closes the request."""
     spent = {} if spent is None else spent
     spent.update(input=0, output=0)
     task, prompt, files = build_prompt(data)
@@ -539,7 +540,9 @@ def ask_stream(data: dict, *, key: str, model: str, spent: dict | None = None):
                 message = item.get("message") if isinstance(item.get("message"), dict) else {}
                 usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
                 reply = {**message, "content": [], "usage": dict(usage)}
-                spent.update(usage_of(reply))
+                # Output is billed as it is generated; until message_delta says how much, count a whole reply, so a
+                # caller that stops early (the browser left) never records less than Anthropic bills.
+                spent.update(input=usage_of(reply)["input"], output=MAX_TOKENS)
                 yield {"type": "start", "model": str(reply.get("model") or "")[:80]}
             elif kind == "content_block_start":
                 block = item.get("content_block")

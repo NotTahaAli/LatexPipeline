@@ -1358,6 +1358,19 @@ class Assistant(HostCase):
         self.assertEqual([self.ask(editor)[0] for _ in range(4)], [200, 200, 200, 429])
         self.assertEqual(self.requests_today(), (3, 300, 60))
 
+    def test_a_whole_reply_is_reserved_while_a_request_runs(self):
+        """Parallel requests see each other's reservation, so they cannot overrun daily_tokens_per_user."""
+        seen = []
+        ai.post_json.side_effect = lambda url, body, headers: seen.append(self.requests_today()) or ai_reply()
+        self.assertEqual(self.ask(self.client("ed@x.org"))[0], 200)
+        self.assertEqual(seen, [(1, 0, ai.MAX_TOKENS)])
+        self.assertEqual(self.requests_today(), (1, 100, 20))  # settled on what was billed
+        self.app.config["ai"] = {**self.AI, "daily_tokens_per_user": ai.MAX_TOKENS}
+        ai.post_json.side_effect = lambda url, body, headers: (
+            seen.append(self.ask(self.client("ed@x.org"))[0]) or ai_reply())
+        self.assertEqual(self.ask(self.client("ed@x.org"))[0], 200)
+        self.assertEqual(seen[-1], 429)  # the second request, while the first was running
+
     def stream(self, client, data=None):
         return client.call("POST", f"/p/{self.pid}/api/ai?stream=1", data or {
             "task": "explain", "error": {"message": "Runaway argument?"},
@@ -1416,10 +1429,10 @@ class Assistant(HostCase):
         sock.close()
         self.assertTrue(closed.wait(5))
         for _ in range(50):
-            if self.requests_today() == (1, 12, 1):
+            if self.requests_today() == (1, 12, ai.MAX_TOKENS):
                 break
             time.sleep(0.05)
-        self.assertEqual(self.requests_today(), (1, 12, 1))  # what message_start reported
+        self.assertEqual(self.requests_today(), (1, 12, ai.MAX_TOKENS))  # stopped before the final count: a whole reply
 
     def test_workers_never_get_the_key_in_their_environment(self):
         seen = {}

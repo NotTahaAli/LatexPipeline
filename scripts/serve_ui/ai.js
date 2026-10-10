@@ -70,7 +70,7 @@ export function aiPanel(root, ctx) {
       save({ enabled: on.checked });
     };
     share.onchange = () => {
-      if (share.checked && !confirm("People with an edit link could then send text to Anthropic with your API key (up to 20 an hour per visitor and 100 in all while this server runs). Allow it?")) { share.checked = false; return; }
+      if (share.checked && !confirm("People with an edit link could then send text to Anthropic with your API key (up to 20 an hour per named link or per address on the anonymous link, 100 in all while this server runs). Allow it?")) { share.checked = false; return; }
       save({ share: share.checked });
     };
     model.onchange = () => save({ model: model.value });
@@ -91,12 +91,13 @@ export function aiPanel(root, ctx) {
   }
 
   // ---- requests ----------------------------------------------------------------------------------------------------
-  /** The checked reply. The answer text arrives through onText while the model writes; a stream that fails before
-   *  its first byte (an old server, a proxy that refuses it) falls back to the plain request. */
+  /** The checked reply. The answer text arrives through onText while the model writes. A server without streaming
+   *  answers ?stream=1 with the plain JSON reply, used as is. Never retried: a request that may have reached the
+   *  server may also have reached Anthropic, and a second one would be billed twice. */
   async function request(body, onText, signal) {
-    const plain = () => ctx.api.ai(ctx.doc(), body);
+    const broke = (e) => (signal.aborted ? e : new Error("The connection to the server broke; try again."));
     let res;
-    try { res = await ctx.api.aiStream(ctx.doc(), body, signal); } catch (e) { if (signal.aborted) throw e; return plain(); }
+    try { res = await ctx.api.aiStream(ctx.doc(), body, signal); } catch (e) { throw broke(e); }
     if (!res.ok) {
       let data = null;
       try { data = await res.json(); } catch { /* non-JSON error body */ }
@@ -104,12 +105,11 @@ export function aiPanel(root, ctx) {
     }
     if (!(res.headers.get("Content-Type") || "").includes("ndjson")) return res.json();   // a server without streaming
     const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = "", started = false;
+    let buf = "";
     for (;;) {
       let chunk;
-      try { chunk = await reader.read(); } catch (e) { if (signal.aborted || started) throw e; return plain(); }
+      try { chunk = await reader.read(); } catch (e) { throw broke(e); }
       if (chunk.done) break;
-      started = true;
       buf += dec.decode(chunk.value, { stream: true });
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {

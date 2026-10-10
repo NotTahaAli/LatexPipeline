@@ -1586,7 +1586,7 @@ def zotero_apply(data: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 AI_GUEST_CAP = 100  # requests from shared links per server run, every guest together
-AI_GUEST_HOURLY = 20  # requests per guest (share link + its client id) per hour
+AI_GUEST_HOURLY = 20  # requests per guest (a named link, or an anonymous link from one address) per hour
 AI: dict = {"guest_used": 0}
 
 
@@ -1631,9 +1631,13 @@ def ai_begin(role: str, guest: str = "") -> tuple[str, str]:
     return ai.env_key() or saved["key"], saved["model"]
 
 
-def ai_guest(token: str | None, client: str | None) -> str:
-    """Who a link visitor is for the AI cap: their share token and, when it is bound to them, their client id."""
-    return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()[:16] + "/" + (client or "-")
+def ai_guest(token: str | None, user: str | None, ip: str) -> str:
+    """Who a link visitor is for the AI cap, from what the server knows, never what the request claims: a named link
+    by its id; an anonymous link by its token and the client's address (behind a tunnel every visitor of that link
+    shares one address, so they share the cap)."""
+    if user:
+        return "user:" + user.partition(";")[0]
+    return "link:" + hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()[:16] + "@" + ip
 
 
 def ai_run(role: str, data: dict, guest: str = "") -> dict:
@@ -3475,7 +3479,7 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/zotero/settings" and self.role == "owner":
             self.json(zotero_call(zotero.save_settings, self.body()))
         elif url.path == "/api/ai" and name in DOCS:
-            guest = ai_guest(self.token, trusted_client(query.get("cid", [""])[0][:64], self.role, self.user))
+            guest = ai_guest(self.token, self.user, self.client_address[0])
             if "stream" in query:
                 self.ai_stream(self.body(), guest)
             else:

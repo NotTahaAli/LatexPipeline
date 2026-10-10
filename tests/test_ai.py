@@ -5,7 +5,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -291,7 +293,8 @@ class Streaming(unittest.TestCase):
         self.assertTrue(any(isinstance(e, dict) and e["type"] == "delta" for e in out))
         self.assertIsInstance(out[-1], ai.AiError)
         self.assertIn("Overloaded", str(out[-1]))
-        self.assertEqual((out[-1].status, out[-1].usage), (502, {"input": 12, "output": 1}))
+        # The stream ended before the final count, so a whole reply is assumed (output is billed as generated).
+        self.assertEqual((out[-1].status, out[-1].usage), (502, {"input": 12, "output": ai.MAX_TOKENS}))
         self.assertEqual(self.closed, [True])
 
     def test_refusals_cut_offs_and_streams_that_end_early_are_errors(self):
@@ -321,7 +324,7 @@ class Streaming(unittest.TestCase):
         spent = {}
         ai.relay(ai.ask_stream(explain(), key="k", model="claude-opus-5-5", spent=spent),
                  lambda: begun.append(1), write)
-        self.assertEqual((begun, self.closed, spent), ([1], [True], {"input": 12, "output": 1}))
+        self.assertEqual((begun, self.closed, spent), ([1], [True], {"input": 12, "output": ai.MAX_TOKENS}))
         self.assertEqual(lines[0]["type"], "start")
         # A later error goes in-band, after the headers.
         self.fake(sse_reply("abc", stop="refusal"))
@@ -379,6 +382,68 @@ class KeysAndSettings(unittest.TestCase):
         with self.assertRaises(ai.AiError):
             ai.check_model("claude-3-haiku")  # no effort setting or JSON schema output: only ai.MODELS
         self.assertEqual(ai.request_body("p", ai.check_model("claude-opus-5-5"), "ask")[0]["max_tokens"], 16_000)
+
+
+AI_JS_CHECK = r"""
+import assert from "node:assert/strict";
+import { aiPanel } from "__AI__";
+globalThis.requestAnimationFrame = (f) => setTimeout(f, 0);
+globalThis.cancelAnimationFrame = (t) => clearTimeout(t);
+class Node {
+  constructor(tag, props = {}, kids = []) {
+    Object.assign(this, { tag, kids: [], attrs: {} }, props);
+    this.append(...kids);
+  }
+  append(...k) { for (const c of k) if (c && typeof c === "object") { c.parentNode = this; this.kids.push(c); } }
+  prepend(c) { c.parentNode = this; this.kids.unshift(c); }
+  replaceChildren(...k) { this.kids = []; this.append(...k); }
+  replaceWith(c) { const p = this.parentNode, i = p.kids.indexOf(this); c.parentNode = p; p.kids[i] = c; }
+  remove() { const p = this.parentNode; if (p) p.kids = p.kids.filter((c) => c !== this); }
+  get lastChild() { return this.kids[this.kids.length - 1]; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  addEventListener() {}
+  all() { return [this, ...this.kids.flatMap((c) => c.all())]; }
+  querySelectorAll(sel) { return sel === "button" ? this.all().filter((n) => n.tag === "button") : []; }
+}
+const el = (tag, props, ...kids) => new Node(tag, props, kids);
+const view = { state: { selection: { main: { from: 0, to: 5 } }, doc: { length: 11 },
+  sliceDoc: (a, b) => "hello world".slice(a, b) } };
+async function attempt(aiStream) {
+  let plain = 0;
+  const root = new Node("div");
+  const panel = aiPanel(root, { el, icon: () => new Node("i"), role: "edit", readOnly: false, doc: () => "d",
+    show() {}, toast() {}, current: () => ({ path: "main.tex", view }),
+    api: { aiInfo: async () => ({ enabled: true }), aiStream,
+      ai: async () => { plain++; return { answer: "x", text: "", edits: [] }; } } });
+  await panel.commands.find((c) => c.id === "ai-rewrite").run();
+  return { plain, text: root.all().map((n) => n.textContent || "").join("|") };
+}
+const ndjson = (read) => ({ ok: true, status: 200, headers: { get: () => "application/x-ndjson" },
+  body: { getReader: () => ({ read }) } });
+// The fetch itself fails: an error, never a second request.
+let r = await attempt(async () => { throw new TypeError("Failed to fetch"); });
+assert.equal(r.plain, 0);
+assert.match(r.text, /connection to the server broke/);
+// The first read fails (the server may already be asking Anthropic): the same.
+r = await attempt(async () => ndjson(async () => { throw new TypeError("network error"); }));
+assert.equal(r.plain, 0);
+assert.match(r.text, /connection to the server broke/);
+// A server without streaming answers with its JSON reply: used as is, no second request.
+r = await attempt(async () => ({ ok: true, status: 200, headers: { get: () => "application/json" },
+  json: async () => ({ answer: "plain answer", text: "", edits: [] }) }));
+assert.equal(r.plain, 0);
+assert.match(r.text, /plain answer/);
+// A streamed reply: deltas, then the checked reply.
+const lines = ['{"type":"start"}', '{"type":"delta","text":"Hel"}',
+  '{"type":"done","reply":{"answer":"Hello there","text":"","edits":[]}}'];
+let n = 0;
+r = await attempt(async () => ndjson(async () => (n < lines.length
+  ? { done: false, value: new TextEncoder().encode(lines[n++] + "\n") } : { done: true })));
+assert.equal(r.plain, 0);
+assert.match(r.text, /Hello there/);
+console.log("ok");
+"""
 
 
 class ServeApi(ts.SharedState, ts.ServerCase):
@@ -497,24 +562,36 @@ class ServeApi(ts.SharedState, ts.ServerCase):
         self.assertEqual(self.run_ai("edit")[0], 429)
         self.assertEqual(self.run_ai("owner")[0], 200)
 
-    def test_each_guest_has_an_hourly_cap(self):
-        """The cap is per visitor (share token + bound client id), so one guest cannot use up everyone's share."""
+    def test_each_guest_has_an_hourly_cap_keyed_on_what_the_server_knows(self):
+        """Per named link, or per anonymous link and address; a client id the browser picks does not matter."""
         self.tokens = self.share_on()
         self.turn_on(share=True)
         mock.patch.object(serve, "AI_GUEST_HOURLY", 2).start()
-        for cid in ("guest-a", "guest-b"):
-            serve.bind_client(cid, "edit")
-        a = [self.request("POST", "/api/ai?doc=demo&cid=guest-a", {"task": "rewrite", "selection": {"text": "x"}},
-                          self.hdr("edit"))[0] for _ in range(3)]
-        b = self.request("POST", "/api/ai?doc=demo&cid=guest-b", {"task": "rewrite", "selection": {"text": "x"}},
-                         self.hdr("edit"))[0]
-        self.assertEqual((a, b), ([200, 200, 429], 200))
-        serve.bind_client("owner-tab", "owner")  # a client id bound to another role is not this guest's
-        self.assertEqual(self.request("POST", "/api/ai?doc=demo&cid=owner-tab", {"task": "rewrite", "selection": {
-            "text": "x"}}, self.hdr("edit"))[0], 200)
-        self.assertEqual([self.run_ai("edit")[0] for _ in range(2)], [200, 429])  # same bucket as the unbound id
+        alice = serve.named.create(serve.SHARE["links"], "Alice", "edit", "demo")
+        bob = serve.named.create(serve.SHARE["links"], "Bob", "edit", "demo")
+        data = {"task": "rewrite", "selection": {"text": "x"}}
+
+        def run(token, cid):
+            serve.bind_client(cid, "edit")  # any new client id binds: it must not open a new bucket
+            return self.request("POST", f"/api/ai?doc=demo&cid={cid}", data,
+                                {"Cookie": f"{serve.cookie_name()}={token}"})[0]
+        self.assertEqual([run(alice["token"], f"a{i}") for i in range(3)], [200, 200, 429])
+        self.assertEqual(run(bob["token"], "b0"), 200)
+        self.assertEqual([run(self.tokens["edit"], f"x{i}") for i in range(3)], [200, 200, 429])
         self.assertEqual(self.run_ai("owner")[0], 200)
         self.assertEqual(serve.AI["guest_used"], 5)
+        self.assertNotEqual(serve.ai_guest(self.tokens["edit"], None, "10.0.0.1"),
+                            serve.ai_guest(self.tokens["edit"], None, "10.0.0.2"))
+        self.assertEqual(serve.ai_guest("t", "link-abc;Alice", "1.1.1.1"), serve.ai_guest("u", "link-abc;A", "2.2.2.2"))
+
+    def test_the_editor_never_sends_a_request_twice(self):
+        """ai.js: a stream whose connection fails may already have reached Anthropic; asking again bills twice."""
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        script = Path(self.root) / "ai_check.mjs"
+        script.write_text(AI_JS_CHECK.replace("__AI__", (ts.UI_DIR / "ai.js").resolve().as_uri()))
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_streaming_has_the_same_checks_and_never_carries_the_key(self):
         self.tokens = self.share_on()
