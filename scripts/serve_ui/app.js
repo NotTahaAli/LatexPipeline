@@ -1186,6 +1186,7 @@ bind("sGrammar", (n) => {
 bind("sGrammarUrl", (n) => { settings.grammarUrl = n.value; pushGrammarSettings(); });
 bind("sGrammarShare", (n) => { settings.grammarShare = n.checked; pushGrammarSettings(); });
 $("focusBtn").onclick = () => previewChapter();
+$("sCheat").onclick = () => { $("settings").close(); $("cheat").showModal(); };
 for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { if (e.target === $(d)) $(d).close(); });
 
 $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnly && c.edit)), { title: "Close dialogs and panels", keys: "Esc" }].flatMap((c) => [el("dt", { textContent: c.title }), el("dd", {}, el("kbd", { textContent: c.keys }))]));
@@ -1298,7 +1299,8 @@ function renderShare(info) {
     body.replaceChildren(
       el("p", { textContent: `Sharing ${info.doc || "the document"} through ${info.provider}.` }),
       linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline."),
-      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Shell escape stays off, but LuaLaTeX can still run code on this computer: share only with people you trust."),
+      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it."),
+      el("p", { className: "caution" }, el("b", { textContent: "Share edit links only with people you trust." }), " Shell escape stays off, but LuaLaTeX can still run code on this computer."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
       el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }),
       el("div", { className: "actions" },
@@ -1393,7 +1395,7 @@ async function pick(name) {
   if (changing && [...tabs.values()].some((t) => t.dirty && !t.collab)) await Promise.all([...tabs.values()].filter((t) => t.dirty && !t.collab).map((t) => saveTab(t)));
   if (changing) await Promise.all([...tabs.values()].map((t) => t.collab?.leave()));
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
-  $("doc").value = name;
+  $("doc").value = name; $("brandDoc").textContent = $("treeDoc").textContent = name.split("/").pop();
   focusView = null; renderFocus();
   tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {} };
   pdfView.version = null;

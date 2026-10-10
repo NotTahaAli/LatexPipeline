@@ -2352,7 +2352,8 @@ border:1px solid var(--rule);border-radius:10px;box-shadow:var(--shadow)}
 .eyebrow{font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--ox)}
 h1{font:600 30px/1.2 "Newsreader",Georgia,serif;letter-spacing:-.01em;margin:8px 0 12px}
 p{margin:0 0 18px;color:var(--ink-2);font-size:15px}
-code{font:13px "IBM Plex Mono",ui-monospace,monospace;background:var(--sunk);padding:1px 5px;border-radius:3px}
+code{font:13px "IBM Plex Mono",ui-monospace,monospace;background:var(--sunk);padding:1px 5px;border-radius:3px;
+white-space:nowrap}
 hr{border:0;border-top:1px solid var(--rule);margin:0}p.note{margin:14px 0 0;color:var(--muted);font-size:13px}
 </style></head><body><main><div class="eyebrow">Error 401</div><h1>This document needs its full link</h1>
 <p>Open the share link you were sent, including the part after <code>?token=</code>.
