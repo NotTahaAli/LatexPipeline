@@ -30,6 +30,13 @@ let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, r
 const firstVisit = store.get("ui") === null;
 const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
+// Phone widths show one pane, or both stacked (CSS reads data-view on #work).
+function setView(v) {
+  ui.view = v; saveUi(); $("work").dataset.view = v;
+  for (const b of $("viewTabs").children) b.setAttribute("aria-pressed", String(b.dataset.view === v));
+}
+for (const b of $("viewTabs").children) b.onclick = () => setView(b.dataset.view);
+setView(ui.view || "split");
 let view;
 
 // ---- who am I, what may I do ---------------------------------------------------------------------
