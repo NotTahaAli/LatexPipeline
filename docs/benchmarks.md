@@ -18,6 +18,10 @@ Document: `bench/sample-report` (303 pages, 25 TikZ/pgfplots figures, ten bibuni
 |---|---|---|---|---|---|---|
 | **this pipeline** (ca12fc6) | 60.7 / 59.7 | 0.37 / 0.35 | 12.9 / 12.6 | 13.6 / 12.2 | 28.3 / 28.1 | 1.8 / 1.8 |
 | plain `latexmk -pdf` (same session) | 99.3 / 98.9 | 0.12 / 0.12 | 25.1 / 24.8 | 25.4 / 25.2 | 25.4 / 24.8 | n/a |
+| **this pipeline** (no-op and figure-edit fixes, later session) | 70.3 / 67.3 | 0.12 / 0.10 | 12.3 / 12.0 | 13.6 / 12.6 | 16.0 / 15.8 | 2.6 / 2.1 |
+| plain `latexmk -pdf` (later session, alternating with the row above) | 113.4 / 108.8 | 0.12 / 0.11 | 27.5 / 25.3 | 25.5 / 24.9 | 27.5 / 26.7 | n/a |
+
+The last two rows were measured in a later session on a slower machine state (plain latexmk cold took 113 s instead of 99 s; every ratio to plain latexmk is what to compare, not the absolute seconds). Two changes since ca12fc6: the no-op check reads the `.fls` with plain strings and one `kpsewhich` call (the pathlib version cost 0.25 s for the 3,700 recorded paths), and a figure edit lists only the changed files before compiling the figure (see below). Cold, text-edit and `--focus` rows are unchanged code paths; their differences from the first row are machine state (`--focus` 2.6 s median against 1.8 s was the noisiest).
 
 Other tools, measured earlier the same day (this pipeline at 092eac7 measured 74.0 cold, 24.0 text, 27.5 figure in that run; the other tools do not depend on our code). These ran under more load, so treat differences below about 10% as noise. They do not distinguish the two text-edit cases:
 
@@ -36,8 +40,9 @@ Tiny document (`files/test`, 2 pages), measured: cold 0.77 s here against 0.62 s
 * **Win, text edits:** about 2x faster than plain latexmk (12.9 vs 25.1 s) for edits in files with or without figures, because the text pass includes finished figure PDFs instead of re-typesetting them.
 * **Win, `--focus`:** 1.8 s for a chapter preview; none of the other tools has an equivalent. It is a preview, not the full PDF.
 * **Win, no-op on Overleaf-style or always-full builds:** 0.4 s against 26 s (Overleaf's rc forces a pass) or 77 s (naive, arara).
-* **Lose, figure edit:** 28.3 vs 25.4 s for plain latexmk. Recompiling the changed figure and then the text pass costs more than latexmk's single pass over inline figures.
-* **Lose, no-op and tiny documents:** plain latexmk answers a no-op in 0.12 s against our 0.37 s, and is 0.1 to 0.25 s quicker on a two-page document (Python start-up and cache checks).
+* **Win, figure edit:** 16.0 vs 27.5 s for plain latexmk (was a loss, 28.3 vs 25.4 s). The old flow typeset the whole document once in draft mode to list the figures (11 s of 25), compiled the figure (1.3 s), then ran the text pass (12 s). Now only the files whose figure text changed are listed (the files that define nothing are skipped, as in a figure job; 1.5 s), the figure is compiled (1.3 s) and the text pass runs. The listing is a guess that the text pass checks: it compares every figure with its `.md5` and sets a mismatching one inline, and the build loop then syncs and runs again. It falls back to the full listing when a figure was added or removed in the changed file, a non-`.tex` input changed, or the `\input` tree is not known. Floor: one text pass (12 s) plus the figure job; there is none lower without changing what a pass does.
+* **Tie, no-op:** 0.12 s against plain latexmk's 0.12 s.
+* **Lose, tiny documents:** plain latexmk is 0.1 to 0.25 s quicker on a two-page document (Python start-up and cache checks); the no-op fix does not change that.
 * **Tie/context:** the naive and arara times look equal to our cold build, but their output is wrong: three passes do not converge on this document, so table-of-contents page numbers are stale (section 3 listed on p.47 instead of p.48; 284 of 143246 word tokens differ). A correct naive script needs a fourth pass (about 98 s).
 * Tectonic builds the document (303 pages, no unresolved references) but was 1.7x to 2.4x slower than pdfTeX here, has no incremental mode, and downloads its bundle on first use.
 
