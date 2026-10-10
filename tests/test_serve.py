@@ -1069,7 +1069,8 @@ class RoomSecurity(SharedState):
         self.assertEqual(self.join("v", "view", path="ch.tex")["leader"], None)
         self.assertEqual(self.join("v", "view", path="new.tex")["data"]["status"], 404)
         self.assertEqual(self.join("v", "view", doc="o")["data"]["status"], 404)
-        self.assertIn("room", self.join("e", "edit", path="new.tex"))  # editors may start a new file
+        self.assertEqual(self.join("e", "edit", path="new.tex")["data"]["status"], 404)  # new files: PUT, not rooms
+        self.assertIn("room", self.join("o", "owner", path="new.tex"))
 
     def test_updates_for_another_document_are_refused_even_for_editors(self):
         self.join("owner", "owner", doc="o")  # the owner works on another document meanwhile
@@ -1116,7 +1117,7 @@ class RoomSecurity(SharedState):
         leaders = [m["data"] for m in serve.BUS.since(0) if m["type"] == "y-leader" and m["data"]["leader"] == "b"]
         self.assertTrue(leaders[-1]["stale"])
         # Once a save went through, the room is in step again
-        serve.note_write("d", "ch.tex", "merged\n", serve.version_of((self.dir / "ch.tex").stat()))
+        serve.note_write("d", "ch.tex", "merged\n", serve.version_of((self.dir / "ch.tex").stat()), "b")
         serve.handle_client_message({"type": "y-leave", "data": {"room": "d\nch.tex"}}, "b", "edit")
         self.assertNotIn("stale", self.join("c", path="ch.tex"))
 
@@ -1133,12 +1134,38 @@ class RoomSecurity(SharedState):
             reply = self.update("a", "d\nmain.tex", "y" * 6)
         self.assertEqual(reply["data"]["status"], 413)
         self.assertEqual(serve.ROOMS["d\nmain.tex"]["log"], ["x" * 6])
+        for name in ("n1.tex", "n2.tex"):
+            (self.dir / name).write_text("x", encoding="utf-8")
         with mock.patch.object(serve, "MAX_ROOMS_PER_CLIENT", 2):
             self.assertIn("room", self.join("a", path="ch.tex"))
             self.assertEqual(self.join("a", path="n1.tex")["data"]["status"], 429)
             self.assertIn("room", self.join("a", path="ch.tex"))  # rejoining a held room is fine
         with mock.patch.object(serve, "MAX_ROOMS", len(serve.ROOMS)):
             self.assertEqual(self.join("z", path="n2.tex")["data"]["status"], 503)
+            self.assertIn("room", self.join("o", "owner", path="n2.tex"))  # the owner is never locked out
+
+    def test_a_link_cannot_open_rooms_by_changing_client_ids_or_for_missing_files(self):
+        for i in range(30):
+            self.assertEqual(self.join(f"x{i}", path=f"ghost{i}.tex")["data"]["status"], 404)
+        self.assertEqual(serve.ROOMS, {})
+        for i in range(5):
+            (self.dir / f"f{i}.tex").write_text("x", encoding="utf-8")
+        with mock.patch.object(serve, "MAX_ROOMS_PER_ROLE", 3):
+            for i in range(3):
+                self.assertIn("room", self.join(f"y{i}", path=f"f{i}.tex"))
+            self.assertEqual(self.join("y9", path="f4.tex")["data"]["status"], 429)
+            self.assertIn("room", self.join("v", "view", path="f4.tex"))  # another role has its own budget
+        with mock.patch.object(serve, "MAX_BYTES_PER_ROLE", 10):
+            self.assertIsNone(self.update("y0", "d\nf0.tex", "x" * 6))
+            self.assertEqual(self.update("y1", "d\nf1.tex", "y" * 6)["data"]["status"], 413)
+
+    def test_a_save_from_outside_the_room_leaves_the_room_drifted(self):
+        self.join("a", path="ch.tex")
+        (self.dir / "ch.tex").write_text("plain tab edit\n", encoding="utf-8")
+        serve.note_write("d", "ch.tex", "plain tab edit\n", serve.version_of((self.dir / "ch.tex").stat()), "tab")
+        serve.handle_client_message({"type": "y-leave", "data": {"room": "d\nch.tex"}}, "a", "edit")
+        taken = self.join("b", path="ch.tex")
+        self.assertEqual((taken["stale"], taken["base"]), (True, "x = 1\n"))
 
 
 class SharedHttpDetails(SharedState, ServerCase):

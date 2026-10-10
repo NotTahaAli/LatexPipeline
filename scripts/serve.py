@@ -1284,7 +1284,9 @@ CLIENT_TIMEOUT = 60.0
 MAX_UPDATE = 2 * 1024 * 1024
 MAX_ROOM_BYTES = 8 * 1024 * 1024  # base64 update log per room; the server cannot compact what it never decodes
 MAX_ROOMS_PER_CLIENT = 40
-MAX_ROOMS = 300
+MAX_ROOMS = 300  # server-wide; the owner is exempt, so a shared link can never lock the owner out
+MAX_ROOMS_PER_ROLE = 40  # rooms a shared role (edit/view) may have opened, however many client ids it uses
+MAX_BYTES_PER_ROLE = 32 * 1024 * 1024  # update-log bytes a shared role may have put into rooms
 
 
 def room_id(doc: str, path: str) -> str:
@@ -1326,11 +1328,14 @@ def publish_leader(rid: str, room: dict) -> None:
         BUS.publish("y-leader", {"room": rid, "leader": leader, **(room_drift(room) if leader else {})})
 
 
-def note_write(doc: str, path: str, text: str, version: str) -> None:
-    """A save went through: the room, if any, now matches the disk again."""
+def note_write(doc: str, path: str, text: str, version: str, client: str | None = None) -> None:
+    """
+    A save went through. Only the room's leader writes the room's text; a save from anywhere else (a tab outside
+    the room) leaves room["disk"] stale, so the next leader sees drift and merges it instead of overwriting it.
+    """
     with COLLAB_LOCK:
         room = ROOMS.get(room_id(doc, path))
-        if room:
+        if room and client is not None and client == room_leader(room):
             room["disk"], room["saved"] = version, text.replace("\r\n", "\n")
 
 
@@ -1403,11 +1408,17 @@ def on_join(message: dict, client: str, role: str) -> dict:
         if rid not in CLIENTS[client]["rooms"] and len(CLIENTS[client]["rooms"]) >= MAX_ROOMS_PER_CLIENT:
             return reply_error(ApiError("Too many files open in shared editing.", 429))
         if room is None:
-            if len(ROOMS) >= MAX_ROOMS:
-                return reply_error(ApiError("Too many shared files open on this server.", 503))
+            if role != "owner":
+                if not path.is_file():  # A shared edit link creates files through PUT only, never rooms.
+                    return reply_error(ApiError("No such file.", 404))
+                if len(ROOMS) >= MAX_ROOMS:
+                    return reply_error(ApiError("Too many shared files open on this server.", 503))
+                if sum(1 for r in ROOMS.values() if r["opener"] == role) >= MAX_ROOMS_PER_ROLE:
+                    return reply_error(ApiError("Too many files open through this link.", 429))
             room = ROOMS[rid] = {
                 "epoch": epoch or secrets.token_hex(8), "log": [], "aware": {}, "members": {}, "gone_at": None,
-                "claimed": bool(epoch), "text": "", "eol": "\n", "leader": None, "bytes": 0,
+                "claimed": bool(epoch), "opener": role, "text": "", "eol": "\n", "leader": None, "bytes": 0,
+                "by_role": {},
                 "doc": data["doc"], "path": data["path"], "disk": None, "saved": "",
             }
             try:  # The seed every first joiner builds identically; kept in the room so it stays consistent.
@@ -1453,6 +1464,10 @@ def on_update(message: dict, client: str, role: str) -> dict | None:
             return None  # Two clients seeding the same file produce the same bytes.
         if room["bytes"] + len(update) > MAX_ROOM_BYTES:
             return reply_error(ApiError("The shared editing history of this file is full; save and reopen it.", 413))
+        used = sum(r["by_role"].get(role, 0) for r in ROOMS.values())
+        if role != "owner" and used + len(update) > MAX_BYTES_PER_ROLE:
+            return reply_error(ApiError("This link has used up its shared editing budget.", 413))
+        room["by_role"][role] = room["by_role"].get(role, 0) + len(update)
         room["bytes"] += len(update)
         room["log"].append(update)
         BUS.publish("y-update", {"room": rid, "u": update, "cid": client})
@@ -1780,7 +1795,8 @@ class Handler(BaseHTTPRequestHandler):
         result = write_text_file(
             root, query.get("path", [""])[0], data.get("text"), data.get("base"), data.get("eol", "\n"),
         )
-        note_write(query["doc"][0], query.get("path", [""])[0], data["text"], result["version"])
+        note_write(query["doc"][0], query.get("path", [""])[0], data["text"], result["version"],
+                   str(query.get("cid", [""])[0])[:64] or None)
         self.json(result)
 
     def get(self) -> None:

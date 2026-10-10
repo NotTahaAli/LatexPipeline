@@ -15,7 +15,7 @@ async function call(path, opts) {
 export const api = {
   files: (doc) => call(`api/files?${qs({ doc })}`),
   read: (doc, path) => call(`api/file?${qs({ doc, path })}`),
-  write: (doc, path, text, base, eol, keepalive) => call(`api/file?${qs({ doc, path })}`, {
+  write: (doc, path, text, base, eol, keepalive, cid) => call(`api/file?${qs(cid ? { doc, path, cid } : { doc, path })}`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, base, eol }), keepalive: !!keepalive,
   }),
   config: () => call("api/config"),

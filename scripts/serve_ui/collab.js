@@ -231,7 +231,7 @@ export class Room {
     if (text === this.savedText) return;
     this.saving = true; this.error = null; this.collab.onChange?.(this);
     try {
-      const res = await this.collab.api.write(this.doc, this.path, text, this.version, this.eol, opts.keepalive);
+      const res = await this.collab.api.write(this.doc, this.path, text, this.version, this.eol, opts.keepalive, this.cid);
       this.version = res.version; this.savedText = text;
     } catch (e) {
       if (e.status === 409) await this.mergeDisk().catch(() => {});
