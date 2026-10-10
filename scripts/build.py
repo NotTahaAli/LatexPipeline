@@ -489,6 +489,11 @@ def log_path_for(main_tex: Path) -> Path:
     return output_path_for(main_tex).with_suffix(".log")
 
 
+def docx_path_for(main_tex: Path) -> Path:
+    """files/reports/final/main.tex -> out/reports/final.docx (optional pandoc export, never published)."""
+    return output_path_for(main_tex).with_suffix(".docx")
+
+
 # ---------------------------------------------------------------------------
 # Per-document settings
 # ---------------------------------------------------------------------------
@@ -1346,8 +1351,9 @@ def prune(documents: list[Path]) -> None:
     expected = {output_path_for(document) for document in documents}
     expected |= {log_path_for(document) for document in documents}
     expected |= {path for document in documents for path in focus_paths(document)}
+    expected |= {docx_path_for(document) for document in documents}
 
-    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]:
+    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx")]:
         if path not in expected:
             info(f"Removing stale: {path.relative_to(ROOT_DIR)}")
             path.unlink()
@@ -1376,6 +1382,48 @@ def clean() -> None:
 
 
 # ---------------------------------------------------------------------------
+# DOCX export (optional: needs pandoc)
+# ---------------------------------------------------------------------------
+
+def export_docx(main_tex: Path) -> tuple[bool, str]:
+    """
+    pandoc main.tex -> out/<name>.docx, run in the document's directory, with every .bib there as bibliography.
+    Returns (ok, message). Pandoc reads \\input files itself, so callers must not use this on untrusted LaTeX.
+    """
+    pandoc = shutil.which("pandoc")
+    if not pandoc:
+        return False, "pandoc was not found on your PATH (https://pandoc.org/installing.html)."
+
+    target = docx_path_for(main_tex)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    folder = main_tex.parent
+    command = [pandoc, main_tex.name, "-o", str(target), f"--resource-path={folder}"]
+    bibs = sorted(path.name for path in folder.glob("*.bib"))
+    if bibs:
+        command += ["--citeproc", *(f"--bibliography={name}" for name in bibs)]
+
+    try:
+        result = subprocess.run(command, cwd=folder, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"pandoc failed: {exc}"
+
+    if result.returncode != 0:
+        return False, (result.stderr.strip() or f"pandoc exited with {result.returncode}").splitlines()[0]
+
+    return True, display(target)
+
+
+def export_docx_all(documents: list[Path]) -> int:
+    """The --docx step: export each document, print one line each; 1 if any failed."""
+    failed = 0
+    for document in documents:
+        ok, message = export_docx(document)
+        (info if ok else error)(f"DOCX {doc_name(document)}: {message}")
+        failed += not ok
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
 # Creating documents
 # ---------------------------------------------------------------------------
 
@@ -1399,9 +1447,84 @@ LATEX_SPECIAL = {
 }
 
 
-def new_document(name: str) -> int:
+# Extra templates: {relative file: text}. "article" is NEW_TEMPLATE above; %(title)s is filled in main.tex only.
+TEMPLATES = {
+    "report": {
+        "main.tex": r"""\documentclass[11pt]{report}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+
+\title{%(title)s}
+\author{Author}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\input{chapters/introduction}
+\input{chapters/methods}
+\input{chapters/conclusion}
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
+""",
+        "chapters/introduction.tex": "\\chapter{Introduction}\n\nPrior work~\\cite{knuth84} goes here.\n",
+        "chapters/methods.tex": "\\chapter{Methods}\n\nDescribe the approach.\n",
+        "chapters/conclusion.tex": "\\chapter{Conclusion}\n\nSummarise the results.\n",
+        "refs.bib": "@book{knuth84,\n  author    = {Donald E. Knuth},\n  title     = {The {TeXbook}},\n"
+                    "  publisher = {Addison-Wesley},\n  year      = {1984}\n}\n",
+        "figures/README.txt": "Put figures here (png, jpg, pdf); \\includegraphics{name} finds them.\n",
+        "build.toml": '# engine = "xelatex"\n# timeout = 600\n# externalize = false\n# lang = "en-US"\n',
+    },
+    "beamer": {
+        "main.tex": r"""\documentclass{beamer}
+
+\title{%(title)s}
+\author{Author}
+\date{\today}
+
+\begin{document}
+
+\frame{\titlepage}
+
+\begin{frame}{Outline}
+  \begin{itemize}
+    \item First point
+    \item Second point
+  \end{itemize}
+\end{frame}
+
+\end{document}
+""",
+    },
+    "letter": {
+        "main.tex": r"""\documentclass{letter}
+\signature{Your name}
+\address{Your address}
+
+\begin{document}
+
+\begin{letter}{Recipient\\Address}
+\opening{Dear Sir or Madam,}
+
+Body of the letter (%(title)s).
+
+\closing{Yours sincerely,}
+\end{letter}
+
+\end{document}
+""",
+    },
+}
+
+
+def new_document(name: str, template: str = "article") -> int:
     """
-    Create files/<name>/main.tex from NEW_TEMPLATE. Never overwrites.
+    Create files/<name>/main.tex (plus companion files for some templates). Never overwrites.
     """
     path = Path(name)
 
@@ -1415,10 +1538,13 @@ def new_document(name: str) -> int:
         error(f"Already exists: {display(target)}")
         return 1
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-
     title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
-    target.write_text(NEW_TEMPLATE % {"title": title}, encoding="utf-8")
+    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
+
+    for rel, text in files.items():
+        out = target.parent / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text % {"title": title} if rel == "main.tex" else text, encoding="utf-8")
 
     info(f"Created: {display(target)}")
     return 0
@@ -1458,6 +1584,19 @@ def parse_args() -> argparse.Namespace:
         "--new",
         metavar="NAME",
         help="Create files/NAME/main.tex from a template and exit.",
+    )
+
+    parser.add_argument(
+        "--template",
+        choices=["article", "report", "beamer", "letter"],
+        default="article",
+        help="Template for --new (default article; report adds chapters/, refs.bib, figures/, build.toml).",
+    )
+
+    parser.add_argument(
+        "--docx",
+        action="store_true",
+        help="After building, also export each selected document to out/<name>.docx with pandoc (must be installed).",
     )
 
     parser.add_argument(
@@ -1622,7 +1761,7 @@ def main() -> int:
         return 0
 
     if args.new is not None:
-        return new_document(args.new)
+        return new_document(args.new, args.template)
 
     documents = find_documents()
 
@@ -1662,6 +1801,10 @@ def main() -> int:
 
         return 0
 
+    if args.docx and not shutil.which("pandoc"):
+        error("--docx needs pandoc, which was not found on your PATH (https://pandoc.org/installing.html).")
+        return 2
+
     latexmk = check_latex()
 
     if args.focus and not args.watch:
@@ -1673,12 +1816,14 @@ def main() -> int:
     if args.watch:
         return watch(latexmk, args.docs, args.open, args.focus)
 
+    exported = documents
+
     if not args.force:
         documents = [document for document in documents if is_stale(document)]
 
         if not documents:
             info("Everything is up to date.")
-            return 0
+            return export_docx_all(exported) if args.docx else 0
 
     separator()
     info(f"Found {len(documents)} document(s).")
@@ -1703,7 +1848,11 @@ def main() -> int:
     write_report(results)
     print_summary(results, args.profile)
 
-    return 1 if any(not entry["ok"] for entry in results) else 0
+    failed = any(not entry["ok"] for entry in results)
+    if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
+        failed = bool(export_docx_all(exported)) or failed
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

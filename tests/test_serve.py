@@ -848,6 +848,23 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("POST", "/api/focus?doc=second&path=main.tex", "owner")[0], 200)
             self.assertEqual(started, [("demo", "main.tex"), ("demo", "main.tex"), ("second", "main.tex")])
 
+    def test_docx_export_is_owner_only_and_the_download_follows_the_pdf_rule(self):
+        url = "/api/docx?doc=demo"
+        with mock.patch.object(build, "export_docx", return_value=(True, "out/demo.docx")) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            export.assert_not_called()
+            self.assertEqual(self.get("POST", url, "owner")[0], 200)
+            export.assert_called_once()
+        with mock.patch.object(build, "export_docx", return_value=(False, "pandoc was not found")):
+            status, reply = self.get("POST", url, "owner")
+            self.assertEqual((status, reply["error"]), (500, "pandoc was not found"))
+        (self.root / "demo.docx").write_bytes(b"PK")
+        with mock.patch.object(build, "docx_path_for", return_value=self.root / "demo.docx"):
+            self.assertEqual(self.get("GET", "/docx/demo", "view")[0], 200)
+            self.assertEqual(self.get("GET", "/docx/second", "view")[0], 403)
+            self.assertEqual(self.get("GET", "/docx/demo")[0], 401)
+
     def test_previews_count_against_the_rebuild_limit_of_editors(self):
         with mock.patch.object(serve, "start_focus", return_value=1.0):
             limit = serve.REBUILD_LIMIT[0]

@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Added
 
+- Optional DOCX export with pandoc: `build.py --docx` writes `out/<name>.docx`; "Export DOCX" in the editor's More menu (owner only, hidden without pandoc). Never published to the release.
+- `build.py --new NAME --template {article,report,beamer,letter}`; `report` creates chapters, `refs.bib`, `figures/` and a commented `build.toml`.
 - **Local editor** (`scripts/serve.py`): live PDF preview, SyncTeX jump in both directions, CodeMirror source editor with visual mode, outline with per-section word goals, file tree (new, rename, delete), figure drop or paste, spell check, build progress, error and warning panels with plain-language hints, restore of the last build after a restart.
 - **Chapter preview** in the editor and `build.py --focus PATH`: typeset one part of a large document with the full build's numbering and references (about 1.7 s for a 303-page report). `--focus auto` follows the file saved last.
 - **Co-editing and sharing** (`serve.py --share`): token-gated view and edit links over cloudflared, ngrok, localtunnel, pinggy, localhost.run or `local`; live shared editing (Yjs) with cursors and presence; `--share-selftest`.

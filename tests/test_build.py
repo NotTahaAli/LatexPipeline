@@ -403,6 +403,72 @@ class CiReportCellTests(unittest.TestCase):
         self.assertTrue(row.startswith("| weird\\|name | **failed** |"))
 
 
+class NewTemplateTests(unittest.TestCase):
+    FILES = {
+        "article": {"main.tex"},
+        "report": {"main.tex", "refs.bib", "build.toml", "figures/README.txt", "chapters/introduction.tex",
+                   "chapters/methods.tex", "chapters/conclusion.tex"},
+        "beamer": {"main.tex"},
+        "letter": {"main.tex"},
+    }
+
+    def test_each_template_writes_its_files_and_never_overwrites(self):
+        for template, expected in self.FILES.items():
+            with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(build.new_document("doc", template), 0)
+                folder = root / "files" / "doc"
+                self.assertEqual({p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}, expected)
+                self.assertEqual(build.new_document("doc", template), 1)
+
+    def test_article_is_unchanged(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            build.new_document("a_b")
+            text = (root / "files" / "a_b" / "main.tex").read_text(encoding="utf-8")
+            self.assertEqual(text, build.NEW_TEMPLATE % {"title": "a\\_b"})
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("bibtex"), "needs latexmk and bibtex")
+    def test_report_template_builds(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            build.new_document("rep", "report")
+            main = root / "files" / "rep" / "main.tex"
+            report, text = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertNotIn("Citation `knuth84' undefined", text)
+
+
+class DocxExportTests(unittest.TestCase):
+    def test_pandoc_command_and_prune(self):
+        with fake_repo() as root:
+            main = write_doc(root, "a", "x")
+            (main.parent / "r.bib").write_text("", encoding="utf-8")
+            ran = []
+            done = mock.Mock(returncode=0, stderr="")
+            fake_run = lambda cmd, **kw: ran.append((cmd, kw)) or done  # noqa: E731
+            with mock.patch.object(build.shutil, "which", return_value="/bin/pandoc"), \
+                    mock.patch.object(build.subprocess, "run", side_effect=fake_run):
+                ok, _ = build.export_docx(main)
+            cmd, kw = ran[0]
+            self.assertTrue(ok)
+            self.assertEqual(kw["cwd"], main.parent)
+            self.assertEqual(cmd[1:3], ["main.tex", "-o"])
+            self.assertIn("--citeproc", cmd)
+            self.assertIn("--bibliography=r.bib", cmd)
+            self.assertEqual(cmd[3], str(root / "out" / "a.docx"))
+
+            (root / "out").mkdir(exist_ok=True)
+            (root / "out" / "a.docx").write_bytes(b"x")
+            (root / "out" / "gone.docx").write_bytes(b"x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build.prune([main])
+            self.assertEqual(sorted(p.name for p in (root / "out").iterdir()), ["a.docx"])
+
+    def test_missing_pandoc_is_a_clear_message(self):
+        with fake_repo() as root, mock.patch.object(build.shutil, "which", return_value=None):
+            ok, message = build.export_docx(write_doc(root, "a", "x"))
+        self.assertFalse(ok)
+        self.assertIn("pandoc was not found", message)
+
+
 if __name__ == "__main__":
     unittest.main()
 

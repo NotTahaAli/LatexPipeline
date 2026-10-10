@@ -45,7 +45,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
   * Debian/Ubuntu: `sudo apt install latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff`
-* Optional: [uv](https://docs.astral.sh/uv/)
+* Optional: [uv](https://docs.astral.sh/uv/); [pandoc](https://pandoc.org/installing.html) for DOCX export
 
 Check that it works with `latexmk --version`. If the command isn't found, add your LaTeX installation to `PATH` and restart the terminal.
 
@@ -61,6 +61,7 @@ python scripts/build.py --force          # rebuild everything (latexmk -g, even 
 python scripts/build.py -j 2             # build two documents at a time (default: CPU count, up to 8)
 python scripts/build.py "FP-123 Report"  # build only that document (or a glob such as "reports/*")
 python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
+python scripts/build.py --new Thesis --template report   # also: beamer, letter (default: article)
 python scripts/build.py --watch --open   # keep running, rebuild on every save, open each PDF after its first build
 python scripts/build.py --list           # show discovered documents and whether they are up to date
 python scripts/build.py --clean          # delete out/ and .latex-cache/
@@ -111,7 +112,13 @@ files/My New Document/
     └── figure.png
 ```
 
+`python scripts/build.py --new MyDoc --template report` writes this kind of layout for you (`article` is the default; `report` adds `chapters/`, `refs.bib`, `figures/` and a commented `build.toml`; `beamer` and `letter` are single files).
+
 You don't need to change `build.py`. Keep inputs inside the document's directory where you can. A file outside it (for example `\input{../shared/x}`) is tracked for rebuilds once the document's first build has read it: the build records every file it reads in `.latex-cache/<name>/<name>.fls` (latexmk `-recorder`). TeX installation files and the cache are never tracked.
+
+### DOCX export
+
+`python scripts/build.py --docx [DOC ...]` builds the selected documents, then runs `pandoc main.tex` in each document's directory and writes `out/<name>.docx` (every `.bib` beside `main.tex` becomes a `--citeproc` bibliography). It exports even when the PDF build failed, needs `pandoc` on `PATH` (otherwise it stops with a message), and the files are never published to the release. In the editor, the owner gets "Export DOCX" in the More menu when pandoc is installed. It is owner-only while sharing, because pandoc reads any file a `\input` names.
 
 ### Reproducible PDFs
 
