@@ -96,4 +96,24 @@ for (const leader of [true, false]) {
   assert.equal(sent.filter((m) => m.type === "y-leave").length, 1);
   assert.equal(room.collab.rooms.has(room.rid), false);
 }
+// 8. Review anchors (anchors.js, beside collab.js): found again after the text moves, gone when the text is gone.
+{
+  const { makeAnchor, locate, disjoint } = await import(pathToFileURL(path.join(path.dirname(path.resolve(process.argv[2])), "anchors.js")).href);
+  const text = "The fox ran. The fox sat. The dog sat.";
+  const at = text.indexOf("fox sat"), a = makeAnchor(text, at, at + 3);
+  assert.deepEqual(locate(text, a), { from: at, to: at + 3 });
+  const moved = "Intro.\n" + text;
+  assert.deepEqual(locate(moved, a), { from: at + 7, to: at + 10 }, "follows an insertion before it");
+  const other = text.replace("The fox ran. ", "");   // the first "fox" is gone; the context picks the right one
+  assert.deepEqual(locate(other, a), { from: other.indexOf("fox sat"), to: other.indexOf("fox sat") + 3 });
+  assert.equal(locate(text.replace("fox sat", "cat sat"), a), null, "quoted text removed");
+  assert.equal(locate("completely different", a), null);
+  const ins = makeAnchor(text, 12, 12);   // a suggested insertion: placed by its context alone
+  assert.deepEqual(locate("Hello. " + text, ins), { from: 19, to: 19 });
+  const long = makeAnchor(text, 0, 11);
+  assert.deepEqual(locate("x" + text, long), { from: 1, to: 12 }, "a long quote needs no context");
+  const { ok, clash } = disjoint([{ from: 5, to: 8 }, { from: 0, to: 3 }, { from: 6, to: 9 }, { from: 3, to: 3 }]);
+  assert.deepEqual(ok.map((e) => e.from), [0, 3, 5]);
+  assert.deepEqual(clash.map((e) => e.from), [6]);
+}
 console.log("collab ok");

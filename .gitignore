@@ -7,6 +7,8 @@
 
 out/
 .latex-cache/
+# Editor version history and review comments (scripts/serve.py)
+.latex-history/
 
 .DS_Store
 *.pem

@@ -1,5 +1,5 @@
 import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
-import { Collab, PALETTE } from "./collab.js";
+import { Collab, PALETTE, hunk } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
@@ -8,6 +8,8 @@ import { grammarSupport } from "./grammar.js";
 import { addBibLookup } from "./bib.js";
 import { refsPanel } from "./refs.js";
 import { aiPanel } from "./ai.js";
+import { reviewSupport } from "./review.js";
+import { historyPanel } from "./history.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -44,6 +46,7 @@ let view;
 const config = await api.config().catch(() => ({ role: "owner" }));
 const role = config.role, readOnly = role === "view";
 const me = store.json("user", null) || (() => { const u = { name: "Guest " + (100 + Math.floor(Math.random() * 900)), color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }; store.set("user", u); return u; })();
+if (!me.key) { me.key = Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join(""); store.set("user", me); }   // marks your own review comments on link shares
 
 // ---- toast ------------------------------------------------------------------------------
 function toast(...kids) { const t = $("toast"); t.replaceChildren(...kids); t.hidden = false; clearTimeout(t.t); t.t = setTimeout(() => t.hidden = true, 5000); }
@@ -61,6 +64,19 @@ function applyAppearance() {
 const { EditorState, Compartment, Prec } = S;
 const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
 const GR = grammarSupport(S, V);
+// Review comments and suggest mode (review.js); the panel lives in the drawer's Review tab.
+const REV = reviewSupport(S, V, {
+  api, el, icon, canEdit: !readOnly, doc: () => cur, me: () => me, view: () => view,
+  activePath: () => (active?.kind === "text" ? active.path : null), openFile: (p, line, opts) => openFile(p, line, opts),
+  showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
+});
+function toggleSuggest() {
+  if (readOnly) return;
+  REV.setSuggest(!REV.suggesting);
+  $("suggestBtn").setAttribute("aria-checked", String(REV.suggesting));
+  $("cm").classList.toggle("suggesting", REV.suggesting);
+}
 const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment();
 
 const latexComplete = (ctx) => {
@@ -91,6 +107,7 @@ function extensionsFor(tab) {
     }),
     errField,
     readOnly ? [] : GR.extension,
+    REV.extension,
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
@@ -250,7 +267,7 @@ function collabState(tab) {
 
 async function activate(tab, line, opts = {}) {
   const same = active === tab;
-  if (active && !same && active.kind === "text") active.state = view.state;
+  if (active && !same && active.kind === "text") { REV.flush(view); active.state = view.state; }
   active = tab;
   if (/\.tex$/i.test(tab.path)) lastTex = tab.path;   // Where the References panel cites into while a .bib is open.
   ui.active = tab.path; persistTabs();
@@ -269,6 +286,8 @@ async function activate(tab, line, opts = {}) {
     if (!opts.noFocus) view.focus();
   }
   renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors(); renderFocus();
+  if (tab.kind === "text") REV.refresh(view);
+  if (ui.drawer && ui.drawerTab === "history" && !same) historyUi.load();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
   renderGrammar(); scheduleGrammar(tab.kind === "text" ? 400 : -1);
@@ -887,6 +906,24 @@ const aiUi = aiPanel($("panel-ai"), {
   async view(path) { if (narrow()) setSide(false); if (active?.path !== path) await openFile(path, 0, { noFocus: true }); return view; },
 });
 aiUi.load().then(() => renderProblems());
+// Version history (history.js): the drawer's History tab and the diff dialog. Restored text for a file open in a
+// co-editing room goes in here, through the editor, like every other edit.
+const historyUi = historyPanel($("dpanel-history"), {
+  api, el, doc: () => cur, activePath: () => (active?.kind === "text" ? active.path : null), canEdit: !readOnly, dialog: $("diffDlg"),
+  toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
+  async apply(path, text) {
+    await openFile(path, 0, { noFocus: true });
+    if (active?.path !== path) return false;
+    const h = hunk(view.state.doc.toString(), text);
+    view.dispatch({ changes: { from: h.from, to: h.to, insert: h.insert }, annotations: REV.bypass.of(true), userEvent: "input.restore" });
+    return true;
+  },
+});
+$("diffClose").onclick = () => $("diffDlg").close();
+REV.mount($("dpanel-review"));
+$("commentBtn").onclick = () => REV.startComment();
+$("suggestBtn").onclick = () => toggleSuggest();
 
 async function loadLint() {
   $("lintList").replaceChildren(el("li", { className: "none", textContent: "Checking..." }));
@@ -992,11 +1029,12 @@ async function loadLog() {
   try { $("logText").textContent = await (await fetch(api.logUrl(cur))).text(); } catch { $("logText").textContent = "No log yet."; }
 }
 
+const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "log"];
 function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
   $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
   for (const b of ["status", "errBadge"]) $(b).setAttribute("aria-expanded", String(open));
-  for (const n of ["problems", "warnings", "lint", "grammar", "log"]) {
+  for (const n of DRAWER_TABS) {
     $("dtab-" + n).setAttribute("aria-selected", String(ui.drawerTab === n));
     $("dpanel-" + n).hidden = ui.drawerTab !== n;
   }
@@ -1004,8 +1042,10 @@ function setDrawer(open, tabName) {
   if (open && ui.drawerTab === "lint") loadLint();
   if (open && ui.drawerTab === "grammar") { renderGrammar(); runGrammar(); }
   if (open && ui.drawerTab === "log") loadLog();
+  if (open && ui.drawerTab === "review") REV.load();
+  if (open && ui.drawerTab === "history") historyUi.load();
 }
-for (const n of ["problems", "warnings", "lint", "grammar", "log"]) $("dtab-" + n).onclick = () => setDrawer(true, n);
+for (const n of DRAWER_TABS) $("dtab-" + n).onclick = () => setDrawer(true, n);
 const toggleDrawer = () => setDrawer(!ui.drawer);
 $("status").onclick = toggleDrawer;
 $("errBadge").onclick = () => setDrawer(true, "problems");
@@ -1124,6 +1164,10 @@ const COMMANDS = [
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "grammar", title: "Show grammar findings", run: () => setDrawer(true, "grammar") },
+  { id: "comment", edit: true, title: "Comment on the selection", keys: `${mod}+Alt+M`, run: () => REV.startComment() },
+  { id: "suggest", edit: true, title: "Toggle suggest mode (track changes)", keys: `${mod}+Alt+S`, run: () => toggleSuggest() },
+  { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
+  { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
   { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
@@ -1214,7 +1258,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]],
+  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? [] : ["comment", "suggest"]), "review", "history"]],
     ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
@@ -1255,6 +1299,8 @@ document.addEventListener("keydown", (e) => {
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
   else if (m && e.altKey && k === "v") { e.preventDefault(); setVisual(!settings.visual); }
   else if (m && e.altKey && k === "p") { e.preventDefault(); setProse(!ui.prose); }
+  else if (m && e.altKey && k === "m" && !readOnly) { e.preventDefault(); REV.startComment(); }
+  else if (m && e.altKey && k === "s" && !readOnly) { e.preventDefault(); toggleSuggest(); }
   else if (m && k === ",") { e.preventDefault(); openSettings(); }
   else if (m && k === "enter" && active?.kind === "text") { e.preventDefault(); toCursor(); }
   else if (m && k === "s") { e.preventDefault(); saveTab(active); }
@@ -1349,6 +1395,7 @@ if (config.hosted) {   // Behind scripts/host.py the editor lives at /p/<id>/: t
   home.append(...logo.childNodes); logo.replaceWith(home);
 }
 if (readOnly) {
+  $("commentBtn").hidden = $("suggestBtn").hidden = true;   // Comments and suggestions need the edit role; the Review tab still lists them.
   for (const [id, why] of [["rebuildBtn", "Only people with the edit link can rebuild"], ["proseBtn", "Paragraph editing needs the edit link"]]) {
     $(id).disabled = true; $(id).title = why;
   }
@@ -1369,6 +1416,7 @@ if (readOnly) {
 
 // ---- bus, documents ---------------------------------------------------------------------------------------------
 const channel = new Channel();
+api.cid = channel.cid;
 const collab = collabLibs && config.collab !== false ? new Collab(channel, api, {
   user: () => me, doc: () => cur, role, saveDelay: () => settings.autosave || 1000,
   onChange: (room) => {
@@ -1402,6 +1450,9 @@ channel.on("state", (data) => {
 });
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
+channel.on("review", (d) => { if (d.doc === cur) REV.changed(); });
+channel.on("history", (d) => { if (d.doc === cur && ui.drawer && ui.drawerTab === "history") { clearTimeout(historyTimer); historyTimer = setTimeout(() => historyUi.load(), 400); } });
+let historyTimer;
 channel.on("forward", (b) => { if (b.doc !== cur) pick(b.doc); else if (shownFocus()) return; pdfView.reveal(b); });
 channel.on("transport", (mode) => {
   document.documentElement.dataset.transport = mode;
@@ -1421,7 +1472,9 @@ async function pick(name) {
   tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {} };
   pdfView.version = null;
   warnKey = warnLoaded = null; warnings = []; renderWarnings();
+  REV.reset(); historyUi.reset();
   renderStatus(); loadPdf(); loadWarnings(); await loadFiles(); await restoreTabs();
+  REV.load(); if (ui.drawer && ui.drawerTab === "history") historyUi.load();
 }
 
 async function restoreTabs() {
@@ -1445,4 +1498,4 @@ applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); b
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
 pushGrammarSettings();
-window.__app = { get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };
+window.__app = { REV, get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };

@@ -32,6 +32,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -50,6 +51,8 @@ import bibfix
 import build
 import grammar
 import hints
+import history
+import review
 import zotero
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
@@ -160,7 +163,7 @@ def visible(messages: list[dict], role: str) -> list[dict]:
         kind, data = message["type"], message["data"]
         if kind == "state":
             message = {**message, "data": {"docs": [d for d in data["docs"] if d["name"] == shared]}}
-        elif kind in ("fs", "forward"):
+        elif kind in ("fs", "forward", "review", "history"):  # data names the document only, no content
             if data.get("doc") != shared:
                 continue
         elif kind in Y_KINDS:
@@ -2233,7 +2236,7 @@ def on_join(message: dict, client: str, role: str) -> dict:
             room = ROOMS[rid] = {
                 "epoch": epoch or secrets.token_hex(8), "log": [], "aware": {}, "members": {}, "gone_at": None,
                 "claimed": bool(epoch), "opener": role, "text": "", "eol": "\n", "leader": None, "bytes": 0,
-                "by_role": {},
+                "by_role": {}, "editors": set(),
                 "doc": data["doc"], "path": data["path"], "disk": None, "saved": "",
             }
             try:  # The seed every first joiner builds identically; kept in the room so it stays consistent.
@@ -2285,6 +2288,7 @@ def on_update(message: dict, client: str, role: str) -> dict | None:
         room["by_role"][role] = room["by_role"].get(role, 0) + len(update)
         room["bytes"] += len(update)
         room["log"].append(update)
+        room["editors"].add(CLIENTS[client]["name"] or ROLE_NAMES.get(role, role))  # authors of the next save
         BUS.publish("y-update", {"room": rid, "u": update, "cid": client})
     return None
 
@@ -2366,6 +2370,337 @@ HANDLERS.update({
 
 
 # ---------------------------------------------------------------------------
+# Version history and review (history.py, review.py)
+# ---------------------------------------------------------------------------
+#
+# Both live in .latex-history/<doc>/ beside the build cache, never in the document directory: not a build input,
+# not in a zip export or a CI scan, and not wiped by build.py --clean. Behind the gateway that folder is inside the
+# project area, so it counts toward the quota and goes with the project. Editor saves, file-tree deletes and
+# renames, labels and restores add versions; a restore is a version too, so it can be undone. A file with an open
+# co-editing room is never written here: the browser that asked applies the text through the room, like the
+# References panel's edits. The bus only says "something changed in <doc>" ("history", "review"); clients refetch.
+
+HISTORY: dict = {"dir": None}  # None: .latex-history beside build.CACHE_DIR
+ROLE_NAMES = {"owner": "Owner", "edit": "Editor", "view": "Viewer"}
+HISTORY_LIMIT = (20, 60.0)  # labels and restores a shared role may make per window
+REVIEW_LIMIT = (120, 60.0)  # comments, suggestions and decisions per window
+MAX_LABEL = 120
+RESTORE_GRACE = 120.0  # seconds a restore applied through a room has to reach the disk
+
+
+def history_folder(name: str) -> Path:
+    try:  # the build cache's key, so bench/x and files/x stay apart
+        key = build.cache_dir_for(DOCS[name]).name
+    except ValueError:  # --source outside the repository
+        key = build.escape_name(name)
+    return Path(HISTORY["dir"] or build.CACHE_DIR.parent / ".latex-history") / key
+
+
+def store_allows(size: int) -> bool:
+    """History and review data count toward the hosted quota like files do; over it they stop growing."""
+    try:
+        quota_check(size)
+        return True
+    except ApiError:
+        return False
+
+
+def history_store(name: str) -> history.Store:
+    cap = min(history.MAX_BYTES, QUOTA["bytes"] // 4) if QUOTA["bytes"] else history.MAX_BYTES
+    return history.Store(history_folder(name), cap, store_allows)
+
+
+def review_store(name: str) -> review.Review:
+    return review.Review(history_folder(name) / "review.json", store_allows)
+
+
+def author_name(role: str, user: str | None, client: str | None = None) -> str:
+    """Display name: the account's behind the gateway, else what the client said in hello."""
+    if user:
+        return user.partition(";")[2] or "Someone"
+    record = CLIENTS.get(client or "")
+    if record and record["role"] == role and record.get("name"):
+        return record["name"]
+    return ROLE_NAMES.get(role, role)
+
+
+def remember(name: str, rel: str, text: str | None, authors=(), kind: str = "auto", label: str | None = None) -> None:
+    """Record a version. History is a convenience: a full disk or quota never fails the edit itself."""
+    if file_kind(rel) != "text":
+        return
+    try:
+        if history_store(name).record(rel, text, authors, kind, label) is not None:
+            BUS.publish("history", {"doc": name})
+    except history.Full:
+        pass
+    except (OSError, sqlite3.Error) as exc:
+        build.error(f"history of {name}: {exc}")
+
+
+def remember_disk(name: str, rel: str) -> None:
+    """Before the editor overwrites, deletes or moves a file: keep the disk text if history does not have it."""
+    try:
+        text = read_text_file(DOCS[name].parent, rel)["text"]
+        last = history_store(name).latest(rel)
+    except (ApiError, OSError, sqlite3.Error):
+        return
+    if last and last["kind"] == "restore" and time.time() - last["time"] < RESTORE_GRACE:
+        return  # A restore is on its way through a co-editing room; the old text is already a version.
+    remember(name, rel, text, (), "outside")
+
+
+def save_authors(doc: str, path: str, client: str | None, fallback: str) -> list[str]:
+    """Who wrote what a save carries: the room's editors since its last save, or the person saving."""
+    with COLLAB_LOCK:
+        room = ROOMS.get(room_id(doc, path))
+        if room and client and client == room_leader(room) and room["editors"]:
+            names = sorted(room["editors"])
+            room["editors"].clear()
+            return names
+    return [fallback]
+
+
+def text_files(name: str, rel: str | None = None) -> list[str]:
+    return [f["path"] for f in list_files(DOCS[name].parent) if f["kind"] == "text"
+            and (rel is None or f["path"] == rel or f["path"].startswith(rel + "/"))]
+
+
+def history_before_fs(name: str, op: str, rel) -> list[str]:
+    """A delete or rename is about to happen: every text file it touches gets its current text kept."""
+    if op not in ("delete", "rename") or not isinstance(rel, str):
+        return []
+    paths = text_files(name, rel)
+    for path in paths:
+        remember_disk(name, path)
+    return paths
+
+
+def history_after_fs(name: str, op: str, rel: str, to: str | None, paths: list[str], author: str) -> None:
+    root = DOCS[name].parent
+    for path in paths:
+        if op == "delete":
+            remember(name, path, None, [author], "delete")
+        elif op == "rename" and to:
+            new = to + path[len(rel):]
+            remember(name, path, None, [author], "rename", f"Renamed to {new}"[:300])
+            try:
+                remember(name, new, read_text_file(root, new)["text"], [author], "rename", f"Renamed from {path}"[:300])
+            except ApiError:
+                pass
+    if op == "rename" and to:
+        try:
+            if review_store(name).rename(rel, to):
+                BUS.publish("review", {"doc": name})
+        except (review.ReviewError, OSError):
+            pass
+
+
+def history_list(name: str, role: str, path: str | None, before) -> dict:
+    if path and role != "owner" and is_rc(path):
+        raise ApiError("This file configures the build; only the owner sees its history.", 403)
+    try:
+        rows = history_store(name).versions(path or None, int(before) if before else None)
+    except ValueError:
+        raise ApiError("Bad version.", 400)
+    if role != "owner":
+        rows = [r for r in rows if not is_rc(r["path"] or "")]
+        for row in rows:
+            if "files" in row:
+                row["files"] = [f for f in row["files"] if not is_rc(f)]
+    return {"versions": rows}
+
+
+def history_row(name: str, vid) -> tuple[history.Store, dict]:
+    store = history_store(name)
+    try:
+        return store, store.get(int(vid))
+    except (KeyError, TypeError, ValueError):
+        raise ApiError("No such version.", 404)
+
+
+def history_text(name: str, role: str, vid, path: str | None) -> dict:
+    store, row = history_row(name, vid)
+    path = path or row["path"]
+    if not path:
+        raise ApiError("Pick a file of this version.", 400)
+    if role != "owner" and is_rc(path):
+        raise ApiError("This file configures the build; only the owner sees its history.", 403)
+    try:
+        text = store.text_at(row["id"], path)
+    except KeyError:
+        raise ApiError("This version's text is gone (pruned).", 410)
+    return {"id": row["id"], "path": path, "text": text}
+
+
+def history_diff(name: str, role: str, vid, path: str | None, against: str) -> dict:
+    """against = current: the version -> the file now (what a restore would undo); previous: what the version did."""
+    found = history_text(name, role, vid, path)
+    store, path, text = history_store(name), found["path"], found["text"] or ""
+    if against == "previous":
+        prev = store.previous(found["id"], path)
+        try:
+            base = (store.text_at(prev, path) or "") if prev else ""
+        except KeyError:
+            base = ""
+        result = history.diff(base, text)
+    else:
+        try:
+            now = read_text_file(DOCS[name].parent, path)["text"]
+        except ApiError:
+            now = ""
+        result = history.diff(text, now)
+    return {"path": path, "id": found["id"], "against": "previous" if against == "previous" else "current", **result}
+
+
+def history_label(name: str, label, author: str) -> dict:
+    """Name the project as it is now: every text file's current text goes into the label's own manifest."""
+    if not isinstance(label, str) or not label.strip() or len(label) > MAX_LABEL:
+        raise ApiError(f"Give the version a name (up to {MAX_LABEL} characters).", 400)
+    root, texts = DOCS[name].parent, {}
+    for path in text_files(name):
+        try:
+            texts[path] = read_text_file(root, path)["text"]
+        except ApiError:
+            continue  # too large or not UTF-8: not something the editor versions
+        remember_disk(name, path)
+    try:
+        vid = history_store(name).label(label.strip(), [author], texts)
+    except history.Full:
+        raise ApiError("This project is over its quota, so no version can be saved. Delete files first.", 507)
+    except (OSError, sqlite3.Error) as exc:
+        raise ApiError(f"Could not save the version: {exc}", 500)
+    BUS.publish("history", {"doc": name})
+    return {"id": vid}
+
+
+def room_open(doc: str, path: str) -> bool:
+    with COLLAB_LOCK:
+        room = ROOMS.get(room_id(doc, path))
+        return bool(room and room["members"])
+
+
+def history_restore(name: str, role: str, vid, path: str | None, author: str) -> dict:
+    """
+    Put one file (path) or every file of a version back. Build-config files stay owner-only; files that did not
+    exist in the version are left alone. Files open in a co-editing room come back in "apply" for the browser to
+    put through the room; the rest are written here. Each restored file gets a "restore" version.
+    """
+    store, row = history_row(name, vid)
+    if path:
+        if role != "owner" and is_rc(path):
+            raise ApiError("This file configures the build and can only be restored by the owner.", 403)
+        try:
+            text = store.text_at(row["id"], path)
+        except KeyError:
+            raise ApiError("This version's text is gone (pruned).", 410)
+        if text is None:
+            raise ApiError(f"{path} did not exist in this version.", 409)
+        targets = {path: text}
+    else:
+        try:
+            targets = {p: store.blob(h) for p, h in store.state_at(row["id"]).items()}
+        except KeyError:
+            raise ApiError("This version's text is gone (pruned).", 410)
+    root = DOCS[name].parent
+    note = f"Restored {row['label'] or 'version ' + str(row['id'])}"[:300]
+    out: dict = {"written": [], "apply": [], "skipped": [], "failed": []}
+    for rel in sorted(targets):
+        text = targets[rel]
+        if role != "owner" and is_rc(rel):
+            out["skipped"].append(rel)
+            continue
+        try:
+            target = resolve_in_doc(root, rel)
+            current = read_text_file(root, rel) if target.exists() else None
+            if current and current["text"] == text:
+                continue
+            if room_open(name, rel):
+                remember_disk(name, rel)
+                remember(name, rel, text, [author], "restore", note)
+                out["apply"].append({"path": rel, "text": text})
+                continue
+            if current:
+                remember_disk(name, rel)
+            parent = target.parent
+            if not parent.is_dir():
+                fs_path(root, posixpath.dirname(rel), "folder")  # a folder the file tree could make too
+                with WRITE_LOCK:
+                    quota_check(ENTRY_BYTES)
+                    parent.mkdir(parents=True, exist_ok=True)
+            write_text_file(root, rel, text, None, current["eol"] if current else "\n")
+            remember(name, rel, text, [author], "restore", note)
+            out["written"].append(rel)
+        except (ApiError, OSError) as exc:
+            out["failed"].append({"path": rel, "error": str(exc)})
+    if out["written"]:
+        broadcast("fs", {"doc": name, "changed": out["written"], "removed": []})
+    return out
+
+
+def reviewer(role: str, user: str | None, data: dict) -> dict:
+    """Who is commenting: the account behind the gateway, the owner, or a link guest known by a browser secret."""
+    if user:
+        uid, _, uname = user.partition(";")
+        return {"key": "u:" + uid, "name": uname or "Someone"}
+    name = data.get("name")
+    name = name.strip()[:40] if isinstance(name, str) and name.strip() else ROLE_NAMES.get(role, role)
+    if role == "owner":
+        return {"key": "owner", "name": name}
+    key = data.get("key")
+    if not isinstance(key, str) or not 16 <= len(key) <= 128:
+        raise ApiError("Missing author key.", 400)
+    return {"key": "k:" + hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:24], "name": name}
+
+
+def review_view(item: dict | None, who_key: str | None) -> dict | None:
+    """An item as clients see it: author keys replaced by "mine"."""
+    if item is None:
+        return None
+    out = {k: v for k, v in item.items() if k not in ("author", "comments")}
+    if "author" in item:
+        out["mine"] = item["author"] == who_key
+    if "comments" in item:
+        out["comments"] = [{**{k: v for k, v in c.items() if k != "author"}, "mine": c.get("author") == who_key}
+                           for c in item["comments"]]
+    return out
+
+
+def review_list(name: str, role: str, user: str | None, key) -> dict:
+    try:
+        who = reviewer(role, user, {"key": key})["key"]
+    except ApiError:
+        who = None
+    data = review_store(name).load()
+    keep = (lambda i: True) if role == "owner" else (lambda i: not is_rc(i.get("path") or ""))
+    return {"threads": [review_view(t, who) for t in data["threads"] if keep(t)],
+            "suggestions": [review_view(s, who) for s in data["suggestions"] if keep(s)],
+            "moderator": role == "owner"}
+
+
+def review_change(name: str, role: str, user: str | None, data: dict) -> dict:
+    who = reviewer(role, user, data)
+    op = data.get("op")
+    if op in ("comment", "suggest"):
+        path = data.get("path")
+        if not isinstance(path, str) or file_kind(path) != "text":
+            raise ApiError("Comments and suggestions go on text files.", 400)
+        if role != "owner" and is_rc(path):
+            raise ApiError("This file configures the build and cannot be reviewed through a shared link.", 403)
+        if not resolve_in_doc(DOCS[name].parent, path).is_file():
+            raise ApiError("No such file.", 404)
+    try:
+        result = review_store(name).apply(op, data, who, moderator=role == "owner")
+    except review.ReviewError as exc:
+        raise ApiError(str(exc), exc.status)
+    BUS.publish("review", {"doc": name})
+    if "item" in result:
+        result["item"] = review_view(result["item"], who["key"])
+    if "removed" in result:
+        result["removed"] = [review_view(s, who["key"]) for s in result["removed"]]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -2381,7 +2716,7 @@ CDNS = "https://esm.sh https://cdnjs.cloudflare.com https://cdn.jsdelivr.net"
 DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
-    "/synctex/edit",
+    "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/review",
 }
 
 
@@ -2537,6 +2872,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("zotero-apply", 20, 60.0):  # CPU only, but a guest could still keep the server busy
             raise ApiError("Too many requests; wait a moment.", 429)
+    elif method == "POST" and path in ("/api/history/label", "/api/history/restore", "/api/review"):
+        need_edit()  # Viewers browse history and read comments (READ_API); changing either needs the edit role.
+        scoped(doc)
+        if not rate_ok(path, *(REVIEW_LIMIT if path == "/api/review" else HISTORY_LIMIT)):
+            raise ApiError("Too many changes; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2646,6 +2986,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("Expected a JSON object.", 400)
         return data
 
+    def author(self, query: dict) -> str:
+        return author_name(self.role, self.user, str(query.get("cid", [""])[0])[:64])
+
     def doc_root(self, query: dict) -> Path:
         name = query.get("doc", [""])[0]
         if name not in DOCS:
@@ -2716,7 +3059,17 @@ class Handler(BaseHTTPRequestHandler):
             self.json(save_upload(name, query.get("name", [""])[0], self.rfile.read(size)))
         elif url.path == "/api/fs" and name in DOCS:
             op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
-            self.json(fs_operation(name, op, rel, to))
+            touched = history_before_fs(name, op, rel)
+            result = fs_operation(name, op, rel, to)
+            history_after_fs(name, op, rel, to, touched, author_name(self.role, self.user, query.get("cid", [""])[0]))
+            self.json(result)
+        elif url.path == "/api/history/label" and name in DOCS:
+            self.json(history_label(name, self.body().get("label"), self.author(query)))
+        elif url.path == "/api/history/restore" and name in DOCS:
+            data = self.body()
+            self.json(history_restore(name, self.role, data.get("id"), data.get("path") or None, self.author(query)))
+        elif url.path == "/api/review" and name in DOCS:
+            self.json(review_change(name, self.role, self.user, self.body()))
         elif url.path == "/api/grammar" and name in DOCS:
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/bib/lookup" and name in DOCS:
@@ -2787,11 +3140,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         root = self.doc_root(query)
         data = self.body()
+        remember_disk(query["doc"][0], query.get("path", [""])[0])  # what is on disk now, if history lacks it
         result = write_text_file(
             root, query.get("path", [""])[0], data.get("text"), data.get("base"), data.get("eol", "\n"),
         )
-        note_write(query["doc"][0], query.get("path", [""])[0], data["text"], result["version"],
-                   str(query.get("cid", [""])[0])[:64] or None)
+        doc, rel, cid = query["doc"][0], query.get("path", [""])[0], str(query.get("cid", [""])[0])[:64] or None
+        note_write(doc, rel, data["text"], result["version"], cid)
+        remember(doc, rel, data["text"], save_authors(doc, rel, cid, self.author(query)))
         self.json(result)
 
     def get(self) -> None:
@@ -2849,6 +3204,21 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/warnings":
             self.doc_root(query)
             self.json({"warnings": doc_warnings(query["doc"][0])})
+        elif path in ("/api/history", "/api/history/version", "/api/history/diff", "/api/review"):
+            self.doc_root(query)  # 404 for an unknown document
+            name = query["doc"][0]
+
+            def arg(key):
+                return query.get(key, [None])[0]
+
+            if path == "/api/history":
+                self.json(history_list(name, self.role, arg("path"), arg("before")))
+            elif path == "/api/history/version":
+                self.json(history_text(name, self.role, arg("id"), arg("path")))
+            elif path == "/api/history/diff":
+                self.json(history_diff(name, self.role, arg("id"), arg("path"), arg("against") or "current"))
+            else:
+                self.json(review_list(name, self.role, self.user, arg("key")))
         elif path == "/synctex/edit":
             name = query.get("doc", [""])[0]
             if name not in DOCS:
