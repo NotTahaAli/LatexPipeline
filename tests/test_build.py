@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import time
 import unittest
 import urllib.parse
@@ -172,7 +173,7 @@ class ReadSettingsTests(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
                          {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
-                          "pdfa": None, "lang": "en-US"})
+                          "pdfa": None, "lang": "en-US", "timeout": 600})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -192,7 +193,7 @@ class ReadSettingsTests(unittest.TestCase):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
                          {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
-                          "pdfa": None, "lang": "en-US"})
+                          "pdfa": None, "lang": "en-US", "timeout": 600})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
@@ -207,6 +208,13 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertConfigError(self.PLAIN, 'latexmk_args = "-g"\n')
         self.assertConfigError(self.PLAIN, 'latexmk_args = [1]\n')
         self.assertConfigError(self.PLAIN, 'engine = \n')  # invalid TOML
+
+    def test_timeout_validation(self):
+        self.assertEqual(self.settings(self.PLAIN, "timeout = 10\n")["timeout"], 10)
+        self.assertEqual(self.settings(self.PLAIN, "timeout = 7200\n")["timeout"], 7200)
+        for bad in ("9", "7201", "1.5", '"60"', "true"):
+            with self.subTest(value=bad):
+                self.assertConfigError(self.PLAIN, f"timeout = {bad}\n")
 
     def test_pdfa_levels_and_metadata(self):
         for value in ("2b", "a-2b", "A-2B"):
@@ -404,6 +412,23 @@ class CleanCacheRetryTests(unittest.TestCase):
 
             (main.parent / "ch" / "a.tex").write_text("fixed\n", encoding="utf-8")
             self.assertTrue(self.build(main)["ok"])
+
+
+@unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+class TimeoutTests(unittest.TestCase):
+    def test_looping_document_is_killed_and_reported(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "loop", "\\documentclass{article}\\begin{document}\\def\\a{\\a}\\a\\end{document}\n",
+                             "timeout = 10\n")
+            began = time.monotonic()
+            report, text = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertFalse(report["ok"])
+            self.assertIn("Build timed out after", text)
+            self.assertLess(time.monotonic() - began, 25)
+            self.assertNotIn("retrying from a clean cache", text)
+            if os.name != "nt" and shutil.which("pgrep"):
+                left = subprocess.run(["pgrep", "-f", str(main.parent)], capture_output=True, text=True)
+                self.assertEqual(left.stdout.strip(), "")
 
 
 class GlobalInputsTests(unittest.TestCase):

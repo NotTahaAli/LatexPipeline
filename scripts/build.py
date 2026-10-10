@@ -494,7 +494,10 @@ def log_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang"}
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang", "timeout"}
+# Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
+DEFAULT_TIMEOUT = 600
+TIMEOUT_RANGE = (10, 7200)
 PDFA_LEVEL = re.compile(r"^(?:a-)?([123][abu])$")
 
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
@@ -542,7 +545,7 @@ def read_settings(main_tex: Path) -> dict:
     Raises ConfigError for invalid values.
     """
     settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
-                "pdfa": None, "lang": "en-US"}
+                "pdfa": None, "lang": "en-US", "timeout": DEFAULT_TIMEOUT}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -582,6 +585,13 @@ def read_settings(main_tex: Path) -> dict:
         settings["pdfa"] = f"a-{match.group(1)}"
     if not (isinstance(settings["lang"], str) and re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]+)*", settings["lang"])):
         raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: lang must be a language tag such as \"en-US\"")
+
+    low, high = TIMEOUT_RANGE
+    timeout = settings["timeout"]
+    if not (isinstance(timeout, int) and not isinstance(timeout, bool) and low <= timeout <= high):
+        raise ConfigError(
+            f"{display(main_tex.parent / 'build.toml')}: timeout must be a whole number of seconds, {low} to {high}"
+        )
 
     args = settings["latexmk_args"]
     if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
@@ -661,6 +671,21 @@ def error_text(name: str, found: dict) -> str:
 # ---------------------------------------------------------------------------
 # Building
 # ---------------------------------------------------------------------------
+
+NEW_GROUP = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+
+
+def kill_tree(process: subprocess.Popen) -> None:
+    """Kill the process and its children (latexmk starts pdflatex)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, timeout=10)
+        else:
+            os.killpg(process.pid, 9)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    process.kill()
+
 
 def build_document(
     main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
@@ -770,16 +795,35 @@ def build_document(
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
+                    **NEW_GROUP,
                 )
             except OSError as exc:
                 errors.append(f"Could not execute {command[0]}: {exc}")
                 return -1
 
-            for line in process.stdout:
-                emit(line)
-                console.append(line)
+            # Watchdog: killing the tree closes the pipe, which ends the line loop below.
+            expired = threading.Event()
 
-            return process.wait()
+            def expire() -> None:
+                expired.set()
+                kill_tree(process)
+
+            watchdog = threading.Timer(settings["timeout"], expire)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                for line in process.stdout:
+                    emit(line)
+                    console.append(line)
+                code = process.wait()
+            except BaseException:  # Ctrl-C: the child is in its own group and would outlive us.
+                kill_tree(process)
+                raise
+            finally:
+                watchdog.cancel()
+            if expired.is_set():
+                errors.append(f"Build timed out after {settings['timeout']} s (the document may loop forever)")
+            return code
 
         def externalized_build() -> tuple[int, str]:
             """
@@ -802,6 +846,8 @@ def build_document(
                 if not figures.names() or figures.touched(last):
                     say("Listing figures ...")
                     run(figures.discover_command(), "figures")
+                    if errors:  # Timed out: no figures, no plain rebuild.
+                        return -1, ""
                     console.clear()  # The listing run is not a result; latexmk's output is.
 
                 for attempt in range(3):
@@ -1364,6 +1410,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--timeout",
+        type=int,
+        metavar="SECONDS",
+        help=f"Wall-clock limit for one latexmk run (default {DEFAULT_TIMEOUT}; a build.toml timeout overrides it).",
+    )
+
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Remove out/ and the .latex-cache/ directory, then exit.",
@@ -1444,6 +1497,9 @@ def parse_args() -> argparse.Namespace:
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
 
+    if args.timeout is not None and not TIMEOUT_RANGE[0] <= args.timeout <= TIMEOUT_RANGE[1]:
+        parser.error(f"--timeout must be {TIMEOUT_RANGE[0]} to {TIMEOUT_RANGE[1]}")
+
     if args.open and not args.watch:
         parser.error("--open needs --watch")
 
@@ -1518,6 +1574,9 @@ def main() -> int:
     global SOURCE_DIR
 
     args = parse_args()
+    if args.timeout is not None:
+        global DEFAULT_TIMEOUT
+        DEFAULT_TIMEOUT = args.timeout
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else ROOT_DIR / args.source

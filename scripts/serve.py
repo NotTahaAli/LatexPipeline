@@ -1304,6 +1304,7 @@ RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # configuration that can r
 # Builds while sharing: no shell escape, and TeX may only read and write below the document's directory
 # (openin_any=p also refuses "..", absolute paths and dotfiles). Environment variables beat texmf.cnf.
 SHARE_ENV = {"shell_escape": "f", "openin_any": "p", "openout_any": "p"}
+SHARE_TIMEOUT = 300
 _SAVED_ENV: dict[str, str | None] = {}
 # latexmk options that take a program, a file or code, or move the output; refused in every spelling.
 VALUE_KEYS = {
@@ -1388,6 +1389,7 @@ def guarded_read_settings(main_tex: Path) -> dict:
         if bad:
             raise build.ConfigError(f"{main_tex.parent.name}/build.toml: {bad[0]!r} is not allowed while sharing")
         settings["shell_escape"] = False
+        settings["timeout"] = min(settings["timeout"], SHARE_TIMEOUT)  # A looping document must not hold BUILD_LOCK.
         settings["latexmk_args"] = ["-norc", *settings["latexmk_args"]]  # A latexmkrc in the document would run code.
     return settings
 

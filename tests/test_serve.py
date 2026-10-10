@@ -1045,6 +1045,14 @@ class SharedBuilds(SharedState):
         self.assertFalse(settings["shell_escape"])
         self.assertEqual(settings["latexmk_args"][0], "-norc")
 
+    def test_timeout_is_capped_while_sharing(self):
+        main = self.doc("timeout = 7000\n")
+        self.assertEqual(serve.build.read_settings(main)["timeout"], 7000)
+        self.share_on("d")
+        self.assertEqual(serve.build.read_settings(main)["timeout"], serve.SHARE_TIMEOUT)
+        main.parent.joinpath("build.toml").write_text("timeout = 20\n", encoding="utf-8")
+        self.assertEqual(serve.build.read_settings(main)["timeout"], 20)
+
     def test_latexmk_never_reads_rc_files_while_sharing(self):
         main = self.doc()
         self.assertNotIn("-norc", serve.build.read_settings(main)["latexmk_args"])

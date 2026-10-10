@@ -111,6 +111,7 @@ latexmk_args = ["-g"]    # extra arguments passed to latexmk
 externalize = false      # default: true; see "Large documents"
 pdfa = "2b"              # default: off; PDF/A-2b, see "PDF/A"
 lang = "en-US"           # document language, written into the PDF/A metadata
+timeout = 600            # default: 600; seconds (10 to 7200) before a latexmk run is killed; --timeout sets the default, sharing caps it at 300
 ```
 
 An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
