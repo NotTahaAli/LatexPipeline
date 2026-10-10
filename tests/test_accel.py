@@ -206,6 +206,31 @@ class ExternalizedBuildTests(unittest.TestCase):
         figures.recorded = time.time()
         self.assertFalse(figures.discover_partial())
 
+    def test_partial_listing_does_not_trust_a_stale_map(self):
+        # a.tex adds a section, b.tex draws \\thesection: the map's counters are one section behind.
+        self.write("a.tex", "\\section{One}\n")
+        self.write("b.tex", pic("S\\thesection"))
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{a}\\input{b}\n\\end{document}\n")
+        self.render()
+        figures = self.figures
+        figures.mark_recorded()  # What build.py does before the run that wrote the map.
+        old = figures.recorded
+        figures.touched(0.0)
+        self.write("a.tex", "\\section{One}\\section{Two}\n")
+        self.write("b.tex", pic("S\\thesection!"))
+        self.assertTrue(figures.touched(0.0))
+        self.assertEqual(figures.load_recorded(), old)  # A partial listing leaves the time alone.
+        os.utime(self.doc / "a.tex", (old + 5, old + 5))  # Edited after the map was written.
+        os.utime(self.doc / "b.tex", (old + 5, old + 5))
+        # Both files were edited after the map: nothing may be skipped, so list everything.
+        self.assertFalse(figures.discover_partial())
+        figures.plan_skips()
+        self.assertEqual(figures.skips, {})  # Files newer than the map: no figure job skips anything.
+
+    def test_focus_counters_tolerate_undefined_names(self):
+        self.assertIn("ifcsname c@#1\\endcsname", accel.FIGSKIP)
+        self.assertIn("ifcsname c@#1\\endcsname", accel.FOCUS)
+
     def test_pictures_that_need_the_page_disable_externalization(self):
         self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}[remember picture,overlay]"
                    "\\node{x};\\end{tikzpicture}\n\\end{document}\n")

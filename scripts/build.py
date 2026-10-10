@@ -391,7 +391,8 @@ def recorded_inputs(main_tex: Path) -> list[Path]:
     Files outside the document's directory that its last build read, from the
     .fls that latexmk writes (-recorder). Empty before the first build.
 
-    The document directory is skipped (newest_input scans it anyway), and so
+    Files whose real path is inside the document directory are skipped (newest_input scans it; a symlinked
+    folder that leads elsewhere does count), and so
     are the TeX installation, the cache and out/: the cache holds generated
     figures and .inject files, rewritten on every build.
     """
@@ -404,18 +405,24 @@ def recorded_inputs(main_tex: Path) -> list[Path]:
     # A TEXMF* value that contains the repository (say "/") would hide every input.
     skip = [path for path in (*tree, CACHE_DIR, OUT_DIR) if path not in ROOT_DIR.parents and path != ROOT_DIR]
     # Plain strings: a .fls of a big document lists thousands of paths, and pathlib costs 0.7 s on them.
-    prefixes = tuple(os.path.normcase(os.path.join(str(path), "")) for path in (*skip, main_tex.parent.resolve()))
+    # The document directory is tested only after realpath: a symlinked folder inside it
+    # (files/doc/shared -> ../../shared) holds files that the directory scan does not reach.
+    outside = tuple(os.path.normcase(os.path.join(str(path), "")) for path in skip)
+    inside = os.path.normcase(os.path.join(str(main_tex.parent.resolve()), ""))
     base = str(main_tex.parent)
     found: dict[str, None] = {}
+    seen: set[str] = set()
 
     for line in recorder.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith("INPUT "):
             continue
         name = os.path.normpath(os.path.join(base, line[len("INPUT "):].strip()))
-        if name in found or os.path.normcase(name).startswith(prefixes):
+        if name in seen or os.path.normcase(name).startswith(outside):
             continue
+        seen.add(name)
         name = os.path.realpath(name)
-        if not os.path.normcase(name).startswith(prefixes):
+        folded = os.path.normcase(name)
+        if not folded.startswith(outside) and not folded.startswith(inside):
             found[name] = None
 
     return [Path(name) for name in found]
@@ -430,12 +437,16 @@ def newest_input(main_tex: Path) -> float:
     # The scripts that decide what a build produces; editing serve.py or ci_report.py rebuilds nothing.
     newest = max(Path(__file__).stat().st_mtime, (SCRIPT_DIR / "accel.py").stat().st_mtime)
 
+    # Directories count too: deleting or renaming an input changes only its folder's time.
+    try:
+        newest = max(newest, main_tex.parent.stat().st_mtime)
+    except OSError:
+        pass
     for path in main_tex.parent.rglob("*"):
         if path.name.startswith("."):
             continue
         try:
-            if path.is_file():
-                newest = max(newest, path.stat().st_mtime)
+            newest = max(newest, path.stat().st_mtime)
         except OSError:
             pass  # Deleted mid-scan.
 
@@ -443,7 +454,7 @@ def newest_input(main_tex: Path) -> float:
         try:
             newest = max(newest, path.stat().st_mtime)
         except OSError:
-            pass  # Gone since the build; the next build drops it from the .fls.
+            return float("inf")  # Read by the last build, gone now: stale until the next build drops it.
 
     return newest
 
@@ -615,9 +626,9 @@ def read_settings(main_tex: Path) -> dict:
 
 
 # \DocumentMetadata keys for tagging: the kernel has tagging=on from 2025-06-01; TeX Live 2023 to 2025
-# (kernel 2023-06 on) has the same through testphase. Older kernels cannot tag, so the build goes on untagged.
+# (kernel 2023-11 on) has the same through testphase. Older kernels cannot tag, so the build goes on untagged.
 TAGGING_NEW = "2025-06-01"
-TAGGING_OLD = "2023-06-01"
+TAGGING_OLD = "2023-11-01"
 
 
 def document_metadata(settings: dict) -> str:
@@ -642,7 +653,8 @@ def document_metadata(settings: dict) -> str:
     if not tagged:
         return f"\\DocumentMetadata{{{base}}}" + "".join(extras)
     ua = "" if level else "pdfstandard=ua-1,"  # PDF/UA-1 identification (a list of standards needs a newer kernel)
-    new = f"\\DocumentMetadata{{{ua}{base},tagging=on}}"
+    # Kernel 2025-06 documents the list form "pdfstandard={a-2a,ua-1}"; TeX Live 2023 rejects it.
+    new = (f"\\DocumentMetadata{{{base.replace(level, '{' + level + ',ua-1}', 1) if level else ua + base},tagging=on}}")
     old = f"\\DocumentMetadata{{{ua}{base},testphase={{phase-III,firstaid}}}}"
     warning = (r"\typeout{WARNING: tagged = true needs LaTeX " + TAGGING_OLD
                + r" or newer; building an untagged PDF.}")
@@ -944,12 +956,13 @@ def build_document(
                 touched = figures.touched(last)
                 if not figures.names() or touched:
                     say("Listing figures ...")
-                    figures.recorded = time.time()
                     began = time.monotonic()
                     # A figure edit: list just the changed files (falls back to the whole document).
+                    # Only a full listing rewrites the focusmap, so only it moves figures.recorded.
                     if touched and figures.discover_partial():
                         phases["figures"] += time.monotonic() - began
                     else:
+                        figures.mark_recorded()
                         run(figures.discover_command(), "figures")
                         if errors:  # Timed out: no figures, no plain rebuild.
                             return -1, ""
@@ -965,7 +978,7 @@ def build_document(
                     if attempt and not changed:
                         return 0, ""
                     extra = [f"-usepretex={meta}{figures.main_pretex}", f"-jobname={main_tex.stem}"]
-                    figures.recorded = time.time()
+                    figures.mark_recorded()
                     code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
                     if code != 0:
                         return code, ""
@@ -1039,7 +1052,7 @@ def build_document(
                     shutil.copy(generated_pdf, output_pdf)
                     os.utime(output_pdf, (started, started))
                     if settings["pdfa"]:
-                        notes.append(pdfa_check(output_pdf, settings["pdfa"], validate))
+                        notes.append(pdfa_check(output_pdf, settings["pdfa"], validate, settings["tagged"]))
                         say(notes[-1])
                     if settings["tagged"]:
                         notes.append(tagged_check(output_pdf))
