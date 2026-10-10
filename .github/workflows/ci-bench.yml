@@ -1,5 +1,5 @@
 # TEMPORARY benchmark of LaTeX install methods. Deleted before merge.
-# bench-rev: 1
+# bench-rev: 2
 name: CI bench
 
 on:
@@ -64,14 +64,14 @@ jobs:
           done
       - name: Build test
         run: python3 scripts/build.py --force
-      - name: Build sample-report
-        run: python3 scripts/build.py --source bench --force sample-report
-      - name: Build engines
-        run: python3 scripts/build.py --source engines --force
       - name: Lint
         run: python3 scripts/ci_report.py lint
       - name: Summary
         run: python3 scripts/ci_report.py summary
+      - name: Build sample-report
+        run: python3 scripts/build.py --source bench --force sample-report
+      - name: Build engines
+        run: python3 scripts/build.py --source engines --force
 
   B:
     name: B install-texlive
@@ -97,11 +97,11 @@ jobs:
           done
       - name: Build test
         run: python3 scripts/build.py --force
-      - name: Build sample-report
-        run: python3 scripts/build.py --source bench --force sample-report
-      - name: Build engines
-        run: python3 scripts/build.py --source engines --force
       - name: Lint
         run: python3 scripts/ci_report.py lint
       - name: Summary
         run: python3 scripts/ci_report.py summary
+      - name: Build sample-report
+        run: python3 scripts/build.py --source bench --force sample-report
+      - name: Build engines
+        run: python3 scripts/build.py --source engines --force
