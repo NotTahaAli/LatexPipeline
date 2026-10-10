@@ -1,0 +1,3 @@
+engine = "lualatex"
+tagged = true
+pdfa = "4f"
