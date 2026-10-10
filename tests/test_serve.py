@@ -2478,6 +2478,15 @@ class ZoteroApi(SharedState, ServerCase):
         self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="edit", doc="demo2")[0], 403)
         self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")[0], 200)
 
+    def test_apply_is_rate_limited_and_bounded_for_shared_editors(self):
+        self.tokens = self.share_on()
+        body = {"text": self.BIB, "ops": []}
+        codes = [self.call("POST", "/api/zotero/apply", body, role="edit")[0] for _ in range(22)]
+        self.assertEqual(codes.count(429), 2)
+        serve.RATE.clear()
+        ops = [{"op": "add", "type": "misc", "key": f"k{i}", "fields": {}} for i in range(self.zotero.MAX_OPS + 1)]
+        self.assertEqual(self.call("POST", "/api/zotero/apply", {"text": self.BIB, "ops": ops}, role="edit")[0], 400)
+
     def test_better_bibtex_is_refused_while_sharing(self):
         self.call("POST", "/api/zotero/settings", {"mode": "local"})
         self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB})[0], 200)

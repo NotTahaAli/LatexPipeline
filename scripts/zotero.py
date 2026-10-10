@@ -25,12 +25,17 @@ import grammar
 API = "https://api.zotero.org"
 LOCAL = "http://127.0.0.1:23119/better-bibtex/export/library?/1/library."  # Better BibTeX, Zotero desktop
 USER_AGENT = "LatexPipeline (https://github.com/NotTahaAli/LatexPipeline)"
-LIMITER = grammar.Limiter(requests=30, size=1, window=60.0)  # one hit per page
+LIMITER = grammar.Limiter(requests=120, size=1, window=60.0)  # one hit per page; a full sync is up to 200 pages
+WAIT = 60.0  # seconds get() may wait for the limiter before refusing
 PAGE = 100  # Zotero's maximum for non-JSON formats
 MAX_PAGES = 200
 MAX_BODY = 8_000_000
 MAX_TOTAL = 20_000_000
-MAX_OPS = 5000
+MAX_OPS = 500
+MAX_OPS_CHARS = 1_000_000
+MAX_FIELDS = 60
+MAX_VALUE = 20_000
+FUZZY_BUDGET = 200_000  # title comparisons per compare()
 FORMATS = ("bibtex", "biblatex")
 IGNORE = {"file"}  # Attachment paths on the Zotero machine
 CACHE: dict = {}  # (mode, base, format) -> {"version", "text"}; small, in memory, never holds the key
@@ -133,18 +138,19 @@ def _opener(local: bool):
     return urllib.request.build_opener(*handlers)
 
 
-def get(url: str, headers: dict, local: bool = False, timeout: float = 20.0) -> tuple:
+def get(url: str, headers: dict, local: bool = False, timeout: float = 20.0, limit: int = MAX_BODY) -> tuple:
     """(status, lower-case headers, body bytes); 304 is a normal answer, other failures raise ZoteroError.
 
-    Throttled. Errors name the status only: never the URL or a header."""
+    Throttled (waits up to WAIT seconds). Reads at most `limit` + 1 bytes: callers refuse a longer body.
+    Errors name the status only: never the URL or a header."""
     try:
-        LIMITER.acquire(0, 0.0)
+        LIMITER.acquire(0, WAIT)
     except grammar.GrammarError:
         raise ZoteroError("Too many Zotero requests; wait a moment.", 429)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **headers})
     try:
         with _opener(local).open(request, timeout=timeout) as reply:
-            return reply.status, {k.lower(): v for k, v in reply.headers.items()}, reply.read(MAX_BODY + 1)
+            return reply.status, {k.lower(): v for k, v in reply.headers.items()}, reply.read(limit + 1)
     except urllib.error.HTTPError as error:
         head = {k.lower(): v for k, v in error.headers.items()} if error.headers else {}
         if error.code == 304:
@@ -166,7 +172,7 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
     if cfg["mode"] == "local":
         if not local_ok:
             raise ZoteroError("Better BibTeX sync is off while sharing: use the web API.", 409)
-        status, _, body = get(LOCAL + cfg["format"], {}, local=True)
+        status, _, body = get(LOCAL + cfg["format"], {}, local=True, limit=MAX_TOTAL)
         if len(body) > MAX_TOTAL:
             raise ZoteroError("The export is too large.", 413)
         return body.decode("utf-8", "replace"), "", False
@@ -183,7 +189,8 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
         page_headers = dict(headers)
         if start == 0 and cached:
             page_headers["If-Modified-Since-Version"] = cached["version"]
-        url = f"{base}?format={cfg['format']}&itemType=-attachment&limit={PAGE}&start={start}"
+        order = "itemType=-attachment&sort=dateAdded&direction=asc"  # stable under edits, so page keys do not shift
+        url = f"{base}?format={cfg['format']}&{order}&limit={PAGE}&start={start}"
         status, head, body = get(url, page_headers)
         if status == 304 and cached:
             return cached["text"], cached["version"], True
@@ -197,7 +204,7 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
         start += PAGE
         total = head.get("total-results", "")
         more = start < int(total) if total.isdigit() else 'rel="next"' in head.get("link", "")
-        if not more or not body.strip():
+        if not more:
             break
         if sum(map(len, parts)) > MAX_TOTAL:
             raise ZoteroError("The library is too large to sync in one go; pick a collection.", 413)
@@ -230,15 +237,67 @@ def _flat(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("{", "").replace("}", "")).strip().lower()
 
 
-def _same_work(a: dict, b: dict) -> bool | None:
-    """True/False when DOIs or titles decide, None when neither entry has either."""
-    doi_a, doi_b = bibfix.clean_doi(a.get("doi", "")).lower(), bibfix.clean_doi(b.get("doi", "")).lower()
-    if doi_a and doi_b:
-        return doi_a == doi_b
-    title_a, title_b = bibfix._norm(a.get("title", "")), bibfix._norm(b.get("title", ""))
-    if title_a and title_b:
-        return difflib.SequenceMatcher(None, title_a, title_b).ratio() >= bibfix.MIN_SIMILARITY
-    return None
+def _doi(fields: dict) -> str:
+    return bibfix.clean_doi(fields.get("doi", "")).lower()
+
+
+def _title(fields: dict) -> str:
+    return bibfix._norm(fields.get("title", ""))
+
+
+def _conflict(a: dict, b: dict) -> bool:
+    """Two entries under one key: different works? Only a DOI mismatch or titles that share little say so; a title
+    edited in Zotero (same key, no DOI) is an update."""
+    if _doi(a) and _doi(b):
+        return _doi(a) != _doi(b)
+    ta, tb = _title(a), _title(b)
+    return bool(ta and tb and difflib.SequenceMatcher(None, ta, tb).ratio() < 0.5)
+
+
+def _twins(remote: list, local: list, claimed: set) -> dict:
+    """remote key -> local entry for the same work under another key: DOI, then exact title, then a close title.
+
+    Indexed, so a thousand entries on each side cost a thousand lookups; only the fuzzy fallback compares titles,
+    behind length and quick-ratio filters and a budget."""
+    by_doi: dict[str, list] = {}
+    by_title: dict[str, list] = {}
+    for other in local:
+        if _doi(other["fields"]):
+            by_doi.setdefault(_doi(other["fields"]), []).append(other)
+        if _title(other["fields"]):
+            by_title.setdefault(_title(other["fields"]), []).append(other)
+    found: dict[str, dict] = {}
+    budget = FUZZY_BUDGET
+
+    def free(item, other) -> bool:
+        both = _doi(item["fields"]) and _doi(other["fields"])
+        return (other["key"] not in claimed and other["key"] != item["key"]
+                and not (both and _doi(item["fields"]) != _doi(other["fields"])))
+
+    for item in remote:
+        pick = None
+        for pool in (by_doi.get(_doi(item["fields"]), []), by_title.get(_title(item["fields"]), [])):
+            pick = next((other for other in pool if free(item, other)), None)
+            if pick:
+                break
+        title = _title(item["fields"])
+        if pick is None and title and budget > 0:
+            for other in local:
+                other_title = _title(other["fields"])
+                if not other_title or not free(item, other):
+                    continue
+                if 2 * min(len(title), len(other_title)) < bibfix.MIN_SIMILARITY * (len(title) + len(other_title)):
+                    continue  # SequenceMatcher's ratio cannot reach MIN_SIMILARITY
+                budget -= 1
+                matcher = difflib.SequenceMatcher(None, title, other_title)
+                floor = bibfix.MIN_SIMILARITY
+                if matcher.real_quick_ratio() >= floor and matcher.quick_ratio() >= floor and matcher.ratio() >= floor:
+                    pick = other
+                    break
+        if pick:
+            found[item["key"]] = pick
+            claimed.add(pick["key"])
+    return found
 
 
 def _free_key(key: str, taken: set) -> str:
@@ -255,44 +314,38 @@ def compare(remote_text: str, local_text: str, taken=()) -> dict:
     local = _entries(local_text)
     by_key = {e["key"]: e for e in local}
     taken = set(taken)
-    taken_all = set(by_key) | taken
+    raw = _entries(remote_text)
+    taken_all = set(by_key) | taken | {e["key"] for e in raw}
     out = {"new": [], "changed": [], "same": 0, "local_only": [], "skipped": 0}
     seen = set()
     remote = []
-    for entry in _entries(remote_text):
+    for entry in raw:
         try:
             kept = {k: v for k, v in entry["fields"].items() if k not in IGNORE}
             fields = bibfix.check_entry(entry["type"], entry["key"], kept)
         except ValueError:
             out["skipped"] += 1
             continue
-        if entry["key"] in seen:
-            out["skipped"] += 1
-            continue
-        seen.add(entry["key"])
-        remote.append({"type": entry["type"], "key": entry["key"], "fields": fields})
-    taken_all |= seen
+        key = entry["key"]
+        if key in seen:  # Per-page exports only de-duplicate within a page: a later page may reuse a key.
+            key = _free_key(key, taken_all)
+            taken_all.add(key)
+        seen.add(key)
+        remote.append({"type": entry["type"], "key": key, "zotero_key": entry["key"], "fields": fields})
     twins: dict[str, tuple] = {}  # remote key -> (local entry, how matched); same key first, then DOI or title
     collided = set()
     for item in remote:
         twin = by_key.get(item["key"])
         if twin is None:
             continue
-        if _same_work(item["fields"], twin["fields"]) is False:
+        if _conflict(item["fields"], twin["fields"]):
             collided.add(item["key"])  # Same key, different work: not an update.
         else:
             twins[item["key"]] = (twin, "key")
     claimed = {twin["key"] for twin, _ in twins.values()}
-    for item in remote:
-        if item["key"] in twins:
-            continue
-        for other in local:
-            if other["key"] in claimed or other["key"] == item["key"]:
-                continue
-            if _same_work(item["fields"], other["fields"]):
-                twins[item["key"]] = (other, "doi/title")
-                claimed.add(other["key"])
-                break
+    rest = [item for item in remote if item["key"] not in twins]
+    for key, other in _twins(rest, local, claimed).items():
+        twins[key] = (other, "doi/title")
     for item in remote:
         if item["key"] not in twins:
             key = item["key"]
@@ -300,13 +353,13 @@ def compare(remote_text: str, local_text: str, taken=()) -> dict:
             if clash:
                 key = _free_key(key, taken_all)
                 taken_all.add(key)
-            out["new"].append({**item, "key": key, "zotero_key": item["key"], "collision": clash})
+            out["new"].append({**item, "key": key, "collision": clash or item["zotero_key"] != key})
             continue
         twin, by = twins[item["key"]]
         diff = [{"field": name, "old": twin["fields"].get(name, ""), "new": value}
                 for name, value in item["fields"].items() if _flat(twin["fields"].get(name, "")) != _flat(value)]
         if diff or item["type"] != twin["type"]:
-            out["changed"].append({"key": twin["key"], "zotero_key": item["key"], "by": by, "type": item["type"],
+            out["changed"].append({"key": twin["key"], "zotero_key": item["zotero_key"], "by": by, "type": item["type"],
                                    "old_type": twin["type"], "diff": diff})
         else:
             out["same"] += 1
@@ -323,32 +376,57 @@ def preview(text: str, taken, local_ok: bool) -> dict:
 def apply(text: str, ops) -> dict:
     """One UTF-16 splice {from, to, insert} that adds/updates the chosen entries of `text` and leaves every other byte.
 
-    ops: [{"op": "add", "type", "key", "fields"} | {"op": "update", "key", "type"?, "fields": changed fields only}]."""
+    ops: [{"op": "add", "type", "key", "fields"} | {"op": "update", "key", "type"?, "fields": changed fields only}].
+    The file is parsed once; updates are spliced in at their original offsets, adds are appended."""
     if not isinstance(ops, list) or len(ops) > MAX_OPS:
-        raise ZoteroError("Send the chosen entries.", 400)
-    new = text
+        raise ZoteroError(f"Send up to {MAX_OPS} chosen entries.", 400)
+    size = 0
+    for op in ops:
+        fields = op.get("fields") if isinstance(op, dict) else None
+        if not isinstance(fields, dict) or len(fields) > MAX_FIELDS or not isinstance(op.get("key"), str) \
+                or len(op["key"]) > 200:
+            raise ZoteroError("Bad entry.", 400)
+        if any(not isinstance(v, str) or len(v) > MAX_VALUE for v in fields.values()):
+            raise ZoteroError("A field value is missing or too long.", 400)
+        size += sum(map(len, fields.values()))
+    if size > MAX_OPS_CHARS:
+        raise ZoteroError("The chosen entries are too large.", 413)
+    entries: dict[str, bibfix.Entry] = {}
+    for entry in bibfix.parse(text):
+        entries.setdefault(entry.key, entry)
+    cuts: list[tuple[int, int, str]] = []
+    adds: list[dict] = []
+    done: set = set()
     try:
         for op in ops:
-            if not isinstance(op, dict) or not isinstance(op.get("fields"), dict):
-                raise ZoteroError("Bad entry.", 400)
-            key = op.get("key")
+            key = op["key"]
             if op.get("op") == "add":
-                if any(e.key == key for e in bibfix.parse(new)):
+                if key in entries or key in done:
                     raise ZoteroError(f"'{key}' is already in this file.", 409)
-                at, insert = bibfix.append_entry(new, op.get("type"), key, op["fields"])
-                new = new[:at] + insert + new[at:]
+                done.add(key)
+                adds.append(op)
             elif op.get("op") == "update":
-                entry = bibfix.find_entry(new, key)
+                entry = entries.get(key)
                 if entry is None:
                     raise ZoteroError(f"No entry '{key}' in this file any more. Preview again.", 409)
+                if key in done:
+                    raise ZoteroError(f"'{key}' is listed twice.", 400)
+                done.add(key)
                 merged: dict[str, str] = {}
                 for field in entry.fields:
                     merged.setdefault(field.name, field.value)
                 merged.update(bibfix.check_entry(op.get("type") or entry.kind, key, op["fields"]))
-                start, end, piece = bibfix.replace_entry(new, key, op.get("type") or entry.kind, key, merged)
-                new = new[:start] + piece + new[end:]
+                cuts.append(bibfix.replace_entry(text, key, op.get("type") or entry.kind, key, merged, entry))
             else:
                 raise ZoteroError("Unknown operation.", 400)
+        new = text
+        for start, end, piece in sorted(cuts, reverse=True):
+            new = new[:start] + piece + new[end:]
+        probe = new  # Each add is laid out after the one before (blank line, the file's indent and line ending).
+        for op in adds:
+            _, insert = bibfix.append_entry(probe, op.get("type"), op["key"], op["fields"])
+            new += insert
+            probe = insert
     except ValueError as exc:
         raise ZoteroError(str(exc), 400)
     head = 0

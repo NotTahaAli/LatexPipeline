@@ -2470,6 +2470,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         need_edit()  # No network: a splice for the chosen entries, like /api/bib/edit.
         # Settings and fetching stay owner only (the default deny below).
         scoped(doc)
+        if not rate_ok("zotero-apply", 20, 60.0):  # CPU only, but a guest could still keep the server busy
+            raise ApiError("Too many requests; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
