@@ -775,6 +775,19 @@ class ShareHttp(SharedState, ServerCase):
             hdrs["Cookie"] = f"{serve.cookie_name()}={self.tokens[role]}"
         return self.request(method, path, body, hdrs)
 
+    def test_fonts_are_public_and_only_the_listed_files(self):
+        self.assertTrue(set(serve.FONT_FILES) <= {p.name for p in serve.FONTS_DIR.iterdir()})
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/fonts/newsreader.woff2", headers={"Host": f"127.0.0.1:{self.port}"})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        self.assertEqual((res.status, res.getheader("Content-Type"), body[:4]), (200, "font/woff2", b"wOF2"))
+        self.assertEqual(self.get("GET", "/fonts/fonts.css")[0], 200)
+        for path in ("/fonts/OFL.txt", "/fonts/README.md", "/fonts/", "/fonts/../serve.py", "/fonts/%2e%2e/serve.py",
+                     "/fonts/..%2fserve.py", "/fonts/x.woff2", "/fonts//etc/passwd"):
+            self.assertEqual(self.get("GET", path)[0], 404, path)
+
     def test_401_is_a_styled_page_for_browsers_and_plain_for_api_clients(self):
         status, page = self.get("GET", "/", headers={"Accept": "text/html,application/xhtml+xml"})
         self.assertEqual(status, 401)

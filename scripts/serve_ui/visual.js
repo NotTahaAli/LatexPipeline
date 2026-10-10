@@ -44,7 +44,7 @@ class MathWidget extends WidgetType {
     el.title = "Click to edit";
     el.textContent = this.tex;
     loadKatex().then((katex) => {
-      katex.render(this.tex, el, { displayMode: this.display, throwOnError: false, errorColor: "var(--bad)" });
+      katex.render(this.tex, el, { displayMode: this.display, throwOnError: false, errorColor: "var(--ox)" });
     }).catch(() => {});
     el.addEventListener("mousedown", (e) => {
       e.preventDefault();
