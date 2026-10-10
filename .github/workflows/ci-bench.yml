@@ -1,5 +1,5 @@
 # TEMPORARY benchmark of LaTeX install methods. Deleted before merge.
-# bench-rev: 2
+# bench-rev: 3
 name: CI bench
 
 on:
