@@ -140,7 +140,10 @@ export function reviewSupport(S, V, ctx) {
   });
 
   const filterTr = S.EditorState.transactionFilter.of((tr) => {
-    if (!suggesting || !tr.docChanged || tr.annotation(bypass) || !["input", "delete", "move"].some((e) => tr.isUserEvent(e))) return tr;
+    // Every change while suggesting becomes a suggestion: typing, undo and redo, commands, panels. Only what must go
+    // through does (accept, restore, reloads: the bypass annotation) and, in a co-editing room, changes without a
+    // user event, which are the other people's edits arriving (our own dispatches all carry one).
+    if (!suggesting || !tr.docChanged || tr.annotation(bypass) || (ctx.shared?.() && tr.annotation(S.Transaction.userEvent) == null)) return tr;
     const st = tr.startState, d = st.field(draftField, false), sel = st.selection.main, changes = [];
     tr.changes.iterChanges((from, to, _f, _t, ins) => changes.push({ from, to, insert: ins.toString() }));
     const c = changes[0], n = c.to - c.from;
@@ -262,7 +265,7 @@ export function reviewSupport(S, V, ctx) {
       failed.push(...clash.map((e) => e.s));
       if (ok.length) view.dispatch({ changes: ok.map(({ from, to, insert }) => ({ from, to, insert })), annotations: bypass.of(true), userEvent: "input.review" });
     }
-    for (const s of failed) await send({ op: "suggest", path: s.path, anchor: s.anchor, insert: s.insert }).catch(() => {});   // Keep it open.
+    if (failed.length) await send({ op: "release", ids: failed.map((s) => s.id) }).catch(() => {});   // Back as they were: same id and author.
     const applied = r.removed.length - failed.length;
     ctx.live(`${applied} ${applied === 1 ? "suggestion" : "suggestions"} accepted`);
     if (failed.length) ctx.toast(`${failed.length} ${failed.length === 1 ? "suggestion was" : "suggestions were"} not applied: the text changed or they overlap. They stay open.`);

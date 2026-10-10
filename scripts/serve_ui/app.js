@@ -70,7 +70,7 @@ const REV = reviewSupport(S, V, {
   api, el, icon, canEdit: !readOnly, doc: () => cur, me: () => me, view: () => view,
   activePath: () => (active?.kind === "text" ? active.path : null), openFile: (p, line, opts) => openFile(p, line, opts),
   showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
-  onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
+  onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(), shared: () => !!active?.collab,
 });
 function toggleSuggest() {
   if (readOnly) return;
@@ -119,6 +119,8 @@ function extensionsFor(tab) {
     spellC.of(spellAttr()),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
+      // Shared undo changes the Yjs text directly, past suggest mode's filter: not while suggesting.
+      ...(room ? ["Mod-z", "Mod-y", "Mod-Shift-z"].map((key) => ({ key, run: () => REV.suggesting && (toast(el("span", { textContent: "Undo is off in suggest mode: withdraw the suggestion in the Review tab instead." })), true) })) : []),
       ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
     ]),
     SR.search({ top: true }),
@@ -173,7 +175,7 @@ async function uploadImages(fs, pos) {
       if (active !== tab) { toast(el("span", { textContent: `Saved ${path}.` })); continue; }
       const text = `\\includegraphics[width=0.8\\linewidth]{${path}}\n`;
       pos = Math.min(pos, view.state.doc.length);
-      view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length }, scrollIntoView: true });
+      view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length }, scrollIntoView: true, userEvent: "input.drop" });
       pos += text.length;
       toast(el("span", { textContent: `Saved ${path} and inserted it.` }));
       loadFiles(); if (settings.visual) loadRefs();
@@ -369,7 +371,7 @@ async function reloadTab(tab, announce) {
     if (tab === active) {
       const head = Math.min(view.state.selection.main.head, doc.length);
       tab.fromDisk = true;
-      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: f.text }, selection: { anchor: head } });
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: f.text }, selection: { anchor: head }, annotations: REV.bypass.of(true) });
       tab.fromDisk = false;
     } else tab.state = tab.state.update({ changes: { from: 0, to: tab.state.doc.length, insert: f.text } }).state;
     renderTabs(); showSaveState(); showBanner();
@@ -1130,7 +1132,7 @@ function onProseInput() {
     const next = prose.htmlToLatex($("proseBody").innerHTML);
     const span = proseSpan;
     if (view.state.doc.sliceString(span.from, span.to) === span.text) {
-      view.dispatch({ changes: { from: span.from, to: span.to, insert: next }, annotations: proseEdit.of(true) });
+      view.dispatch({ changes: { from: span.from, to: span.to, insert: next }, annotations: proseEdit.of(true), userEvent: "input.prose" });
       proseSpan = { from: span.from, to: span.from + next.length, text: next };
     }
   }, 120);

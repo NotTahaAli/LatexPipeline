@@ -2644,7 +2644,7 @@ class HistoryStore(unittest.TestCase):
             small.record("a.tex", os.urandom(40).hex(), ["x"], now=n * 1000.0)
         total = sum(p.stat().st_size for p in (Path(self.tmp.name) / "s" / "blobs").rglob("*") if p.is_file())
         self.assertLessEqual(total, 400)  # the newest version always stays, even when it alone is over the cap
-        full = self.history.Store(Path(self.tmp.name) / "q", allow=lambda size: False)
+        full = self.history.Store(Path(self.tmp.name) / "q", room=lambda: 0)
         with self.assertRaises(self.history.Full):
             full.record("a.tex", "x", [])
 
@@ -2927,6 +2927,134 @@ class HostedHistoryAndReview(SharedState, ServerCase):
                              "anchor": {"from": 0, "to": 0, "quote": "", "prefix": "", "suffix": ""}})
         self.assertEqual(status, 507)
         self.assertEqual(self.as_("edit", "POST", "/api/history/label?doc=demo", {"label": "v"})[0], 507)
+
+    def test_a_client_id_counts_only_for_its_own_account(self):
+        serve.bind_client("c1", "edit", "7;Ada")
+        serve.handle_client_message({"type": "hello", "data": {"doc": "demo"}}, "c1", "edit", "7;Ada")
+        serve.handle_client_message({"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}},
+                                    "c1", "edit", "7;Ada")
+        serve.handle_client_message({"type": "y-update", "data": {"room": "demo\nmain.tex", "u": "AAAA"}},
+                                    "c1", "edit", "7;Ada")
+        # Bob saw c1 (Ada, the room's leader) in presence and saves with it: his save is his, Ada's edits stay pending.
+        status, _ = self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex&cid=c1", {"text": "by Bob"}, user="8;Bob")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"][0]["authors"], ["Bob"])
+        self.assertEqual(serve.ROOMS["demo\nmain.tex"]["editors"], {"Ada"})
+        self.assertEqual(serve.ROOMS["demo\nmain.tex"]["saved"], "\\section{A}\nhello\n")  # not the room's save
+
+
+class HistoryAndReviewLimits(SharedState, ServerCase):
+    """What a hostile editor could do to history and review data, and what keeps it bounded."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import history
+        self.history = history
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        self.tokens = self.share_on()
+
+    def call(self, method, path, body=None, role="edit"):
+        return self.request(method, path, body, {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"})
+
+    def test_diff_of_large_and_repetitive_files_is_bounded(self):
+        a = "\n".join(["same"] * 5 + ["x"] * 15000 + ["end"])
+        b = "\n".join(["same"] * 5 + ["y", "x"] * 7500 + ["end"])
+        began = time.monotonic()
+        d = self.history.diff(a, b)
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertTrue(d["truncated"])
+        d = self.history.diff("\n".join(map(str, range(5000))), "\n".join(map(str, range(5000))).replace("2500", "X"))
+        self.assertEqual([r[:3] for r in d["hunks"][0] if r[0] != " "], [["-", 2501, None], ["+", None, 2501]])
+        self.assertEqual(d["hunks"][0][0][:3], [" ", 2498, 2498])  # context lines keep their real numbers
+
+    def test_history_reads_are_rate_limited_for_links(self):
+        limit = serve.HISTORY_READ_LIMIT[0]
+        codes = [self.call("GET", "/api/history?doc=demo", role="view")[0] for _ in range(limit + 1)]
+        self.assertEqual(codes.count(429), 1)
+        self.assertEqual(self.call("GET", "/api/history?doc=demo", role="owner")[0], 200)
+
+    def test_file_changes_and_saves_are_rate_limited_for_links(self):
+        with mock.patch.object(serve, "FS_LIMIT", (2, 60.0)), mock.patch.object(serve, "PUT_LIMIT", (2, 60.0)):
+            fs = [self.call("POST", f"/api/fs?doc=demo&op=newfile&path=n{i}.tex")[0] for i in range(3)]
+            put = [self.call("PUT", "/api/file?doc=demo&path=main.tex", {"text": str(i)})[0] for i in range(3)]
+        self.assertEqual((fs, put), ([200, 200, 429], [200, 200, 429]))
+
+    def test_labels_and_the_text_before_a_delete_are_never_evicted(self):
+        store = self.history.Store(self.base / "s")
+        label = store.label("keep", ["Owner"], {"main.tex": "precious"})
+        store.record("gone.tex", "last words", ["E"], now=1.0)
+        store.record("gone.tex", None, ["E"], "delete", now=2.0)
+        with mock.patch.object(self.history, "MAX_ROWS", 4):
+            store.record("a.tex", "1", ["E"], now=3.0)
+            store.record("a.tex", "2", ["F"], now=4.0)
+            store.record("a.tex", "3", ["G"], now=5.0)  # the oldest superseded version of a.tex makes room
+            store.record("new.tex", "x", ["E"], now=10.0)  # and a2 for this one
+            with self.assertRaises(self.history.Full):  # nothing old may go: history stops, nothing is forgotten
+                store.record("other.tex", "y", ["E"], now=20.0)
+        self.assertEqual(store.text_at(label, "main.tex"), "precious")
+        deleted = next(r for r in store.versions("gone.tex") if r["kind"] == "auto")
+        self.assertEqual(store.text_at(deleted["id"], "gone.tex"), "last words")
+        self.assertNotIn("other.tex", [r["path"] for r in store.versions()])
+        self.assertEqual(len(list((self.base / "s" / "blobs").rglob("*.*"))), 0)  # no stray temp files
+
+    def test_link_roles_have_their_own_label_cap(self):
+        with mock.patch.object(self.history, "MAX_SHARED_LABELS", 2):
+            codes = [self.call("POST", "/api/history/label?doc=demo", {"label": f"v{i}"})[0] for i in range(3)]
+            self.assertEqual(codes, [200, 200, 409])
+            self.assertEqual(self.call("POST", "/api/history/label?doc=demo", {"label": "mine"}, role="owner")[0], 200)
+
+    def test_the_quota_is_measured_once_per_history_write(self):
+        for n in range(5):
+            self.write(f"ch{n}.tex", f"chapter {n}\n")
+        mock.patch.dict(serve.QUOTA, {"bytes": 10 ** 9, "area": self.base}).start()
+        with mock.patch.object(serve, "folder_bytes", wraps=serve.folder_bytes) as walks:
+            self.assertEqual(self.call("POST", "/api/history/label?doc=demo", {"label": "v"}, role="owner")[0], 200)
+        self.assertLessEqual(walks.call_count, 7)  # one per file recorded first, one for the label: not one per blob
+
+    def test_a_failed_accept_is_released_as_it_was(self):
+        anchor = {"from": 12, "to": 17, "quote": "hello", "prefix": "", "suffix": ""}
+        key_a, key_b = "a" * 32, "b" * 32
+        made = self.call("POST", "/api/review?doc=demo", {"op": "suggest", "path": "main.tex", "anchor": anchor,
+                                                          "insert": "hi", "key": key_a, "name": "Ann"})[1]["item"]
+        sid = made["id"]
+        self.call("POST", "/api/review?doc=demo", {"op": "accept", "ids": [sid], "key": key_b, "name": "Bo"})
+        self.assertEqual(self.call("POST", "/api/review?doc=demo", {"op": "release", "ids": [sid], "key": key_a,
+                                                                    "name": "Ann"})[1]["released"], 0)  # not her claim
+        self.assertEqual(self.call("POST", "/api/review?doc=demo", {"op": "release", "ids": [sid], "key": key_b,
+                                                                    "name": "Bo"})[1]["released"], 1)
+        (back,) = self.call("GET", f"/api/review?doc=demo&key={key_a}")[1]["suggestions"]
+        self.assertEqual((back["id"], back["name"], back["mine"]), (sid, "Ann", True))
+
+    def test_unreadable_or_damaged_review_data_is_never_overwritten(self):
+        anchor = {"from": 0, "to": 1, "quote": "\\", "prefix": "", "suffix": ""}
+        body = {"op": "comment", "path": "main.tex", "anchor": anchor, "text": "x", "key": "a" * 32}
+        self.assertEqual(self.call("POST", "/api/review?doc=demo", body)[0], 200)
+        stored = serve.history_folder("demo") / "review.json"
+        good = stored.read_bytes()
+        stored.unlink()
+        stored.mkdir()  # cannot be read
+        self.assertEqual(self.call("GET", "/api/review?doc=demo")[0], 500)
+        self.assertEqual(self.call("POST", "/api/review?doc=demo", body)[0], 500)
+        stored.rmdir()
+        stored.write_bytes(good[:-5])  # damaged: moved aside, then a fresh start
+        self.assertEqual(self.call("POST", "/api/review?doc=demo", body)[0], 200)
+        (aside,) = stored.parent.glob("review.json.bad-*")
+        self.assertEqual(aside.read_bytes(), good[:-5])
+
+    def test_review_data_is_capped_and_anchors_cannot_grow(self):
+        anchor = {"from": 12, "to": 17, "quote": "hello", "prefix": "", "suffix": ""}
+        made = self.call("POST", "/api/review?doc=demo", {"op": "comment", "path": "main.tex", "anchor": anchor,
+                                                          "text": "x", "key": "a" * 32})[1]["item"]
+        grown = {**anchor, "to": 20000, "quote": "h" * 19988}
+        moved = self.call("POST", "/api/review?doc=demo", {"op": "reanchor", "key": "a" * 32,
+                                                           "items": [{"id": made["id"], "anchor": grown}]})[1]
+        self.assertEqual(moved["moved"], 0)
+        import review
+        with mock.patch.object(review, "MAX_FILE", 600):
+            status, err = self.call("POST", "/api/review?doc=demo", {"op": "reply", "thread": made["id"],
+                                                                     "text": "y" * 600, "key": "a" * 32})
+        self.assertEqual(status, 413)
 
 
 if __name__ == "__main__":
