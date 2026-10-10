@@ -19,6 +19,7 @@ instead of failing the run.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -57,6 +58,14 @@ CREF_RANGE = re.compile(r"\\[cC]refrange\*?\{([^{}]+)\}\{([^{}]+)\}")
 CITE = re.compile(r"\\\w*cite\w*\*?(?:\[[^\]]*\]){0,2}\{([^{}]+)\}")
 NOCITE_ALL = re.compile(r"\\nocite\{\s*\*\s*\}")
 BIB_ENTRY = re.compile(r"^[ \t]*@(\w+)[ \t]*[({][ \t]*([^,\s]+)[ \t]*,", re.MULTILINE)
+# Fields an entry type needs; "a|b" accepts either (biblatex names included).
+BIB_REQUIRED = {
+    "article": ("author", "title", "journal|journaltitle", "year|date"),
+    "book": ("author|editor", "title", "publisher", "year|date"),
+    "inproceedings": ("author", "title", "booktitle", "year|date"),
+}
+BIB_YEAR_FIRST = 1450
+BIB_ACRONYM = re.compile(r"\b(?=\w*[A-Z]\w*[A-Z])\w+\b")  # BERT, LaTeX, iPhone: two capitals in a word
 BIB_LINK = re.compile(r"[{,\s](?:doi|url)\s*=", re.IGNORECASE)  # inline or on its own line
 
 
@@ -382,9 +391,69 @@ def figure_findings(doc_dir: Path, sources: dict[str, str]) -> list[Finding]:
     return findings
 
 
+def bib_fields(body: str) -> dict[str, str]:
+    """name -> value of the top-level fields of one entry body (the text after "@type{key,")."""
+    fields: dict[str, str] = {}
+    flat, depth, quoted = [], 0, False
+    for char in body:  # blank everything nested in braces or quotes so "title = {a = b}" is one field
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                break
+        elif char == '"' and depth == 0:
+            quoted = not quoted
+        flat.append(char if depth == 0 and not quoted and char not in '{}"' else " ")
+    flat_text = "".join(flat)
+    for match in re.finditer(r"(\w[\w-]*)\s*=", flat_text):
+        rest = body[match.end():]
+        value = re.match(r"\s*(\{(?:[^{}]|\{[^{}]*\})*\}|\"[^\"]*\"|[^,}\s]+)", rest)
+        fields[match.group(1).lower()] = value.group(1).strip("{}\" \n") if value else ""
+    return fields
+
+
+def entry_findings(rel: str, line: int, kind: str, key: str, body: str, dois: dict[str, str]) -> list[Finding]:
+    fields = bib_fields(body)
+    found: list[Finding] = []
+    if "crossref" not in fields:  # inherits its fields
+        missing = [need.split("|")[0] for need in BIB_REQUIRED.get(kind, ()) if not any(
+            fields.get(name) for name in need.split("|"))]
+        if missing:
+            found.append(Finding("missing-bib-field", rel, line,
+                                 f"@{kind} '{key}' lacks {', '.join(missing)}", key))
+    year = fields.get("year", "")
+    if year and not (re.fullmatch(r"\d{4}", year) and BIB_YEAR_FIRST <= int(year) <= datetime.date.today().year + 1):
+        found.append(Finding("bib-year", rel, line, f"'{key}' has a suspicious year: {year!r}", key))
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", fields.get("doi", ""), flags=re.IGNORECASE).lower()
+    if doi:
+        if doi in dois:
+            found.append(Finding("dup-doi", rel, line, f"'{key}' has the same DOI as '{dois[doi]}'", key))
+        else:
+            dois[doi] = key
+    title = fields.get("title", "")
+    unprotected = re.sub(r"\{[^{}]*\}", "", title)  # text inside braces is protected
+    if BIB_ACRONYM.search(unprotected):
+        found.append(Finding("bib-title-case", rel, line,
+                             f"'{key}': wrap capitals in braces so styles keep them, e.g. {{BERT}}",
+                             key, level="info"))
+    return found
+
+
+def unused_bib_files(doc_dir: Path, sources: dict[str, str]) -> list[Finding]:
+    """A .bib whose path is named nowhere in the sources (custom macros such as \\unitbib{...} count)."""
+    text = "\n".join(sources.values())
+    return [
+        Finding("unused-bib-file", rel, None, f"{rel} is not named in any source file", rel)
+        for rel in (path.relative_to(doc_dir).as_posix() for path in visible_files(doc_dir) if path.suffix == ".bib")
+        if not re.search(rf"(?<![\w/.-]){re.escape(rel.removesuffix('.bib'))}(?:\.bib)?(?![\w/-])", text)
+    ]
+
+
 def bib_findings(doc_dir: Path, sources: dict[str, str]) -> list[Finding]:
     findings: list[Finding] = []
     entries: dict[str, tuple[str, int]] = {}  # first definition of each key
+    dois: dict[str, str] = {}
     for path in visible_files(doc_dir):
         if path.suffix != ".bib":
             continue
@@ -403,10 +472,12 @@ def bib_findings(doc_dir: Path, sources: dict[str, str]) -> list[Finding]:
             else:
                 entries[key] = (rel, line)
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            findings += entry_findings(rel, line, kind, key, text[match.end():end], dois)
             if kind == "article" and not BIB_LINK.search(text[match.start():end]):
                 findings.append(Finding("missing-doi", rel, line,
                                         f"@article '{key}' has no doi or url", key, level="info"))
 
+    findings += unused_bib_files(doc_dir, sources)
     if any(NOCITE_ALL.search(text) for text in sources.values()):
         return findings  # \nocite{*} cites every entry.
     cited = {key.strip() for text in sources.values()

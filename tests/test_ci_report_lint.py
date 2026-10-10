@@ -80,18 +80,48 @@ class LintDocumentTests(unittest.TestCase):
             ),
             "doc/extra.bib": "@misc{smith, title={E}}\n",
         })
+        findings = [f for f in findings if f.kind != "missing-bib-field"]
         self.assertEqual(kinds(findings), [
             ("dup-bib-key", "smith"),
             ("missing-doi", "jones"),
             ("uncited-bib", "unused"),
+            ("unused-bib-file", "extra.bib"),
         ])
         missing = next(f for f in findings if f.kind == "missing-doi")
         self.assertEqual(missing.level, "info")
 
+    def test_bib_entry_checks(self):
+        findings = self.lint({
+            "doc/main.tex": "\\cite{a,b,c,d,e,f}\n\\bibliography{refs}\n",
+            "doc/refs.bib": (
+                "@article{a, author={X}, title={Fine {BERT} one}, journal={J}, year={2020}, doi={10.1/Z}}\n"
+                "@article{b, author={X}, title={Deep BERT models}, journal={J}, year={20x0},\n"
+                "  doi={https://doi.org/10.1/z}}\n"
+                "@book{c, editor={X}, title={T = x}, year={1999}}\n"
+                "@inproceedings{d, author={X}, title={T}, booktitle={B}, year={1200}}\n"
+                "@article{e, crossref={a}}\n"
+                "@misc{f, title={Anything}}\n"
+            ),
+            "doc/old.bib": "@misc{g, title={x}}\n",
+            "doc/.lint-baseline": "",
+        })
+        self.assertEqual(sorted(kinds(findings)), [
+            ("bib-title-case", "b"),
+            ("bib-year", "b"),
+            ("bib-year", "d"),
+            ("dup-doi", "b"),
+            ("missing-bib-field", "c"),
+            ("missing-doi", "e"),  # a crossref entry is exempt from required fields, not from this
+            ("uncited-bib", "g"),
+            ("unused-bib-file", "old.bib"),
+        ])
+        self.assertIn("publisher", next(f for f in findings if f.kind == "missing-bib-field").message)
+        self.assertEqual(next(f for f in findings if f.kind == "bib-title-case").level, "info")
+
     def test_nocite_all_cites_every_entry(self):
         findings = self.lint({
             "doc/main.tex": "\\nocite{*}\n\\bibliography{refs}\n",
-            "doc/refs.bib": "@book{unused, title={D}}\n",
+            "doc/refs.bib": "@misc{unused, title={D}}\n",
         })
         self.assertEqual(kinds(findings), [])
 
