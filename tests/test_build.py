@@ -591,7 +591,7 @@ class ReportAndFocusTests(unittest.TestCase):
 
             def fake_run(*args, **kwargs):
                 seen.update(kwargs)
-                raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+                raise subprocess.TimeoutExpired(kwargs["args"], kwargs["timeout"])
 
             with mock.patch.object(build.accel, "read_focusmap", return_value=[]), \
                     mock.patch.object(build.accel, "focus_selection", return_value=([], "a")), \
