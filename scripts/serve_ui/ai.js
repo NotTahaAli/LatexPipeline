@@ -5,6 +5,7 @@
 
 const TASKS = { rewrite: "Rewrite", shorten: "Shorten", grammar: "Fix grammar", translate: "Translate", write: "Write LaTeX", explain: "Explain error", ask: "Question" };
 const CONTEXT = 2000;   // characters of context before and after the selection or cursor
+const RC = /(^|[\\/])(\.?latexmkrc|build\.toml)$/i;   // ai.RC_NAMES: never sent, never edited
 
 /**
  * ctx = {api, el, icon, doc(), role, readOnly, toast(msg), show() (open this panel), text(path) (open-tab or saved text),
@@ -57,7 +58,7 @@ export function aiPanel(root, ctx) {
   function renderSettings() {
     const open = settingsBox.open;
     const on = el("input", { type: "checkbox", id: uid("on"), checked: !!info.on });
-    const share = el("input", { type: "checkbox", id: uid("share"), checked: !!info.share });
+    const share = el("input", { type: "checkbox", id: uid("share"), checked: !!info.share, disabled: !info.sandboxed });
     const model = el("select", { id: uid("model") }, ...[...new Set([...(info.models || []), info.model])].map((m) => new Option(m, m, false, m === info.model)));
     const key = el("input", { type: "password", id: uid("key"), autocomplete: "off", spellcheck: false, placeholder: info.key ? "(saved; type to replace)" : "sk-ant-..." });
     const msg = el("p", { className: "mute", role: "status" });
@@ -82,8 +83,9 @@ export function aiPanel(root, ctx) {
         el("div", { className: "ai-row" }, key,
           el("button", { type: "button", className: "btn", textContent: "Save key", onclick: () => { if (key.value.trim()) save({ key: key.value.trim() }); key.value = ""; } }),
           ...(info.key === "settings" ? [el("button", { type: "button", className: "btn ghost", textContent: "Forget", onclick: () => save({ forget_key: true }) })] : [])),
-        el("p", { className: "mute", textContent: keyNote + " It is never sent to the browser or to people you share with." }),
+        el("p", { className: "mute", textContent: keyNote + " The server never sends it to a browser." }),
         el("label", { className: "check" }, share, " Let people with an edit link use it while sharing"),
+        ...(info.sandboxed ? [] : [el("p", { className: "mute", textContent: "Needs sandboxed builds (serve.py --sandbox). Without them, LuaLaTeX from an edit link can read your key on this computer." })]),
         msg));
     settingsBox.open = open || !info.on;
   }
@@ -191,6 +193,7 @@ export function aiPanel(root, ctx) {
     if (!e) { ctx.toast("The last build has no error with a file and line."); return; }
     ctx.show();
     const files = [];
+    if (RC.test(e.file)) { ctx.toast("Build configuration files are not sent to the assistant."); return; }   // the log names any file; the build can write it
     for (const path of [...new Set([e.file, "main.tex"])]) {
       try { files.push({ path, text: await ctx.text(path), ...(path === e.file ? { line: e.line } : {}) }); } catch { /* not readable: leave it out */ }
     }
@@ -226,5 +229,12 @@ export function aiPanel(root, ctx) {
     { id: "ai-write", edit: true, title: "AI: write LaTeX at the cursor...", run: () => { ctx.show(); prompt.focus(); } },
   ];
 
-  return { load, explainButton, commands, get enabled() { return info.enabled; } };
+  /** For the Share dialog: what an edit link means for the owner's key. */
+  function shareNote() {
+    if (!info.key) return "";
+    return info.sandboxed ? `AI assistant: ${info.share ? "edit links may use it with your API key." : "off for shared links."}`
+      : "AI assistant: off for shared links. Builds are not sandboxed, so LuaLaTeX from an edit link can read your Anthropic API key on this computer; share with --sandbox, or forget the key first.";
+  }
+
+  return { load, explainButton, commands, shareNote, get enabled() { return info.enabled; } };
 }

@@ -71,7 +71,8 @@ CONFIG_DEFAULTS: dict = {
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
 }
 AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
-                     "daily_per_user": 50, "daily_per_workspace": 500}
+                     "daily_per_user": 50, "daily_per_workspace": 500, "daily_total": 2000,
+                     "daily_tokens_per_user": 1_000_000}
 CONFIG_RANGES = {"max_connections": (8, 100000), "max_upload_mb": (1, 10000), "max_streams_per_user": (1, 1000),
                  "signups_per_ip_hour": (1, 100000)}
 CONFIG_TEMPLATE = """\
@@ -111,6 +112,8 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # api_key_env = "ANTHROPIC_API_KEY"    # the environment variable holding the key
 # daily_per_user = 50                  # requests per person per day (UTC)
 # daily_per_workspace = 500            # requests per workspace per day
+# daily_total = 2000                   # requests for the whole server per day (the spending cap)
+# daily_tokens_per_user = 1000000      # input + output tokens per person per day
 """
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
@@ -170,12 +173,12 @@ def load_config(data: Path) -> dict:
     if not isinstance(config["ai"], dict) or set(config["ai"]) - set(AI_DEFAULTS):
         raise ConfigError(f"{path}: [ai] takes only {', '.join(AI_DEFAULTS)}")
     config["ai"] = cfg = {**AI_DEFAULTS, **config["ai"]}
-    if not isinstance(cfg["enabled"], bool) or not ai.MODEL_NAME.fullmatch(str(cfg["model"])) \
+    if not isinstance(cfg["enabled"], bool) or cfg["model"] not in ai.MODELS \
             or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key")):
-        raise ConfigError(f"{path}: [ai] needs enabled = true/false, a Claude model id and text for the key settings")
-    for key in ("daily_per_user", "daily_per_workspace"):
-        if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 1_000_000):
-            raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000")
+        raise ConfigError(f"{path}: [ai] needs enabled = true/false, a model from {ai.MODELS} and text for the keys")
+    for key in ("daily_per_user", "daily_per_workspace", "daily_total", "daily_tokens_per_user"):
+        if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
+            raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
     return config
 
 
@@ -1275,11 +1278,22 @@ class Handler(BaseHTTPRequestHandler):
         uid, tid, day = self.session["id"], project["tenant_id"], time.strftime("%Y-%m-%d", time.gmtime())
 
         def left() -> int:
-            mine = APP.db.one("SELECT COALESCE(SUM(requests), 0) AS n FROM ai_usage WHERE day = ? AND user_id = ?",
-                              day, uid)["n"]
-            team = APP.db.one("SELECT COALESCE(SUM(requests), 0) AS n FROM ai_usage WHERE day = ? AND tenant_id = ?",
-                              day, tid)["n"]
-            return max(0, min(cfg["daily_per_user"] - mine, cfg["daily_per_workspace"] - team))
+            """Requests left today: per person, per workspace, for the whole server (open sign-up makes one
+            workspace per account), and none once the person's token budget is spent."""
+            n = APP.db.one(
+                "SELECT COALESCE(SUM(CASE WHEN user_id = ? THEN requests END), 0) AS mine, "
+                "COALESCE(SUM(CASE WHEN user_id = ? THEN input_tokens + output_tokens END), 0) AS tokens, "
+                "COALESCE(SUM(CASE WHEN tenant_id = ? THEN requests END), 0) AS team, "
+                "COALESCE(SUM(requests), 0) AS total FROM ai_usage WHERE day = ?", uid, uid, tid, day)
+            if n["tokens"] >= cfg["daily_tokens_per_user"]:
+                return 0
+            return max(0, min(cfg["daily_per_user"] - n["mine"], cfg["daily_per_workspace"] - n["team"],
+                              cfg["daily_total"] - n["total"]))
+
+        def record(usage: dict) -> None:
+            APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
+                       "WHERE day = ? AND user_id = ? AND tenant_id = ?",
+                       usage["input"], usage["output"], day, uid, tid)
 
         reason = ("View-only members cannot use the assistant." if role != "edit"
                   else "The AI assistant is off on this server." if not on
@@ -1308,12 +1322,11 @@ class Handler(BaseHTTPRequestHandler):
             APP.db.run("INSERT INTO ai_usage(day, user_id, tenant_id, requests) VALUES (?, ?, ?, 1) "
                        "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1", day, uid, tid)
         try:
-            result = ai.ask(data, key=key, model=cfg["model"], owner=False)
+            result = ai.ask(data, key=key, model=cfg["model"])
         except ai.AiError as exc:
+            record(exc.usage)  # a refusal, cut-off or malformed answer is billed too
             raise HttpError(exc.status, str(exc))
-        APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
-                   "WHERE day = ? AND user_id = ? AND tenant_id = ?",
-                   result["usage"]["input"], result["usage"]["output"], day, uid, tid)
+        record(result["usage"])
         self.send_json(result)
 
     def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
@@ -1917,6 +1930,7 @@ def api_admin(h: Handler) -> None:
           "sandbox": APP.sandbox, "modes": SIGNUP_MODES,
           "ai": {"enabled": bool(cfg["enabled"] and ai_key()), "configured": cfg["enabled"], "model": cfg["model"],
                  "daily_per_user": cfg["daily_per_user"], "daily_per_workspace": cfg["daily_per_workspace"],
+                 "daily_total": cfg["daily_total"], "daily_tokens_per_user": cfg["daily_tokens_per_user"],
                  "usage": usage}})
 
 

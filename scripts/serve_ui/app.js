@@ -986,7 +986,10 @@ async function pushGrammarSettings() {
   catch (e) { toast(el("span", { textContent: "Grammar settings: " + e.message })); }
   scheduleGrammar(0);
 }
-function grammarShareNote() {
+function grammarShareNote() {   // also the AI assistant's line (ai.js), when the owner has a key
+  return [grammarOnlyNote(), aiUi.shareNote()].filter(Boolean).join(" ");
+}
+function grammarOnlyNote() {
   return settings.grammar === "public" || settings.grammarShare
     ? (settings.grammarShare ? "Grammar: the public LanguageTool API is allowed while sharing, so text from everyone with a link is sent to languagetool.org."
       : "Grammar: public mode is switched off while sharing; allow it in Settings, Grammar.")

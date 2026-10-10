@@ -1241,8 +1241,7 @@ class Assistant(HostCase):
 
     def ask(self, client, data=None, **kw):
         data = data or {"task": "explain", "error": {"message": "Runaway argument?"},
-                        "files": [{"path": "main.tex", "text": "a \\textbf{x\n", "line": 1},
-                                  {"path": "build.toml", "text": "a = 1\n"}]}
+                        "files": [{"path": "main.tex", "text": "a \\textbf{x\n", "line": 1}]}
         return client.call("POST", f"/p/{self.pid}/api/ai", data, **kw)
 
     def test_editors_get_checked_answers_and_the_key_stays_on_the_gateway(self):
@@ -1291,6 +1290,34 @@ class Assistant(HostCase):
         self.assertNotIn(self.KEY, json.dumps(data))
         self.assertEqual(editor.call("GET", "/api/admin")[0], 404)
 
+    def test_server_wide_cap_and_token_budget(self):
+        """Open sign-up gives everyone a workspace of their own, so the per-workspace cap alone is no spending cap."""
+        self.app.config["ai"] = {**self.AI, "daily_per_user": 100, "daily_total": 2}
+        editor = self.client("ed@x.org")
+        self.assertEqual([self.ask(editor)[0] for _ in range(3)], [200, 200, 429])
+        self.assertFalse(editor.call("GET", f"/p/{self.pid}/api/ai")[1]["enabled"])
+        self.app.config["ai"] = {**self.AI, "daily_per_user": 100, "daily_tokens_per_user": 240}
+        self.assertEqual(self.ask(editor)[0], 429)  # 2 x 120 tokens spent
+        self.app.config["ai"] = {**self.AI, "daily_per_user": 100, "daily_tokens_per_user": 241}
+        self.assertEqual(self.ask(editor)[0], 200)
+
+    def test_billed_failures_are_recorded(self):
+        refused = ai_reply()
+        refused["stop_reason"] = "refusal"
+        refused["usage"]["iterations"] = [{"input_tokens": 100, "output_tokens": 5},
+                                          {"input_tokens": 100, "output_tokens": 7}]
+        ai.post_json.side_effect = None
+        ai.post_json.return_value = refused
+        self.assertEqual(self.ask(self.client("ed@x.org"))[0], 422)
+        row = self.app.db.one("SELECT requests, input_tokens, output_tokens FROM ai_usage")
+        self.assertEqual((row["requests"], row["input_tokens"], row["output_tokens"]), (1, 200, 12))
+
+    def test_build_configuration_is_never_sent(self):
+        data = {"task": "explain", "error": {"message": "x"},
+                "files": [{"path": ".latexmkrc", "text": "1;", "line": 1}]}
+        self.assertEqual(self.ask(self.client("ed@x.org"), data)[0], 400)
+        self.assertEqual(self.calls, [])
+
     def test_bad_requests_and_upstream_errors(self):
         editor = self.client("ed@x.org")
         self.assertEqual(self.ask(editor, {"task": "nope"})[0], 400)
@@ -1318,8 +1345,8 @@ class Assistant(HostCase):
     def test_config_section_is_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
-            for text in ('[ai]\nenabled = "yes"', '[ai]\nmodel = "gpt-4"', '[ai]\ndaily_per_user = -1',
-                         '[ai]\nshell = "x"', 'ai = 3'):
+            for text in ('[ai]\nenabled = "yes"', '[ai]\nmodel = "gpt-4"', '[ai]\nmodel = "claude-3-haiku"',
+                         '[ai]\ndaily_total = -1', '[ai]\ndaily_per_user = -1', '[ai]\nshell = "x"', 'ai = 3'):
                 (data / "config.toml").write_text(text)
                 with self.subTest(text=text), self.assertRaises(host.ConfigError):
                     host.load_config(data)
