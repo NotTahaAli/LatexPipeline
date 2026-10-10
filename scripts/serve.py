@@ -2817,6 +2817,7 @@ def main() -> int:
         if SHARE["provider"] == "ngrok":
             print("  ngrok's free plan shows a warning page first; each visitor clicks 'Visit Site' once.")
         address = address.replace(f":{port}/", f":{port}/?token={SHARE['tokens']['owner']}", 1)
+        print(f"  you (owner)     : {address}  (keep this one private)")
     if not args.no_open:
         threading.Timer(0.3, webbrowser.open, (address,)).start()
 
