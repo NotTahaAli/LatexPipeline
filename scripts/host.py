@@ -1262,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise HttpError(429, "Too many open editor tabs. Close some and reload.")
                 APP.streams[self.session["id"]] += 1
         try:
-            self.relay(project, pid, rest, query, role, upgrade, size)
+            self.relay(project, pid, rest, query, role, upgrade, size, tenant_role_ == "admin")
         finally:
             if stream:
                 with APP.streams_lock:
@@ -1329,7 +1329,8 @@ class Handler(BaseHTTPRequestHandler):
         record(result["usage"])
         self.send_json(result)
 
-    def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
+    def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int,
+              admin: bool = False) -> None:
         worker = APP.workers.acquire(project)
         upstream = None
         try:
@@ -1340,6 +1341,8 @@ class Handler(BaseHTTPRequestHandler):
             lines += [f"{name}: {self.headers[name]}" for name in FORWARD if self.headers.get(name) is not None]
             lines += ["Connection: Upgrade", "Upgrade: websocket"] if upgrade else ["Connection: close"]
             lines += [f"X-Host-Secret: {worker.secret}", f"X-Host-Role: {role}", f"X-Host-User: {quote(user, ';')}"]
+            if admin:  # workspace admins may clean up version history; the worker trusts it only with the secret
+                lines.append("X-Host-Admin: 1")
             upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
             left = size
             while left:

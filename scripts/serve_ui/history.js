@@ -1,6 +1,8 @@
 // Version history panel: the versions the server keeps (serve.py, history.py), a line diff of any of them, labels
-// ("name this version") and restore. Restoring writes files on the server, except files open in a co-editing room:
-// those come back to us and go in through the editor (ctx.apply), so everyone in the room stays consistent.
+// ("name this version"), restore and clean-up (the owner, or a workspace admin when hosted). Restoring writes files
+// on the server, except files open in a co-editing room: those stay pending on the server until one editor in the
+// room claims one (claim-once), applies it as one edit and says "restore-done" on the bus after its Yjs update
+// (resume). The server finishes what nobody in an emptied room applied. Deleting versions has no undo.
 import { hunk } from "./collab.js";
 
 export function ago(t) {
@@ -13,13 +15,16 @@ export function ago(t) {
 
 const KINDS = { auto: "Edited", outside: "From disk", delete: "Deleted", rename: "Renamed", restore: "Restored", label: "Named version" };
 
+const AGES = [["7", "1 week"], ["30", "1 month"], ["90", "3 months"], ["365", "1 year"]];
+
 /**
- * ctx = {api, el, doc(), activePath(), canEdit, toast(msg), live(msg), saveAll(), apply(path, text) -> Promise<bool>,
- *        dialog: <dialog>}
+ * ctx = {api, el, doc(), activePath(), canEdit, canClean, toast(msg), live(msg), saveAll(), dialog: <dialog>,
+ *        inRoom(path) -> bool (open in a ready co-editing room), roomApply(path, text) -> bool (one edit),
+ *        send(message) (the bus)}
  */
 export function historyPanel(root, ctx) {
   const { el } = ctx;
-  let rows = [], scope = "file", more = false, labeling = false, loading = 0;
+  let rows = [], scope = "file", more = false, labeling = false, cleaning = false, full = false, loading = 0;
   const dlg = ctx.dialog;
 
   const btn = (text, onclick, cls = "btn", title) => el("button", { type: "button", className: cls, textContent: text, onclick, ...(title ? { title } : {}) });
@@ -32,6 +37,7 @@ export function historyPanel(root, ctx) {
       if (run !== loading) return;
       rows = append ? [...rows, ...r.versions] : r.versions;
       more = r.versions.length >= 200;
+      full = !!r.full;
     } catch (e) { if (run === loading) { rows = []; root.replaceChildren(el("p", { className: "gnote", textContent: e.message })); } return; }
     render();
   }
@@ -42,8 +48,11 @@ export function historyPanel(root, ctx) {
       new Option(path ? `This file (${path.split("/").pop()})` : "This file", "file"), new Option("All files", "all"));
     pick.value = scope;
     const tools = [];
-    if (ctx.canEdit) tools.push(btn("Name this version", () => { labeling = true; render(); root.querySelector("#hvLabel")?.focus(); }, "btn", "Save the project as it is now under a name"));
+    if (ctx.canEdit) tools.push(btn("Name this version", () => { labeling = true; cleaning = false; render(); root.querySelector("#hvLabel")?.focus(); }, "btn", "Save the project as it is now under a name"));
+    if (ctx.canClean) tools.push(btn("Clean up", () => { cleaning = !cleaning; labeling = false; render(); root.querySelector("#hvAge")?.focus(); }, "btn ghost", "Delete old versions"));
     const parts = [el("div", { className: "rv-bar" }, el("label", { htmlFor: "hvScope", className: "sr", textContent: "Versions of" }), pick, el("span", { className: "spacer" }), ...tools)];
+    if (full) parts.push(el("p", { className: "hv-full", role: "status", textContent: "The history is full: new versions are not being kept. Saving still works. " + (ctx.canClean ? "Delete old or named versions with Clean up to make room." : "Ask the owner to delete old versions.") }));
+    if (cleaning) parts.push(cleanForm());
     if (labeling) {
       const input = el("input", { type: "text", id: "hvLabel", maxLength: 120, placeholder: "e.g. Sent to supervisor", autocomplete: "off" });
       const save = btn("Save", async () => {
@@ -64,12 +73,63 @@ export function historyPanel(root, ctx) {
           el("span", { className: "hv-kind " + v.kind, textContent: KINDS[v.kind] || v.kind }),
           el("span", { className: "hv-what", textContent: what, title: v.path || (v.files || []).join(", ") }),
           el("span", { className: "mute hv-meta", textContent: [who, ago(v.time)].filter(Boolean).join(" · "), title: new Date(v.time * 1000).toLocaleString() })),
-        ...(v.deleted ? [] : [btn("View", () => openDiff(v), "btn", `Show the changes of version ${v.id}`)]));
+        ...(v.deleted ? [] : [btn("View", () => openDiff(v), "btn", `Show the changes of version ${v.id}`)]),
+        ...(v.kind === "label" && ctx.canClean ? [btn("Delete", () => dropLabel(v), "btn ghost danger", `Delete the named version “${v.label}”`)] : []));
       return li;
     });
     parts.push(el("ul", { className: "plist hv-list" }, ...(items.length ? items : [el("li", { className: "none", textContent: scope === "file" && !path ? "Open a file to see its versions." : "No versions yet. Every save in the editor adds one." })])));
     if (more) parts.push(el("div", { className: "rv-actions hv-more" }, btn("Show older versions", () => load(true))));
     root.replaceChildren(...parts);
+  }
+
+  // ---- clean-up (owner, workspace admins) ---------------------------------------------------------------------------
+  function cleanForm() {
+    const age = el("select", { id: "hvAge" }, ...AGES.map(([d, t]) => new Option(t, d)));
+    age.value = "90";
+    const named = el("input", { type: "checkbox", id: "hvNamed" });
+    const go = btn("Delete old versions", async () => {
+      const span = age.selectedOptions[0].textContent;
+      if (!confirm(`Delete every version older than ${span}${named.checked ? ", named versions included" : " (named versions stay)"}? Each file's newest version stays. This cannot be undone.`)) return;
+      go.disabled = true;
+      try {
+        const r = await ctx.api.historyClean(ctx.doc(), { op: "clear", days: Number(age.value), named: named.checked });
+        cleaning = false;
+        ctx.live(`${r.removed} ${r.removed === 1 ? "version" : "versions"} deleted`);
+        await load();
+      } catch (e) { ctx.toast(e.message); go.disabled = false; }
+    }, "btn danger");
+    return el("div", { className: "rv-form hv-label hv-clean" },
+      el("label", { htmlFor: "hvAge", textContent: "Delete versions older than" }), age,
+      el("label", { className: "hv-check" }, named, " Also delete named versions"),
+      el("p", { className: "mute", textContent: "Older versions are already thinned out automatically: everything for a day, then one per hour for a week, one per day for 90 days, then one per week." }),
+      el("div", { className: "rv-actions" }, go, btn("Cancel", () => { cleaning = false; render(); }, "btn ghost")));
+  }
+
+  async function dropLabel(v) {
+    if (!confirm(`Delete the named version “${v.label}”? Its text stays only where other versions still use it. This cannot be undone.`)) return;
+    try { await ctx.api.historyClean(ctx.doc(), { op: "drop", id: v.id }); ctx.live("Named version deleted"); await load(); }
+    catch (e) { ctx.toast(e.message); }
+  }
+
+  // ---- pending restores of files open in a co-editing room -----------------------------------------------------------
+  let resuming = false, again = false;
+  async function resume() {
+    const doc = ctx.doc();
+    if (!ctx.canEdit || !doc) return;
+    if (resuming) { again = true; return; }
+    resuming = true;
+    try {
+      const { pending } = await ctx.api.historyPending(doc);
+      for (const p of pending) {
+        if (p.claimed || !ctx.inRoom(p.path)) continue;
+        let got;
+        try { got = await ctx.api.historyClaim(doc, p.path, "claim"); } catch { continue; }   // another editor has it
+        if (ctx.doc() === doc && ctx.roomApply(p.path, got.text)) ctx.send({ type: "restore-done", topic: "y", data: { doc, path: p.path, token: got.token } });
+        else await ctx.api.historyClaim(doc, p.path, "release").catch(() => {});
+      }
+    } catch { /* the next history message tries again; the server finishes it when the room empties */ }
+    resuming = false;
+    if (again) { again = false; resume(); }
   }
 
   // ---- diff dialog ------------------------------------------------------------------------------------------------
@@ -156,10 +216,10 @@ export function historyPanel(root, ctx) {
     try {
       await ctx.saveAll();
       const r = await ctx.api.historyRestore(ctx.doc(), v.id, path);
-      let applied = 0;
-      for (const item of r.apply) if (await ctx.apply(item.path, item.text)) applied++; else r.failed.push({ path: item.path, error: "could not open it" });
-      const done = r.written.length + applied;
+      const done = r.written.length + r.pending.length;
+      resume();
       ctx.toast([done ? `Restored ${done} ${done === 1 ? "file" : "files"}.` : "Nothing to restore: the files already match.",
+        r.pending.length ? ` ${r.pending.length === 1 ? "One is" : r.pending.length + " are"} open in shared editing and ${r.pending.length === 1 ? "goes" : "go"} in through the editor.` : "",
         r.skipped.length ? ` ${r.skipped.length} build configuration ${r.skipped.length === 1 ? "file stays" : "files stay"} as they are (owner only).` : "",
         r.failed.length ? ` Failed: ${r.failed.map((f) => `${f.path} (${f.error})`).join(", ")}.` : ""].join(""));
       dlg.close();
@@ -168,5 +228,5 @@ export function historyPanel(root, ctx) {
   }
 
   dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
-  return { load, render, reset() { rows = []; render(); } };
+  return { load, render, resume, reset() { rows = []; full = false; cleaning = false; render(); } };
 }

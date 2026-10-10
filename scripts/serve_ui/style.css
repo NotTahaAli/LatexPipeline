@@ -556,6 +556,10 @@ dialog::backdrop{background:var(--scrim)}
 .hv-label{padding:10px 16px;border-bottom:1px solid var(--rule)}
 .hv-label label{font-size:12px;font-weight:600;color:var(--ink-2)}
 .hv-more{padding:10px 16px}
+.hv-full{margin:0;padding:10px 16px;background:var(--ochre-soft);color:var(--ink);font-size:13px;border-bottom:1px solid var(--rule)}
+.hv-clean select{max-width:16em}
+.hv-clean .hv-check{display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)}
+.hv-clean p{margin:0;font-size:12px}
 #diffDlg{width:min(1000px,96vw);max-width:96vw;max-height:90vh;flex-direction:column}
 #diffDlg[open]{display:flex}
 .hv-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 22px;border-bottom:1px solid var(--rule)}

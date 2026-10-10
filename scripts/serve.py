@@ -2414,6 +2414,7 @@ def reap(now: float | None = None) -> None:
             del ROOMS[rid]
     for cid in stale:
         client_gone(cid)
+    finish_all_pending()
 
 
 def housekeeping() -> None:
@@ -2447,6 +2448,9 @@ FS_LIMIT = (60, 60.0)  # file tree changes a shared role may make per window
 PUT_LIMIT = (900, 60.0)  # saves a shared role may make per window (every editor of the link together)
 MAX_LABEL = 120
 RESTORE_GRACE = 120.0  # seconds a restore applied through a room has to reach the disk
+HISTORY_FULL: set = set()  # documents whose last version could not be kept (caps or quota), shown in the panel
+PENDING_DOCS: set | None = None  # documents that may have pending restores (None: not yet looked, check them all)
+MAX_CLEAN_DAYS = 36500
 
 
 def history_folder(name: str) -> Path:
@@ -2507,8 +2511,11 @@ def remember(name: str, rel: str, text: str | None, authors=(), kind: str = "aut
     try:
         if history_store(name).record(rel, text, authors, kind, label) is not None:
             BUS.publish("history", {"doc": name})
+        HISTORY_FULL.discard(name)
     except history.Full:
-        pass
+        if name not in HISTORY_FULL:
+            HISTORY_FULL.add(name)
+            BUS.publish("history", {"doc": name})  # the History panel says so
     except (OSError, sqlite3.Error) as exc:
         build.error(f"history of {name}: {exc}")
 
@@ -2583,7 +2590,7 @@ def history_list(name: str, role: str, path: str | None, before) -> dict:
         for row in rows:
             if "files" in row:
                 row["files"] = [f for f in row["files"] if not is_rc(f)]
-    return {"versions": rows}
+    return {"versions": rows, "full": name in HISTORY_FULL}
 
 
 def history_row(name: str, vid) -> tuple[history.Store, dict]:
@@ -2657,12 +2664,35 @@ def room_open(doc: str, path: str) -> bool:
         return bool(room and room["members"])
 
 
+def write_restored(name: str, rel: str, text: str, author: str, note: str) -> bool:
+    """Write restored text to a file no co-editing room has open; False when it already matched."""
+    root = DOCS[name].parent
+    target = resolve_in_doc(root, rel)
+    current = read_text_file(root, rel) if target.exists() else None
+    if current and current["text"] == text:
+        return False
+    if current:
+        remember_disk(name, rel)
+    parent = target.parent
+    if not parent.is_dir():
+        fs_path(root, posixpath.dirname(rel), "folder")  # a folder the file tree could make too
+        with WRITE_LOCK:
+            quota_check(ENTRY_BYTES)
+            parent.mkdir(parents=True, exist_ok=True)
+    write_text_file(root, rel, text, None, current["eol"] if current else "\n")
+    remember(name, rel, text, [author], "restore", note)
+    return True
+
+
 def history_restore(name: str, role: str, vid, path: str | None, author: str) -> dict:
     """
     Put one file (path) or every file of a version back. Build-config files stay owner-only; files that did not
-    exist in the version are left alone. Files open in a co-editing room come back in "apply" for the browser to
-    put through the room; the rest are written here. Each restored file gets a "restore" version.
+    exist in the version are left alone. A file open in a co-editing room is never written here: it becomes a
+    pending restore (recorded first, so a restore is never left half done) that one editor in the room claims and
+    applies as one edit ("pending" lists them); if the room closes first, the server writes it (finish_pending).
+    The rest are written here. Each restored file gets a "restore" version.
     """
+    global PENDING_DOCS
     store, row = history_row(name, vid)
     if path:
         if role != "owner" and is_rc(path):
@@ -2681,38 +2711,165 @@ def history_restore(name: str, role: str, vid, path: str | None, author: str) ->
             raise ApiError("This version's text is gone (pruned).", 410)
     root = DOCS[name].parent
     note = f"Restored {row['label'] or 'version ' + str(row['id'])}"[:300]
-    out: dict = {"written": [], "apply": [], "skipped": [], "failed": []}
-    for rel in sorted(targets):
+    out: dict = {"written": [], "pending": [], "skipped": [], "failed": []}
+    later = []
+    for rel in sorted(targets):  # first the files open in rooms: what is left to do is on record before any write
         text = targets[rel]
         if role != "owner" and is_rc(rel):
             out["skipped"].append(rel)
             continue
         try:
-            target = resolve_in_doc(root, rel)
-            current = read_text_file(root, rel) if target.exists() else None
-            if current and current["text"] == text:
+            resolve_in_doc(root, rel)
+            if not room_open(name, rel):
+                later.append(rel)
                 continue
-            if room_open(name, rel):
-                remember_disk(name, rel)
+            current = read_text_file(root, rel)
+            remember_disk(name, rel)
+            store.pend(rel, text, secrets.token_hex(8))
+            if current["text"] != text:  # the room may hold edits the disk does not have yet: apply it anyway
                 remember(name, rel, text, [author], "restore", note)
-                out["apply"].append({"path": rel, "text": text})
-                continue
-            if current:
-                remember_disk(name, rel)
-            parent = target.parent
-            if not parent.is_dir():
-                fs_path(root, posixpath.dirname(rel), "folder")  # a folder the file tree could make too
-                with WRITE_LOCK:
-                    quota_check(ENTRY_BYTES)
-                    parent.mkdir(parents=True, exist_ok=True)
-            write_text_file(root, rel, text, None, current["eol"] if current else "\n")
-            remember(name, rel, text, [author], "restore", note)
-            out["written"].append(rel)
+            out["pending"].append(rel)
+        except history.Full:
+            out["failed"].append({"path": rel, "error": "the history is full"})
+        except (ApiError, OSError, sqlite3.Error) as exc:
+            out["failed"].append({"path": rel, "error": str(exc)})
+    for rel in later:
+        try:
+            if write_restored(name, rel, targets[rel], author, note):
+                out["written"].append(rel)
         except (ApiError, OSError) as exc:
             out["failed"].append({"path": rel, "error": str(exc)})
     if out["written"]:
         broadcast("fs", {"doc": name, "changed": out["written"], "removed": []})
+    if out["pending"]:
+        if PENDING_DOCS is not None:
+            PENDING_DOCS.add(name)
+        BUS.publish("history", {"doc": name})  # the editors in those rooms claim and apply them
     return out
+
+
+def history_pending(name: str, role: str) -> dict:
+    try:
+        rows = history_store(name).pending()
+    except (OSError, sqlite3.Error) as exc:
+        raise ApiError(f"Could not read the history: {exc}", 500)
+    return {"pending": [{"path": r["path"], "claimed": bool(r["claim"])} for r in rows
+                        if role == "owner" or not is_rc(r["path"])]}
+
+
+def claim_alive(cid: str | None) -> bool:
+    with COLLAB_LOCK:
+        return bool(cid) and cid in CLIENTS
+
+
+def history_claim(name: str, role: str, cid: str | None, data: dict) -> dict:
+    """
+    POST /api/history/pending: op "claim" hands one editor in the file's room the pending restore (one claimer at a
+    time, so two editors never apply it concurrently); it applies the text as one edit and then sends "restore-done"
+    on the bus, after its Yjs update, so the next claimer's copy already holds it. op "release": it could not.
+    """
+    path, op = data.get("path"), data.get("op")
+    if not isinstance(path, str) or (role != "owner" and is_rc(path)):
+        raise ApiError("No such pending restore.", 404)
+    if cid is None:
+        raise ApiError("Unknown client.", 403)
+    store = history_store(name)
+    if op == "release":
+        if store.release(path, cid):
+            BUS.publish("history", {"doc": name})
+        return {"released": True}
+    if op != "claim":
+        raise ApiError("Unknown operation.", 400)
+    with COLLAB_LOCK:
+        room = ROOMS.get(room_id(name, path))
+        member = room["members"].get(cid) if room else None
+    if not member or member["role"] not in ("owner", "edit"):
+        raise ApiError("Open the file for editing first.", 409)
+    got = store.claim(path, cid, claim_alive)
+    if got is None:
+        raise ApiError("Nothing to restore, or someone else is restoring it.", 409)
+    return {"path": path, **got}
+
+
+def on_restore_done(message: dict, client: str, role: str) -> dict | None:
+    """Bus message "restore-done" {doc, path, token}: the claimer's edit went into the room (sent after it)."""
+    data = message.get("data") or {}
+    doc, path, token = data.get("doc"), data.get("path"), data.get("token")
+    if role == "view" or doc not in DOCS or (role != "owner" and doc != SHARE["doc"]):
+        return reply_error(ApiError("Not allowed.", 403))
+    if not isinstance(path, str) or not isinstance(token, str):
+        return reply_error(ApiError("Bad message.", 400))
+    try:
+        history_store(doc).finish(path, token, client)
+        BUS.publish("history", {"doc": doc})  # done, or a newer restore of the file is free to claim
+    except (history.Full, OSError, sqlite3.Error) as exc:
+        return reply_error(ApiError(f"Could not update the history: {exc}", 500))
+    return None
+
+
+HANDLERS["restore-done"] = on_restore_done
+
+
+def finish_pending(name: str) -> bool:
+    """
+    Complete the pending restores of a document whose rooms closed (the browser that claimed one is gone and nobody
+    else was there): the server writes them now, as it does for files without a room. A claim whose client went
+    away is released, so another editor in the room takes it. True while something is still pending.
+    """
+    store = history_store(name)
+    left = False
+    for row in store.pending():
+        rel = row["path"]
+        if room_open(name, rel):
+            left = True
+            if row["claim"] and not claim_alive(row["claim"]) and store.release(rel, row["claim"]):
+                BUS.publish("history", {"doc": name})
+            continue
+        try:
+            if write_restored(name, rel, store.blob(row["hash"]), "Restore", "Restored (finished by the server)"):
+                broadcast("fs", {"doc": name, "changed": [rel], "removed": []})
+        except (KeyError, ApiError, OSError) as exc:
+            build.error(f"history of {name}: could not finish restoring {rel}: {exc}")
+        store.finish(rel, row["token"])
+    return left
+
+
+def finish_all_pending() -> None:
+    """From housekeeping: every few seconds for the documents that may have pending restores."""
+    global PENDING_DOCS
+    if PENDING_DOCS is None:
+        PENDING_DOCS = set(DOCS)  # after a restart: anything left over from the last run
+    for name in list(PENDING_DOCS):
+        try:
+            if name not in DOCS or not finish_pending(name):
+                PENDING_DOCS.discard(name)
+        except (OSError, sqlite3.Error, history.Full) as exc:
+            build.error(f"history of {name}: {exc}")
+
+
+def history_clean(name: str, data: dict) -> dict:
+    """Delete a named version (op "drop", id) or every version older than `days` (op "clear"; named ones only
+    with named=true). Each file's newest version and the text before a deletion always stay."""
+    store, op = history_store(name), data.get("op")
+    try:
+        if op == "drop":
+            vid = data.get("id")
+            if not isinstance(vid, int) or not store.drop_label(vid):
+                raise ApiError("No such named version.", 404)
+            removed = 1
+        elif op == "clear":
+            days, named = data.get("days"), data.get("named", False)
+            if not isinstance(days, (int, float)) or isinstance(days, bool) or not 0 < days <= MAX_CLEAN_DAYS \
+                    or not isinstance(named, bool):
+                raise ApiError("Say how many days of history to keep.", 400)
+            removed = store.clear(time.time() - days * 86400, named)
+        else:
+            raise ApiError("Unknown operation.", 400)
+    except (OSError, sqlite3.Error) as exc:
+        raise ApiError(f"Could not clean up the history: {exc}", 500)
+    HISTORY_FULL.discard(name)
+    BUS.publish("history", {"doc": name})
+    return {"removed": removed}
 
 
 def reviewer(role: str, user: str | None, data: dict) -> dict:
@@ -2797,7 +2954,8 @@ CDNS = "https://esm.sh https://cdnjs.cloudflare.com https://cdn.jsdelivr.net"
 DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
-    "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/review",
+    "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
+    "/api/review",
 }
 
 
@@ -2880,8 +3038,9 @@ def csp(page: bytes, host: str) -> str:
     ])
 
 
-def check_permission(role: str, method: str, path: str, query: dict) -> None:
-    """Raise ApiError unless this role may make this request. The owner may do anything."""
+def check_permission(role: str, method: str, path: str, query: dict, admin: bool = False) -> None:
+    """Raise ApiError unless this role may make this request. The owner may do anything; admin: a workspace admin
+    behind the gateway (always with the edit role), who may also clean up the version history."""
     if role == "owner":
         return
     doc = (query.get("doc") or [None])[0]
@@ -2957,6 +3116,17 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("zotero-apply", 20, 60.0):  # CPU only, but a guest could still keep the server busy
             raise ApiError("Too many requests; wait a moment.", 429)
+    elif method == "POST" and path == "/api/history/clean":
+        if not admin:  # Deletes versions for everyone: the local owner, or a workspace admin behind the gateway.
+            raise ApiError("Only the owner or a workspace admin can delete versions.", 403)
+        scoped(doc)
+        if not rate_ok(path, *HISTORY_LIMIT):
+            raise ApiError("Too many changes; wait a moment.", 429)
+    elif method == "POST" and path == "/api/history/pending":
+        need_edit()  # Claims a restore this editor applies through its open co-editing room.
+        scoped(doc)
+        if not rate_ok(path, *REVIEW_LIMIT):
+            raise ApiError("Too many changes; wait a moment.", 429)
     elif method == "POST" and path in ("/api/history/label", "/api/history/restore", "/api/review"):
         need_edit()  # Viewers browse history and read comments (READ_API); changing either needs the edit role.
         scoped(doc)
@@ -3003,6 +3173,7 @@ class Handler(BaseHTTPRequestHandler):
     role = "owner"
     token = None
     user = None  # "id;display name" behind the gateway
+    admin = False  # a workspace admin behind the gateway (never a share link)
 
     def log_message(self, *args) -> None:  # Quiet: build output is the interesting part.
         pass
@@ -3037,6 +3208,8 @@ class Handler(BaseHTTPRequestHandler):
     def authenticate(self) -> str | None:
         if GATEWAY["secret"]:
             role, self.user = gateway_identity(self.headers)
+            # A workspace admin (host.py says so, under the same secret) may clean up the version history.
+            self.admin = role == "edit" and self.headers.get("X-Host-Admin") == "1"
             return role
         if not SHARE["on"]:
             return "owner"
@@ -3119,7 +3292,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain")
                 return
-            check_permission(self.role, self.command, unquote(url.path), query)
+            check_permission(self.role, self.command, unquote(url.path), query, self.admin)
             method()
         except ApiError as exc:
             self.json({"error": str(exc), **exc.extra}, exc.status)
@@ -3166,6 +3339,11 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/history/restore" and name in DOCS:
             data = self.body()
             self.json(history_restore(name, self.role, data.get("id"), data.get("path") or None, self.author(query)))
+        elif url.path == "/api/history/pending" and name in DOCS:
+            cid = trusted_client(str(query.get("cid", [""])[0])[:64] or None, self.role, self.user)
+            self.json(history_claim(name, self.role, cid, self.body()))
+        elif url.path == "/api/history/clean" and name in DOCS:
+            self.json(history_clean(name, self.body()))
         elif url.path == "/api/review" and name in DOCS:
             self.json(review_change(name, self.role, self.user, self.body()))
         elif url.path == "/api/grammar" and name in DOCS:
@@ -3267,6 +3445,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(health(self.role))
         elif path == "/api/config":
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
+                       "cleanup": self.role == "owner" or self.admin,
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
         elif path == "/api/zotero" and self.role == "owner" and not GATEWAY["secret"]:
@@ -3309,7 +3488,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/warnings":
             self.doc_root(query)
             self.json({"warnings": doc_warnings(query["doc"][0])})
-        elif path in ("/api/history", "/api/history/version", "/api/history/diff", "/api/review"):
+        elif path in ("/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
+                      "/api/review"):
             self.doc_root(query)  # 404 for an unknown document
             name = query["doc"][0]
 
@@ -3322,6 +3502,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(history_text(name, self.role, arg("id"), arg("path")))
             elif path == "/api/history/diff":
                 self.json(history_diff(name, self.role, arg("id"), arg("path"), arg("against") or "current"))
+            elif path == "/api/history/pending":
+                self.json(history_pending(name, self.role))
             else:
                 self.json(review_list(name, self.role, self.user, arg("key")))
         elif path == "/synctex/edit":

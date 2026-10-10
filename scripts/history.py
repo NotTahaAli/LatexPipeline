@@ -8,6 +8,12 @@ own manifest {path: hash}, so pruning old rows never changes what a label restor
 
 Kinds: auto (saved in the editor; one person's saves of a file within COALESCE seconds merge into one row),
 outside (the file changed outside the editor, recorded before it is overwritten), delete, rename, restore, label.
+
+Unnamed versions thin out with age (THIN): every new version thins the older ones a little (at most THIN_BATCH rows),
+so the store keeps a long, sparse past instead of filling up. Named versions, each file's newest row and the text
+before a deletion are never thinned; blobs no row refers to any more are deleted. The caps (MAX_ROWS, max_bytes,
+the caller's room()) stay as a last resort: past them history raises Full and stops rather than forget. A pending
+restore (pend) is text a restore must still put into a file that is open in a co-editing room.
 """
 
 from __future__ import annotations
@@ -32,6 +38,12 @@ MAX_BYTES = 64 * 1024 * 1024  # compressed blob bytes per document
 MAX_DIFF_ROWS = 4000
 MAX_DIFF_LINES = 2000  # lines of the changed middle (after the common start and end) the diff matcher looks at
 BLOCK = 4096  # a quota charges at least one disk block per file
+ROW_BYTES = 256  # what one index row is charged against room() (the sqlite file counts toward a quota too)
+# (age in seconds, one version per this many seconds and file): newer than a day all, a week hourly, 90 days daily,
+# then weekly. A bucket keeps its newest version.
+THIN = ((86400.0, 0.0), (7 * 86400.0, 3600.0), (90 * 86400.0, 86400.0), (float("inf"), 7 * 86400.0))
+THIN_BATCH = 500  # versions one record may thin, so a write never does unbounded work
+CLAIM_TTL = 30.0  # seconds a client's claim on a pending restore holds before another editor may take it over
 LOCK = threading.RLock()  # ponytail: one lock for every store; history writes are small and rare enough
 
 SCHEMA = """
@@ -41,7 +53,12 @@ CREATE TABLE IF NOT EXISTS versions (
     authors TEXT NOT NULL DEFAULT '[]', label TEXT, manifest TEXT, role TEXT);
 CREATE INDEX IF NOT EXISTS versions_path ON versions(path, id);
 CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pending (path TEXT PRIMARY KEY, hash TEXT NOT NULL, token TEXT NOT NULL,
+    time REAL NOT NULL, claim TEXT, claimed REAL);
 """
+
+
+FILE_ROWS = "SELECT id, path, time, hash FROM versions WHERE path IS NOT NULL ORDER BY path, id"
 
 
 class Full(Exception):
@@ -82,11 +99,7 @@ class Store:
         if con.execute("SELECT 1 FROM blobs WHERE hash = ?", (h,)).fetchone() and self._blob_path(h).is_file():
             return h
         data = zlib.compress(text.encode("utf-8"), 6)
-        cost = max(len(data), BLOCK)
-        if budget[0] is not None:
-            if cost > budget[0]:
-                raise Full("no room for history")
-            budget[0] -= cost
+        self._charge(budget, max(len(data), BLOCK))
         path = self._blob_path(h)
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=".blob.")
@@ -104,15 +117,26 @@ class Store:
         con.execute("INSERT OR REPLACE INTO blobs (hash, bytes) VALUES (?, ?)", (h, len(data)))
         return h
 
-    def _write(self, work):
-        """Run work(con, put) in one transaction; on any failure nothing stays, the new blob files included."""
+    @staticmethod
+    def _charge(budget: list, cost: int) -> None:
+        if budget[0] is not None:
+            if cost > budget[0]:
+                raise Full("no room for history")
+            budget[0] -= cost
+
+    def _write(self, work, vacuum: bool = False):
+        """
+        Run work(con, put, charge) in one transaction; on any failure nothing stays, the new blob files included.
+        charge(n) bills n bytes of index growth against room(); vacuum shrinks the index file afterwards.
+        """
         written: list = []
         with LOCK, closing(self._db()) as con:
             self._doomed = []
             budget = [self.room()]
             try:
                 with con:
-                    result = work(con, lambda text: self._put(con, text, budget, written))
+                    result = work(con, lambda text: self._put(con, text, budget, written),
+                                  lambda cost: self._charge(budget, cost))
             except BaseException:
                 gone = written
                 raise
@@ -124,6 +148,8 @@ class Store:
                         self._blob_path(h).unlink()
                     except OSError:
                         pass
+            if vacuum:
+                con.execute("VACUUM")
             return result
 
     def blob(self, h: str) -> str:
@@ -144,7 +170,7 @@ class Store:
         now = time.time() if now is None else now
         names = json.dumps(sorted({str(a)[:80] for a in authors if a}))
 
-        def work(con, put):
+        def work(con, put, charge):
             last = con.execute("SELECT * FROM versions WHERE path = ? ORDER BY id DESC LIMIT 1", (path,)).fetchone()
             h = None if text is None else digest(text)
             if last is not None and last["hash"] == h and kind in ("auto", "outside", "delete"):
@@ -163,9 +189,11 @@ class Store:
                 self._collect(con)
                 self._prune(con)
                 return None
+            charge(ROW_BYTES + len(path) + len(names) + len(label or ""))
             cur = con.execute(
                 "INSERT INTO versions (time, started, path, hash, size, kind, authors, label) VALUES (?,?,?,?,?,?,?,?)",
                 (now, now, path, h, size, kind, names, label))
+            self._thin(con, now)
             self._prune(con)
             return cur.lastrowid
 
@@ -175,12 +203,13 @@ class Store:
         """Name the current state of the project (texts: every text file's content). Raises Refused past the caps."""
         now = time.time() if now is None else now
 
-        def work(con, put):
+        def work(con, put, charge):
             total, shared = con.execute("SELECT COUNT(*), COALESCE(SUM(role != 'owner'), 0) FROM versions "
                                         "WHERE kind = 'label'").fetchone()
             if total >= MAX_LABELS or (role != "owner" and shared >= MAX_SHARED_LABELS):
                 raise Refused(f"This document has {total} named versions, the most it keeps.")
             manifest = {path: put(text) for path, text in sorted(texts.items())}
+            charge(ROW_BYTES + len(json.dumps(manifest)) + len(name))
             cur = con.execute(
                 "INSERT INTO versions (time, started, path, hash, size, kind, authors, label, manifest, role) "
                 "VALUES (?, ?, NULL, NULL, ?, 'label', ?, ?, ?, ?)",
@@ -207,15 +236,149 @@ class Store:
             con.execute(f"DELETE FROM versions WHERE id IN ({','.join('?' * len(victims))})", victims)
             self._collect(con)
 
+    @staticmethod
+    def _kept(rows: list) -> set:
+        """Ids never thinned or cleared: each file's newest row, and the last text before a deletion or rename."""
+        keep = set()
+        for i, r in enumerate(rows):  # rows ordered by path, id
+            newest = i + 1 == len(rows) or rows[i + 1]["path"] != r["path"]
+            if newest or (r["hash"] is not None and rows[i + 1]["hash"] is None):
+                keep.add(r["id"])
+        return keep
+
+    def _thin(self, con: sqlite3.Connection, now: float) -> None:
+        """
+        Thin unnamed versions by age (THIN): in each bucket of one file the newest version stays. Deletion and rename
+        markers stay (they say a file was gone). At most THIN_BATCH rows go per call; the rest go on later records.
+        """
+        rows = con.execute(FILE_ROWS).fetchall()
+        keep, seen, victims = self._kept(rows), set(), []
+        for r in reversed(rows):  # newest first, so each bucket keeps its newest version
+            step = next(s for limit, s in THIN if now - r["time"] < limit)
+            if not step or r["hash"] is None:
+                continue
+            key = (r["path"], step, int(r["time"] // step))
+            if r["id"] not in keep and key in seen:
+                victims.append(r["id"])
+                if len(victims) >= THIN_BATCH:
+                    break
+            seen.add(key)
+        if victims:
+            con.execute(f"DELETE FROM versions WHERE id IN ({','.join('?' * len(victims))})", victims)
+            self._collect(con)
+
     def _collect(self, con: sqlite3.Connection) -> None:
-        """Forget blobs no row and no label manifest refers to; their files go once the transaction commits."""
-        used = {r[0] for r in con.execute("SELECT hash FROM versions WHERE hash IS NOT NULL")}
+        """Forget blobs no row, label manifest or pending restore refers to; their files go once the transaction
+        commits."""
+        used = {r[0] for r in con.execute("SELECT hash FROM versions WHERE hash IS NOT NULL UNION "
+                                          "SELECT hash FROM pending")}
         for (manifest,) in con.execute("SELECT manifest FROM versions WHERE manifest IS NOT NULL"):
             used.update(json.loads(manifest).values())
         for (h,) in con.execute("SELECT hash FROM blobs").fetchall():
             if h not in used:
                 con.execute("DELETE FROM blobs WHERE hash = ?", (h,))
                 self._doomed.append(h)
+
+    # --- cleaning up (the local owner, or a workspace admin behind the gateway) --------------------------------
+
+    def drop_label(self, vid: int) -> bool:
+        """Delete a named version; its blobs go unless another version still uses them."""
+        def work(con, put, charge):
+            gone = con.execute("DELETE FROM versions WHERE id = ? AND kind = 'label'", (vid,)).rowcount
+            self._collect(con)
+            return bool(gone)
+
+        return self._write(work, vacuum=True)
+
+    def clear(self, before: float, named: bool = False) -> int:
+        """
+        Delete versions older than `before` (named ones only with named=True). Each file's newest version and the
+        text before a deletion stay, so the current state and deleted files can still be restored. Returns the count.
+        """
+        def work(con, put, charge):
+            rows = con.execute(FILE_ROWS).fetchall()
+            keep = self._kept(rows)
+            ids = [r[0] for r in con.execute("SELECT id FROM versions WHERE time < ? AND (path IS NOT NULL OR ?)",
+                                              (before, int(named))) if r[0] not in keep]
+            for at in range(0, len(ids), 500):
+                chunk = ids[at:at + 500]
+                con.execute(f"DELETE FROM versions WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+            self._collect(con)
+            return len(ids)
+
+        return self._write(work, vacuum=True)
+
+    def usage(self) -> dict:
+        with LOCK, closing(self._db()) as con:
+            rows, labels = con.execute("SELECT COALESCE(SUM(kind != 'label'), 0), COALESCE(SUM(kind = 'label'), 0) "
+                                       "FROM versions").fetchone()
+            size = con.execute("SELECT COALESCE(SUM(bytes), 0) FROM blobs").fetchone()[0]
+        return {"rows": rows, "labels": labels, "bytes": size, "max_rows": MAX_ROWS, "max_labels": MAX_LABELS,
+                "max_bytes": self.max_bytes}
+
+    # --- pending restores (files open in a co-editing room) ----------------------------------------------------
+
+    def pend(self, path: str, text: str, token: str, now: float | None = None) -> None:
+        """
+        Remember that `path` must still become `text`. A newer restore of the same file replaces the text but keeps a
+        claim on it: the claimer may be applying the older one right now, and the next claim must see that first.
+        """
+        def work(con, put, charge):
+            h = put(text)
+            charge(ROW_BYTES + len(path))
+            con.execute("INSERT INTO pending (path, hash, token, time) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO "
+                        "UPDATE SET hash = excluded.hash, token = excluded.token, time = excluded.time",
+                        (path, h, token, time.time() if now is None else now))
+            self._collect(con)  # the text a replaced pending restore held
+
+        self._write(work)
+
+    def pending(self) -> list[dict]:
+        if not (self.folder / "index.sqlite3").is_file():
+            return []  # never create a store just to look
+        with LOCK, closing(self._db()) as con:
+            return [dict(r) for r in con.execute("SELECT * FROM pending ORDER BY path")]
+
+    def claim(self, path: str, cid: str, alive, now: float | None = None) -> dict | None:
+        """
+        Claim the pending restore of `path` for client cid: one claimer at a time, so two editors never apply it
+        concurrently. A claim lapses after CLAIM_TTL or once alive(claimer) is False. None: nothing pending, or
+        another live client holds it. Returns {token, text}.
+        """
+        now = time.time() if now is None else now
+        with LOCK, closing(self._db()) as con:
+            with con:
+                r = con.execute("SELECT * FROM pending WHERE path = ?", (path,)).fetchone()
+                if r is None or (r["claim"] and r["claim"] != cid and now - r["claimed"] < CLAIM_TTL
+                                 and alive(r["claim"])):
+                    return None
+                con.execute("UPDATE pending SET claim = ?, claimed = ? WHERE path = ?", (cid, now, path))
+            return {"token": r["token"], "text": self.blob(r["hash"])}
+
+    def release(self, path: str, cid: str) -> bool:
+        """The claimer could not apply it (or went away): another editor may take it."""
+        with LOCK, closing(self._db()) as con:
+            with con:
+                return bool(con.execute("UPDATE pending SET claim = NULL, claimed = NULL WHERE path = ? AND claim = ?",
+                                        (path, cid)).rowcount)
+
+    def finish(self, path: str, token: str, cid: str | None = None) -> bool:
+        """
+        The restore reached the file: through the room by its claimer cid, or written by the server (cid None).
+        True when that was the pending one; a claimer's older token (a newer restore came meanwhile) only ends its
+        claim, so the newer text gets claimed and applied after it.
+        """
+        def work(con, put, charge):
+            sql, args = "DELETE FROM pending WHERE path = ? AND token = ?", [path, token]
+            if cid is not None:
+                sql, args = sql + " AND claim = ?", [*args, cid]
+            gone = con.execute(sql, args).rowcount
+            if not gone and cid is not None:
+                con.execute("UPDATE pending SET claim = NULL, claimed = NULL WHERE path = ? AND claim = ?", (path, cid))
+            self._collect(con)
+            return bool(gone)
+
+        return self._write(work)
 
     # --- reading ----------------------------------------------------------------------------------------------
 

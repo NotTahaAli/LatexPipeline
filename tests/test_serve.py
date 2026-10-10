@@ -2655,6 +2655,97 @@ class HistoryStore(unittest.TestCase):
         with self.assertRaises(self.history.Full):
             full.record("a.tex", "x", [])
 
+    def test_old_versions_thin_out_by_age(self):
+        s, day, now = self.store, 86400.0, 200 * 86400.0
+        times = [now - day * 150 + i * 1800.0 for i in range(0, 7200, 7)]  # every 3.5 h for 150 days, 30 min steps
+        times += [now - 3600.0 * h for h in range(30, 0, -1)]  # hourly through the last 30 hours
+        for n, t in enumerate(sorted(times)):
+            s.record("a.tex", f"text {n}", [f"p{n % 2}"], now=t)  # two authors in turn: never merged
+            if n == 100:
+                label = s.label("keep", [], {"a.tex": f"text {n}"}, now=t)
+                s.record("gone.tex", "last words", ["x"], now=t)
+                s.record("gone.tex", None, ["x"], "delete", now=t + 1)
+        with mock.patch.object(self.history, "THIN_BATCH", 10 ** 6):
+            s.record("b.tex", "b", ["x"], now=now)  # one more record thins everything that is due
+        rows = [r for r in s.versions("a.tex", limit=500) if r["kind"] == "auto"]
+        ages = [(now - r["time"]) / day for r in rows]
+        self.assertEqual(sum(1 for a in ages if a < 1), sum(1 for t in times if now - t < day))  # the last day: all
+        week = [int(r["time"] // 3600) for r, a in zip(rows, ages) if 1 <= a < 7]
+        self.assertEqual(len(week), len(set(week)))  # one per hour
+        months = [int(r["time"] // day) for r, a in zip(rows, ages) if 7 <= a < 90]
+        self.assertEqual(len(months), len(set(months)))  # one per day
+        older = [int(r["time"] // (7 * day)) for r, a in zip(rows, ages) if a >= 90]
+        self.assertEqual(len(older), len(set(older)))  # one per week
+        self.assertLess(len(rows), 200)
+        self.assertEqual(s.text_at(label, "a.tex"), "text 100")  # named versions never thin
+        before = next(r for r in s.versions("gone.tex") if r["kind"] == "auto")
+        self.assertEqual(s.text_at(before["id"], "gone.tex"), "last words")  # nor the text before a delete
+        self.assertEqual(s.text_at(rows[0]["id"], "a.tex"), f"text {len(times) - 1}")  # nor the newest
+        self.assertLessEqual(len(self.blobs()), s.usage()["rows"])  # blobs of thinned versions are gone
+
+    def test_thinning_is_bounded_per_record(self):
+        s, day = self.store, 86400.0
+        for n in range(20):
+            s.record("a.tex", f"t{n}", [f"p{n % 2}"], now=n * 60.0)  # 20 versions within one hour
+        with mock.patch.object(self.history, "THIN_BATCH", 5):
+            s.record("b.tex", "b", ["x"], now=3 * day)
+            self.assertEqual(len(s.versions("a.tex")), 15)
+            s.record("b.tex", "c", ["y"], now=3 * day + 1)
+            self.assertEqual(len(s.versions("a.tex")), 10)
+            for n in range(3):
+                s.record("b.tex", f"d{n}", [f"z{n}"], now=3 * day + 2 + n)
+        self.assertEqual(len(s.versions("a.tex")), 1)
+
+    def test_clear_and_drop_named_versions(self):
+        s, day = self.store, 86400.0
+        for n in range(5):
+            s.record("a.tex", f"a{n}", [f"p{n % 2}"], now=n * day)
+        s.record("gone.tex", "bye", ["x"], now=0.0)
+        s.record("gone.tex", None, ["x"], "delete", now=1.0)
+        old = s.label("old", [], {"a.tex": "a0", "c.tex": "only here"}, now=0.5)
+        new = s.label("new", [], {"a.tex": "a4"}, now=4 * day)
+        self.assertEqual(s.clear(3.5 * day), 4)  # a0..a3
+        kinds = [(r["path"], r["kind"]) for r in s.versions()]
+        self.assertIn(("gone.tex", "auto"), kinds)  # the text before a delete stays
+        self.assertIn(old, [r["id"] for r in s.versions()])  # named versions stay unless asked
+        self.assertEqual(s.text_at(old, "c.tex"), "only here")
+        self.assertEqual(s.clear(10 * day, named=True), 2)  # both labels; a4 is the newest and stays
+        self.assertEqual(sorted(r["path"] for r in s.versions() if r["kind"] == "auto"), ["a.tex", "gone.tex"])
+        self.assertFalse(s.drop_label(new))  # already gone
+        third = s.label("third", [], {"a.tex": "a4", "c.tex": "kept by nothing"}, now=5 * day)
+        self.assertTrue(s.drop_label(third))
+        self.assertFalse(s.drop_label(s.versions("a.tex")[0]["id"]))  # only named versions
+        self.assertEqual(len(self.blobs()), 2)  # a4 and "bye": every other blob was collected
+
+    def test_pending_restores_are_claimed_once(self):
+        s = self.store
+        s.pend("a.tex", "restored", "t1", now=0.0)
+        self.assertEqual([p["path"] for p in s.pending()], ["a.tex"])
+        alive = {"c1", "c2"}
+        got = s.claim("a.tex", "c1", alive.__contains__, now=1.0)
+        self.assertEqual(got, {"token": "t1", "text": "restored"})
+        self.assertIsNone(s.claim("a.tex", "c2", alive.__contains__, now=2.0))
+        self.assertIsNotNone(s.claim("a.tex", "c2", alive.__contains__, now=1.0 + self.history.CLAIM_TTL))
+        alive.discard("c2")  # the claimer went away: someone else may take it at once
+        self.assertIsNotNone(s.claim("a.tex", "c1", alive.__contains__, now=40.0))
+        self.assertFalse(s.finish("a.tex", "t1", "c2"))  # not the claimer
+        self.assertTrue(s.finish("a.tex", "t1", "c1"))
+        self.assertEqual((s.pending(), self.blobs()), ([], []))
+        self.assertIsNone(s.claim("a.tex", "c1", alive.__contains__))
+        self.assertEqual(self.history.Store(Path(self.tmp.name) / "none").pending(), [])
+        self.assertFalse((Path(self.tmp.name) / "none").exists())  # looking never creates a store
+
+    def test_index_rows_count_toward_the_room(self):
+        block, row = self.history.BLOCK, self.history.ROW_BYTES
+        tight = self.history.Store(Path(self.tmp.name) / "t", room=lambda: block + 10)
+        with self.assertRaises(self.history.Full):
+            tight.record("a.tex", "x", [])  # the blob fits, its index row does not
+        roomy = self.history.Store(Path(self.tmp.name) / "r", room=lambda: block + row + 100)
+        self.assertIsNotNone(roomy.record("a.tex", "x", []))
+        with mock.patch.object(roomy, "room", lambda: 10):  # an old text again: no new blob, but a new row
+            with self.assertRaises(self.history.Full):
+                roomy.record("a.tex", None, [], "delete")
+
     def test_diff_rows(self):
         d = self.history.diff("a\nb\nc", "a\nB\nc\nd")
         self.assertEqual((d["added"], d["removed"]), (2, 1))
@@ -2724,18 +2815,114 @@ class HistoryApi(SharedState, ServerCase):
         self.assertEqual(self.call("POST", "/api/history/label?doc=demo", {"label": " "})[0], 400)
         self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": 99999})[0], 404)
 
+    def join(self, cid, role="owner", path="main.tex"):
+        serve.bind_client(cid, role)
+        serve.handle_client_message({"type": "y-join", "data": {"doc": "demo", "path": path, "aid": 1}}, cid, role)
+
+    def claim(self, cid, path="main.tex", op="claim"):
+        return self.call("POST", f"/api/history/pending?doc=demo&cid={cid}", {"op": op, "path": path})
+
+    def done(self, cid, token, path="main.tex", role="owner"):
+        return serve.handle_client_message({"type": "restore-done", "data": {"doc": "demo", "path": path,
+                                                                             "token": token}}, cid, role)
+
+    def pending(self):
+        return [p["path"] for p in self.call("GET", "/api/history/pending?doc=demo")[1]["pending"]]
+
     def test_a_file_with_an_open_room_is_restored_through_the_room(self):
+        mock.patch.object(serve, "PENDING_DOCS", set()).start()
         self.put("new\n")
+        self.write("ch.tex", "chapter\n")
+        made = self.call("POST", "/api/history/label?doc=demo", {"label": "both"})[1]["id"]
+        self.put("newer\n")
+        self.write("ch.tex", "chapter changed\n")
+        self.join("c1")
+        self.join("c2")
+        serve.bind_client("c3", "owner")
+        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": made})
+        self.assertEqual((status, out["written"], out["pending"]), (200, ["ch.tex"], ["main.tex"]))
+        self.assertEqual((self.root / "main.tex").read_text(), "newer\n")  # never written under an open room
+        self.assertEqual((self.root / "ch.tex").read_text(), "chapter\n")
+        self.assertEqual(self.pending(), ["main.tex"])
+        self.assertEqual(self.claim("c3")[0], 409)  # not in the room: cannot apply it
+        self.assertEqual(self.claim("nobody")[0], 403)
+        status, got = self.claim("c1")
+        self.assertEqual((status, got["text"]), (200, "new\n"))
+        self.assertEqual(self.claim("c2")[0], 409)  # claimed once: a second editor never applies it concurrently
+        self.assertIsNone(self.done("c2", got["token"]))
+        self.assertEqual(self.pending(), ["main.tex"])  # only the claimer finishes it
+        self.done("c1", got["token"])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
+        self.put("new\n")  # the leader saves the restored text: no "from disk" row for the old one
+        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
+
+    def test_a_restore_left_by_a_closed_browser_is_finished(self):
+        mock.patch.object(serve, "PENDING_DOCS", set()).start()
+        self.put("new\n")
+        first = self.versions("&path=main.tex")[-1]["id"]
+        self.join("c1")
+        self.join("c2")
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": first})[1]["pending"], ["main.tex"])
+        self.assertEqual(self.claim("c1")[0], 200)
+        serve.client_gone("c1")  # the claimer's browser closed before it applied the restore
+        serve.finish_all_pending()  # housekeeping: the claim lapses, another editor in the room may take it
+        self.assertEqual(self.claim("c2")[0], 200)
+        serve.client_gone("c2")  # the last one leaves too: the room is empty, so the server writes the file
+        serve.finish_all_pending()
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(serve.PENDING_DOCS, set())
+
+    def test_concurrent_restores_of_one_file_end_with_the_last(self):
+        mock.patch.object(serve, "PENDING_DOCS", set()).start()
+        self.put("one\n")
+        self.put("two\n")  # merged into one version with "one": same author within COALESCE
+        v1 = self.call("POST", "/api/history/label?doc=demo", {"label": "two"})[1]["id"]
+        self.put("three\n")
         first = self.versions("&path=main.tex")[-1]["id"]  # the text before the first save
-        serve.bind_client("c1", "owner")
-        serve.handle_client_message({"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}}, "c1")
-        status, out = self.call("POST", "/api/history/restore?doc=demo", {"id": first, "path": "main.tex"})
-        self.assertEqual((status, out["written"], out["apply"]),
-                         (200, [], [{"path": "main.tex", "text": "\\section{A}\nhello\n"}]))
-        self.assertEqual((self.root / "main.tex").read_text(), "new\n")  # the browser applies it through the room
-        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
-        self.put("\\section{A}\nhello\n")  # the leader saves the restored text: no "from disk" row for the old one
-        self.assertEqual(self.versions("&path=main.tex")[0]["kind"], "restore")
+        self.join("c1")
+        self.join("c2")
+        self.call("POST", "/api/history/restore?doc=demo", {"id": v1})
+        a = self.claim("c1")[1]
+        self.call("POST", "/api/history/restore?doc=demo", {"id": first})  # a second restore while one is applied
+        self.assertEqual(self.claim("c2")[0], 409)  # still claimed: one at a time
+        self.done("c1", a["token"])  # the first one's token no longer matches: the second stays pending, unclaimed
+        self.assertEqual(self.pending(), ["main.tex"])
+        b = self.claim("c1")[1]
+        self.assertEqual(b["text"], "\\section{A}\nhello\n")
+        self.assertEqual(self.claim("c1", op="release")[1], {"released": True})
+        self.assertEqual(self.claim("c2")[1]["token"], b["token"])
+        self.assertEqual(self.claim("c2", path="build.toml")[0], 409)  # nothing pending there
+
+    def test_cleanup_is_for_the_owner(self):
+        self.tokens = self.share_on()
+        self.put("x\n")
+        label = self.call("POST", "/api/history/label?doc=demo", {"label": "v1"})[1]["id"]
+        for role in ("edit", "view"):
+            self.assertEqual(self.call("POST", "/api/history/clean?doc=demo", {"op": "drop", "id": label},
+                                       role=role)[0], 403)
+        self.assertEqual(self.call("GET", "/api/config", role="edit")[1]["cleanup"], False)
+        self.assertEqual(self.call("GET", "/api/config")[1]["cleanup"], True)
+        for body in ({"op": "drop", "id": "1"}, {"op": "clear", "days": 0}, {"op": "clear", "days": True},
+                     {"op": "clear", "days": 1, "named": "yes"}, {"op": "nuke"}):
+            with self.subTest(body=body):
+                self.assertIn(self.call("POST", "/api/history/clean?doc=demo", body)[0], (400, 404))
+        self.assertEqual(self.call("POST", "/api/history/clean?doc=demo", {"op": "drop", "id": label})[1],
+                         {"removed": 1})
+        self.assertEqual([r for r in self.versions() if r["kind"] == "label"], [])
+        self.assertEqual(self.call("POST", "/api/history/clean?doc=demo", {"op": "drop", "id": label})[0], 404)
+        self.assertEqual(self.call("POST", "/api/history/clean?doc=demo", {"op": "clear", "days": 1})[1],
+                         {"removed": 0})  # everything is newer than a day
+
+    def test_a_full_history_is_reported(self):
+        import history
+        mock.patch.object(serve, "HISTORY_FULL", set()).start()
+        with mock.patch.object(history.Store, "record", side_effect=history.Full("full")):
+            self.assertEqual(self.put("x\n"), 200)  # the save itself never fails
+        self.assertTrue(self.call("GET", "/api/history?doc=demo")[1]["full"])
+        self.put("y\n")
+        self.assertFalse(self.call("GET", "/api/history?doc=demo")[1]["full"])
 
     def test_file_tree_deletes_and_renames_are_versions(self):
         self.write("sub/a.tex", "a text\n")
@@ -2774,6 +2961,16 @@ class HistoryApi(SharedState, ServerCase):
         self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": label["id"], "path": "build.toml"},
                                    role="owner")[0], 200)
         self.assertEqual((self.root / "build.toml").read_text(), "engine = 'pdflatex'\n")
+        self.assertEqual(self.call("GET", "/api/history/pending?doc=demo", role="view")[1], {"pending": []})
+        self.assertEqual(self.call("POST", "/api/history/pending?doc=demo", {"op": "claim", "path": "main.tex"},
+                                   role="view")[0], 403)
+        self.assertEqual(self.call("GET", "/api/history/pending?doc=second", role="edit")[0], 403)
+        serve.bind_client("v1", "view")
+        msg = {"type": "restore-done", "data": {"doc": "demo", "path": "main.tex", "token": "x"}}
+        self.assertEqual(serve.handle_client_message(msg, "v1", "view")["data"]["status"], 403)
+        serve.bind_client("e1", "edit")
+        self.assertEqual(serve.handle_client_message({**msg, "data": {**msg["data"], "doc": "second"}}, "e1",
+                                                     "edit")["data"]["status"], 403)
 
     def test_bus_messages_name_only_the_document_and_are_filtered(self):
         serve.SHARE["doc"] = "demo"
@@ -2934,6 +3131,35 @@ class HostedHistoryAndReview(SharedState, ServerCase):
                              "anchor": {"from": 0, "to": 0, "quote": "", "prefix": "", "suffix": ""}})
         self.assertEqual(status, 507)
         self.assertEqual(self.as_("edit", "POST", "/api/history/label?doc=demo", {"label": "v"})[0], 507)
+
+    def test_workspace_admins_clean_up_history(self):
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "v2"})[0], 200)
+        label = self.as_("edit", "POST", "/api/history/label?doc=demo", {"label": "v"})[1]["id"]
+        admin = {"X-Host-Admin": "1"}
+        drop = {"op": "drop", "id": label}
+        self.assertEqual(self.as_("edit", "POST", "/api/history/clean?doc=demo", drop)[0], 403)
+        self.assertEqual(self.as_("view", "POST", "/api/history/clean?doc=demo", drop, headers=admin)[0], 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/history/clean?doc=demo", drop, headers=admin,
+                                  secret="x" * 40)[0], 401)  # only with the worker secret
+        self.assertEqual(self.as_("edit", "POST", "/api/history/clean?doc=demo", drop,
+                                  headers={"X-Host-Admin": "true"})[0], 403)
+        self.assertFalse(self.as_("edit", "GET", "/api/config")[1]["cleanup"])
+        self.assertTrue(self.as_("edit", "GET", "/api/config", headers=admin)[1]["cleanup"])
+        self.assertEqual(self.as_("edit", "POST", "/api/history/clean?doc=demo", drop, headers=admin)[1],
+                         {"removed": 1})
+        self.assertEqual(self.as_("edit", "POST", "/api/history/clean?doc=demo", {"op": "clear", "days": 30},
+                                  headers=admin)[0], 200)
+
+    def test_the_history_index_counts_toward_the_quota(self):
+        self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "a"})
+        index = serve.history_folder("demo") / "index.sqlite3"
+        self.assertTrue(index.is_file())
+        mock.patch.dict(serve.QUOTA, {"bytes": serve.folder_bytes(self.base) + 100, "area": self.base}).start()
+        rows = self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"]
+        # Back to the text before: its blob is already stored, so only the index would grow, and that is over quota.
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex",
+                                  {"text": "\\section{A}\nhello\n"}, user="8;Bob")[0], 200)
+        self.assertEqual(self.as_("view", "GET", "/api/history?doc=demo")[1]["versions"], rows)
 
     def test_a_client_id_counts_only_for_its_own_account(self):
         serve.bind_client("c1", "edit", "7;Ada")
