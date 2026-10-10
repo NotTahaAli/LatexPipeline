@@ -149,6 +149,68 @@ class CrossrefTests(unittest.TestCase):
             bibfix.suggest_for(text, "nope")
 
 
+class EntryEditTests(unittest.TestCase):
+    TEXT = ('% my refs\n@string{jx = "J. X"}\n\n@article{a,\n    author  = {Ann {B}},\n    title   = "A {T} = q",\n'
+            '    journal = jx,\n    year    = 2001,\n}\n\n@book{b, title={B}, year={1999}}\n\n@misc{c,\n  note = {x}\n}')
+
+    @staticmethod
+    def splice(text, edit):
+        return text[:edit[0]] + edit[2] + text[edit[1]:]
+
+    def test_replace_keeps_unchanged_fields_and_delimiters(self):
+        edit = bibfix.replace_entry(self.TEXT, "a", "article", "a", {
+            "author": "Ann {B}", "title": "New", "journal": "jy", "year": "2002", "doi": "10.1/x"})
+        got = self.splice(self.TEXT, edit)
+        self.assertEqual(got, self.TEXT.replace('"A {T} = q"', '"New"').replace("jx,\n    year    = 2001,",
+                         "jy,\n    year    = 2002,\n    doi     = {10.1/x},"))
+
+    def test_replace_removes_fields_renames_and_retypes(self):
+        got = self.splice(self.TEXT, bibfix.replace_entry(self.TEXT, "a", "inproceedings", "a2", {"author": "Ann {B}", "year": "2001"}))
+        self.assertIn("@inproceedings{a2,\n    author  = {Ann {B}},\n    year    = 2001,\n}\n\n@book", got)
+        inline = self.splice(self.TEXT, bibfix.replace_entry(self.TEXT, "b", "book", "b", {"year": "1999"}))
+        self.assertIn("@book{b, year={1999}}", inline)
+        last = self.splice(self.TEXT, bibfix.replace_entry(self.TEXT, "c", "misc", "c", {"title": "T"}))
+        self.assertTrue(last.endswith("@misc{c,\n  title = {T},\n}"), last[-40:])
+
+    def test_replace_crlf_and_bad_input(self):
+        text = self.TEXT.replace("\n", "\r\n")
+        got = self.splice(text, bibfix.replace_entry(text, "a", "article", "a", {"author": "Ann {B}", "year": "2001", "url": "u"}))
+        self.assertNotIn("\n", got.replace("\r\n", ""))
+        self.assertIn("year    = 2001,\r\n    url     = {u},\r\n}", got)
+        for kind, key, fields in (("article", "a b", {}), ("string", "a", {}), ("article", "a", {"title": "x}"}), ("article", "a", {"bad name": "x"})):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                bibfix.replace_entry(self.TEXT, "a", kind, key, fields)
+        with self.assertRaises(KeyError):
+            bibfix.replace_entry(self.TEXT, "zz", "misc", "zz", {})
+
+    def test_delete_takes_its_line_and_one_blank_line(self):
+        start, end = bibfix.delete_entry(self.TEXT, "b")
+        self.assertEqual(self.TEXT[:start] + self.TEXT[end:], self.TEXT.replace("@book{b, title={B}, year={1999}}\n\n", ""))
+        start, end = bibfix.delete_entry(self.TEXT, "c")  # last entry, no trailing newline
+        self.assertTrue((self.TEXT[:start] + self.TEXT[end:]).endswith("year={1999}}\n\n"))
+        crlf = "@misc{x, a={1}}\r\n\r\n@misc{y, a={2}}\r\n"
+        start, end = bibfix.delete_entry(crlf, "x")
+        self.assertEqual(crlf[:start] + crlf[end:], "@misc{y, a={2}}\r\n")
+
+    def test_append_matches_eol_and_indent(self):
+        at, insert = bibfix.append_entry(self.TEXT, "online", "w", {"title": "{W} x", "url": "http://e", "year": "2020", "note": " "})
+        self.assertEqual(at, len(self.TEXT))
+        self.assertEqual(insert, "\n\n@online{w,\n  title = {{W} x},\n  url = {http://e},\n  year = {2020},\n}\n")
+        at, insert = bibfix.append_entry("@misc{x,\r\n\tnote = {n},\r\n}\r\n", "misc", "y", {"note": "m"})
+        self.assertEqual(insert, "\r\n@misc{y,\r\n\tnote = {m},\r\n}\r\n")
+        self.assertEqual(bibfix.append_entry("", "misc", "z", {})[1], "@misc{z,\n}\n")
+        for text in (self.TEXT, ""):
+            at, insert = bibfix.append_entry(text, "misc", "new", {"title": "T"})
+            self.assertIn("new", [e.key for e in bibfix.parse(text + insert)])
+
+    def test_entry_for_doi(self):
+        with mock.patch.object(bibfix, "get_json", return_value=WORK):
+            got = bibfix.entry_for_doi("doi:10.1000/xyz_123")
+        self.assertEqual((got["type"], got["fields"]["journal"]), ("article", "Journal of Examples"))
+        with self.assertRaises(bibfix.BibLookupError):
+            bibfix.entry_for_doi("not a doi")
+
+
 class LintTests(unittest.TestCase):
     def test_bib_lookup_adds_an_info_finding_and_is_quiet_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2092,6 +2092,110 @@ class BibLookupApi(SharedState, ServerCase):
         self.assertEqual(self.lookup({"text": "x" * serve.BIB_MAX_CHARS, "key": "k"})[0], 200)
 
 
+class BibPanelApi(SharedState, ServerCase):
+    """POST /api/bib, /api/bib/edit, /api/bib/import: the References panel. Crossref is mocked."""
+
+    BIB = "@article{used,\n  title = {T \U0001F600},\n  year = {2020}\n}\n\n@book{spare, title = {S}}\n"
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import bibfix
+        self.bibfix = bibfix
+        work = json.loads((Path(__file__).parent / "fixtures" / "crossref_work.json").read_text(encoding="utf-8"))
+        self.fetch = mock.patch.object(bibfix, "get_json", return_value=work).start()
+        self.write("main.tex", "\\section{A}\n% \\cite{commented}\nSee \\cite[p.~2]{used, gone}.\n\\input{ch}\n"
+                               "\\input{../secret}\n\\bibliography{refs}\n")
+        self.write("ch.tex", "\U0001F600 \\citep{used}\n")
+        self.write("refs.bib", self.BIB)
+        self.write("old/other.bib", "@misc{used, note = {dup}}\n")
+        (self.base / "secret.tex").write_text("\\cite{leaked}", encoding="utf-8")
+        self.tokens = {}
+
+    def post(self, path, body, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"{path}?doc={doc}", body, hdrs)
+
+    def test_overview_lists_entries_citations_and_files(self):
+        status, body = self.post("/api/bib", {})
+        self.assertEqual(status, 200)
+        self.assertEqual([(f["path"], f["used"]) for f in body["files"]],
+                         [("refs.bib", True), ("old/other.bib", False)])
+        by = {(e["key"], e["file"]): e for e in body["entries"]}
+        self.assertEqual(by[("used", "refs.bib")]["missing"], ["author", "journal"])
+        self.assertEqual(by[("spare", "refs.bib")]["line"], 6)
+        spare = by[("spare", "refs.bib")]
+        units = self.BIB.encode("utf-16-le")[spare["start"] * 2:spare["end"] * 2]
+        self.assertEqual(units.decode("utf-16-le"), "@book{spare, title = {S}}")
+        self.assertEqual(body["citations"]["used"],
+                         [{"file": "main.tex", "line": 3, "col": 17}, {"file": "ch.tex", "line": 1, "col": 11}])
+        self.assertEqual(body["citations"]["gone"][0]["col"], 23)
+        self.assertNotIn("commented", body["citations"])
+        self.assertNotIn("leaked", body["citations"])  # a file outside the document is never read into the reply
+        self.assertEqual(body["required"]["article"], ["author", "title", "journal", "year"])
+        # Unsaved editor text wins over the disk.
+        body = self.post("/api/bib", {"texts": {"refs.bib": "@misc{fresh, note={n}}"}})[1]
+        self.assertEqual(sorted(e["key"] for e in body["entries"]), ["fresh", "used"])
+
+    def test_overview_caps_sizes(self):
+        self.write("big.bib", "x" * (serve.BIB_MAX_CHARS + 1))
+        body = self.post("/api/bib", {})[1]
+        self.assertTrue(any("big.bib" in p for p in body["problems"]))
+        with mock.patch.object(serve, "BIB_MAX_FILES", 1):
+            body = self.post("/api/bib", {})[1]
+        self.assertEqual(len(body["files"]), 1)
+        self.assertTrue(any("first 1" in p for p in body["problems"]))
+
+    def test_edit_add_and_delete_return_utf16_splices(self):
+        def apply(reply):
+            raw = self.BIB.encode("utf-16-le")
+            before, after = raw[:reply["from"] * 2], raw[reply["to"] * 2:]
+            return before.decode("utf-16-le") + reply["insert"] + after.decode("utf-16-le")
+        status, reply = self.post("/api/bib/edit", {"text": self.BIB, "op": "edit", "key": "spare", "entry": {
+            "type": "book", "key": "spare", "fields": {"title": "S2"}}})
+        self.assertEqual(status, 200)
+        self.assertEqual(apply(reply), self.BIB.replace("{S}", "{S2}"))
+        reply = self.post("/api/bib/edit", {"text": self.BIB, "op": "delete", "key": "spare"})[1]
+        self.assertEqual(apply(reply), "@article{used,\n  title = {T \U0001F600},\n  year = {2020}\n}\n\n")
+        add = {"type": "misc", "key": "n", "fields": {"note": "x"}}
+        reply = self.post("/api/bib/edit", {"text": self.BIB, "op": "add", "entry": add})[1]
+        self.assertTrue(apply(reply).endswith("\n@misc{n,\n  note = {x},\n}\n"))
+        def entry(key, **fields):
+            return {"type": "misc", "key": key, "fields": fields}
+        for body, code in (({"text": self.BIB, "op": "add", "entry": entry("used")}, 409),
+                           ({"text": self.BIB, "op": "edit", "key": "spare", "entry": entry("used")}, 409),
+                           ({"text": self.BIB, "op": "delete", "key": "zz"}, 409),
+                           ({"text": self.BIB, "op": "add", "entry": entry("a b")}, 400),
+                           ({"text": self.BIB, "op": "add", "entry": entry("k", t="}{")}, 400),
+                           ({"text": self.BIB, "op": "nuke"}, 400), ({"text": 3}, 400),
+                           ({"text": "x" * (serve.BIB_MAX_CHARS + 1), "op": "delete", "key": "k"}, 413)):
+            with self.subTest(body=str(body)[:60]):
+                self.assertEqual(self.post("/api/bib/edit", body)[0], code)
+
+    def test_import_bibtex_and_doi(self):
+        body = self.post("/api/bib/import", {"bibtex": "@article{a, title={A}}\n@book{b, title={oops}"})[1]
+        self.assertEqual([e["key"] for e in body["entries"]], ["a"])
+        self.assertIn("1 entry could not be read", body["error"])
+        self.assertIn("No complete", self.post("/api/bib/import", {"bibtex": "nothing"})[1]["error"])
+        body = self.post("/api/bib/import", {"doi": "https://doi.org/10.1000/xyz_123"})[1]
+        self.assertEqual((body["entries"][0]["type"], body["entries"][0]["fields"]["year"]), ("article", "2019"))
+        self.assertEqual(self.post("/api/bib/import", {"bibtex": 4})[0], 400)
+
+    def test_roles(self):
+        self.tokens = self.share_on()
+        edit = {"text": self.BIB, "op": "delete", "key": "spare"}
+        self.assertEqual(self.post("/api/bib", {}, role="view")[0], 200)  # reading is what a view link is for
+        self.assertEqual(self.post("/api/bib", {}, role="view", doc="demo2")[0], 403)
+        self.assertEqual(self.post("/api/bib/edit", edit, role="view")[0], 403)
+        self.assertEqual(self.post("/api/bib/import", {"doi": "10.1000/xyz_123"}, role="view")[0], 403)
+        self.assertEqual(self.fetch.call_count, 0)
+        self.assertEqual(self.post("/api/bib/edit", edit, role="edit")[0], 200)
+        self.assertEqual(self.post("/api/bib/edit", edit, role="edit", doc="demo2")[0], 403)
+        codes = [self.post("/api/bib/import", {"doi": "10.1000/xyz_123"}, role="edit")[0] for _ in range(11)]
+        self.assertEqual(codes.count(429), 1)  # shares the guests' Crossref budget with Look up
+        self.assertEqual(self.post("/api/bib/lookup", {"text": self.BIB, "key": "used"}, role="edit")[0], 429)
+
+
 class UiWiring(unittest.TestCase):
     """No browser here: check that the scripts only reach for elements the page has, and the page stays accessible."""
 

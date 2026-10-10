@@ -6,6 +6,7 @@ import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
 import * as prose from "./prose.js";
 import { grammarSupport } from "./grammar.js";
 import { addBibLookup } from "./bib.js";
+import { refsPanel } from "./refs.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -25,7 +26,7 @@ const saveSettings = () => store.set("settings", settings);
 // ---- state ------------------------------------------------------------------------------
 let docs = {}, cur = decodeURIComponent(location.hash.slice(1));
 const tabs = new Map();      // path -> tab (per-file editor state)
-let active = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
+let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
 const firstVisit = store.get("ui") === null;
 const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
@@ -243,6 +244,7 @@ async function activate(tab, line, opts = {}) {
   const same = active === tab;
   if (active && !same && active.kind === "text") active.state = view.state;
   active = tab;
+  if (/\.tex$/i.test(tab.path)) lastTex = tab.path;   // Where the References panel cites into while a .bib is open.
   ui.active = tab.path; persistTabs();
   $("cm").hidden = tab.kind !== "text"; $("imgPreview").hidden = tab.kind !== "image";
   if (tab.kind === "image") {
@@ -822,6 +824,38 @@ const bibCtx = {
   },
 };
 
+// References panel (refs.js): reads through the server, writes as splices into the open editor document.
+const refsUi = refsPanel($("panel-refs"), {
+  api, el, icon, readOnly, bib: bibCtx, doc: () => cur, toast: (m) => toast(el("span", { textContent: m })),
+  text: (path) => bibCtx.text(path),
+  async openTexts() { return Object.fromEntries(await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && /\.bib$/i.test(t.path)).map(async (t) => [t.path, await bibCtx.text(t.path)]))); },
+  async splice(path, from, to, insert, expect) {
+    await openFile(path, 0, { noFocus: true });
+    if (view.state.doc.toString() !== expect) return false;   // Edited meanwhile: the offsets no longer fit.
+    view.dispatch({ changes: { from, to, insert }, selection: { anchor: from }, scrollIntoView: true, userEvent: "input.complete" });
+    return true;
+  },
+  async insertCite(keys) {
+    const path = active?.kind === "text" && /\.tex$/i.test(active.path) ? active.path : lastTex;
+    if (!path) { toast(el("span", { textContent: "Open a .tex file first; \\cite goes in at its cursor." })); return; }
+    if (narrow()) setSide(false);
+    if (active?.path !== path) await openFile(path, 0, { noFocus: true });
+    const sel = view.state.selection.main, before = view.state.doc.sliceString(Math.max(0, sel.head - 300), sel.head), after = view.state.doc.sliceString(sel.head, sel.head + 300);
+    const inside = sel.empty && /\\\w*cite\w*\*?(?:\[[^\]]*\])*\{[^{}]*$/.test(before) && /^[^{}]*\}/.test(after);   // Cursor in \cite{...}: add the keys to it.
+    const insert = inside ? (/[{,]\s*$/.test(before) ? "" : ",") + keys.join(",") + (/^\s*[,}]/.test(after) ? "" : ",") : `\\cite{${keys.join(",")}}`;
+    view.dispatch({ changes: { from: sel.from, to: sel.to, insert }, selection: { anchor: sel.from + insert.length }, scrollIntoView: true, userEvent: "input" });
+    view.focus();
+  },
+  async jump(path, line, col) {
+    if (/\.tex$/i.test(path)) await jumpTo(path, line); else { if (narrow()) setSide(false); await openFile(path, line); }
+    if (!col || active?.path !== path) return;
+    const ln = view.state.doc.line(Math.max(1, Math.min(line, view.state.doc.lines))), pos = Math.min(ln.from + col - 1, ln.to);
+    view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: "center" }) });
+  },
+  async newFile(path) { await api.fs(cur, "newfile", path); await loadFiles(); },
+  changed: () => loadRefs(),
+});
+
 async function loadLint() {
   $("lintList").replaceChildren(el("li", { className: "none", textContent: "Checking..." }));
   try {
@@ -949,17 +983,18 @@ $("drawerClose").onclick = () => setDrawer(false);
 // ---- sidebar toggles ----------------------------------------------------------------------------------
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
-  $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open));
-  for (const n of ["files", "outline"]) {
+  $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
+  for (const n of ["files", "outline", "refs"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
-  if (open) { loadFiles(); renderTree(); loadOutline(); }
+  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); }
 }
 $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
 $("tab-files").onclick = () => setSide(true, "files");
 $("tab-outline").onclick = () => setSide(true, "outline");
+$("tab-refs").onclick = () => setSide(true, "refs");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------
 async function setVisual(on) {
@@ -1047,6 +1082,7 @@ const COMMANDS = [
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
+  { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
@@ -1141,7 +1177,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
+  const entries = ["files", "outline", "references", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
@@ -1347,6 +1383,7 @@ async function restoreTabs() {
   const want = tabs.get(saved?.active) || [...tabs.values()][0];
   if (want) await activate(want, 0, { noFocus: true });
   if (settings.visual) loadRefs();
+  if (ui.side && ui.sideTab === "refs") refsUi.load();
 }
 
 $("doc").onchange = (e) => pick(e.target.value);
