@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _support import ci_report
+from _support import build, ci_report
 
 grammar = importlib.import_module("grammar")  # after _support put scripts/ on sys.path
 
@@ -34,6 +34,7 @@ class GrammarLintTests(unittest.TestCase):
         grammar.CACHE.clear()
         for patch in (
             mock.patch.object(ci_report, "SOURCE_DIR", root / "files"),
+            mock.patch.object(build, "ROOT_DIR", root),
             mock.patch.object(ci_report, "OUT_DIR", root / "out"),
             mock.patch.object(ci_report, "LINT_PATH", root / "out" / "lint.json"),
             mock.patch.object(ci_report, "REPORT_PATH", root / "none.json"),
@@ -65,6 +66,13 @@ class GrammarLintTests(unittest.TestCase):
         self.assertIn("Try: good", [f["message"] for f in found if f["kind"] == "grammar"][0])
         self.assertIn("OTHER", self.post.call_args.args[1]["disabledRules"])
         self.assertIs(self.post.call_args.kwargs["proxy"], False)
+
+    def test_invalid_build_toml_skips_the_document_without_crashing(self):
+        self.toml("grammar = [\n")
+        code, output = self.run_lint()
+        self.assertEqual(code, 0)
+        self.assertIn("grammar check skipped", output)
+        self.post.assert_not_called()
 
     def test_baseline_suppresses_grammar_findings(self):
         self.toml('grammar = "local"\n')

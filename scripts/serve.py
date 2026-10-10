@@ -1208,6 +1208,7 @@ def lint(doc_name: str) -> list[dict]:
 # and without that a local server if one answers. Public mode sends text to languagetool.org.
 GRAMMAR: dict = {"mode": "auto", "url": None, "share_public": False}
 GRAMMAR_MAX_CHARS = 400_000
+GRAMMAR_MAX_SHARED_CHARS = 100_000  # while sharing: a non-owner must not tie up LanguageTool
 _PROBES: dict = {}
 
 
@@ -1239,7 +1240,7 @@ def grammar_plan(name: str) -> tuple[str, str | None, dict]:
 
 def grammar_check(name: str, text) -> dict:
     """Findings for the text of one open file, positioned in UTF-16 units like the editor counts."""
-    if not isinstance(text, str) or len(text) > GRAMMAR_MAX_CHARS:
+    if not isinstance(text, str) or len(text) > (GRAMMAR_MAX_SHARED_CHARS if SHARE["on"] else GRAMMAR_MAX_CHARS):
         raise ApiError("Bad or oversized text.", 413)
     mode, url, cfg = grammar_plan(name)
     if mode == "off":

@@ -1856,6 +1856,12 @@ class GrammarApi(SharedState, ServerCase):
         self.assertIn("languagetool.org", body["notice"])
         self.assertEqual(self.calls[0], (self.grammar.PUBLIC_URL, True))
 
+    def test_text_limit_is_lower_while_sharing(self):
+        big = "a " * (serve.GRAMMAR_MAX_SHARED_CHARS // 2 + 10)
+        self.assertEqual(self.check(big)[0], 200)
+        self.tokens = self.share_on()
+        self.assertEqual(self.check(big, role="edit")[0], 413)
+
     def test_bad_input(self):
         self.assertEqual(self.request("POST", "/api/grammar?doc=demo", {"text": 5})[0], 413)
         huge = {"text": "x" * (serve.GRAMMAR_MAX_CHARS + 1)}

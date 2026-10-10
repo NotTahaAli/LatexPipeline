@@ -32,7 +32,7 @@ from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 import grammar
-from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, read_settings, size_text
+from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, ConfigError, read_settings, size_text
 from hints import overfull_boxes
 
 REPORT_PATH = OUT_DIR / "build-report.json"
@@ -509,8 +509,8 @@ def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[F
 
 def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
     """LanguageTool findings for every .tex file the document pulls in. Quiet and empty when grammar is off."""
-    settings = read_settings(doc_dir / "main.tex")
     try:
+        settings = read_settings(doc_dir / "main.tex")
         grammar.validate_settings(settings)
         mode, url = grammar.resolve(settings.get("grammar"), settings.get("grammar_url"))
         in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -537,7 +537,7 @@ def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
                                                  lang=settings["lang"], disabled=settings.get("disabled_rules", []))
             ]
         return found
-    except grammar.GrammarError as error:
+    except (grammar.GrammarError, ConfigError) as error:
         print(f"{name}: grammar check skipped: {error}")
         return []
 

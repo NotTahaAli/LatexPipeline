@@ -36,6 +36,7 @@ MODES = ("auto", "off", "local", "public")
 PROBE_TIMEOUT = 0.3
 CHUNK_BYTES = 15_000  # of text per request; the public limit is 20 KB
 MAX_REPLACEMENTS = 3
+MAX_MATCHES = 500  # per LanguageTool reply; more are noise and cost time
 # Rules that misfire on text extracted from LaTeX (spacing, quotes, placeholders for math and references).
 IGNORED_RULES = {
     "WHITESPACE_RULE", "CONSECUTIVE_SPACES", "SENTENCE_WHITESPACE", "COMMA_PARENTHESIS_WHITESPACE", "EN_QUOTES",
@@ -104,6 +105,7 @@ BLANK_LINE = re.compile(r"[ \t]*\n(?:[ \t]*\n)+")
 class Extracted(NamedTuple):
     plain: str
     src: list[int]  # src[k] = offset in the source of plain[k]
+    end: list[int]  # end[k] = offset just past the source that produced plain[k]
 
 
 def match_brace(text: str, pos: int) -> int:
@@ -140,11 +142,13 @@ class _Plain:
     def __init__(self) -> None:
         self.chars: list[str] = []
         self.src: list[int] = []
+        self.end: list[int] = []
 
-    def add(self, text: str, at: int) -> None:
+    def add(self, text: str, at: int, end: int | None = None) -> None:
         for char in text:
             self.chars.append(char)
             self.src.append(at)
+            self.end.append(at + 1 if end is None else end)
 
     def space(self, at: int) -> None:
         if self.chars and self.chars[-1] not in " \n":
@@ -154,12 +158,14 @@ class _Plain:
         while self.chars and self.chars[-1] == " ":
             self.chars.pop()
             self.src.pop()
+            self.end.pop()
         if self.chars and "".join(self.chars[-2:]) != "\n\n":
             self.add("\n\n", at)
 
     def clear(self) -> None:
         self.chars.clear()
         self.src.clear()
+        self.end.clear()
 
 
 def skip_groups(text: str, i: int, count: int) -> int:
@@ -218,10 +224,10 @@ def extract(text: str) -> Extracted:
                 out.space(i)
                 i += 1
         elif text.startswith("``", i):
-            out.add("“", i)
+            out.add("“", i, i + 2)
             i += 2
         elif text.startswith("''", i):
-            out.add("”", i)
+            out.add("”", i, i + 2)
             i += 2
         elif c == "`":
             out.add("‘", i)
@@ -233,7 +239,8 @@ def extract(text: str) -> Extracted:
     while out.chars and out.chars[-1] in " \n":
         out.chars.pop()
         out.src.pop()
-    return Extracted("".join(out.chars), out.src)
+        out.end.pop()
+    return Extracted("".join(out.chars), out.src, out.end)
 
 
 def _dollar(text: str, i: int, out: _Plain) -> int:
@@ -241,7 +248,7 @@ def _dollar(text: str, i: int, out: _Plain) -> int:
     end = find_unescaped(text, token, i + len(token))
     if end < 0 or BLANK_LINE.search(text, i, end):
         return i + 1  # a stray $ never swallows a paragraph
-    out.add("X", i)
+    out.add("X", i, end + len(token))
     return end + len(token)
 
 
@@ -260,11 +267,11 @@ def _command(text: str, i: int, out: _Plain, closers: set[int]) -> int:
         end = find_unescaped(text, "\\]" if nxt == "[" else "\\)", i + 2)
         if end < 0:
             return i + 2
-        out.add("X", i)
+        out.add("X", i, end + 2)
         return end + 2
     if nxt in ACCENT_MARKS:
         return _accent(text, i, i + 2, ACCENT_MARKS[nxt], out)
-    if not nxt.isalpha():
+    if not (nxt.isascii() and nxt.isalpha()):  # control words are ASCII letters; \é is a control symbol
         if nxt == " ":
             out.space(i)
         return i + 2  # \, \; \! \- \/ and the like
@@ -326,7 +333,7 @@ def _accent(text: str, i: int, j: int, mark: str, out: _Plain) -> int:
         if text[k:k + 1] != "}":
             return j  # {\'ab}: not a single letter, leave it
         k += 1
-    out.add(unicodedata.normalize("NFC", base + mark), i)
+    out.add(unicodedata.normalize("NFC", base + mark), i, k)
     return k
 
 
@@ -371,6 +378,17 @@ def utf16_length(text: str) -> int:
 def to_utf16(text: str, index: int) -> int:
     """UTF-16 code unit offset (what CodeMirror and LanguageTool count) of a code point index."""
     return index + sum(ord(c) > 0xFFFF for c in text[:index])
+
+
+class Utf16Map:
+    """from_utf16 for many offsets into one text: O(log n) each after one pass."""
+
+    def __init__(self, text: str) -> None:
+        self.units = [i + k for k, i in enumerate(i for i, c in enumerate(text) if ord(c) > 0xFFFF)]
+        self.size = len(text)
+
+    def index(self, unit: int) -> int:
+        return min(max(unit - bisect.bisect_right(self.units, unit - 2), 0), self.size)
 
 
 def from_utf16(text: str, unit: int) -> int:
@@ -519,7 +537,7 @@ def split_paragraphs(plain: str) -> list[tuple[int, str]]:
             cut = text.rfind(" ", 0, CHUNK_BYTES // 4)  # characters, so a multi-byte text still fits
             cut = cut if cut > 0 else CHUNK_BYTES // 4
             pieces.append((start, text[:cut]))
-            start, text = start + cut + 1, text[cut + 1:]
+            start, text = start + cut, text[cut:]
         if text.strip():
             pieces.append((start, text))
     return pieces
@@ -527,11 +545,12 @@ def split_paragraphs(plain: str) -> list[tuple[int, str]]:
 
 def _raw_matches(reply: dict, chunk: str) -> list[tuple[int, int, str, str, str, tuple[str, ...]]]:
     found = []
-    for match in reply.get("matches", []):
+    units = Utf16Map(chunk)
+    for match in reply.get("matches", [])[:MAX_MATCHES]:
         rule = match.get("rule") or {}
         category = (rule.get("category") or {}).get("id", "")
-        start = from_utf16(chunk, int(match.get("offset", 0)))
-        end = from_utf16(chunk, int(match.get("offset", 0)) + int(match.get("length", 0)))
+        start = units.index(int(match.get("offset", 0)))
+        end = units.index(int(match.get("offset", 0)) + int(match.get("length", 0)))
         replacements = tuple(r.get("value", "") for r in match.get("replacements", [])[:MAX_REPLACEMENTS])
         found.append((start, end, rule.get("id", "UNKNOWN"), str(match.get("message", "")), category, replacements))
     return found
@@ -573,18 +592,25 @@ def check_plain(plain: str, *, url: str, public: bool, lang: str, disabled: set[
         for start, paragraph, key in batch:
             spans.append((position, position + len(paragraph), start, key))
             position += len(paragraph) + 2
+        lows = [span[0] for span in spans]
         per_paragraph: dict[str, list] = {key: [] for _, _, _, key in spans}
         for a, b, rule, message, category, replacements in raw:
             if rule in off or category in IGNORED_CATEGORIES:
                 continue
-            for low, high, start, key in spans:
-                if low <= a and b <= high:  # a match across two paragraphs is dropped
-                    per_paragraph[key].append((a - low, b - low, rule, message, replacements))
-                    matches.append((start + a - low, start + b - low, rule, message, replacements))
-                    break
+            low, high, start, key = spans[max(bisect.bisect_right(lows, a) - 1, 0)]
+            if low <= a and b <= high:  # a match across two paragraphs is dropped
+                per_paragraph[key].append((a - low, b - low, rule, message, replacements))
+                matches.append((start + a - low, start + b - low, rule, message, replacements))
         for _, _, _, key in spans:
             _cache_put(key, per_paragraph[key])
     return sorted(matches)
+
+
+def _exact(span: str, plain: str) -> bool:
+    """Does the source span read as exactly this plain text (quotes and whitespace aside)? Else no quick fix."""
+    def norm(t: str) -> str:
+        return " ".join(t.replace("``", "“").replace("''", "”").replace("`", "‘").replace("~", " ").split())
+    return norm(span) == norm(plain)
 
 
 def check_source(text: str, path: str, *, url: str, public: bool, lang: str = "auto", disabled=(),
@@ -597,9 +623,10 @@ def check_source(text: str, path: str, *, url: str, public: bool, lang: str = "a
             extracted.plain, url=url, public=public, lang=lang, disabled=set(disabled), max_wait=max_wait):
         if end <= start:
             continue
-        first, last = extracted.src[start], extracted.src[end - 1] + 1
+        first, last = extracted.src[start], extracted.end[end - 1]
         span = text[first:last]
-        if UNSAFE_REPLACE.search(span) or "\n" in span and "\n\n" in span:
+        if (UNSAFE_REPLACE.search(span) or "\n" in span and "\n\n" in span
+                or not _exact(span, extracted.plain[start:end])):
             replacements = ()
         line, col = index.locate(first)
         findings.append(Finding(path, line, col, rule, message, replacements, first, last - first, span))

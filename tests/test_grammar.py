@@ -80,6 +80,12 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(grammar.extract("Caf\\'e na\\\"{\\i}ve Schr\\\"odinger \\c{c}a").plain, "Café naïve Schrödinger ça")
         self.assertEqual(grammar.extract("``Quoted'' \\LaTeX{} and\\ldots").plain, "\u201cQuoted\u201d LaTeX and…")
 
+    def test_backslash_before_non_ascii_letter_does_not_crash(self):
+        for src in ("Text \\\u00e9 more", "Text \\\u00fc more", "Text \\\u00df more"):
+            grammar.extract(src)
+        self.assertIn("more", grammar.extract("Text \\\u00e9 more").plain)
+        self.assertEqual(grammar.extract("Caf\\'e and \\\"u").plain, "Caf\u00e9 and \u00fc")
+
     def test_line_and_column_of_a_mapped_character(self):
         source = "One.\n  \\textbf{Two} three.\n"
         got = grammar.extract(source)
@@ -172,6 +178,44 @@ class CheckTests(unittest.TestCase):
         grammar.check_source("word " * 20000, "m.tex", url="u", public=False)
         for call in self.post.call_args_list:
             self.assertLessEqual(len(call.args[1]["text"].encode()), grammar.CHUNK_BYTES)
+
+    def test_no_character_is_lost_when_a_cut_finds_no_space(self):
+        text = "x" * 40000
+        pieces = grammar.split_paragraphs(text)
+        self.assertEqual("".join(t for _, t in pieces), text)
+        self.assertTrue(all(text[s:s + len(t)] == t for s, t in pieces))
+
+    def test_many_matches_are_capped_and_fast(self):
+        import time
+        text = "the the " * 50000
+
+        def reply(url, fields, proxy=False):
+            return {"matches": [{"message": "m", "offset": 4 * k, "length": 3, "replacements": [],
+                                 "rule": {"id": "R", "category": {"id": "GRAMMAR"}}} for k in range(1000)]}
+        self.post.side_effect = reply
+        began = time.monotonic()
+        found = grammar.check_source(text, "m.tex", url="u", public=False)
+        self.assertLess(time.monotonic() - began, 3)
+        self.assertTrue(found)
+        self.assertLessEqual(len(found), grammar.MAX_MATCHES * len(self.post.call_args_list))
+
+    def test_utf16_map_matches_from_utf16(self):
+        text = "a\U0001F600b\U0001F600\U0001F600c"
+        mapper = grammar.Utf16Map(text)
+        for unit in range(grammar.utf16_length(text) + 2):
+            self.assertEqual(mapper.index(unit), grammar.from_utf16(text, unit), unit)
+
+    def test_quote_ligature_quick_fix_covers_the_whole_source(self):
+        self.post.side_effect = lambda url, fields, proxy=False: lt_reply(fields["text"], "\u201chello\u201d")
+        source = "Say ``hello'' now."
+        (found,) = grammar.check_source(source, "m.tex", url="u", public=False)
+        self.assertEqual(source[found.offset:found.offset + found.length], "``hello''")
+        self.assertEqual(found.replacements, ("fixed",))
+
+    def test_replacements_dropped_when_the_span_is_not_the_plain_text(self):
+        self.post.side_effect = lambda url, fields, proxy=False: lt_reply(fields["text"], "a 1 b")
+        (found,) = grammar.check_source("It is a \\ref{x} b.", "m.tex", url="u", public=False)
+        self.assertEqual(found.replacements, ())
 
     def test_local_requests_bypass_proxies_public_ones_do_not(self):
         self.post.return_value = {"matches": []}
