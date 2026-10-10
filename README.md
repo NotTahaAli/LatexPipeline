@@ -1,23 +1,46 @@
-# Latex Document Pipeline
+# LaTeX Document Pipeline
 
-LaTeX document pipeline, including a cross-platform build script and github releases document upload.
+A cross-platform build script, a local editor with live preview, and a GitHub Actions workflow that publishes every document's PDF to a release.
 
-**Latest PDFs:** [Releases, `pdfs`](https://github.com/NotTahaAli/LatexPipeline/releases/tag/pdfs). This release always holds the newest PDF of every document, with the full log of its latest build (`.log`) next to it.
+**Latest PDFs:** [Releases, `pdfs`](https://github.com/NotTahaAli/LatexPipeline/releases/tag/pdfs). It always holds the newest PDF of every document, with the log of its latest build (`.log`) next to it.
 
-Every directory under `files/` that contains a `main.tex` is a standalone document. It compiles to a PDF under `out/`, mirroring its path:
+Each directory under `files/` that contains a `main.tex` is a standalone document, built to `out/<path>.pdf`:
 
 ```text
-files/abc/main.tex   ->  out/abc.pdf
-files/reports/final/main.tex     ->  out/reports/final.pdf
+files/abc/main.tex            ->  out/abc.pdf
+files/reports/final/main.tex  ->  out/reports/final.pdf
 ```
 
-Everything inside a document's directory (`.tex`, `.bib`, `.cls`, figures, ...) counts as that document's input.
+## Quick start
+
+```bash
+latexmk --version                          # needs Python 3.9+ and a LaTeX distribution, see Requirements
+python scripts/build.py                    # build documents that are missing or out of date
+python scripts/build.py --watch --open     # rebuild on every save, open each PDF
+python scripts/serve.py                    # editor with live preview at http://localhost:8000
+python scripts/build.py --new MyDoc        # new document from a template (files/MyDoc/main.tex)
+```
+
+With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --help` and `python scripts/serve.py --help` list every flag.
+
+## Contents
+
+* [Requirements](#requirements)
+* [Building](#building)
+* [Documents and settings](#documents-and-settings): [build.toml keys](#buildtoml-keys), [grammar](#grammar), [PDF/A](#pdfa)
+* [Large documents](#large-documents) and [benchmarks](#benchmarks)
+* [VS Code](#vs-code)
+* [Live preview and editor](#live-preview-and-editor), [sharing](#sharing)
+* [Lint and CI reports](#lint-and-ci-reports)
+* [GitHub Actions](#github-actions)
+* [Tests and lint](#tests-and-lint)
+* [Python project](#python-project-and-requirementstxt)
 
 ---
 
 ## Requirements
 
-* Python 3.9+ (standard library only; Python 3.9 and 3.10 also need `tomli` for `build.toml`, see [Engine and settings](#engine-and-settings))
+* Python 3.9+ (standard library only; Python 3.9 and 3.10 also need `tomli` for `build.toml`, see [build.toml keys](#buildtoml-keys))
 * A LaTeX distribution that includes `latexmk`:
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
@@ -40,7 +63,7 @@ python scripts/build.py "FP-123 Report"  # build only that document (or a glob s
 python scripts/build.py --new MyDoc      # create files/MyDoc/main.tex from a template
 python scripts/build.py --watch --open   # keep running, rebuild on every save, open each PDF after its first build
 python scripts/build.py --list           # show discovered documents and whether they are up to date
-python scripts/build.py --clean          # delete out/
+python scripts/build.py --clean          # delete out/ and .latex-cache/
 python scripts/build.py --changed-since origin/main   # only documents changed since a git ref
 python scripts/build.py --profile        # also print the figures and LaTeX time of each document
 python scripts/build.py --source bench sample-report   # build from bench/ instead of files/ (not built by CI)
@@ -55,7 +78,7 @@ A document counts as **out of date** when any file in its directory, any file ou
 
 For each document, the script:
 
-1. Runs `latexmk -pdf` in `.latex-cache/` (git-ignored), with one directory per document, so nested documents never share one. The `.aux`, `.bbl`, ... files stay there between builds, so a text edit needs one LaTeX pass instead of a full cold build (about 7 s instead of 19 s for the report). If a build fails with cached files, the cache is wiped and the build retried once from scratch. CI keeps the same cache with `actions/cache`.
+1. Runs `latexmk -pdf` in `.latex-cache/` (git-ignored), with one directory per document, so nested documents never share one. The `.aux`, `.bbl`, ... files stay there between builds, so a text edit needs one LaTeX pass instead of a full cold build (see the measurements under Large documents). If a build fails with cached files, the cache is wiped and the build retried once from scratch. CI keeps the same cache with `actions/cache`.
 2. Copies only the final PDF into `out/`.
 3. Writes the full build log to `out/<name>.log` (for example `out/FP-123 Proposal.log`), whether the build succeeded or not. The log starts with the result and any errors. Then comes the latexmk console output from every pass, followed by LaTeX's own `.log` and BibTeX's `.blg`, so every info line, warning and error is in it.
 4. Carries on with the remaining documents if one fails (an unexpected exception included, reported as `Build crashed: ...`), and prints a summary.
@@ -73,7 +96,9 @@ If `latexmk` isn't on `PATH`, the script stops before building and prints instal
 
 ---
 
-## Adding a document
+## Documents and settings
+
+### Adding a document
 
 Create a directory under `files/` with a `main.tex`:
 
@@ -92,38 +117,34 @@ You don't need to change `build.py`. Keep inputs inside the document's directory
 
 latexmk runs with `SOURCE_DATE_EPOCH` set to the time of the last commit that touched the document's directory (its newest input when git has no history for it) and `FORCE_SOURCE_DATE=1`. Building the same commit twice gives byte-identical PDFs. Side effect: `\today` shows that commit's date, not the build date.
 
-### Engine and settings
+### build.toml keys
 
-The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex`:
+The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex` (`% !TEX program = xelatex`; `pdflatex` is the default). A `build.toml` next to `main.tex` can set the rest; every key is optional, and an unknown key, a wrong type or an unsupported value fails that document only (the reason is at the top of its log).
 
-```latex
-% !TEX program = xelatex
-```
-
-Supported engines are `pdflatex` (the default), `xelatex` and `lualatex`.
-
-A document can also have a `build.toml` next to its `main.tex`. Every key is optional:
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `engine` | magic comment, else `"pdflatex"` | `"pdflatex"`, `"xelatex"` or `"lualatex"`; overrides the magic comment. |
+| `shell_escape` | `false` | Allow `\write18`. Forced off while [sharing](#sharing). |
+| `latexmk_args` | `[]` | Extra latexmk arguments (list of strings). While sharing, ones that run code or move output fail the build. |
+| `externalize` | `true` | Compile TikZ/pgfplots figures once and cache them, see [Large documents](#large-documents). |
+| `pdfa` | off | PDF/A level, `"2b"` or `"a-2b"` (part 1, 2 or 3 with conformance a, b or u, such as `"3b"`), see [PDF/A](#pdfa). |
+| `lang` | `"en-US"` | Document language: PDF/A metadata and the grammar checker. |
+| `timeout` | `600` | Seconds (10 to 7200) before a latexmk run is killed. `--timeout` changes the default; sharing caps it at 300. |
+| `grammar` | `"auto"` | `"auto"`, `"off"`, `"local"` or `"public"`, see [Grammar](#grammar). |
+| `grammar_url` | `http://localhost:8081` | LanguageTool server for local mode (`LANGUAGETOOL_URL` is the fallback). |
+| `disabled_rules` | `[]` | LanguageTool rule ids to ignore. |
 
 ```toml
-engine = "lualatex"      # overrides the magic comment
-shell_escape = true      # default: false
-latexmk_args = ["-g"]    # extra arguments passed to latexmk
-externalize = false      # default: true; see "Large documents"
-pdfa = "2b"              # default: off; PDF/A-2b, see "PDF/A"
-lang = "en-US"           # document language, written into the PDF/A metadata
-timeout = 600            # default: 600; seconds (10 to 7200) before a latexmk run is killed; --timeout sets the default, sharing caps it at 300
-grammar = "auto"         # default: auto; off, local or public, see "Grammar"
-grammar_url = "http://localhost:8081"  # a LanguageTool server (default; LANGUAGETOOL_URL also works)
-disabled_rules = ["MORFOLOGIK_RULE_EN_US"]  # LanguageTool rule ids to ignore
+engine = "lualatex"
+pdfa = "2b"
+timeout = 900
 ```
-
-An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
 
 ### Grammar
 
 Grammar and style checks come from [LanguageTool](https://languagetool.org). `scripts/grammar.py` reduces the LaTeX to prose (no comments, commands, math, `verbatim`, `lstlisting`, `minted` or `tikzpicture`; headings, captions, footnotes and the text of `\emph{}` and `\textbf{}` stay) and remembers where every character came from, so a finding is `file:line:col`. `\ref` and `\cite` become a number, math becomes `X`. Spacing and quote rules that misfire on extracted text are ignored, as is the Typography category.
 
-* **Local server** (default when one answers `/v2/languages` within 300 ms): `docker run -d -p 8081:8010 erikvl87/languagetool`, or the LanguageTool zip with `java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8081`. URL: `grammar_url` in `build.toml`, else `LANGUAGETOOL_URL`, else `http://localhost:8081`. The text never leaves your machine, and local requests bypass any proxy.
+* **Local server** (what `auto` picks when one answers `/v2/languages` within 300 ms): `docker run -d -p 8081:8010 erikvl87/languagetool`, or the LanguageTool zip with `java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8081`. URL: `grammar_url` in `build.toml`, else `LANGUAGETOOL_URL`, else `http://localhost:8081`. The text never leaves your machine, and local requests bypass any proxy.
 * **Public API** (`grammar = "public"` in `build.toml`, or Settings > Grammar in the editor): **your text is sent to languagetool.org** (`https://api.languagetool.org/v2/check`). It is never chosen automatically. Requests are paragraph batches of at most 15 KB, throttled below the free tier (20 requests and 75 KB a minute), and cached by paragraph, so re-checking an edited file only sends the changed paragraphs.
 * `grammar = "off"` or nothing found: no check, no network. The language is `lang` from `build.toml` (default `en-US`).
 
@@ -149,9 +170,9 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 ---
 
-## Live preview
+## Live preview and editor
 
-`python scripts/serve.py [DOC] [--port 8000] [--no-open]` starts an editor and live preview at http://localhost:8000, bound to 127.0.0.1 only. It rebuilds on save, keeps scroll and zoom, lists errors with editor links, and double-click in the PDF jumps to the source. It needs the synctex CLI from TeX Live, and internet for PDF.js, CodeMirror and Yjs from pinned CDN versions.
+`python scripts/serve.py [DOC ...] [--port 8000] [--no-open] [--source DIR] [--editor vscode]` starts an editor and live preview at http://localhost:8000, bound to 127.0.0.1 only. It rebuilds on save, keeps scroll and zoom, lists errors with editor links, and double-click in the PDF jumps to the source. It needs the synctex CLI from TeX Live, and internet for PDF.js, CodeMirror and Yjs from pinned CDN versions.
 
 **Finding your way.** The first visit shows a one-line quick start (Outline, Visual, Ctrl+K, double-click the PDF); "Got it" hides it for good and More > "Show getting-started tips" brings it back. The Outline lists sections with word counts; hover a row for the target button to set a per-section word goal (stored in this browser; the row fills as you write). While a build runs the top bar counts the seconds and a bar fills against the previous build's time, the empty PDF pane shows a page skeleton instead of a blank, and after a failed build the old PDF stays with a "last good PDF" note. The failing line is marked in the editor and the first error opens by itself with its hint. Fit width follows the pane until you zoom by hand. Visual mode sets prose in the UI sans font and leftover LaTeX in monospace, in both themes; PDF pages are always white. The page is keyboard operable (dialogs trap focus and return it, the build result is announced to screen readers) and passes axe-core in light and dark. A view link shows a "View only" chip, and Rebuild and Paragraph stay visible but disabled, with the reason as their tooltip.
 
@@ -163,13 +184,15 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 **Editing together.** Everyone who opens the same document edits it live (Yjs): you see each other's cursors and selections with names and colours, and a stack of avatars in the top bar opens the list of people. The server only relays the changes. One editor per file, the "leader", saves to disk through the normal atomic save; if the leader leaves, another takes over. If you change a file outside the editor (git, vim) while it is open, the change is merged into the shared text instead of overwriting anyone's typing. If the connection drops, you can keep typing; the edits merge when it returns, over WebSocket or the long-poll fallback.
 
-**Sharing.** `python scripts/serve.py --share [cloudflared|ngrok|localtunnel|pinggy|localhost.run|auto]` (or Share in the top bar) starts a tunnel and prints two links for the first document: a view link (read-only source, PDF and outline) and an edit link (edit the document's files and rebuild it). `auto` picks the first installed of cloudflared, ngrok, npx localtunnel, then ssh (pinggy, localhost.run); with none installed it tells you what to install. No link works after you stop sharing or quit.
+### Sharing
+
+`python scripts/serve.py --share [auto|local|cloudflared|ngrok|localtunnel|pinggy|localhost.run]` (or Share in the top bar) starts a tunnel and prints two links for the first document: a view link (read-only source, PDF and outline) and an edit link (edit the document's files and rebuild it). `local` gives token links without a tunnel (same network or your own tunnel). `auto` picks the first installed of cloudflared, ngrok, npx localtunnel, then ssh (pinggy, localhost.run); with none installed it tells you what to install. No link works after you stop sharing or quit.
 
 * Install: [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) (no account, the default), [ngrok](https://ngrok.com/download) (free account and `ngrok config add-authtoken`), Node.js for localtunnel, or ssh for pinggy and localhost.run. The ssh and ngrok parsers follow each tool's documented output but are untested here; if one fails, please report its output.
 * ngrok's free plan shows a warning page on the first visit; each visitor clicks Visit Site once. localtunnel may ask for a tunnel password (your public IP).
 * Cloudflare quick tunnels do not support Server-Sent Events; the editor uses WebSocket with a long-poll fallback, so it works. `python scripts/serve.py --share-selftest [--share PROVIDER]` starts the tunnel and checks `/api/health`, a WebSocket echo and a 30 s long-poll through the public URL, then prints a table. Run it on your own machine before a session; it needs outbound access that restricted networks do not give.
 
-Security while sharing:
+**Security while sharing:**
 
 * Every request needs a token, loopback included. A tunnel connects to the server from 127.0.0.1, so "local" proves nothing; your own browser gets a private third token as a cookie when sharing starts. Tokens are random 32-byte URL-safe strings, compared in constant time. A link sets an HttpOnly, SameSite=Lax cookie on the first visit and redirects to a URL without the token. New links ("New links" in the Share dialog) disconnect everyone on the old ones.
 * The view role cannot save, rebuild, or see other documents (their messages, cursors and names included), in the UI or the API; it can open existing files of the shared document. The edit role can create and change any file of the shared document (text, `.tex`, `.bib`, `.cls`, ...) and rebuild it, but never `build.toml`, `latexmkrc` or `.latexmkrc`, not even through live co-editing. Rebuilds are rate limited (6 a minute). Each client and room is capped in count and size.
@@ -225,6 +248,24 @@ python scripts/build.py --source bench sample-report
 
 ---
 
+## Lint and CI reports
+
+`scripts/ci_report.py` (standard library only; CI-only apart from local use) reads `out/build-report.json`:
+
+```bash
+python scripts/ci_report.py summary                  # markdown table of the last build
+python scripts/ci_report.py lint [DOC ...]           # labels, refs, figures, bib checks, overfull boxes, chktex, word counts -> out/lint-report.json
+python scripts/ci_report.py lint --strict            # exit 1 on findings
+python scripts/ci_report.py lint --update-baseline   # accept current findings in files/<doc>/.lint-baseline
+python scripts/ci_report.py lint --grammar           # add LanguageTool findings, see Grammar
+python scripts/ci_report.py diff --base REF --out DIR  # latexdiff of changed documents
+python scripts/ci_report.py pr-comment [--print]     # sticky PR comment (needs gh and GH_TOKEN)
+```
+
+A missing `chktex`, `texcount` or `latexdiff` leaves its column blank. `--overfull-pt` (default 10) sets the overfull-box threshold.
+
+---
+
 ## Tests and lint
 
 ```bash
@@ -232,13 +273,13 @@ python3 -m unittest discover -s tests   # unit tests, standard library only
 uvx ruff check scripts tests            # lint: rules in pyproject.toml
 ```
 
-The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, and ruff (pinned version) on Ubuntu.
+The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, ruff (pinned version) and the editor's co-editing check (`node tests/collab_check.mjs scripts/serve_ui/collab.js`) on Ubuntu, and the `requirements.txt` check. It runs when `scripts/`, `tests/` or the Python project files change.
 
 ---
 
 ## GitHub Actions
 
-[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when anything under `files/` or `scripts/`, the workflow itself, or the Python project files change. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
+[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when `files/`, one of the build scripts (`build.py`, `accel.py`, `hints.py`, `publish_release.py`, `ci_report.py`), the workflow, `.github/texlive-packages.txt` or the Python project files change. Editing only `serve.py`, its UI or the tests does not trigger it. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
 
 * **build** gets TeX Live from a cache (about 12 s) or, on a cache miss, from trimmed apt (about 70 s) while a parallel `texlive-cache` job installs it from tug.org via `zauguin/install-texlive` and saves the cache for the next run (packages: `.github/texlive-packages.txt`), compiles only the documents that changed, and uploads the resulting PDFs and logs as the `pdfs` run artifact. What counts as changed depends on the trigger:
   * Push to the default branch: everything changed since the last fully successful publish. Runs that were skipped or failed get caught up.
