@@ -625,7 +625,7 @@ def pdfa_metadata(settings: dict) -> str:
     return "".join(lines)  # one -usepretex argument: no newlines
 
 
-def pdfa_check(pdf: Path, level: str) -> str:
+def pdfa_check(pdf: Path, level: str, validate: bool = True) -> str:
     """
     A cheap look, not validation (use veraPDF for that): does the PDF carry
     the XMP pdfaid declaration and an OutputIntent? Returns a one-line note.
@@ -646,7 +646,9 @@ def pdfa_check(pdf: Path, level: str) -> str:
         missing.append("OutputIntent")
     if missing:
         return f"PDF/A {level} requested, but the PDF has no {' or '.join(missing)} (needs LaTeX 2023-06 or newer)."
-    verapdf = shutil.which("verapdf")
+    verapdf = shutil.which("verapdf") if validate else None
+    if verapdf is not None and os.name == "nt" and verapdf.lower().endswith((".bat", ".cmd")) and "%" in str(pdf):
+        return f"PDF/A {level}: veraPDF skipped (a .bat launcher cannot take '%' in the path); run veraPDF manually."
     if verapdf is None:
         return (f"PDF/A {level}: XMP pdfaid and OutputIntent present "
                 "(not validated; install veraPDF to check conformance).")
@@ -726,7 +728,7 @@ def kill_tree(process: subprocess.Popen) -> None:
 
 def build_document(
     main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
-    record: bool = False,
+    record: bool = False, validate: bool = True,
 ) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
@@ -743,6 +745,7 @@ def build_document(
     returned text once the document finishes, so parallel builds don't mix.
 
     force passes latexmk -g, which rebuilds even when its cache says up to date.
+    validate=False skips veraPDF (the editor's builds: validation takes seconds).
     """
     began = time.monotonic()
     relative = main_tex.relative_to(ROOT_DIR)
@@ -970,7 +973,7 @@ def build_document(
                     shutil.copy(generated_pdf, output_pdf)
                     os.utime(output_pdf, (started, started))
                     if settings["pdfa"]:
-                        notes.append(pdfa_check(output_pdf, settings["pdfa"]))
+                        notes.append(pdfa_check(output_pdf, settings["pdfa"], validate))
                         say(notes[-1])
                 except OSError as exc:
                     errors.append(f"Could not copy generated PDF: {exc}")
@@ -1148,13 +1151,14 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
 
 def build_safely(
     main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS, record: bool = False,
+    validate: bool = True,
 ) -> tuple[dict, str]:
     """
     build_document, but an exception (OSError and the like) fails only this
     document: its report entry carries the message and the run goes on.
     """
     try:
-        return build_document(main_tex, latexmk, live, force, fig_jobs, record)
+        return build_document(main_tex, latexmk, live, force, fig_jobs, record, validate)
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
         error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
@@ -1403,12 +1407,15 @@ def export_docx(main_tex: Path) -> tuple[bool, str]:
         command += ["--citeproc", *(f"--bibliography={name}" for name in bibs)]
 
     try:
-        result = subprocess.run(command, cwd=folder, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(command, cwd=folder, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"pandoc failed: {exc}"
 
     if result.returncode != 0:
-        return False, (result.stderr.strip() or f"pandoc exited with {result.returncode}").splitlines()[0]
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        return False, next((line for line in reversed(lines) if not line.startswith("[WARNING]")),
+                           lines[-1] if lines else f"pandoc exited with {result.returncode}")
 
     return True, display(target)
 
@@ -1533,13 +1540,14 @@ def new_document(name: str, template: str = "article") -> int:
         return 1
 
     target = SOURCE_DIR / path / "main.tex"
+    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
 
-    if target.exists():
-        error(f"Already exists: {display(target)}")
-        return 1
+    for rel in files:
+        if (target.parent / rel).exists():
+            error(f"Already exists: {display(target.parent / rel)}")
+            return 1
 
     title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
-    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
 
     for rel, text in files.items():
         out = target.parent / rel
@@ -1589,7 +1597,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--template",
         choices=["article", "report", "beamer", "letter"],
-        default="article",
         help="Template for --new (default article; report adds chapters/, refs.bib, figures/, build.toml).",
     )
 
@@ -1673,6 +1680,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.open and not args.watch:
         parser.error("--open needs --watch")
+
+    if args.template and args.new is None:
+        parser.error("--template needs --new")
+
+    if args.docx and (args.watch or args.focus):
+        parser.error("--docx cannot be combined with --watch or --focus")
 
     return args
 
@@ -1761,7 +1774,7 @@ def main() -> int:
         return 0
 
     if args.new is not None:
-        return new_document(args.new, args.template)
+        return new_document(args.new, args.template or "article")
 
     documents = find_documents()
 

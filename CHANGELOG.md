@@ -46,6 +46,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Security
 
+- DOCX export is owner-only (`GET /docx/<doc>` too) and refused while sharing: pandoc follows `\input{../x}` and `\lstinputlisting{/abs/path}` into the .docx, so a shared source could leak files.
+- `bibfix.parse` is linear on unterminated braces (a 64 KB input took ~30 s); `POST /api/bib/lookup` refuses text over 1 MB.
+- Shared (non-owner) Crossref lookups use their own limit (10 per minute), so they cannot use up the owner's quota.
 - While sharing, treat every non-owner as hostile: tokens on every request (loopback included), builds run with `-norc`, `shell_escape=f`, `openin_any=p`, `openout_any=p`, unsafe `latexmk_args` rejected, builds time out after at most 300 s and are rate limited (6 a minute).
 - View and edit roles enforced in the API and message bus: no cross-document messages, `build.toml` and `latexmkrc` owner-only (also in live rooms), uploads magic-byte checked, per-client and per-room caps, Content-Security-Policy with pinned CDNs, Host header check.
 - Grammar: the public API is never chosen automatically, needs confirmation, `GRAMMAR_PUBLIC_OK=1` in CI and the owner's permission while sharing; requests are chunked and throttled.
