@@ -37,6 +37,8 @@ export const api = {
   zotero: () => call("api/zotero"),
   zoteroSettings: (body) => call("api/zotero/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   zoteroPreview: (doc, body) => call(`api/zotero/preview?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  zoteroFetch: (doc) => call(`api/zotero/fetch?${qs({ doc })}`, { method: "POST" }),
+  zoteroCompare: (doc, body) => call(`api/zotero/compare?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   zoteroApply: (doc, body) => call(`api/zotero/apply?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   ai: (doc, body) => call(`api/ai?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   // The raw Response: NDJSON lines {type: start|delta|ping|done|error} while the model writes (ai.js reads them).

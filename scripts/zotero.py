@@ -9,8 +9,10 @@ dir. It is sent only in the `Zotero-API-Key` header (never in a URL) and `info()
 
 from __future__ import annotations
 
+import collections
 import difflib
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -31,6 +33,9 @@ LIMITER = grammar.Limiter(requests=120, size=1, window=60.0)  # one hit per page
 WAIT = 60.0  # seconds get() may wait for the limiter before refusing
 PAGE = 100  # Zotero's maximum for non-JSON formats
 MAX_PAGES = 200
+HOSTED_PAGES = 20  # pages per sync behind the hosted gateway (2000 entries; a bigger library syncs by collection)
+HOSTED_TOTAL = 3_000_000  # characters of one hosted sync: it travels to the browser and on to the worker
+CACHE_SIZE = 4
 MAX_BODY = 8_000_000
 MAX_TOTAL = 20_000_000
 MAX_OPS = 500
@@ -39,8 +44,10 @@ MAX_FIELDS = 60
 MAX_VALUE = 20_000
 MAX_TEXT = 1_000_000  # characters of the target .bib (serve.BIB_MAX_CHARS)
 MAX_OTHERS = 4 * MAX_TEXT  # characters of the project's other .bib files together
-MAX_REQUEST = 6 * 1024 * 1024  # bytes of a preview request's JSON (the gateway reads it itself)
-FUZZY_BUDGET = 200_000  # title comparisons per compare()
+TITLE_CAP = 300  # characters of a normalised title that are compared
+FUZZY_WORK = 30_000_000  # len(a) * len(b) summed over the title comparisons of one compare()
+FUZZY_VISITS = 1_500_000  # entries the fuzzy title pass of one compare() looks at
+POOL_SCAN = 50  # entries with the same DOI or title looked at for one Zotero entry
 FORMATS = ("bibtex", "biblatex")
 IGNORE = {"file"}  # Attachment paths on the Zotero machine
 CACHE: dict = {}  # (mode, base, format, key hash) -> {"version", "text"}; small, in memory, never holds the key
@@ -75,13 +82,27 @@ def _read() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+_ENV: dict = {}
+
+
+def env_key() -> str:
+    """ZOTERO_API_KEY, taken out of os.environ on first use (at import, before serve.py starts a build) so no
+    build or worker inherits it: kpathsea expands $VARS in file names, and Lua can read the environment."""
+    if "key" not in _ENV:
+        _ENV["key"] = os.environ.pop("ZOTERO_API_KEY", "").strip()
+    return _ENV["key"]
+
+
+env_key()
+
+
 def _key(cfg: dict) -> str:
-    return os.environ.get("ZOTERO_API_KEY", "").strip() or str(cfg.get("key") or "")
+    return env_key() or str(cfg.get("key") or "")
 
 
 def info() -> dict:
     """What the settings dialog may see. Never the key, only whether there is one."""
-    cfg, env = _read(), bool(os.environ.get("ZOTERO_API_KEY", "").strip())
+    cfg, env = _read(), bool(env_key())
     mode = "local" if cfg.get("mode") == "local" else "web"
     out = {"mode": mode, "library_type": "groups" if cfg.get("library_type") == "groups" else "users",
            "library_id": str(cfg.get("library_id") or ""), "collection": str(cfg.get("collection") or ""),
@@ -198,8 +219,11 @@ def get(url: str, headers: dict, local: bool = False, timeout: float = 20.0, lim
                           else "Zotero is not reachable.")
 
 
-def fetch(cfg: dict, local_ok: bool) -> tuple:
-    """(bibtex text, version, from_cache). An unchanged library answers 304 and the cached text is reused."""
+def fetch(cfg: dict, local_ok: bool, max_pages: int = MAX_PAGES, max_total: int = MAX_TOTAL) -> tuple:
+    """(bibtex text, version, from_cache). An unchanged library answers 304 and the cached text is reused.
+
+    The hosted gateway passes HOSTED_PAGES and HOSTED_TOTAL: one sync there must not take the shared LIMITER's
+    whole minute, and the cache (CACHE_SIZE entries) stays small."""
     if cfg["mode"] == "local":
         if not local_ok:
             raise ZoteroError("Better BibTeX sync is off while sharing: use the web API.", 409)
@@ -217,7 +241,7 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
         cached = CACHE.get(cache_key)
     headers = {"Zotero-API-Version": "3", "Zotero-API-Key": cfg["key"]}
     parts, version, start = [], None, 0
-    for _ in range(MAX_PAGES):
+    for _ in range(max_pages):
         page_headers = dict(headers)
         if start == 0 and cached:
             page_headers["If-Modified-Since-Version"] = cached["version"]
@@ -238,15 +262,17 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
         more = start < int(total) if total.isdigit() else 'rel="next"' in head.get("link", "")
         if not more:
             break
-        if sum(map(len, parts)) > MAX_TOTAL:
+        if sum(map(len, parts)) > max_total:
             raise ZoteroError("The library is too large to sync in one go; pick a collection.", 413)
     else:
         raise ZoteroError("The library is too large to sync in one go; pick a collection.", 413)
     text = "\n".join(parts)
+    if len(text) > max_total:
+        raise ZoteroError("The library is too large to sync in one go; pick a collection.", 413)
     with CACHE_LOCK:
         if version:
             CACHE[cache_key] = {"version": version, "text": text}
-        while len(CACHE) > 4:
+        while len(CACHE) > CACHE_SIZE:
             CACHE.pop(next(iter(CACHE)))
     return text, version or "", False
 
@@ -270,7 +296,8 @@ def _entries(text: str) -> list[dict]:
         fields: dict[str, str] = {}
         for field in entry.fields:
             fields.setdefault(field.name, field.value)
-        out.append({"type": entry.kind, "key": entry.key, "fields": fields})
+        out.append({"type": entry.kind, "key": entry.key, "fields": fields, "doi": _doi(fields),
+                    "title": _title(fields)})
     return out
 
 
@@ -279,60 +306,70 @@ def _flat(value: str) -> str:
 
 
 def _doi(fields: dict) -> str:
-    return bibfix.clean_doi(fields.get("doi", "")).lower()
+    return bibfix.clean_doi(fields.get("doi", "")[:500]).lower()
 
 
 def _title(fields: dict) -> str:
-    return bibfix._norm(fields.get("title", ""))
+    """The normalised title, at most TITLE_CAP characters: what DOI-less matching compares."""
+    return bibfix._norm(fields.get("title", "")[:4 * TITLE_CAP])[:TITLE_CAP]
 
 
-def _conflict(a: dict, b: dict) -> bool:
+def _similar(a: str, b: str, floor: float, budget: dict) -> bool | None:
+    """SequenceMatcher ratio >= floor, behind the cheap upper bounds; None once the comparison budget is spent."""
+    if 2 * min(len(a), len(b)) < floor * (len(a) + len(b)):
+        return False  # the ratio cannot reach the floor
+    if budget["work"] <= 0:
+        return None
+    budget["work"] -= len(a) * len(b)
+    matcher = difflib.SequenceMatcher(None, a, b)
+    return matcher.real_quick_ratio() >= floor and matcher.quick_ratio() >= floor and matcher.ratio() >= floor
+
+
+def _conflict(a: dict, b: dict, budget: dict) -> bool:
     """Two entries under one key: different works? Only a DOI mismatch or titles that share little say so; a title
-    edited in Zotero (same key, no DOI) is an update."""
-    if _doi(a) and _doi(b):
-        return _doi(a) != _doi(b)
-    ta, tb = _title(a), _title(b)
-    return bool(ta and tb and difflib.SequenceMatcher(None, ta, tb).ratio() < 0.5)
+    edited in Zotero (same key, no DOI) is an update, and so is anything once the budget is spent (it is offered
+    unticked, with its diff)."""
+    if a["doi"] and b["doi"]:
+        return a["doi"] != b["doi"]
+    return bool(a["title"] and b["title"] and _similar(a["title"], b["title"], 0.5, budget) is False)
 
 
-def _twins(remote: list, local: list, claimed: set) -> dict:
+def _twins(remote: list, local: list, claimed: set, budget: dict) -> dict:
     """remote key -> local entry for the same work under another key: DOI, then exact title, then a close title.
 
-    Indexed, so a thousand entries on each side cost a thousand lookups; only the fuzzy fallback compares titles,
-    behind length and quick-ratio filters and a budget."""
-    by_doi: dict[str, list] = {}
-    by_title: dict[str, list] = {}
+    Indexed: claimed entries leave the front of their pools and at most POOL_SCAN candidates of a pool are looked
+    at, so a thousand entries sharing one DOI cost a thousand lookups. The fuzzy fallback shares `budget` (entries
+    visited, title characters compared) with the rest of one compare()."""
+    by_doi: dict[str, collections.deque] = {}
+    by_title: dict[str, collections.deque] = {}
     for other in local:
-        if _doi(other["fields"]):
-            by_doi.setdefault(_doi(other["fields"]), []).append(other)
-        if _title(other["fields"]):
-            by_title.setdefault(_title(other["fields"]), []).append(other)
+        if other["doi"]:
+            by_doi.setdefault(other["doi"], collections.deque()).append(other)
+        if other["title"]:
+            by_title.setdefault(other["title"], collections.deque()).append(other)
     found: dict[str, dict] = {}
-    budget = FUZZY_BUDGET
 
     def free(item, other) -> bool:
-        both = _doi(item["fields"]) and _doi(other["fields"])
         return (other["key"] not in claimed and other["key"] != item["key"]
-                and not (both and _doi(item["fields"]) != _doi(other["fields"])))
+                and not (item["doi"] and other["doi"] and item["doi"] != other["doi"]))
 
     for item in remote:
         pick = None
-        for pool in (by_doi.get(_doi(item["fields"]), []), by_title.get(_title(item["fields"]), [])):
-            pick = next((other for other in pool if free(item, other)), None)
+        for pool in (by_doi.get(item["doi"]) if item["doi"] else None,
+                     by_title.get(item["title"]) if item["title"] else None):
+            while pool and pool[0]["key"] in claimed:
+                pool.popleft()
+            pick = next((o for o in itertools.islice(pool or (), POOL_SCAN) if free(item, o)), None)
             if pick:
                 break
-        title = _title(item["fields"])
-        if pick is None and title and budget > 0:
+        title = item["title"]
+        if pick is None and title:
             for other in local:
-                other_title = _title(other["fields"])
-                if not other_title or not free(item, other):
-                    continue
-                if 2 * min(len(title), len(other_title)) < bibfix.MIN_SIMILARITY * (len(title) + len(other_title)):
-                    continue  # SequenceMatcher's ratio cannot reach MIN_SIMILARITY
-                budget -= 1
-                matcher = difflib.SequenceMatcher(None, title, other_title)
-                floor = bibfix.MIN_SIMILARITY
-                if matcher.real_quick_ratio() >= floor and matcher.quick_ratio() >= floor and matcher.ratio() >= floor:
+                if budget["visits"] <= 0:
+                    break
+                budget["visits"] -= 1
+                if other["title"] and free(item, other) and _similar(title, other["title"], bibfix.MIN_SIMILARITY,
+                                                                      budget):
                     pick = other
                     break
         if pick:
@@ -378,28 +415,30 @@ def compare(remote_text: str, local_text: str, taken=(), others=None) -> dict:
             key = _free_key(key, taken_all)
             taken_all.add(key)
         seen.add(key)
-        remote.append({"type": entry["type"], "key": key, "zotero_key": entry["key"], "fields": fields})
+        remote.append({"type": entry["type"], "key": key, "zotero_key": entry["key"], "fields": fields,
+                       "doi": _doi(fields), "title": _title(fields)})
+    budget = {"work": FUZZY_WORK, "visits": FUZZY_VISITS}  # shared by every title comparison below
     twins: dict[str, tuple] = {}  # remote key -> (local entry, how matched); same key first, then DOI or title
     collided = set()
     for item in remote:
         twin = by_key.get(item["key"])
         if twin is None:
             continue
-        if _conflict(item["fields"], twin["fields"]):
+        if _conflict(item, twin, budget):
             collided.add(item["key"])  # Same key, different work: not an update.
         else:
             twins[item["key"]] = (twin, "key")
     claimed = {twin["key"] for twin, _ in twins.values()}
     rest = [item for item in remote if item["key"] not in twins]
-    for key, other in _twins(rest, local, claimed).items():
+    for key, other in _twins(rest, local, claimed, budget).items():
         twins[key] = (other, "doi/title")
     found: dict[str, dict] = {}  # remote key -> entry of another file
     for item in remote:
         twin = away_by_key.get(item["key"])
-        if item["key"] not in twins and twin and not _conflict(item["fields"], twin["fields"]):
+        if item["key"] not in twins and twin and not _conflict(item, twin, budget):
             found[item["key"]] = twin
     rest = [item for item in remote if item["key"] not in twins and item["key"] not in found]
-    found.update(_twins(rest, away, {twin["key"] for twin in found.values()}))
+    found.update(_twins(rest, away, {twin["key"] for twin in found.values()}, budget))
     for item in remote:
         if item["key"] in found:
             twin = found[item["key"]]
@@ -411,7 +450,8 @@ def compare(remote_text: str, local_text: str, taken=(), others=None) -> dict:
             if clash:
                 key = _free_key(key, taken_all)
                 taken_all.add(key)
-            out["new"].append({**item, "key": key, "collision": clash or item["zotero_key"] != key})
+            out["new"].append({"type": item["type"], "key": key, "zotero_key": item["zotero_key"],
+                               "fields": item["fields"], "collision": clash or item["zotero_key"] != key})
             continue
         twin, by = twins[item["key"]]
         diff = [{"field": name, "old": twin["fields"].get(name, ""), "new": value}

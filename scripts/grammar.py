@@ -489,7 +489,11 @@ class Limiter:
         self.lock = threading.Lock()
 
     def acquire(self, size: int, max_wait: float | None = None) -> None:
-        with self.lock:  # one waiter at a time: the sleeper holds the line
+        # One waiter at a time: the sleeper holds the line. With max_wait, queueing for the line is bounded too, so
+        # a thread never waits behind other sleepers for longer than it was willing to wait (at most twice in all).
+        if not self.lock.acquire(timeout=-1 if max_wait is None else max(max_wait, 0.0)):
+            raise GrammarError(f"The free LanguageTool limit is reached; try again in {math.ceil(max_wait or 1)} s.")
+        try:
             while True:
                 now = self.clock()
                 while self.hits and now - self.hits[0][0] >= self.window:
@@ -501,6 +505,8 @@ class Limiter:
                 if max_wait is not None and wait > max_wait:
                     raise GrammarError(f"The free LanguageTool limit is reached; try again in {math.ceil(wait)} s.")
                 self.sleep(max(wait, 0.01))
+        finally:
+            self.lock.release()
 
 
 PUBLIC_LIMITER = Limiter()

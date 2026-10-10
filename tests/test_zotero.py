@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -32,7 +33,7 @@ class Base(unittest.TestCase):
         self.cfg = Path(tmp.name) / "cfg" / "zotero.json"
         mock.patch.object(zotero, "config_path", return_value=self.cfg).start()
         mock.patch.dict(os.environ).start()
-        os.environ.pop("ZOTERO_API_KEY", None)
+        mock.patch.dict(zotero._ENV, {"key": ""}).start()
         zotero.CACHE.clear()
         zotero.LIMITER.hits.clear()
         self.addCleanup(mock.patch.stopall)
@@ -54,8 +55,16 @@ class Settings(Base):
         self.assertTrue(zotero.info()["has_key"])
         self.assertFalse(zotero.save_settings({"library_id": "12345", "clear_key": True})["has_key"])
 
+    def test_environment_key_leaves_the_environment(self):
+        """Like ai.env_key: taken out of os.environ so no build or worker started later inherits it."""
+        with mock.patch.dict(os.environ, {"ZOTERO_API_KEY": " EnvKey1234567 "}), mock.patch.dict(zotero._ENV, clear=True):
+            self.assertEqual(zotero.env_key(), "EnvKey1234567")
+            self.assertNotIn("ZOTERO_API_KEY", os.environ)
+            self.assertEqual(zotero.env_key(), "EnvKey1234567")
+            self.assertTrue(zotero.info()["key_from_env"])
+
     def test_environment_key_wins_and_is_flagged(self):
-        os.environ["ZOTERO_API_KEY"] = "E" * 20
+        zotero._ENV["key"] = "E" * 20
         shown = zotero.save_settings({"library_id": "7"})
         self.assertTrue(shown["key_from_env"] and shown["configured"])
         self.assertNotIn("key", json.loads(self.cfg.read_text()))
@@ -155,6 +164,20 @@ class Fetch(Base):
     def test_redirects_are_not_followed(self):
         handler = zotero._NoRedirect()
         self.assertIsNone(handler.redirect_request(mock.Mock(), None, 302, "Found", {}, "https://evil.example/"))
+
+    def test_waiting_for_the_limiter_is_bounded_too(self):
+        """A thread queued behind a sleeping one gives up after its own max_wait instead of waiting for the lock."""
+        limiter = zotero.grammar.Limiter(requests=1, size=1, window=60.0)
+        limiter.lock.acquire()  # another thread sleeping in acquire() holds the line
+        try:
+            started = time.monotonic()
+            with self.assertRaises(zotero.grammar.GrammarError):
+                limiter.acquire(0, 0.2)
+            self.assertLess(time.monotonic() - started, 2)
+        finally:
+            limiter.lock.release()
+        limiter.acquire(0, 0.2)  # free again: works
+        self.assertFalse(limiter.lock.locked())
 
     def test_requests_are_throttled(self):
         zotero.LIMITER.hits.extend([(zotero.LIMITER.clock(), 0)] * zotero.LIMITER.requests)
@@ -370,6 +393,27 @@ class Compare(unittest.TestCase):
                              entry("k", title="The first paper ever", doi="10.1/a"), taken=["k2"])
         self.assertEqual([(e["key"], e["zotero_key"], e["collision"]) for e in out["new"]], [("ka", "k", True), ("k2a", "k2", True)])
         self.assertEqual((out["changed"], out["local_only"]), ([], ["k"]))
+
+    def test_adversarial_libraries_compare_in_bounded_time(self):
+        """Same DOI everywhere, one title everywhere with different DOIs, very long near-equal titles: each used to
+        take seconds to minutes; pools are indexed and title work is budgeted (FUZZY_WORK, FUZZY_VISITS)."""
+        def bib(rows):
+            return "".join(f"@article{{{k},\n  title = {{{t}}},\n  doi = {{{d}}}\n}}\n" for k, t, d in rows)
+        long_a, long_b = "word " * 4000, "word " * 3999 + "other"
+        cases = [
+            (bib((f"r{i}", f"t{i}", "10.1/x") for i in range(3000)), bib((f"l{i}", f"u{i}", "10.1/x") for i in range(3000))),
+            (bib((f"r{i}", "same title for all", f"10.1/r{i}") for i in range(3000)),
+             bib((f"l{i}", "same title for all", f"10.1/l{i}") for i in range(3000))),
+            (bib((f"k{i}", long_a, "") for i in range(100)), bib((f"k{i}", long_b, "") for i in range(100))),
+            (bib((f"r{i}", f"{long_a} {i}", "") for i in range(100)), bib((f"l{i}", f"{long_b} {i}", "") for i in range(300))),
+        ]
+        for remote, local in cases:
+            started = time.perf_counter()
+            zotero.compare(remote, local)
+            zotero.compare(remote, "", others={"o.bib": local})
+            self.assertLess(time.perf_counter() - started, 8)
+        out = zotero.compare(cases[0][0], cases[0][1])
+        self.assertEqual((len(out["changed"]), out["new"]), (3000, []))  # still matched by DOI, one to one
 
     def test_entries_in_other_files_are_not_offered_again(self):
         remote = (entry("same_key", title="In the other file", doi="10.1/o") + entry("zot_doi", title="Renamed there", doi="10.1/r")

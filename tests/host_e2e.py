@@ -299,7 +299,7 @@ def run(browser, origin, data: Path, insecure: bool) -> None:
     while "Zotero2024Sync" not in bib.read_text() and time.monotonic() < deadline:
         time.sleep(0.5)
     assert "Zotero2024Sync" in bib.read_text(), "the synced entry was not saved"
-    status = vi.request.post(origin + f"/p/{pid}/api/zotero/preview", data={"text": ""},
+    status = vi.request.post(origin + f"/p/{pid}/api/zotero/fetch",
                              headers={"Origin": origin}).status
     assert status == 403, status
     ok("an editor saves their own Zotero key on the Account page and syncs refs.bib; a viewer cannot (403)")
