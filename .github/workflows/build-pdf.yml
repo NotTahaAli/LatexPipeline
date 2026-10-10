@@ -48,7 +48,7 @@ jobs:
           git diff --exit-code requirements.txt
 
   # Runs beside `build`, which never waits for it: on a cache miss it installs TeX Live
-  # from tug.org and saves ~/texlive for the next run. Bump `v1` in both keys to refresh.
+  # from tug.org and saves ~/texlive for the next run (the first cold run takes minutes). Bump `v1` in both keys to refresh.
   texlive-cache:
     runs-on: ubuntu-latest
     continue-on-error: true

@@ -85,4 +85,15 @@ let writes;
   assert.equal(writes, 0); assert.equal(room.savedText, null);
   clearTimeout(room.retryTimer);
 }
+// 7. The server closed the room (file renamed or deleted in the tree): leader or not, stop writing, leave, forget the room.
+for (const leader of [true, false]) {
+  writes = 0;
+  const { room, warned, sent } = make({ read: async () => ({ text: "room text", version: "1", eol: "\n" }), write: async () => { writes++; return { version: "2" }; } });
+  room.collab.rooms.set(room.rid, room);
+  if (leader) await room.becomeLeader(); else room.leader = "someone else";
+  room.touch(); room.onClosed(); await wait(30);
+  assert.equal(writes, 0); assert.equal(room.canEdit, false); assert.equal(warned.length, 1);
+  assert.equal(sent.filter((m) => m.type === "y-leave").length, 1);
+  assert.equal(room.collab.rooms.has(room.rid), false);
+}
 console.log("collab ok");

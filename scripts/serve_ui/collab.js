@@ -47,6 +47,7 @@ export class Collab {
     channel.on("y-update", (d) => { if (d.cid !== channel.cid) this.rooms.get(d.room)?.onRemote(d.u); });
     channel.on("y-aware", (d) => { if (d.cid !== channel.cid) this.rooms.get(d.room)?.onAware(d.u); });
     channel.on("y-gone", (d) => this.rooms.get(d.room)?.onGone(d.aid));
+    channel.on("y-closed", (d) => this.rooms.get(d.room)?.onClosed());
     channel.on("y-leader", (d) => this.rooms.get(d.room)?.setLeader(d.leader, d));
     channel.on("presence", (d) => this.onPresence?.(d.users));
     channel.on("error", (d) => { if (d?.error) this.onWarn?.(d.error); });
@@ -215,6 +216,12 @@ export class Room {
     this.collab.channel.send({ type: "y-leave", topic: "y", data: { room: this.rid } });
     this.collab.onWarn?.(why);
     this.collab.onChange?.(this);
+  }
+
+  /** The server closed the room because the file was renamed or deleted in the file tree: stop, whoever leads. */
+  onClosed() {
+    this.drop(`${this.path} was renamed or deleted; shared editing of it stopped.`);
+    this.collab.rooms.delete(this.rid);   // A file created under this name later starts a fresh room.
   }
 
   touch() {

@@ -643,6 +643,27 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("GET", "/api/files?doc=second", "edit")[0], 403)
         self.assertEqual(self.get("POST", "/api/share", "edit", {"provider": "local"})[0], 403)
 
+    def test_file_operations_need_the_edit_link_stay_in_the_shared_document_and_spare_build_config(self):
+        for who in ("view", None):
+            for op, path in (("newfile", "x.tex"), ("mkdir", "d"), ("delete", "other"), ("rename", "other&to=y")):
+                with self.subTest(who=who, op=op):
+                    self.assertEqual(self.get("POST", f"/api/fs?doc=demo&op={op}&path={path}", who)[0],
+                                     403 if who else 401)
+        self.assertEqual(self.get("POST", "/api/fs?doc=second&op=newfile&path=x.tex", "edit")[0], 403)
+        for path in ("build.toml", "sub/.latexmkrc", "latexmkrc", ".latexmkrc", "sub/BUILD.TOML"):
+            for op in ("newfile", "delete", "mkdir"):
+                with self.subTest(op=op, path=path):
+                    self.assertEqual(self.get("POST", f"/api/fs?doc=demo&op={op}&path={path}", "edit")[0], 403)
+        # Neither can a harmless file be renamed into a build-config name, nor the config renamed away.
+        self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=rename&path=other&to=latexmkrc", "edit")[0], 403)
+        self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=rename&path=build.toml&to=x.toml", "edit")[0], 403)
+        self.assertTrue((self.root / "build.toml").exists())
+        self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=newfile&path=made.tex", "edit")[0], 200)
+        self.assertTrue((self.root / "made.tex").exists())
+        self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=mkdir&path=made2", "owner")[0], 200)
+        self.assertEqual(self.get("POST", "/api/fs?doc=second&op=newfile&path=x.tex", "owner")[0], 200)
+        self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=newfile&path=../escape.tex", "edit")[0], 400)
+
     def test_rebuilds_are_rate_limited_for_editors_only(self):
         limit = serve.REBUILD_LIMIT[0]
         codes = [self.get("POST", "/rebuild?doc=demo", "edit")[0] for _ in range(limit + 2)]
@@ -1411,6 +1432,136 @@ class LogWarnings(ServerCase):
             self.log.write_text(self.LOG, encoding="utf-8")
             pdf.unlink()
             self.assertIsNone(serve.fresh_state("demo", self.root / "main.tex")["pages"])  # no PDF, no result
+
+
+class FileOps(SharedState, ServerCase):
+    """New file, new folder, rename and delete in the file tree."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("Chapters/one.tex", "one")
+        self.write("Chapters/two.tex", "two")
+        self.write("refs.bib", "@a{b,}")
+
+    def fs(self, op, path, to=None, method="POST"):
+        extra = f"&to={to}" if to is not None else ""
+        return self.request(method, f"/api/fs?doc=demo&op={op}&path={path}{extra}")
+
+    def paths(self):
+        return sorted(f["path"] for f in serve.list_files(self.root))
+
+    def test_empty_folders_are_listed_so_a_new_folder_shows_up(self):
+        self.assertEqual(serve.empty_dirs(self.root), [])
+        self.assertEqual(self.fs("mkdir", "Figures")[0], 200)
+        self.assertEqual(self.fs("mkdir", "a/b/c")[0], 200)
+        (self.root / ".hidden").mkdir()
+        self.assertEqual(sorted(serve.empty_dirs(self.root)), ["Figures", "a/b/c"])  # a, a/b hold a folder: not empty
+        self.assertEqual(self.request("GET", "/api/files?doc=demo")[1]["dirs"], serve.empty_dirs(self.root))
+        try:
+            os.symlink(self.base, self.root / "out-link")
+        except (OSError, NotImplementedError):
+            return
+        self.assertNotIn("out-link", serve.empty_dirs(self.root))
+
+    def test_create_files_and_folders(self):
+        self.assertEqual(self.fs("newfile", "Chapters/three.tex")[0], 200)
+        self.assertEqual((self.root / "Chapters/three.tex").read_text(), "")
+        self.assertEqual(self.fs("newfile", "deep/er/new.bib")[0], 200)  # parents are made
+        self.assertEqual(self.fs("mkdir", "Figures")[0], 200)
+        self.assertTrue((self.root / "Figures").is_dir())
+        self.assertEqual(self.fs("newfile", "Chapters/three.tex")[0], 409)  # never overwrites
+        self.assertEqual(self.fs("mkdir", "Chapters")[0], 409)
+        self.assertEqual(self.fs("newfile", "pic.png")[0], 415)  # only text files
+        self.assertEqual(self.fs("newfile", "refs.bib/x.tex")[0], 409)  # a file is in the way
+        self.assertEqual((self.root / "refs.bib").read_text(), "@a{b,}")
+
+    def test_bad_names_and_traversal_are_refused_everywhere(self):
+        bad = ["../x.tex", "a/../../x.tex", "/etc/x.tex", "a//b.tex", "a\\b.tex", ".hidden.tex", "sub/.git/x.tex",
+               ".git/config", "C:/x.tex", "a/b<c>.tex", "name?.tex", "trailing.tex.", "x" * 300 + ".tex",
+               "a/" * 9 + "x.tex",
+               "node_modules/x.tex"]
+        for rel in bad:
+            for op in ("newfile", "mkdir", "delete"):
+                with self.subTest(op=op, rel=rel):
+                    self.assertIn(self.fs(op, rel.replace("\\", "%5C"))[0], (400, 403))
+            with self.subTest(op="rename-to", rel=rel):
+                self.assertIn(self.fs("rename", "refs.bib", rel.replace("\\", "%5C"))[0], (400, 403))
+            with self.subTest(op="rename-from", rel=rel):
+                self.assertIn(self.fs("rename", rel.replace("\\", "%5C"), "ok.bib")[0], (400, 403, 404))
+        self.assertEqual(self.paths(), ["Chapters/one.tex", "Chapters/two.tex", "fig.png", "main.tex", "refs.bib"])
+        self.assertEqual((self.base / "secret.tex").read_text(), "secret")
+        self.assertEqual(self.fs("delete", "refs.bib", method="GET")[0], 404)  # only POST is an operation
+        self.assertTrue((self.root / "refs.bib").exists())
+
+    def test_rename_moves_files_and_folders(self):
+        self.assertEqual(self.fs("rename", "refs.bib", "bib/refs.bib")[0], 404)  # target folder must exist
+        self.assertEqual(self.fs("rename", "refs.bib", "literature.bib")[0], 200)
+        self.assertEqual(self.fs("rename", "Chapters", "Parts")[0], 200)
+        self.assertEqual(self.paths(), ["Parts/one.tex", "Parts/two.tex", "fig.png", "literature.bib", "main.tex"])
+        self.assertEqual((self.root / "Parts/one.tex").read_text(), "one")
+        self.assertEqual(self.fs("rename", "Parts/one.tex", "Parts/two.tex")[0], 409)  # never overwrites
+        self.assertEqual(self.fs("rename", "Parts", "Parts/inner")[0], 400)
+        self.assertEqual(self.fs("rename", "Parts", "Parts")[0], 400)
+        self.assertEqual(self.fs("rename", "nothing.tex", "x.tex")[0], 404)
+
+    def test_delete_files_and_folders_but_never_main_tex(self):
+        self.assertEqual(self.fs("delete", "refs.bib")[0], 200)
+        self.assertEqual(self.fs("delete", "Chapters")[0], 200)
+        self.assertEqual(self.paths(), ["fig.png", "main.tex"])
+        self.assertEqual(self.fs("delete", "main.tex")[0], 409)
+        self.assertEqual(self.fs("rename", "main.tex", "start.tex")[0], 409)
+        self.assertEqual(self.fs("delete", "refs.bib")[0], 404)
+        self.assertEqual(self.fs("explode", "main.tex")[0], 400)
+        self.assertTrue((self.root / "main.tex").exists())
+
+    def test_symlinks_are_removed_themselves_and_never_followed_out_of_the_document(self):
+        try:
+            os.symlink(self.base / "secret.tex", self.root / "escape.tex")
+            os.symlink(self.root / "refs.bib", self.root / "alias.bib")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not available")
+        self.assertEqual(self.fs("delete", "escape.tex")[0], 403)
+        self.assertEqual(self.fs("rename", "escape.tex", "mine.tex")[0], 403)
+        self.assertEqual((self.base / "secret.tex").read_text(), "secret")
+        self.assertEqual(self.fs("delete", "alias.bib")[0], 200)
+        self.assertEqual((self.root / "refs.bib").read_text(), "@a{b,}")  # the link went, not its target
+
+    def test_operations_tell_the_browsers_and_close_the_rooms_of_what_is_gone(self):
+        def join(path, cid="c1"):
+            serve.bind_client(cid, "owner")
+            data = {"doc": "demo", "path": path, "aid": 1}
+            serve.handle_client_message({"type": "y-join", "data": data}, cid, "owner")
+
+        join("Chapters/one.tex")
+        join("Chapters/two.tex", "c2")
+        join("refs.bib")
+        self.assertEqual(len(serve.ROOMS), 3)
+        rev = serve.BUS.rev
+        self.assertEqual(self.fs("rename", "Chapters", "Parts")[0], 200)
+        self.assertEqual(sorted(r.split("\n")[1] for r in serve.ROOMS), ["refs.bib"])  # the old rooms are gone
+        self.assertNotIn("demo\nChapters/one.tex", serve.CLIENTS["c1"]["rooms"])
+        messages = serve.BUS.since(rev)
+        closed = sorted(m["data"]["room"] for m in messages if m["type"] == "y-closed")
+        self.assertEqual(closed, ["demo\nChapters/one.tex", "demo\nChapters/two.tex"])
+        fs = next(m for m in messages if m["type"] == "fs")["data"]
+        self.assertEqual(fs["doc"], "demo")
+        self.assertEqual(sorted(fs["removed"]), ["Chapters/one.tex", "Chapters/two.tex"])
+        self.assertEqual(sorted(fs["changed"]), ["Parts/one.tex", "Parts/two.tex"])
+        self.assertEqual(self.fs("delete", "refs.bib")[0], 200)
+        self.assertEqual(dict(serve.ROOMS), {})
+        # A new file under a deleted name starts a fresh room, not the old room's replay.
+        self.assertEqual(self.fs("newfile", "refs.bib")[0], 200)
+        again = {"type": "y-join", "data": {"doc": "demo", "path": "refs.bib", "aid": 1}}
+        self.assertEqual(serve.handle_client_message(again, "c1", "owner")["data"]["updates"], [])
+
+    def test_a_shared_session_never_hears_about_other_documents_closed_rooms(self):
+        self.share_on("demo")
+        mine = {"rev": 1, "topic": "doc", "type": "y-closed", "data": {"room": "demo\nx.tex"}}
+        other = {"rev": 2, "topic": "doc", "type": "y-closed", "data": {"room": "second\nx.tex"}}
+        config = {"rev": 3, "topic": "doc", "type": "y-closed", "data": {"room": "demo\nbuild.toml"}}
+        self.assertEqual([m["rev"] for m in serve.visible([mine, other, config], "edit")], [1])
+        self.assertEqual([m["rev"] for m in serve.visible([mine, other, config], "view")], [1])
 
 
 class FocusPreview(ServerCase):

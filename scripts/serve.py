@@ -136,7 +136,7 @@ def handle_client_message(message: dict, client: str, role: str = "owner") -> di
     return handler(message, client, role) if handler else None
 
 
-Y_KINDS = ("y-update", "y-aware", "y-leader", "y-gone")  # data["room"] is "<doc>\n<path>"
+Y_KINDS = ("y-update", "y-aware", "y-leader", "y-gone", "y-closed")  # data["room"] is "<doc>\n<path>"
 
 
 def visible(messages: list[dict], role: str) -> list[dict]:
@@ -590,6 +590,7 @@ def fs_watcher(interval: float = 1.0) -> None:
         for name, main_tex in list(DOCS.items()):
             try:
                 now = {f["path"]: f["version"] for f in list_files(main_tex.parent)}
+                now.update({d + "/": "dir" for d in empty_dirs(main_tex.parent)})  # A new empty folder is news too.
             except OSError:
                 continue
             before = known.get(name)
@@ -675,6 +676,20 @@ def list_files(root: Path, limit: int = 5000) -> list[dict]:
     return found
 
 
+def empty_dirs(root: Path, limit: int = 500) -> list[str]:
+    """Folders with nothing visible in them (list_files shows files only), so a new folder appears in the tree."""
+    base = root.resolve()
+    found: list[str] = []
+    for current, dirs, names in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in HIDDEN_DIRS and not d.startswith(".")
+                         and not os.path.islink(os.path.join(current, d)))
+        if not dirs and not [n for n in names if not n.startswith(".") or n == ".latexmkrc"] and Path(current) != base:
+            found.append(Path(current).relative_to(base).as_posix())
+            if len(found) >= limit:
+                break
+    return found
+
+
 def read_text_file(root: Path, rel: str) -> dict:
     path = resolve_in_doc(root, rel)
     if file_kind(rel) != "text":
@@ -738,6 +753,96 @@ def write_text_file(root: Path, rel: str, text: str, base: str | None, eol: str 
                 raise ApiError("The file changed on disk.", 409, current=current)
         atomic_write(path, data)
         return {"path": rel, "version": version_of(path.stat())}
+
+
+# --- File tree operations: new file, new folder, rename, delete -------------------------------------------------
+
+BAD_NAME = re.compile(r'[\x00-\x1f<>:"|?*\\]|[ .]$')
+MAX_REL = 240
+MAX_DEPTH_NEW = 8
+
+
+def fs_path(root: Path, rel, what: str = "path") -> Path:
+    """
+    A path the file tree may create, rename or delete: inside the document (resolve_in_doc), no dotfiles or hidden
+    folders, no characters Windows refuses. Returns the lexical path, so a symlink is renamed or deleted itself,
+    never the file it points to.
+    """
+    if not isinstance(rel, str) or not rel or len(rel) > MAX_REL:
+        raise ApiError(f"Bad {what}.", 400)
+    parts = rel.split("/")
+    if len(parts) > MAX_DEPTH_NEW or any(p.startswith(".") or p in HIDDEN_DIRS or BAD_NAME.search(p) for p in parts):
+        raise ApiError(f"Bad {what}: names cannot start with a dot or contain special characters.", 400)
+    resolve_in_doc(root, rel)  # Traversal, absolute paths and symlinks that leave the document.
+    return root.resolve() / rel
+
+
+def close_rooms(doc: str, rel: str, below: bool = True) -> None:
+    """
+    Drop the co-editing rooms of a path (and everything below it): their update log would replay the old text into
+    whatever is created there next. Members are told with y-closed and stop writing.
+    """
+    with COLLAB_LOCK:
+        for rid in [r for r, room in ROOMS.items() if room["doc"] == doc and (
+                room["path"] == rel or (below and room["path"].startswith(rel + "/")))]:
+            room = ROOMS.pop(rid)
+            for cid in room["members"]:
+                if cid in CLIENTS:
+                    CLIENTS[cid]["rooms"].discard(rid)
+            BUS.publish("y-closed", {"room": rid})
+
+
+def fs_operation(doc: str, op, rel, to=None) -> dict:
+    """Run one file tree operation in document `doc` and tell the browsers; raises ApiError."""
+    root = DOCS[doc].parent
+    changed: list[str] = []
+    removed: list[str] = []
+    with WRITE_LOCK:
+        source = fs_path(root, rel)
+        if op in ("newfile", "mkdir"):
+            if source.exists() or source.is_symlink():
+                raise ApiError("Something with that name already exists.", 409)
+            if op == "newfile" and file_kind(rel) != "text":
+                raise ApiError("Only text files (.tex, .bib, ...) can be created here; drop images on the editor.", 415)
+            if any(parent.is_file() for parent in source.parents if root.resolve() in parent.parents):
+                raise ApiError("A file is in the way of that folder.", 409)
+            source.parent.mkdir(parents=True, exist_ok=True)
+            if op == "mkdir":
+                source.mkdir()
+            else:
+                os.close(os.open(source, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+                changed.append(rel)
+            close_rooms(doc, rel)
+        elif op in ("rename", "delete"):
+            if rel == "main.tex":
+                raise ApiError("main.tex is the document itself and cannot be renamed or deleted.", 409)
+            if not (source.exists() or source.is_symlink()):
+                raise ApiError("No such file or folder.", 404)
+            folder = source.is_dir() and not source.is_symlink()
+            moved = [f["path"] for f in list_files(source)] if folder else [rel]
+            moved = [rel + "/" + m if folder else m for m in moved]
+            if op == "delete":
+                if folder:
+                    shutil.rmtree(source)
+                else:
+                    source.unlink()
+            else:
+                target = fs_path(root, to, "new name")
+                if target == source or target.is_relative_to(source):
+                    raise ApiError("A folder cannot be moved into itself.", 400)
+                if target.exists() or target.is_symlink():
+                    raise ApiError("Something with that name already exists.", 409)
+                if not target.parent.is_dir():
+                    raise ApiError("The folder you are moving into does not exist.", 404)
+                os.rename(source, target)
+                changed += [to + m[len(rel):] for m in moved]
+                close_rooms(doc, to)
+            removed += moved
+            close_rooms(doc, rel)
+        else:
+            raise ApiError("Unknown operation.", 400)
+    broadcast("fs", {"doc": doc, "changed": changed, "removed": removed})
+    return {"ok": True, "path": to if op == "rename" else rel}
 
 
 def find_image(root: Path, name: str, origin: str = "") -> Path | None:
@@ -1838,6 +1943,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many rebuilds; wait a moment.", 429)
+    elif method == "POST" and path == "/api/fs":
+        need_edit()
+        scoped(doc)
+        if any(is_rc((query.get(key) or [""])[0]) for key in ("path", "to")):
+            raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -1991,6 +2101,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 FORCE.add(name)
             self.json({"ok": True})
+        elif url.path == "/api/fs" and name in DOCS:
+            op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
+            self.json(fs_operation(name, op, rel, to))
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
@@ -2057,7 +2170,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith(("/pdf/", "/log/")):
             self.file(path, "focus" in query)
         elif path == "/api/files":
-            self.json({"files": list_files(self.doc_root(query))})
+            root = self.doc_root(query)
+            self.json({"files": list_files(root), "dirs": empty_dirs(root)})
         elif path == "/api/file":
             self.json(read_text_file(self.doc_root(query), query.get("path", [""])[0]))
         elif path == "/api/raw":
