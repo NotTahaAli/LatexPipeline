@@ -2,6 +2,7 @@
 // The server parses (POST api/bib, bibfix.py); edits come back as splices that go into the open editor document,
 // like bib.js's Apply, so co-editing stays consistent and the normal save path writes the file.
 import { addBibLookup } from "./bib.js";
+import { zoteroUi } from "./zotero.js";
 
 // Fields shown first for each type (the server's lint list wins where it has one), then the usual optional ones.
 const TYPES = {
@@ -57,8 +58,10 @@ export function refsPanel(root, ctx) {
   scope.setAttribute("aria-label", "Bibliography files");
   const addBtn = el("button", { type: "button", className: "icon", title: "New reference", hidden: ctx.readOnly }, icon("plus"));
   addBtn.setAttribute("aria-label", "New reference");
+  const zotActs = ctx.readOnly ? [] : [action("Sync from Zotero...", () => zot.sync()), action("Zotero settings...", () => zot.settings())];
+  zotActs.forEach((b) => { b.hidden = true; });   // Shown once the server says this viewer may (owner of a local editor).
   const more = details("More reference actions", [
-    ...(ctx.readOnly ? [] : [action("Import BibTeX or DOI...", () => openImport()), action("New .bib file...", () => newBib())]),
+    ...(ctx.readOnly ? [] : [action("Import BibTeX, RIS or DOI...", () => openImport()), ...zotActs, action("New .bib file...", () => newBib())]),
     action("Refresh", () => load()),
   ]);
   const chips = el("div", { className: "refs-chips", role: "group" });
@@ -77,6 +80,8 @@ export function refsPanel(root, ctx) {
     chips, selBar, formBox, notes, list);
   root.querySelector(".refs-bar").setAttribute("aria-label", "References");
 
+  const zot = zoteroUi({ ...ctx, box: formBox, data: () => S.data, scope: () => S.scope, uid, authorLabel, yearOf, reload: () => load() });
+  if (zotActs.length) zot.probe().then((info) => { zotActs.forEach((b) => { b.hidden = !info; }); });
   search.oninput = () => { S.q = search.value; render(); };
   scope.onchange = () => { S.scope = scope.value; render(); };
   sort.onchange = () => { S.sort = sort.value; render(); };
@@ -354,14 +359,17 @@ export function refsPanel(root, ctx) {
   function openImport() {
     const d = S.data;
     if (!d.files.length) { ctx.toast("Create a .bib file first."); return; }
-    const box = el("textarea", { rows: 5, placeholder: "@article{...} or 10.1000/xyz123", spellcheck: false, id: uid("imp") });
+    const box = el("textarea", { rows: 5, placeholder: "@article{...}, TY  - JOUR ... or 10.1000/xyz123", spellcheck: false, id: uid("imp") });
     const fileSel = el("select", { id: uid("impf") }, ...d.files.map((f) => new Option(f.path, f.path)));
     fileSel.value = S.scope || d.files.find((f) => f.used)?.path || d.files[0].path;
+    const picker = el("input", { type: "file", accept: ".bib,.bibtex,.ris,.txt,text/plain", id: uid("impx") });
+    picker.onchange = async () => { const f = picker.files[0]; if (f) { if (f.size > 1_000_000) ctx.toast("That file is over 1 MB."); else box.value = await f.text(); } };
     const out = el("div", { className: "refs-imp-out", role: "status" });
     const read = el("button", { type: "submit", className: "btn primary", textContent: "Read" });
     const form = el("form", { className: "refs-form" }, el("h2", { id: uid("imph"), textContent: "Import" }),
-      el("div", { className: "rf" }, el("label", { htmlFor: box.id, textContent: "BibTeX or a DOI" }), box,
-        el("span", { className: "mute rh", textContent: "A DOI is looked up at Crossref (only the DOI is sent)." })),
+      el("div", { className: "rf" }, el("label", { htmlFor: box.id, textContent: "BibTeX, RIS or a DOI" }), box,
+        el("span", { className: "mute rh", textContent: "A DOI is looked up at Crossref (only the DOI is sent). From Mendeley (its API is closed to new apps), Zotero, EndNote or a publisher: export as BibTeX or RIS and choose the file." })),
+      el("div", { className: "rf" }, el("label", { htmlFor: picker.id, textContent: "Or choose an export file (.bib, .ris)" }), picker),
       el("div", { className: "rf" }, el("label", { htmlFor: fileSel.id, textContent: "Add to" }), fileSel),
       out, el("div", { className: "fixes" }, read, el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: () => { formBox.hidden = true; formBox.replaceChildren(); } })));
     form.setAttribute("aria-labelledby", form.firstChild.id);
@@ -370,7 +378,7 @@ export function refsPanel(root, ctx) {
       ev.preventDefault();
       const raw = box.value.trim();
       const doi = /^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:)?10\.\S+\/\S+$/i.test(raw);
-      if (!raw || (!doi && !raw.includes("@"))) { out.replaceChildren(el("p", { className: "refs-err", textContent: "Paste one or more BibTeX entries, or a DOI such as 10.1000/xyz123." })); return; }
+      if (!raw || (!doi && !raw.includes("@") && !/^\s*TY  ?-/m.test(raw))) { out.replaceChildren(el("p", { className: "refs-err", textContent: "Paste BibTeX or RIS entries, choose an export file, or enter a DOI such as 10.1000/xyz123." })); return; }
       read.disabled = true; out.replaceChildren(el("p", { className: "mute", textContent: doi ? "Asking Crossref..." : "Reading..." }));
       try {
         const r = await ctx.api.bibImport(ctx.doc(), doi ? { doi: raw } : { bibtex: raw });
