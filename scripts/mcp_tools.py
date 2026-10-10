@@ -77,16 +77,19 @@ def _s(type_: str, description: str, **extra) -> dict:
 PROJECT = _s("string", "The project: its `project` value from list_projects.", maxLength=200)
 PATH = _s("string", "A file in the project, relative, with forward slashes (for example chapters/intro.tex).",
           maxLength=240)
+BIB = _s("string", "A .bib file in the project (for example refs.bib).", maxLength=240)
 
 
 def _tool(name: str, title: str, scope: str, description: str, props: dict | None = None, required=(),
-          project: bool = True, read_only: bool = True, destructive: bool = False, idempotent: bool = True) -> dict:
+          project: bool = True, read_only: bool = True, destructive: bool = False, idempotent: bool = True,
+          local: bool = False) -> dict:
     props = {"project": PROJECT, **(props or {})} if project else dict(props or {})
     schema: dict = {"type": "object", "properties": props, "additionalProperties": False}
     needed = (["project"] if project else []) + list(required)
     if needed:
         schema["required"] = needed
     return {"name": name, "title": title, "description": description, "inputSchema": schema, "_scope": scope,
+            "_local": local,
             "annotations": {"title": title, "readOnlyHint": read_only, "destructiveHint": destructive,
                             "idempotentHint": idempotent, "openWorldHint": False}}
 
@@ -178,24 +181,139 @@ TOOLS = [
           ["path", "quote", "comment"], read_only=False, idempotent=False),
     _tool("add_suggestion", "Suggest an edit", "review",
           "Suggest replacing a passage; a person accepts or rejects it in the editor (nothing changes until then). "
-          "quote must appear in the file; pass occurrence when it appears more than once.",
+          "quote must appear in the file; pass occurrence when it appears more than once. One suggestion can change "
+          "up to 4 places at once (accepted or rejected together): quote_2/replacement_2 ... quote_4/replacement_4, "
+          "each found after the previous part.",
           {"path": PATH, "quote": _s("string", "The exact text to replace.", maxLength=20000),
            "replacement": _s("string", "The suggested text (may be empty to suggest deleting).", maxLength=20000),
            "occurrence": _s("integer", "Which occurrence of quote (1-based) when it appears more than once.",
-                            minimum=1)},
+                            minimum=1),
+           **{f"{name}_{n}": _s("string", f"{what} of part {n} (optional).", maxLength=20000)
+              for n in (2, 3, 4) for name, what in (("quote", "The exact text"), ("replacement", "The new text"))}},
           ["path", "quote", "replacement"], read_only=False, idempotent=False),
+    _tool("reply_comment", "Reply to a comment", "review",
+          "Add a reply to a comment thread (thread ids come from list_reviews).",
+          {"thread": _s("string", "The thread id.", maxLength=40), "comment": _s("string", "The reply.",
+                                                                                  maxLength=4000)},
+          ["thread", "comment"], read_only=False, idempotent=False),
+    _tool("resolve_thread", "Resolve or reopen a thread", "review",
+          "Mark a comment thread resolved, or reopen it with reopen=true.",
+          {"thread": _s("string", "The thread id.", maxLength=40),
+           "reopen": _s("boolean", "Reopen instead of resolving (default false).")}, ["thread"], read_only=False),
+    _tool("delete_comment", "Delete your comment", "review",
+          "Delete a comment this AI client wrote (other people's comments cannot be deleted).",
+          {"thread": _s("string", "The thread id.", maxLength=40), "comment": _s("string", "The comment id.",
+                                                                                  maxLength=40)},
+          ["thread", "comment"], read_only=False, destructive=True),
+    _tool("withdraw_suggestion", "Withdraw your suggestion", "review",
+          "Withdraw a suggestion this AI client made. Accepting or rejecting other people's suggestions is for people.",
+          {"id": _s("string", "The suggestion id (list_reviews).", maxLength=40)}, ["id"], read_only=False,
+          destructive=True),
+    _tool("grammar_check", "Check grammar", "review",
+          "Grammar and spelling findings for a text file from LanguageTool (a local server, or the public service "
+          "only if the owner allowed it), with line, column, message and suggested replacements. LaTeX commands are "
+          "skipped. The text is sent to that LanguageTool server.",
+          {"path": PATH}, ["path"]),
+    _tool("word_counts", "Word counts", "read",
+          "Words per part, chapter and section (texcount when installed, else a built-in count), with totals.",
+          {"level": _s("string", "Deepest heading level to list (default section).",
+                       enum=["part", "chapter", "section", "subsection", "subsubsection"])}),
+    _tool("source_for_pdf_position", "Find the source of a PDF spot", "read",
+          "Inverse SyncTeX: the source file and line that produced a point on a page of the built PDF. x and y are "
+          "PDF points from the page's top-left corner (72 per inch).",
+          {"page": _s("integer", "Page number, 1-based.", minimum=1),
+           "x": _s("number", "Points from the left edge.", minimum=0, maximum=20000),
+           "y": _s("number", "Points from the top edge.", minimum=0, maximum=20000)}, ["page", "x", "y"]),
+    _tool("list_versions", "List versions", "read",
+          "The version history of one file, or of the whole project: id, time, authors, kind (save, restore, "
+          "delete, rename, label) and names of named versions. Page with before=<smallest id seen>.",
+          {"path": _s("string", "Only this file (and named versions).", maxLength=240),
+           "before": _s("integer", "Only versions older than this id.", minimum=1)}),
+    _tool("version_diff", "Compare a version", "read",
+          "A line diff of one file at a version: against=current (what restoring would undo) or previous (what the "
+          "version changed). Long diffs are cut.",
+          {"id": _s("integer", "The version id.", minimum=1), "path": _s("string", "The file (needed for named "
+                                                                                    "versions).", maxLength=240),
+           "against": _s("string", "current (default) or previous.", enum=["current", "previous"])}, ["id"]),
+    _tool("restore_version", "Restore a version", "write",
+          "Put one file (path) or every file of a named version back. The current text is kept as a version first, "
+          "so a restore can be undone; files open in the editor are restored through it.",
+          {"id": _s("integer", "The version id.", minimum=1),
+           "path": _s("string", "Only this file (default: all files of a named version).", maxLength=240)},
+          ["id"], read_only=False, destructive=True, idempotent=False),
+    _tool("label_version", "Name this version", "write",
+          "Save the whole project as it is now under a name (for example \"Sent to supervisor\").",
+          {"label": _s("string", "The name.", maxLength=120)}, ["label"], read_only=False, idempotent=False),
+    _tool("insert_citation", "Insert a citation", "write",
+          "Insert \\cite{key} (or another cite command) right after a quoted passage of a .tex file. The key must "
+          "exist in one of the project's .bib files.",
+          {"path": PATH, "quote": _s("string", "The exact text after which the citation goes.", maxLength=20000),
+           "key": _s("string", "The citation key (comma-separated for several).", maxLength=500),
+           "command": _s("string", "The cite command (default cite).",
+                         enum=["cite", "citep", "citet", "parencite", "textcite", "autocite", "footcite", "nocite"]),
+           "occurrence": _s("integer", "Which occurrence of quote (1-based) when it appears more than once.",
+                            minimum=1)},
+          ["path", "quote", "key"], read_only=False, idempotent=False),
+    _tool("bib_add_entry", "Add bibliography entries", "write",
+          "Add one or more BibTeX entries (written as BibTeX, e.g. @article{key, title={...}, author={...}, "
+          "year={...}}) at the end of a .bib file. Keys already in the file are refused.",
+          {"path": BIB, "bibtex": _s("string", "The entries as BibTeX.", maxLength=200000)},
+          ["path", "bibtex"], read_only=False, idempotent=False),
+    _tool("bib_edit_entry", "Change a bibliography entry", "write",
+          "Replace the type, key and fields of one entry with the BibTeX given; the rest of the file stays "
+          "byte for byte.",
+          {"path": BIB, "key": _s("string", "The key of the entry to change.", maxLength=200),
+           "bibtex": _s("string", "The new entry as BibTeX.", maxLength=50000)},
+          ["path", "key", "bibtex"], read_only=False, destructive=True),
+    _tool("bib_delete_entry", "Delete a bibliography entry", "write",
+          "Delete one entry from a .bib file.",
+          {"path": BIB, "key": _s("string", "The key of the entry.", maxLength=200)},
+          ["path", "key"], read_only=False, destructive=True),
+    _tool("bib_import", "Import references", "write",
+          "Add entries from pasted BibTeX, RIS (Mendeley, EndNote, publisher exports) or a DOI (looked up at "
+          "Crossref: only the DOI is sent) to a .bib file. Keys already in the project are skipped.",
+          {"path": BIB, "source": _s("string", "BibTeX, RIS, or a DOI such as 10.1000/xyz.", maxLength=1000000)},
+          ["path", "source"], read_only=False, idempotent=False),
+    _tool("bib_lookup", "Fill in missing fields", "write",
+          "Ask Crossref (by DOI, or by a close title match; only the DOI or title is sent) for the fields an entry "
+          "lacks. Returns the proposal; with apply=true it is added to the file (existing fields never change).",
+          {"path": BIB, "key": _s("string", "The key of the entry.", maxLength=200),
+           "apply": _s("boolean", "Add the proposed fields (default false: only show them).")},
+          ["path", "key"], read_only=False),
+    _tool("zotero_sync_preview", "Compare with Zotero", "write",
+          "Compare a .bib file with the Zotero library set up for this project (the owner's locally; your own "
+          "hosted): entries new in Zotero, entries Zotero changed (field by field), and entries only the file has. "
+          "Nothing changes; apply chosen keys with zotero_apply.",
+          {"path": BIB}, ["path"]),
+    _tool("zotero_apply", "Apply Zotero entries", "write",
+          "Add new Zotero entries and/or take Zotero's changed fields, by key (from zotero_sync_preview). Entries "
+          "only the file has are never deleted.",
+          {"path": BIB, "add": _s("string", "Comma-separated keys of new entries to add.", maxLength=20000),
+           "update": _s("string", "Comma-separated keys of changed entries to update.", maxLength=20000)},
+          ["path"], read_only=False, idempotent=False),
+    _tool("export_docx", "Export to Word", "write",
+          "Convert the document to out/<name>.docx with pandoc (local server only; never while sharing). Returns "
+          "the file's path on this computer.", local=True, read_only=False),
+    _tool("new_document_from_template", "New document from a template", "write",
+          "Create a new document (locally files/<name>/; hosted a new project in a workspace you edit) from a "
+          "template: article, report (chapters, refs.bib, figures/), beamer or letter.",
+          {"name": _s("string", "The new document's name.", maxLength=80),
+           "template": _s("string", "The template (default article).", enum=["article", "report", "beamer", "letter"]),
+           "workspace": _s("string", "Hosted only: the workspace id (from list_projects) to create it in.",
+                           maxLength=40)},
+          ["name"], project=False, read_only=False, idempotent=False),
 ]
 TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
-GLOBAL_TOOLS = ("list_projects", "search", "fetch")  # the rest work on one project
+GLOBAL_TOOLS = ("list_projects", "search", "fetch", "new_document_from_template")  # the rest work on one project
 
 
 def public(tool: dict) -> dict:
     return {k: v for k, v in tool.items() if not k.startswith("_")}
 
 
-def tools_for(scopes) -> list[dict]:
-    """The tools a set of scopes allows (write and review include read)."""
-    return [t for t in TOOLS if t["_scope"] == "read" or t["_scope"] in scopes]
+def tools_for(scopes, local: bool = False) -> list[dict]:
+    """The tools a set of scopes allows (write and review include read); local-only ones only for mcp_server.py."""
+    return [t for t in TOOLS if (t["_scope"] == "read" or t["_scope"] in scopes) and (local or not t["_local"])]
 
 
 def check_args(schema: dict, args) -> dict:
@@ -213,12 +331,15 @@ def check_args(schema: dict, args) -> dict:
             continue
         spec, kind = props[key], props[key]["type"]
         good = (kind == "string" and isinstance(value, str)) or (kind == "boolean" and isinstance(value, bool)) or (
-            kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            kind == "integer" and isinstance(value, int) and not isinstance(value, bool)) or (
+            kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and abs(value) < 1e9)
         if not good:
             raise ToolError(f"Argument {key!r} must be a {kind}.")
         if kind == "string" and (len(value) > spec.get("maxLength", 10 ** 9) or "\0" in value):
             raise ToolError(f"Argument {key!r} is too long or contains a NUL character.")
-        if kind == "integer" and not spec.get("minimum", -10 ** 18) <= value <= spec.get("maximum", 10 ** 18):
+        if kind in ("integer", "number") and not spec.get("minimum", -10 ** 18) <= value <= spec.get("maximum",
+                                                                                                     10 ** 18):
             raise ToolError(f"Argument {key!r} must be from {spec.get('minimum')} to {spec.get('maximum', 'any')}.")
         clean[key] = value
     missing = [key for key in schema.get("required", ()) if key not in clean]
@@ -479,10 +600,19 @@ class Doc:
         if self.role not in ("owner", "edit"):
             raise ToolError("Your role in this project is view-only: you cannot change it.")
         if limit and self.role != "owner":
-            key, (count, window) = limit, {"put": self.s.PUT_LIMIT, "fs": self.s.FS_LIMIT,
-                                           "review": self.s.REVIEW_LIMIT, "rebuild": self.s.REBUILD_LIMIT}[limit]
-            if not self.s.rate_ok(key, count, window):
-                raise ToolError("Too many changes in a short time; wait a minute and try again.")
+            self.need_rate(limit)
+
+    LIMITS = {"put": "PUT_LIMIT", "fs": "FS_LIMIT", "review": "REVIEW_LIMIT", "rebuild": "REBUILD_LIMIT",
+              "history": "HISTORY_LIMIT", "history-read": "HISTORY_READ_LIMIT"}
+    OTHER_LIMITS = {"grammar": (30, 60.0), "bib-guest": (10, 60.0), "zotero-apply": (20, 60.0)}  # check_permission's
+
+    def need_rate(self, limit: str) -> None:
+        """The editor's rate limits (check_permission) for shared roles; the owner is not limited."""
+        if self.role == "owner":
+            return
+        count, window = getattr(self.s, self.LIMITS[limit]) if limit in self.LIMITS else self.OTHER_LIMITS[limit]
+        if not self.s.rate_ok(limit, count, window):
+            raise ToolError("Too many requests of this kind in a short time; wait a minute and try again.")
 
     def need_text_path(self, path: str) -> None:
         """Build configuration (build.toml, latexmkrc) can run programs, and the model reads text others wrote: no
@@ -492,15 +622,43 @@ class Doc:
             raise ToolError(f"{path} configures the build ({', '.join(sorted(self.s.RC_NAMES))}) and can run "
                             "programs, so AI clients cannot change it. Edit it yourself.")
 
-    def need_no_room(self, path: str) -> None:
+    def busy(self, path: str) -> list[str]:
         with self.s.COLLAB_LOCK:  # rooms in this process (hosted worker), or in a local serve.py (its marker)
             open_paths = [r["path"] for r in self.s.ROOMS.values() if r["doc"] == self.name and r["members"]]
         open_paths += self.s.rooms_elsewhere(self.name)
-        busy = [p for p in open_paths if p == path or p.startswith(path.rstrip("/") + "/")]
+        return [p for p in open_paths if p == path or p.startswith(path.rstrip("/") + "/")]
+
+    def need_no_room(self, path: str) -> None:
+        busy = self.busy(path)
         if busy:
             raise ToolError(f"{busy[0]} is open in the editor right now, so a direct change would collide with "
                             "someone's typing. Use add_suggestion (they can accept it with one click), or try again "
                             "once nobody has the file open.")
+
+    def change(self, path: str, current: dict, new: str, what: str) -> dict:
+        """Write `new` over the file, or, while the file is open in the editor, make the same change a suggestion
+        (one splice: the common start and end of old and new text stay)."""
+        old = current["text"]
+        if new == old:
+            raise ToolError("That changes nothing.")
+        if not self.busy(path):
+            written = self.save(path, new, current)
+            return {"path": path, "written": True, "version": written["version"], "change": what}
+        start = 0
+        while start < min(len(old), len(new)) and old[start] == new[start]:
+            start += 1
+        end_old, end_new = len(old), len(new)
+        while end_old > start and end_new > start and old[end_old - 1] == new[end_new - 1]:
+            end_old, end_new = end_old - 1, end_new - 1
+        utf16 = lambda part: len(part.encode("utf-16-le")) // 2  # noqa: E731
+        at = utf16(old[:start])
+        anchor = {"from": at, "to": at + utf16(old[start:end_old]), "quote": old[start:end_old],
+                  "prefix": old[max(0, start - 32):start], "suffix": old[end_old:end_old + 32]}
+        self.need_rate("review")
+        done = self.s.review_change(self.name, self.role, self.user, {
+            "op": "suggest", "path": path, "anchor": anchor, "insert": new[start:end_new], "name": self.author})
+        return {"path": path, "written": False, "suggestion": done["item"]["id"], "change": what,
+                "note": f"{path} is open in the editor, so this became a suggestion for the people there to accept."}
 
     def save(self, path: str, text: str, current: dict | None) -> dict:
         self.s.remember_disk(self.name, path)  # what is on disk now, if history lacks it
@@ -744,14 +902,15 @@ class Doc:
 
     # --- review ----------------------------------------------------------------------------------------------
 
-    def anchor(self, path: str, quote: str, occurrence: int | None) -> dict:
-        self.need_edit("review")
-        self.need_text_path(path)
-        text = self.s.read_text_file(self.root, path)["text"]
+    def anchor(self, path: str, quote: str, occurrence: int | None, text: str | None = None, after: int = 0) -> dict:
+        if text is None:
+            self.need_edit("review")
+            self.need_text_path(path)
+            text = self.s.read_text_file(self.root, path)["text"]
         quote = quote.replace("\r\n", "\n")
         if not quote:
             raise ToolError("quote is empty.")
-        spots, at = [], text.find(quote)
+        spots, at = [], text.find(quote, after)
         while at >= 0 and len(spots) < 1000:
             spots.append(at)
             at = text.find(quote, at + len(quote))
@@ -765,11 +924,13 @@ class Doc:
         utf16 = lambda part: len(part.encode("utf-16-le")) // 2  # noqa: E731 - the editor counts UTF-16 units
         start = utf16(text[:i])
         return {"from": start, "to": start + utf16(quote), "quote": quote, "prefix": text[max(0, i - 32):i],
-                "suffix": text[i + len(quote):i + len(quote) + 32], "_line": text[:i].count("\n") + 1}
+                "suffix": text[i + len(quote):i + len(quote) + 32], "_line": text[:i].count("\n") + 1,
+                "_end": i + len(quote)}
 
     def review(self, op: str, path: str, quote: str, occurrence: int | None, **fields) -> dict:
         spot = self.anchor(path, quote, occurrence)
         line = spot.pop("_line")
+        spot.pop("_end")
         done = self.s.review_change(self.name, self.role, self.user,
                                     {"op": op, "path": path, "anchor": spot, "name": self.author, **fields})
         return result({"id": done["item"]["id"], "path": path, "line": line})
@@ -777,8 +938,379 @@ class Doc:
     def t_add_comment(self, path: str, quote: str, comment: str, occurrence: int | None = None) -> dict:
         return self.review("comment", path, quote, occurrence, text=comment)
 
-    def t_add_suggestion(self, path: str, quote: str, replacement: str, occurrence: int | None = None) -> dict:
-        return self.review("suggest", path, quote, occurrence, insert=replacement)
+    def t_add_suggestion(self, path: str, quote: str, replacement: str, occurrence: int | None = None,
+                         **more) -> dict:
+        extra = [(more.get(f"quote_{n}"), more.get(f"replacement_{n}")) for n in (2, 3, 4)]
+        if any((q is None) != (r is None) for q, r in extra):
+            raise ToolError("Give quote_N and replacement_N together.")
+        extra = [(q, r) for q, r in extra if q is not None]
+        if not extra:
+            return self.review("suggest", path, quote, occurrence, insert=replacement)
+        first = self.anchor(path, quote, occurrence)
+        text = self.s.read_text_file(self.root, path)["text"]
+        parts, end = [], first.pop("_end")
+        line = first.pop("_line")
+        for q, r in extra:
+            spot = self.anchor(path, q, 1, text=text, after=end)
+            end = spot.pop("_end")
+            spot.pop("_line")
+            parts.append({"anchor": spot, "insert": r.replace("\r\n", "\n")})
+        done = self.s.review_change(self.name, self.role, self.user, {
+            "op": "suggest", "path": path, "anchor": first, "insert": replacement, "more": parts, "name": self.author})
+        return result({"id": done["item"]["id"], "path": path, "line": line, "parts": 1 + len(parts)})
+
+    def thread(self, tid: str) -> dict:
+        """A comment thread, refused like its file would be (build configuration)."""
+        found = next((t for t in self.s.review_store(self.name).load()["threads"] if t.get("id") == tid), None)
+        if found is None:
+            raise ToolError("No such comment thread (list_reviews shows them).")
+        self.need_text_path(found.get("path") or "")
+        return found
+
+    def t_reply_comment(self, thread: str, comment: str) -> dict:
+        self.need_edit("review")
+        self.thread(thread)
+        done = self.s.review_change(self.name, self.role, self.user,
+                                    {"op": "reply", "thread": thread, "text": comment, "name": self.author})
+        return result({"thread": thread, "comments": len(done["item"]["comments"])})
+
+    def t_resolve_thread(self, thread: str, reopen: bool = False) -> dict:
+        self.need_edit("review")
+        self.thread(thread)
+        self.s.review_change(self.name, self.role, self.user,
+                             {"op": "resolve", "thread": thread, "resolved": not reopen, "name": self.author})
+        return result({"thread": thread, "resolved": not reopen})
+
+    def own(self, item: dict) -> bool:
+        """Made by this caller through MCP: the same account (or the local owner) and this client's name."""
+        who = self.s.reviewer(self.role, self.user, {"name": self.author, "key": "x" * 16})["key"]
+        return item.get("author") == who and item.get("name") == self.author
+
+    def t_delete_comment(self, thread: str, comment: str) -> dict:
+        self.need_edit("review")
+        found = self.thread(thread)
+        target = next((c for c in found["comments"] if c.get("id") == comment), None)
+        if target is None:
+            raise ToolError("No such comment in that thread.")
+        if not self.own(target):
+            raise ToolError("Only comments this AI client wrote can be deleted here.")
+        self.s.review_change(self.name, self.role, self.user,
+                             {"op": "delete", "thread": thread, "comment": comment, "name": self.author})
+        return result({"thread": thread, "deleted": comment})
+
+    def t_withdraw_suggestion(self, id: str) -> dict:  # noqa: A002 - the schema's name
+        self.need_edit("review")
+        found = next((x for x in self.s.review_store(self.name).load()["suggestions"] if x.get("id") == id), None)
+        if found is None:
+            raise ToolError("No such open suggestion (list_reviews shows them).")
+        if not self.own(found):
+            raise ToolError("Only suggestions this AI client made can be withdrawn; accepting or rejecting is for "
+                            "people.")
+        self.s.review_change(self.name, self.role, self.user, {"op": "reject", "ids": [id], "name": self.author})
+        return result({"withdrawn": id})
+
+    # --- checks, PDF ---------------------------------------------------------------------------------------------
+
+    def t_grammar_check(self, path: str) -> dict:
+        self.need_edit("grammar")  # like POST /api/grammar: it sends text to a server
+        text = self.s.read_text_file(self.root, path)["text"]
+        found = self.s.grammar_check(self.name, text)
+        rows = [{k: f[k] for k in ("line", "col", "rule", "message")} | {"replacements": f["replacements"][:5]}
+                for f in found["findings"][:300]]
+        return result({"mode": found["mode"], "notice": found.get("notice"), "findings": rows,
+                       "more": max(0, len(found["findings"]) - 300)})
+
+    def t_word_counts(self, level: str = "section") -> dict:
+        data = self.s.outline(self.main)
+        deepest = self.s.LEVELS[level]
+        rows = [{"level": i["kind"], "title": i["title"], "file": i["file"], "line": i["line"], "words": i["words"],
+                 "own_words": i["own"]} for i in data["items"] if i["level"] <= deepest]
+        return result({"total_words": data["total_words"], "counter": data["counter"],
+                       "words_before_first_heading": data["top_words"], "headings": rows[:MAX_ITEMS]})
+
+    def t_source_for_pdf_position(self, page: int, x: float, y: float) -> dict:
+        found = self.s.inverse(self.main, {"page": [str(page)], "x": [str(x)], "y": [str(y)]})
+        if not found.get("rel"):
+            raise ToolError("That spot comes from a file outside the project (a class or package).")
+        return result({"path": found["rel"], "line": found["line"]})
+
+    # --- history -------------------------------------------------------------------------------------------------
+
+    def t_list_versions(self, path: str | None = None, before: int | None = None) -> dict:
+        self.need_rate("history-read")
+        rows = self.s.history_list(self.name, self.role, path, before)["versions"][:100]
+        keep = ("id", "time", "path", "kind", "authors", "label", "deleted")
+        return result({"versions": [{k: r.get(k) for k in keep} | ({"files": r["files"][:100]} if "files" in r
+                                                                    else {}) for r in rows]})
+
+    def t_version_diff(self, id: int, path: str | None = None, against: str = "current") -> dict:  # noqa: A002
+        self.need_rate("history-read")
+        return result(self.s.history_diff(self.name, self.role, id, path, against))
+
+    def t_restore_version(self, id: int, path: str | None = None) -> dict:  # noqa: A002
+        self.need_edit("history")
+        elsewhere = self.s.rooms_elsewhere(self.name)  # a local serve.py: its rooms are not this process's
+        if path is not None:
+            self.need_text_path(path)
+            if path in elsewhere:
+                self.need_no_room(path)
+        elif elsewhere:
+            raise ToolError("Files of this project are open in the editor; restore one file at a time, or restore "
+                            "from the editor's History tab.")
+        role = self.role if self.build_config or self.role != "owner" else "edit"  # build config stays as it is
+        return result(self.s.history_restore(self.name, role, id, path, self.author))
+
+    def t_label_version(self, label: str) -> dict:
+        self.need_edit("history")
+        return result(self.s.history_label(self.name, label, self.author, self.role))
+
+    # --- bibliography ------------------------------------------------------------------------------------------
+
+    def bib_file(self, path: str) -> dict:
+        self.need_edit("put")
+        if not path.endswith(".bib"):
+            raise ToolError("Give a .bib file.")
+        current = self.s.read_text_file(self.root, path)
+        if len(current["text"]) > self.s.BIB_MAX_CHARS:
+            raise ToolError("This .bib file is too large to edit here (1 MB limit).")
+        return current
+
+    def project_keys(self, skip: str | None = None) -> dict:
+        """key -> .bib path for every entry in the project's .bib files (except `skip`)."""
+        keys: dict[str, str] = {}
+        for rel, full in text_files(self.root):
+            if rel.endswith(".bib") and rel != skip:
+                try:
+                    for entry in self.s.bibfix.parse(full.read_text("utf-8", "replace")):
+                        keys.setdefault(entry.key, rel)
+                except OSError:
+                    continue
+        return keys
+
+    def parsed(self, bibtex: str, many: bool = True) -> list:
+        entries = [e for e in self.s.bibfix.parse(bibtex) if e.kind.lower() not in ("comment", "string", "preamble")]
+        if not entries or (not many and len(entries) != 1):
+            raise ToolError("Give " + ("BibTeX entries" if many else "one BibTeX entry") + " like "
+                            "@article{key, title={...}, year={2024}}; check braces and commas.")
+        out = []
+        for entry in entries[:200]:
+            fields: dict[str, str] = {}
+            for field in entry.fields:
+                fields.setdefault(field.name, field.value)
+            try:
+                out.append((entry.kind, entry.key, self.s.bibfix.check_entry(entry.kind, entry.key, fields)))
+            except ValueError as exc:
+                raise ToolError(f"{entry.key}: {exc}")
+        return out
+
+    def append(self, text: str, entries, taken) -> tuple[str, list, list]:
+        added, skipped = [], []
+        for kind, key, fields in entries:
+            if key in taken:
+                skipped.append(key)
+                continue
+            start, insert = self.s.bibfix.append_entry(text, kind, key, fields)
+            text = text[:start] + insert + text[start:]
+            taken = {*taken, key}
+            added.append(key)
+        return text, added, skipped
+
+    def t_bib_add_entry(self, path: str, bibtex: str) -> dict:
+        current = self.bib_file(path)
+        entries = self.parsed(bibtex)
+        mine = {e.key for e in self.s.bibfix.parse(current["text"])}
+        clash = [key for _, key, _ in entries if key in mine]
+        if clash:
+            raise ToolError(f"Already in {path}: {', '.join(clash[:20])}. Use bib_edit_entry to change them.")
+        text, added, _ = self.append(current["text"], entries, set())
+        return result({**self.change(path, current, text, f"added {', '.join(added)}"), "added": added})
+
+    def t_bib_edit_entry(self, path: str, key: str, bibtex: str) -> dict:
+        current = self.bib_file(path)
+        [(kind, new_key, fields)] = self.parsed(bibtex, many=False)
+        text = current["text"]
+        if new_key != key and any(e.key == new_key for e in self.s.bibfix.parse(text)):
+            raise ToolError(f"'{new_key}' is already in this file.")
+        try:
+            start, end, insert = self.s.bibfix.replace_entry(text, key, kind, new_key, fields)
+        except KeyError:
+            raise ToolError(f"No entry '{key}' in {path}.")
+        except ValueError as exc:
+            raise ToolError(str(exc))
+        return result(self.change(path, current, text[:start] + insert + text[end:], f"changed {key}"))
+
+    def t_bib_delete_entry(self, path: str, key: str) -> dict:
+        current = self.bib_file(path)
+        text = current["text"]
+        try:
+            start, end = self.s.bibfix.delete_entry(text, key)
+        except KeyError:
+            raise ToolError(f"No entry '{key}' in {path}.")
+        return result(self.change(path, current, text[:start] + text[end:], f"deleted {key}"))
+
+    def t_bib_import(self, path: str, source: str) -> dict:
+        current = self.bib_file(path)
+        source = source.strip()
+        doi = re.fullmatch(r"(?:https?://(?:dx\.)?doi\.org/|doi:\s*)?(10\.\d{4,9}/\S+)", source, re.I)
+        if doi:
+            self.need_rate("bib-guest")  # one Crossref request, like the editor's Import (DOI)
+        found = self.s.bib_import({"doi": doi.group(1)} if doi else {"bibtex": source})
+        if not found["entries"]:
+            raise ToolError(found.get("error") or "Nothing to import.")
+        entries = []
+        made = set(self.project_keys()) | {e.key for e in self.s.bibfix.parse(current["text"])}
+        for item in found["entries"][:200]:
+            if not item.get("key"):  # a DOI record: name it like authorYEAR, unused in the project
+                fields = item.get("fields") or {}
+                first = (fields.get("author") or "").split(" and ")[0].split(",")[0].split()
+                base = (re.sub(r"[^a-z]", "", first[-1].lower()) if first else "") or "ref"
+                base += re.sub(r"\D", "", fields.get("year") or "")[:4]
+                key, n = base, 1
+                while key in made:
+                    n += 1
+                    key = f"{base}{chr(96 + n) if n < 27 else n}"
+                item = {**item, "key": key}
+                made.add(key)
+            try:
+                entries.append((item["type"], item["key"],
+                                self.s.bibfix.check_entry(item["type"], item["key"], item["fields"])))
+            except ValueError as exc:
+                raise ToolError(f"{item.get('key')}: {exc}")
+        taken = set(self.project_keys()) | {e.key for e in self.s.bibfix.parse(current["text"])}
+        text, added, skipped = self.append(current["text"], entries, taken)
+        if not added:
+            return result({"added": [], "skipped": skipped, "note": "Every key is already in the project."})
+        return result({**self.change(path, current, text, f"imported {len(added)} entries"), "added": added,
+                       "skipped": skipped, "warning": found.get("error")})
+
+    def t_bib_lookup(self, path: str, key: str, apply: bool = False) -> dict:
+        current = self.bib_file(path)
+        self.need_rate("bib-guest")
+        text = current["text"]
+        entry = self.s.bibfix.find_entry(text, key)
+        if entry is None:
+            raise ToolError(f"No entry '{key}' in {path}.")
+        try:
+            found = self.s.bibfix.suggest(entry.kind, {f.name: f.value for f in entry.fields})
+        except self.s.bibfix.BibLookupError as exc:
+            raise ToolError(str(exc))
+        out = {k: found.get(k) for k in ("fields", "source", "doi", "matched") if k in found}
+        edit = self.s.bibfix.edit_for(text, key, found.get("fields") or {})
+        if not edit:
+            return result({**out, "note": "Nothing to add: Crossref has no fields this entry lacks."})
+        if not apply:
+            return result({**out, "note": "Not applied: call again with apply=true to add these fields."})
+        at, insert = edit
+        return result({**out, **self.change(path, current, text[:at] + insert + text[at:], f"filled in {key}")})
+
+    def t_insert_citation(self, path: str, quote: str, key: str, command: str = "cite",
+                          occurrence: int | None = None) -> dict:
+        self.need_edit("put")
+        self.need_text_path(path)
+        if not path.endswith(".tex"):
+            raise ToolError("Citations go into .tex files.")
+        keys = [k.strip() for k in key.split(",") if k.strip()]
+        known = self.project_keys()
+        missing = [k for k in keys if k not in known]
+        if not keys or missing:
+            raise ToolError(f"Not in any .bib file of the project: {', '.join(missing) or key}. Add it first "
+                            "(bib_add_entry or bib_import).")
+        current = self.s.read_text_file(self.root, path)
+        spot = self.anchor(path, quote, occurrence, text=current["text"])
+        at = spot["_end"]
+        cite = "\\" + command + "{" + ",".join(keys) + "}"
+        text = current["text"]
+        return result({**self.change(path, current, text[:at] + cite + text[at:], f"inserted {cite}"),
+                       "line": spot["_line"]})
+
+    # --- Zotero ------------------------------------------------------------------------------------------------
+
+    def zotero_compare(self, path: str, remote: str | None) -> tuple[dict, dict]:
+        current = self.bib_file(path)
+        others = {}
+        for rel, full in text_files(self.root):
+            if rel.endswith(".bib") and rel != path:
+                others[rel] = full.read_text("utf-8", "replace")
+        taken = sorted({e.key for text in others.values() for e in self.s.bibfix.parse(text)})
+        request = {"text": current["text"], "taken": taken, "others": others}
+        if remote is not None:  # hosted: the gateway fetched the person's library with their own key
+            found = self.s.zotero_compare({**request, "remote": remote})
+        else:
+            if not self.s.zotero_info(self.role).get("can_sync"):
+                raise ToolError(self.s.zotero_info(self.role).get("reason") or "Zotero is not set up here: add your "
+                                "library in the editor's References panel (More > Zotero settings).")
+            found = self.s.zotero_preview(request)
+        return current, found
+
+    def t_zotero_sync_preview(self, path: str, remote: str | None = None) -> dict:
+        _, found = self.zotero_compare(path, remote)
+        title = lambda f: (f.get("title") or "")[:200]  # noqa: E731
+        return result({
+            "new": [{"key": e["key"], "type": e["type"], "title": title(e["fields"])} for e in found["new"][:300]],
+            "changed": [{"key": c["key"], "fields": [{"field": d["field"], "old": d["old"][:300], "new": d["new"][:300]}
+                                                    for d in c["diff"]]} for c in found["changed"][:300]],
+            "same": found["same"], "only_in_file": found["local_only"][:500], "skipped": found.get("skipped", 0),
+            "already_in_other_files": found["elsewhere"][:300]})
+
+    def t_zotero_apply(self, path: str, add: str = "", update: str = "", remote: str | None = None) -> dict:
+        self.need_edit("zotero-apply")
+        current, found = self.zotero_compare(path, remote)
+        want_add = {k.strip() for k in add.split(",") if k.strip()}
+        want_update = {k.strip() for k in update.split(",") if k.strip()}
+        if not want_add and not want_update:
+            raise ToolError("Name the keys to add and/or update (from zotero_sync_preview).")
+        new = {e["key"]: e for e in found["new"]}
+        changed = {c["key"]: c for c in found["changed"]}
+        unknown = sorted((want_add - set(new)) | (want_update - set(changed)))
+        if unknown:
+            raise ToolError(f"Not offered by Zotero now: {', '.join(unknown[:20])}. Run zotero_sync_preview again.")
+        ops = [{"op": "add", "type": new[k]["type"], "key": k, "fields": new[k]["fields"]} for k in sorted(want_add)]
+        ops += [{"op": "update", "key": k, "type": changed[k]["type"],
+                 "fields": {d["field"]: d["new"] for d in changed[k]["diff"]}} for k in sorted(want_update)]
+        cut = self.s.zotero_apply({"text": current["text"], "ops": ops})
+        text = current["text"]
+        start, end = from_utf16(text, cut["from"]), from_utf16(text, cut["to"])
+        return result(self.change(path, current, text[:start] + cut["insert"] + text[end:],
+                                  f"Zotero: {len(want_add)} added, {len(want_update)} updated"))
+
+    # --- export ------------------------------------------------------------------------------------------------
+
+    def t_export_docx(self) -> dict:
+        if self.role != "owner" or self.s.SHARE["on"] or self.s.GATEWAY["secret"]:
+            raise ToolError("DOCX export is only for the owner's local server, and off while sharing: pandoc reads "
+                            "any file the source names.")
+        ok, message = self.s.build.export_docx(self.main)
+        if not ok:
+            raise ToolError(message)
+        return result({"docx": str(self.s.build.docx_path_for(self.main)), "message": message})
+
+
+def from_utf16(text: str, units: int) -> int:
+    """The str index of a UTF-16 offset into text (the editor counts UTF-16 units)."""
+    count = 0
+    for index, char in enumerate(text):
+        if count >= units:
+            return index
+        count += 2 if ord(char) > 0xFFFF else 1
+    return len(text)
+
+
+def new_local_document(serve, name: str, template: str = "article") -> dict:
+    """mcp_server.py: files/<name>/ from build.template_files, served from now on. Never overwrites."""
+    build = serve.build
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}", name) or name.endswith((".", " ")):
+        raise ToolError("Use a simple name: letters, digits, spaces, dots, dashes and underscores.")
+    target = build.SOURCE_DIR / name
+    if target.exists():
+        raise ToolError(f"{name} exists already.")
+    for rel, text in build.template_files(name, template).items():
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        (target / rel).write_text(text, encoding="utf-8")
+    main = target / "main.tex"
+    doc = build.doc_name(main)
+    serve.DOCS[doc] = main
+    serve.STATE[doc] = serve.fresh_state(doc, main)
+    return result({"project": doc, "files": sorted(build.template_files(name, template)), "template": template})
 
 
 def worker_call(serve, name: str, role: str, user: str | None, data: dict) -> dict:
@@ -788,7 +1320,18 @@ def worker_call(serve, name: str, role: str, user: str | None, data: dict) -> di
         return failed("Unknown tool.")
     author = (user or ";Someone").partition(";")[2] or "Someone"
     try:
-        return Doc(serve, name, role, user, author).run(tool, data.get("arguments") or {})
+        doc = Doc(serve, name, role, user, author)
+        if tool in ("zotero_sync_preview", "zotero_apply"):  # the library the gateway fetched with the person's key
+            remote = data.get("remote")
+            if not isinstance(remote, str):
+                return failed("Zotero sync needs the library from the gateway.")
+            args = check_args(TOOL_BY_NAME[tool]["inputSchema"], {"project": name, **(data.get("arguments") or {})})
+            args.pop("project")
+            try:
+                return getattr(doc, "t_" + tool)(**args, remote=remote)
+            except serve.ApiError as exc:
+                raise ToolError(str(exc))
+        return doc.run(tool, data.get("arguments") or {})
     except ToolError as exc:
         return failed(str(exc))
 

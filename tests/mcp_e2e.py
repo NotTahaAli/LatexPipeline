@@ -258,6 +258,20 @@ def run(browser, origin: str, port: int) -> None:
     png = base64.b64decode(image["data"])
     assert image["mimeType"] == "image/png" and png.startswith(b"\x89PNG"), image["mimeType"]
     ok(f"render_page returns a PNG ({len(png) // 1024} KiB)")
+    spot = call("source_for_pdf_position", project=pid, page=1, x=150, y=150)["structuredContent"]
+    assert spot["path"] == "main.tex", spot
+    words = call("word_counts", project=pid)["structuredContent"]
+    assert words["total_words"] > 0, words
+    tid = call("add_comment", project=pid, path="main.tex", quote="Written by an AI client over MCP.",
+               comment="Is this sentence needed?")["structuredContent"]["id"]
+    call("reply_comment", project=pid, thread=tid, comment="Kept for the test.")
+    call("write_file", project=pid, path="refs.bib", content="@book{knuth, title={The TeXbook}, year={1986}}\n")
+    call("bib_add_entry", project=pid, path="refs.bib", bibtex="@misc{lamport, title={LaTeX}, year={1994}}")
+    call("insert_citation", project=pid, path="main.tex", quote="Written by an AI client over MCP.", key="lamport")
+    versions = call("list_versions", project=pid, path="main.tex")["structuredContent"]["versions"]
+    assert versions[0]["authors"] == ["Ada via E2E Client"], versions[0]
+    call("label_version", project=pid, label="After the MCP edits")
+    ok("inverse SyncTeX, word counts, comment + reply, bib entry + citation, history with the client's name")
     modern = {"jsonrpc": "2.0", "id": 4, "method": "server/discover", "params": {"_meta": {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}
     status, data, _ = client("POST", "/mcp", modern, origin=False, headers={

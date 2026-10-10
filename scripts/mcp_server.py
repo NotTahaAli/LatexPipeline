@@ -36,7 +36,7 @@ class Local:
         return f"{self.client} (MCP)"
 
     def tools(self) -> list[dict]:
-        return self.tools_mod.tools_for(() if self.read_only else ("write", "review"))
+        return self.tools_mod.tools_for(() if self.read_only else ("write", "review"), local=True)
 
     def challenge(self, scope: str):
         return None
@@ -75,6 +75,8 @@ class Local:
             return t.result({"id": args["id"], "title": f"{doc}: {rel}", "text": text,
                              "url": (s.DOCS[doc].parent / rel).resolve().as_uri(),
                              "metadata": {"project": doc, "path": rel, "truncated": cut}})
+        if name == "new_document_from_template":
+            return t.new_local_document(s, args["name"], args.get("template", "article"))
         doc = args.pop("project")
         if doc not in s.DOCS:
             raise t.ToolError(f"No project {doc!r}. list_projects shows the names.")

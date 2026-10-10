@@ -36,6 +36,7 @@ import time
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import mcp_tools
+from mcp_tools import NeedScope
 
 H = None  # the host module, set by install()
 
@@ -64,7 +65,8 @@ APP_SCHEMES = {"cursor", "vscode", "vscode-insiders", "windsurf"}
 BAD_SCHEMES = {"javascript", "data", "file", "vbscript", "blob", "about", "ftp", "ws", "wss", "view-source",
                "filesystem", "intent", "chrome", "jar", "mailto", "tel", "sms"}
 SCOPE_TEXT = {"read": "Read files, outline, build results and PDF pages",
-              "write": "Change files and run builds", "review": "Add comments and suggested edits"}
+              "write": "Change files, references and history, run builds",
+              "review": "Comment, suggest edits and check grammar"}
 WRITE_TOOLS = {t["name"] for t in mcp_tools.TOOLS if t["_scope"] != "read"}
 THROTTLES: dict = {}
 
@@ -565,6 +567,13 @@ def mcp(h) -> None:
         h.send_json(response, status, extra)
 
 
+class _Who:
+    """What host.new_project needs of a request: the user."""
+
+    def __init__(self, user: dict) -> None:
+        self.user = user
+
+
 class Hosted:
     """mcp_tools.handle's backend for one bearer token: its user, client and grant."""
 
@@ -600,10 +609,18 @@ class Hosted:
         reachable = self.projects()
         if name == "list_projects":
             spaces = {t["id"]: t["name"] for t in H.APP.db.all("SELECT id, name FROM tenants")}
+            whole = [{"workspace_id": tid, "name": spaces[tid], "role": H.tenant_role(H.APP, self.user, tid),
+                      "can_create_projects": "write" in self.scopes
+                      and H.tenant_role(H.APP, self.user, tid) in H.EDIT_ROLES}
+                     for tid in json.loads(self.grant["tenants"]) if tid in spaces
+                     and H.tenant_role(H.APP, self.user, tid)]
             return mcp_tools.result({"projects": [
-                {"project": pid, "name": p["name"], "workspace": spaces.get(p["tenant_id"]), "access": self.access(r),
+                {"project": pid, "name": p["name"], "workspace": spaces.get(p["tenant_id"]),
+                 "workspace_id": p["tenant_id"], "access": self.access(r),
                  "pdf": (H.APP.project_root(p) / ".out" / f"{p['slug']}.pdf").is_file()}
-                for pid, (p, r) in reachable.items()]})
+                for pid, (p, r) in reachable.items()], "workspaces": whole})
+        if name == "new_document_from_template":
+            return self.new_project(args)
         if name == "search":  # reads files in the gateway: per person (not per grant), and a small budget
             limit = throttle("search", SEARCHES_PER_MINUTE, 60)
             if limit.full(f"u{self.user['id']}"):
@@ -635,16 +652,64 @@ class Hosted:
                 raise mcp_tools.ToolError("Your role in this workspace is viewer: you can read but not change it.")
             H.audit_log(H.APP, "mcp_tool", self.user["id"], self.h.ip, project["tenant_id"],
                         f"{self.grant['client_name']}: {name} {pid}")
-        return self.worker(project, "edit" if name in WRITE_TOOLS else "view", name, args)
+        remote = self.zotero_library() if name in ("zotero_sync_preview", "zotero_apply") else None
+        return self.worker(project, "edit" if name in WRITE_TOOLS else "view", name, args, remote)
 
-    def worker(self, project: dict, role: str, name: str, args: dict) -> dict:
+    def zotero_library(self) -> str:
+        """The person's own Zotero library (their key from the Account page, never sent on), fetched like the
+        editor's Sync: per-account limit, a few fetches server-wide, at most HOSTED_PAGES pages. Comparing and
+        applying happen in the worker."""
+        zotero, uid = H.zotero, self.user["id"]
+        cfg = H.zotero_settings(uid)
+        if not zotero.configured(cfg):
+            raise mcp_tools.ToolError("Add your Zotero library and API key on the Account page first.")
+        if H.APP.zotero_syncs.full(f"zotero:{uid}"):
+            raise mcp_tools.ToolError("Too many Zotero syncs; wait a few minutes.")
+        if not H.ZOTERO_SLOTS.acquire(blocking=False):
+            raise mcp_tools.ToolError("The server is busy syncing with Zotero; try again in a minute.")
+        try:
+            H.APP.zotero_syncs.fail(f"zotero:{uid}")
+            text, _, _ = zotero.fetch(cfg, False, max_pages=zotero.HOSTED_PAGES, max_total=zotero.HOSTED_TOTAL)
+        except zotero.ZoteroError as exc:
+            raise mcp_tools.ToolError(str(exc))
+        finally:
+            H.ZOTERO_SLOTS.release()
+        return text
+
+    def new_project(self, args: dict) -> dict:
+        """A project from a template, like the projects page: write permission, editor in a workspace this
+        connection may use as a whole (so the new project is part of the grant), the workspace's project cap."""
+        tid = args.get("workspace") or ""
+        if "write" not in self.scopes:
+            raise NeedScope("write")
+        if tid not in json.loads(self.grant["tenants"]) or H.tenant_role(H.APP, self.user, tid) not in H.EDIT_ROLES:
+            raise mcp_tools.ToolError("Give workspace: the id of a workspace you edit and connected as a whole "
+                                      "(list_projects shows them under workspaces).")
+        template = args.get("template", "article")
+        try:
+            name = H.clean_name(args["name"], "Project name")
+
+            def fill(target) -> None:
+                for rel, text in H.build.template_files(name, template).items():
+                    (target / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (target / rel).write_text(text, encoding="utf-8")
+
+            project = H.new_project(_Who(self.user), tid, name, fill)
+        except H.HttpError as exc:
+            raise mcp_tools.ToolError(exc.message)
+        H.audit_log(H.APP, "project_created", self.user["id"], self.h.ip, tid,
+                    f"{project['id']} {name} ({template}) via {self.grant['client_name']}")
+        return mcp_tools.result({"project": project["id"], "name": name, "template": template})
+
+    def worker(self, project: dict, role: str, name: str, args: dict, remote: str | None = None) -> dict:
         who = f"{self.user['name']} via {self.grant['client_name']}"[:80]
         worker = H.APP.workers.acquire(project)
         conn = None
         try:
             conn = http.client.HTTPConnection("127.0.0.1", worker.port, timeout=H.APP.settings()["build_timeout"] + 60)
             conn.request("POST", f"/api/mcp?doc={quote(project['slug'])}",
-                         json.dumps({"tool": name, "arguments": args}).encode(),
+                         json.dumps({"tool": name, "arguments": args,
+                                     **({"remote": remote} if remote is not None else {})}).encode(),
                          {"Host": f"127.0.0.1:{worker.port}", "Content-Type": "application/json",
                           "X-Host-Secret": worker.secret, "X-Host-Role": role,
                           "X-Host-User": quote(f"{self.user['id']};{who}", ";")})

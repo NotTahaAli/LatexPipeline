@@ -27,6 +27,7 @@ import ai
 import host
 import host_mcp
 import serve
+import zotero
 
 
 def make_zip(entries: dict, symlink: str | None = None) -> bytes:
@@ -1759,9 +1760,9 @@ class Mcp(HostCase):
                 "MCP-Protocol-Version": "2025-06-18", **(headers or {})}
         return Client(self).call("POST", "/mcp", message, headers=hdrs, origin=origin)
 
-    def tool(self, token, name, **args):
+    def tool(self, token, tool, /, **args):
         status, data, _ = self.mcp(token, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
-                                           "params": {"name": name, "arguments": args}})
+                                           "params": {"name": tool, "arguments": args}})
         self.assertEqual(status, 200, data)
         return data["result"]
 
@@ -2039,6 +2040,73 @@ class Mcp(HostCase):
         self.app.db.run("UPDATE oauth_clients SET created = 0 WHERE id = ?", unused)
         host_mcp.cleanup()
         self.assertIsNone(self.app.db.one("SELECT id FROM oauth_clients WHERE id = ?", unused))
+
+    def test_editor_features_through_the_worker(self):
+        self.worker()
+        token = self.connect()[1]["access_token"]
+        names = {t["name"] for t in self.mcp(token, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[1]
+                 ["result"]["tools"]}
+        self.assertTrue({"reply_comment", "bib_add_entry", "zotero_apply", "restore_version", "grammar_check",
+                         "source_for_pdf_position", "new_document_from_template"} <= names)
+        self.assertNotIn("export_docx", names)  # owner only, never hosted
+        tid = self.tool(token, "add_comment", project=self.pid, path="main.tex", quote="\\begin{document}",
+                        comment="Hi")["structuredContent"]["id"]
+        self.assertFalse(self.tool(token, "reply_comment", project=self.pid, thread=tid, comment="Re")["isError"])
+        self.assertFalse(self.tool(token, "resolve_thread", project=self.pid, thread=tid)["isError"])
+        self.tool(token, "write_file", project=self.pid, path="refs.bib", content="@book{a, title={A}}\n")
+        out = self.tool(token, "bib_add_entry", project=self.pid, path="refs.bib", bibtex="@misc{b, title={B}}")
+        self.assertFalse(out["isError"], out)
+        out = self.tool(token, "insert_citation", project=self.pid, path="main.tex", quote="\\begin{document}",
+                        key="b")
+        self.assertFalse(out["isError"], out)
+        versions = self.tool(token, "list_versions", project=self.pid, path="refs.bib")["structuredContent"]
+        self.assertEqual(versions["versions"][0]["authors"], ["Ed via Test Client"])
+        self.assertTrue(self.tool(token, "grep", project=self.pid, query="(a+)+$", regex=True)["isError"])
+        with mock.patch.object(serve, "grammar_check", return_value={"mode": "local", "findings": []}):
+            self.assertFalse(self.tool(token, "grammar_check", project=self.pid, path="main.tex")["isError"])
+        viewer = self.connect(email="vi@x.org")[1]["access_token"]
+        for name, args in (("reply_comment", {"thread": tid, "comment": "x"}),
+                           ("bib_delete_entry", {"path": "refs.bib", "key": "a"}),
+                           ("label_version", {"label": "x"})):
+            out = self.tool(viewer, name, project=self.pid, **args)
+            self.assertTrue(out["isError"], name)
+            self.assertIn("viewer", out["content"][0]["text"])
+
+    def test_zotero_uses_the_persons_own_library(self):
+        self.worker()
+        token = self.connect()[1]["access_token"]
+        self.tool(token, "write_file", project=self.pid, path="refs.bib", content="@book{a, title={A}}\n")
+        self.assertIn("Account page", self.tool(token, "zotero_sync_preview", project=self.pid,
+                                                 path="refs.bib")["content"][0]["text"])
+        remote = "@book{a, title={A}}\n@misc{z, title={From Zotero}}\n"
+        with mock.patch.object(host, "zotero_settings", return_value={"mode": "web", "key": "k" * 24}), \
+                mock.patch.object(zotero, "configured", return_value=True), \
+                mock.patch.object(zotero, "fetch", return_value=(remote, "3", False)) as fetched:
+            out = self.tool(token, "zotero_sync_preview", project=self.pid, path="refs.bib")
+            self.assertEqual([e["key"] for e in out["structuredContent"]["new"]], ["z"], out)
+            self.assertFalse(self.tool(token, "zotero_apply", project=self.pid, path="refs.bib", add="z")["isError"])
+            self.assertEqual(fetched.call_args.kwargs["max_pages"], zotero.HOSTED_PAGES)
+            self.assertNotIn("k" * 24, json.dumps(out))
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        self.assertIn("From Zotero", (source / "refs.bib").read_text())
+
+    def test_new_projects_from_templates(self):
+        token = self.connect(tenants=[self.tenant], projects=[])[1]["access_token"]
+        listed = self.tool(token, "list_projects")["structuredContent"]
+        self.assertEqual(listed["workspaces"][0]["workspace_id"], self.tenant)
+        self.assertTrue(listed["workspaces"][0]["can_create_projects"])
+        made = self.tool(token, "new_document_from_template", name="Fresh", workspace=self.tenant, template="report")
+        self.assertFalse(made["isError"], made)
+        pid = made["structuredContent"]["project"]
+        self.assertIn(pid, [p["project"] for p in self.tool(token, "list_projects")["structuredContent"]["projects"]])
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", pid))
+        self.assertTrue((source / "refs.bib").is_file())
+        self.assertTrue(self.tool(token, "new_document_from_template", name="X", workspace=self.other)["isError"])
+        only = self.connect()[1]["access_token"]  # one project, not the workspace: no new projects there
+        self.assertTrue(self.tool(only, "new_document_from_template", name="Y", workspace=self.tenant)["isError"])
+        viewer = self.connect(email="vi@x.org", tenants=[self.tenant], projects=[])[1]["access_token"]
+        self.assertTrue(self.tool(viewer, "new_document_from_template", name="Z", workspace=self.tenant)["isError"])
+        self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM projects")["n"], 3)
 
     def test_endpoint_rules_origin_protocol_and_rate(self):
         _, tokens = self.connect()
