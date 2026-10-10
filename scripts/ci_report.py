@@ -515,6 +515,7 @@ def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[F
 def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]:
     """For entries lacking required fields: info findings naming what Crossref can fill in (sends a DOI or title)."""
     out = []
+    bibfix.LOOKUP_WAIT = 60.0  # Outside the server a lookup waits for the rate limit instead of silently skipping.
     for finding in findings:
         if finding.kind != "missing-bib-field":
             continue
@@ -646,7 +647,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
             "suppressed": suppressed,
             "findings": [finding.as_dict() for finding in findings],
         }
-        total += len(findings)
+        total += sum(finding.kind != "bib-suggestion" for finding in findings)  # Suggestions are notices, not failures.
         print(f"{name}: words={lint[name]['words']} chktex={lint[name]['chktex']} "
               f"lint={len(findings)} suppressed={lint[name]['suppressed']}")
         annotate(name, findings)
