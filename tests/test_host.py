@@ -656,7 +656,7 @@ class Proxy(HostCase):
                                      origin=False)[0], 403)
         self.app.save_settings({"max_project_mb": 1})
         big = "x" * (1024 * 1024 + 10)
-        self.assertEqual(editor.call("PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex", {"text": big})[0], 413)
+        self.assertEqual(editor.call("PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex", {"text": big})[0], 507)
 
     def real_worker(self):
         """serve.py's gateway handler in this process, standing in for a worker."""

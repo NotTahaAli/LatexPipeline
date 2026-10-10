@@ -538,6 +538,77 @@ class GatewayMode(SharedState, ServerCase):
         self.assertEqual(self.as_("edit", "POST", "/rebuild?doc=demo", headers=bad)[0], 403)
 
 
+
+class GatewayQuota(GatewayMode):
+    """The worker enforces the project quota itself: every write path, fresh sizes, and build output."""
+
+    def setUp(self):
+        super().setUp()
+        used = serve.folder_bytes(self.base)
+        mock.patch.dict(serve.QUOTA, {"bytes": used + 1000, "area": self.base}).start()
+
+    def put(self, path, text):
+        return self.as_("edit", "PUT", f"/api/file?doc=demo&path={path}", {"text": text})[0]
+
+    def test_parallel_writes_cannot_pass_on_a_stale_size(self):
+        results = []
+        threads = [threading.Thread(target=lambda n=n: results.append(self.put(f"f{n}.tex", "x" * 300)))
+                   for n in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(results), [200] * 3 + [507] * 5)
+        self.assertLessEqual(serve.folder_bytes(self.base), serve.QUOTA["bytes"])
+
+    def test_every_write_path_refuses_over_quota_but_shrinking_and_deleting_work(self):
+        (self.base / ".cache").mkdir()
+        (self.base / ".cache" / "big").write_bytes(b"0" * 2000)  # build output counts too
+        self.assertEqual(self.put("a.tex", "x"), 507)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=newfile&path=b.tex")[0], 507)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=mkdir&path=dir")[0], 507)
+        with self.assertRaises(serve.ApiError) as up:
+            serve.save_upload("demo", "x.png", b"\x89PNG\r\n\x1a\n0")
+        self.assertEqual(up.exception.status, 507)
+        self.assertEqual(self.put("main.tex", "y"), 200)  # smaller than before
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=delete&path=fig.png")[0], 200)
+
+    def test_a_build_over_quota_loses_its_new_output(self):
+        out = self.base / ".out"
+        out.mkdir()
+        for name, value in (("ROOT_DIR", self.base), ("SOURCE_DIR", self.base), ("FILES_DIR", self.base),
+                            ("OUT_DIR", out), ("CACHE_DIR", self.base / ".cache")):
+            mock.patch.object(serve.build, name, value).start()
+        (out / "old.pdf").write_bytes(b"old")
+        old = time.time() - 60
+        os.utime(out / "old.pdf", (old, old))
+        name = serve.build.doc_name(self.root / "main.tex")
+        serve.STATE[name] = serve.fresh_state(name, self.root / "main.tex")
+        self.addCleanup(serve.STATE.pop, name, None)
+
+        def small_build(*args, size=10, **kwargs):
+            (out / "doc.pdf").write_bytes(b"0" * size)
+            return {"ok": True, "errors": [], "seconds": 0, "pages": 1, "warnings": 0, "engine": "pdflatex",
+                    "error": None}, None
+
+        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=5000)):
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        state = serve.STATE[name]
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("quota", state["error"])
+        self.assertFalse((out / "doc.pdf").exists())
+        self.assertTrue((out / "old.pdf").exists())  # older output stays
+        with mock.patch.object(serve.build, "build_safely", side_effect=small_build) as ran, \
+                mock.patch.object(serve, "remember_build"):
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        self.assertEqual(serve.STATE[name]["status"], "ok")
+        (self.root / "huge.tex").write_bytes(b"0" * 5000)
+        ran.reset_mock()
+        with mock.patch.object(serve.build, "build_safely", side_effect=small_build) as ran:
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        ran.assert_not_called()  # already over quota: no LaTeX run at all
+        self.assertIn("quota", serve.STATE[name]["error"])
+
 class TunnelParsing(unittest.TestCase):
     def test_urls_from_each_tools_output(self):
         samples = {

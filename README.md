@@ -320,7 +320,7 @@ sudoedit /var/lib/latex-host/data/config.toml        # public_url = "https://lat
 | `session_days`, `session_idle_hours` | `14`, `12` | A login lasts at most this long, and ends after this long without a request. |
 | `[providers.<name>]` | none | Sign-in providers, see below. |
 
-Site settings live in the database and are changed on the Site admin page: sign-up (`invite_only` by default; `open`, where each new person gets their own workspace; or `open_domains`, which needs a provider that confirms the email), linking providers to existing accounts by email, projects per workspace, megabytes per project, open projects on the server and per workspace (each worker builds one document at a time, so this also caps concurrent builds), idle timeout and build time limit.
+Site settings live in the database and are changed on the Site admin page: sign-up (`invite_only` by default; `open`, where each new person gets their own workspace; or `open_domains`, which needs a provider that confirms the email), linking providers to existing accounts by email, projects per workspace, megabytes per project, open projects on the server and per workspace (each worker builds one document at a time, so this also caps concurrent builds), idle timeout and build time limit. The megabytes per project count the document plus its build output and caches (`.out/`, `.cache/`, `.home/`); the project's worker measures them afresh on every save, co-editing save, upload and new file (`507` when full; shrinking and deleting always work), and a build that goes over loses what it wrote and reports a quota error. A changed quota applies to workers started after the change.
 
 ### Sign-in providers
 

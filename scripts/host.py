@@ -554,7 +554,8 @@ class Workers:
         home.mkdir(parents=True, exist_ok=True)
         secret = secrets.token_urlsafe(32)
         env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "LANG": "C.UTF-8", "HOME": str(home),
-               "LP_HOST_SECRET": secret, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+               "LP_HOST_SECRET": secret, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+               "LP_QUOTA_BYTES": str(self.app.settings()["max_project_mb"] * 1024 * 1024)}
         for key in ("SYSTEMROOT", "TEMP", "TMP"):  # Windows needs these to start Python at all.
             if key in os.environ and os.name == "nt":
                 env[key] = os.environ[key]
@@ -678,11 +679,14 @@ class App:
     def project_source(self, project: dict) -> Path:
         return self.project_root(project) / project["slug"]
 
-    def project_bytes(self, project: dict, fresh: bool = False) -> int:
-        """Size of the document folder, cached for a few seconds (every proxied write asks)."""
+    def project_bytes(self, project: dict) -> int:
+        """
+        Size of the project area (document, .out, .cache, .home), cached for a few seconds: only a cheap early
+        reject. The worker enforces the quota itself on every write, under its write lock, with a fresh size.
+        """
         when, size = self.sizes.get(project["id"], (0.0, 0))
-        if fresh or time.monotonic() - when > 5:
-            size = folder_bytes(self.project_source(project))
+        if time.monotonic() - when > 5:
+            size = folder_bytes(self.project_root(project))
             self.sizes[project["id"]] = (time.monotonic(), size)
         return size
 
@@ -1028,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
-                raise HttpError(413, f"This project is over its {limit // 1048576} MB quota. Delete files first.")
+                raise HttpError(507, f"This project is over its {limit // 1048576} MB quota. Delete files first.")
         worker = APP.workers.acquire(project)
         upstream = None
         try:

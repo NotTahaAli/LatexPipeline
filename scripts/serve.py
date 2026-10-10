@@ -450,7 +450,16 @@ def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -
     name = build.doc_name(main_tex)
     publish(name, status="building", started=time.time())
     with BUILD_LOCK:
-        entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record, validate=False)
+        started = time.time()
+        over = quota_after_build(started)  # Already over quota: do not build at all.
+        if over is None:
+            entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record, validate=False)
+            over = quota_after_build(started)
+    if over is not None:
+        publish(name, status="failed", ok=False, error=over, error_hint=None, errors=[], finished=time.time(),
+                version=pdf_version(main_tex))
+        build.error(f"{name}: {over}")
+        return
     remember_build(entry)
     try:
         log_text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
@@ -508,10 +517,16 @@ def run_focus(name: str, rel: str, began: float | None = None) -> None:
             result["target"] = target
             if target is None:
                 result["error"] = f"{rel} is not read by main.tex with \\input or \\include, so it has no chapter."
-            elif build.build_focus(main_tex, SETTINGS["latexmk"], target):
-                result.update(status="ok", version=str(build.focus_paths(main_tex)[0].stat().st_mtime_ns))
             else:
-                result["error"] = focus_error(main_tex)
+                started = time.time()
+                built = build.build_focus(main_tex, SETTINGS["latexmk"], target)
+                over = quota_after_build(started)
+                if over:
+                    result["error"] = over
+                elif built:
+                    result.update(status="ok", version=str(build.focus_paths(main_tex)[0].stat().st_mtime_ns))
+                else:
+                    result["error"] = focus_error(main_tex)
     except Exception as exc:  # noqa: BLE001 - a failed preview must not take the server down.
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
@@ -735,6 +750,52 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 
 WRITE_LOCK = threading.Lock()
+# --gateway: bytes the whole project area (the document plus .out, .cache and .home beside it) may use; 0 = none.
+# host.py passes it in LP_QUOTA_BYTES. A worker serves one project, so WRITE_LOCK is the per-project lock.
+QUOTA: dict = {"bytes": 0, "area": None}
+
+
+def folder_bytes(root: Path) -> int:
+    """Apparent size of every file below root, symlinks not followed. Same rule as host.py's."""
+    total = 0
+    for current, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(current, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def quota_check(adding: int) -> None:
+    """Refuse (507) a write of `adding` more bytes that would take the project over its quota; shrinking is fine.
+    Measured fresh every time, under WRITE_LOCK, so parallel writes cannot all pass on one old number."""
+    if QUOTA["bytes"] and adding >= 0 and folder_bytes(QUOTA["area"]) + adding > QUOTA["bytes"]:
+        raise ApiError(f"This project is over its {QUOTA['bytes'] // 1048576} MB quota (files plus build output). "
+                       "Delete files to make room.", 507)
+
+
+def quota_after_build(started: float) -> str | None:
+    """
+    After a LaTeX run: if the project is over quota, delete what the run wrote (files in .out, .cache and .home
+    changed since `started`) and return the error to report; None when within quota.
+    """
+    area = QUOTA["area"]
+    if not QUOTA["bytes"] or folder_bytes(area) <= QUOTA["bytes"]:
+        return None
+    for sub in (".out", ".cache", ".home"):
+        for current, dirs, names in os.walk(area / sub):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+            for name in names:
+                path = os.path.join(current, name)
+                try:
+                    if os.lstat(path).st_mtime >= started:
+                        os.unlink(path)
+                except OSError:
+                    pass
+    return (f"The build went over the project's {QUOTA['bytes'] // 1048576} MB quota (files plus build output), "
+            "so its output was deleted. Delete files or make the document smaller.")
 
 
 def write_text_file(root: Path, rel: str, text: str, base: str | None, eol: str = "\n") -> dict:
@@ -755,6 +816,11 @@ def write_text_file(root: Path, rel: str, text: str, base: str | None, eol: str 
                 raise ApiError("The file was deleted or renamed on disk.", 409, deleted=True)
             if current != base:
                 raise ApiError("The file changed on disk.", 409, current=current)
+        try:
+            old = path.stat().st_size
+        except OSError:
+            old = 0
+        quota_check(len(data) - old)
         atomic_write(path, data)
         return {"path": rel, "version": version_of(path.stat())}
 
@@ -817,6 +883,7 @@ def fs_operation(doc: str, op, rel, to=None) -> dict:
                 raise ApiError("Only text files (.tex, .bib, ...) can be created here; drop images on the editor.", 415)
             if any(parent.is_file() for parent in source.parents if root.resolve() in parent.parents):
                 raise ApiError("A file is in the way of that folder.", 409)
+            quota_check(0)  # Empty, but not once the project is over quota.
             source.parent.mkdir(parents=True, exist_ok=True)
             if op == "mkdir":
                 source.mkdir()
@@ -891,6 +958,7 @@ def save_upload(doc: str, name, data: bytes) -> dict:
         raise ApiError("That file is not really a png, jpg or pdf.", 415)
     folder = "Figures" if (root / "Figures").is_dir() and not (root / "Figures").is_symlink() else ""
     with WRITE_LOCK:
+        quota_check(len(data))
         for n in range(100):
             rel = posixpath.join(folder, f"{stem[:80]}{'' if n == 0 else '-' + str(n)}{ext}")
             target = fs_path(root, rel)
@@ -2957,6 +3025,11 @@ def main() -> int:
         build.OUT_DIR, build.CACHE_DIR = project.parent / ".out", project.parent / ".cache"
         args.docs, args.source = [project.name], None
         gateway_enable(secret, project.name, args.build_timeout)
+        try:
+            QUOTA.update(bytes=max(0, int(os.environ.pop("LP_QUOTA_BYTES", "0"))), area=project.parent)
+        except ValueError:
+            build.error("LP_QUOTA_BYTES must be a whole number of bytes.")
+            return 2
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else build.ROOT_DIR / args.source
