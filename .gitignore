@@ -13,3 +13,5 @@ out/
 
 .venv/
 __pycache__/
+# Offline copies of the editor libraries (python3 scripts/vendor_ui.py)
+scripts/serve_ui/vendor/

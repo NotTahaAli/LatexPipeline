@@ -49,9 +49,9 @@ import build
 import grammar
 import hints
 
-PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 UI_DIR = Path(__file__).resolve().parent / "serve_ui"
+VENDOR_DIR = UI_DIR / "vendor"  # made by scripts/vendor_ui.py; when present the editor needs no CDN
 STARTED = time.time()
 
 STOP = threading.Event()
@@ -2030,6 +2030,7 @@ HANDLERS.update({
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8", ".woff2": "font/woff2",
 }
 MAX_BODY = 8 * 1024 * 1024
 POLL_HOLD = 25.0
@@ -2042,14 +2043,33 @@ READ_API = {
 }
 
 
+def vendor_files() -> dict:
+    """url -> file name of the offline copies, or {} when scripts/vendor_ui.py has not run (then the CDNs are used)."""
+    try:
+        files = json.loads((VENDOR_DIR / "manifest.json").read_text("utf-8"))["files"]
+        return {url: info["file"] for url, info in files.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def localize(page: bytes) -> bytes:
+    """With vendored libraries, point the import map at the local copies."""
+    local = vendor_files()
+    if not local:
+        return page
+    return re.sub(rb'"(https://[^"]+)"', lambda m: b'"/ui/vendor/%s"' % local[m.group(1).decode()].encode()
+                  if m.group(1).decode() in local else m.group(0), page)
+
+
 def csp(page: bytes, host: str) -> str:
-    """Only our own files, the pinned CDNs and this origin's sockets; the inline import map is allowed by hash."""
+    """Only our own files, the pinned CDNs (none when vendored), this origin's sockets; import map by hash."""
+    cdns = "" if vendor_files() else " " + CDNS
     block = re.search(rb'<script type="importmap">(.*?)</script>', page, re.S)
     inline = f" 'sha256-{base64.b64encode(hashlib.sha256(block.group(1)).digest()).decode()}'" if block else ""
     return "; ".join([
-        "default-src 'none'", f"script-src 'self'{inline} {CDNS}", f"style-src 'self' 'unsafe-inline' {CDNS}",
-        "img-src 'self' data: blob:", f"font-src 'self' data: {CDNS}", f"worker-src blob: {CDNS}",
-        f"connect-src 'self' ws://{host} wss://{host} {CDNS}", "base-uri 'none'", "form-action 'self'",
+        "default-src 'none'", f"script-src 'self'{inline}{cdns}", f"style-src 'self' 'unsafe-inline'{cdns}",
+        "img-src 'self' data: blob:", f"font-src 'self' data:{cdns}", f"worker-src 'self' blob:{cdns}",
+        f"connect-src 'self' ws://{host} wss://{host}{cdns}", "base-uri 'none'", "form-action 'self'",
         "frame-ancestors 'none'", "object-src 'none'",
     ])
 
@@ -2323,7 +2343,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             self.json(health(self.role))
         elif path == "/api/config":
-            self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"], "role": self.role, "collab": True,
+            self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "grammar": grammar_info(self.role)})
         elif path == "/api/share":
             self.json(share_info())
@@ -2376,11 +2396,20 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not found", "text/plain")
 
     def static(self, name: str) -> None:
+        if name.startswith("vendor/"):  # only files the manifest lists, never a path from the URL
+            name = name[7:]
+            target = VENDOR_DIR / name
+            if name not in vendor_files().values() or not target.is_file():
+                self.reply(404, b"Not found", "text/plain")
+                return
+            self.reply(200, target.read_bytes(), STATIC_TYPES.get(target.suffix, "application/octet-stream"))
+            return
         target = UI_DIR / name
         if "/" in name or "\\" in name or not target.is_file() or target.suffix not in STATIC_TYPES:
             self.reply(404, b"Not found", "text/plain")
             return
-        self.reply(200, target.read_bytes(), STATIC_TYPES[target.suffix])
+        body = target.read_bytes()
+        self.reply(200, localize(body) if name == "index.html" else body, STATIC_TYPES[target.suffix])
 
     def image(self, path: Path) -> None:
         self.reply(200, path.read_bytes(), IMAGE_TYPES[path.suffix.lower()], {"Content-Security-Policy": "sandbox"})

@@ -1,6 +1,5 @@
 // PDF.js viewer: page boxes first, canvases only for pages near the viewport,
 // so a 300-page document costs one getPage for the first paint.
-import { PDFJS } from "./libs.js";
 
 export class PdfView {
   constructor(viewer, pagesEl, { zoom, onZoom, onFirstPage }) {
@@ -11,8 +10,8 @@ export class PdfView {
       const i = +e.target.dataset.i;
       if (e.isIntersecting) this.render(i); else this.release(i);
     }), { root: viewer, rootMargin: "1200px 0px" });
-    this.ready = import(`${PDFJS}/pdf.min.mjs`).then((m) => {
-      this.lib = m; m.GlobalWorkerOptions.workerSrc = `${PDFJS}/pdf.worker.min.mjs`;
+    this.ready = import("pdfjs").then((m) => {
+      this.lib = m; m.GlobalWorkerOptions.workerSrc = import.meta.resolve("pdfjs-worker");
     });
   }
 
