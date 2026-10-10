@@ -995,6 +995,7 @@ DROP_RESPONSE = {"set-cookie", "connection", "keep-alive", "transfer-encoding", 
 PROXY_HEADERS = ["X-Frame-Options: DENY", "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer",
                  "Content-Security-Policy: frame-ancestors 'none'"]
 QUOTA_PATHS = {"/api/file", "/api/upload", "/api/fs"}
+ZOTERO_SLOTS = threading.BoundedSemaphore(4)  # Zotero fetches in flight on the whole server
 
 
 def route(method: str, pattern: str, need: str = "user"):
@@ -1299,7 +1300,7 @@ class Handler(BaseHTTPRequestHandler):
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
-        if rest in ("/api/zotero", "/api/zotero/preview"):
+        if rest in ("/api/zotero", "/api/zotero/fetch", "/api/zotero/preview"):
             self.zotero_sync(rest, role, size)
             return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
@@ -1392,9 +1393,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(result)
 
     def zotero_sync(self, rest: str, role: str, size: int) -> None:
-        """/p/<id>/api/zotero[/preview] stops here: each person's own Zotero key (Account page) lives in host.db and
-        never reaches a worker. GET says whether the editor may offer a sync; POST fetches with that person's key
-        and compares with the .bib text the editor sent. Applying stays in the worker (a network-free splice)."""
+        """/p/<id>/api/zotero[/fetch] stops here: each person's own Zotero key (Account page) lives in host.db and
+        never reaches a worker. GET says whether the editor may offer a sync; POST /fetch reads that person's
+        library (at most HOSTED_PAGES pages) and returns its BibTeX. Comparing (CPU) and applying happen in the
+        project's worker (/api/zotero/compare and /apply, no network), never in this shared process."""
         cfg = zotero_settings(self.session["id"])
         allowed = role == "edit" and zotero.configured(cfg)
         reason = ("View-only members cannot sync from Zotero." if role != "edit" else None if allowed
@@ -1402,28 +1404,38 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and rest == "/api/zotero":
             self.send_json({**zotero_public(cfg), "hosted": True, "can_sync": allowed, "reason": reason})
             return
-        if self.command != "POST" or rest != "/api/zotero/preview":
+        if self.command != "POST" or rest != "/api/zotero/fetch":
             raise HttpError(405, "Method not allowed.")
         if reason:
             raise HttpError(403 if role != "edit" else 400, reason)
-        if APP.zotero_syncs.full(f"zotero:{self.session['id']}"):
+        if size > MAX_JSON:
+            raise HttpError(413, "Too large.")
+        self.read_exact(size)  # nothing is needed from the body
+        uid = self.session["id"]
+        if APP.zotero_syncs.full(f"zotero:{uid}"):
             raise HttpError(429, "Too many Zotero syncs; wait a few minutes.")
-        if size > zotero.MAX_REQUEST:
-            raise HttpError(413, "The .bib files are too large to compare.")
-        if "json" not in self.headers.get("Content-Type", ""):
-            raise HttpError(415, "Expected application/json.")
+        if not ZOTERO_SLOTS.acquire(blocking=False):  # a sync may wait a minute for Zotero: never pile threads up
+            raise HttpError(503, "The server is busy syncing with Zotero; try again in a minute.",
+                            {"Retry-After": "30"})
         try:
-            data = json.loads(self.read_exact(size) or b"{}")
-        except ValueError:
-            raise HttpError(400, "Bad JSON.")
-        if not isinstance(data, dict):
-            raise HttpError(400, "Expected a JSON object.")
-        APP.zotero_syncs.fail(f"zotero:{self.session['id']}")  # counted before the fetch: a slow one still counts
-        try:
-            text, taken, others = zotero.check_request(data)
-            self.send_json(zotero.preview(text, taken, False, others, cfg))
+            with APP.streams_lock:  # a sync holds a thread like an open editor tab
+                if APP.streams[uid] >= APP.config["max_streams_per_user"]:
+                    raise HttpError(429, "Too many open editor tabs or syncs. Close some and try again.")
+                APP.streams[uid] += 1
+            try:
+                APP.zotero_syncs.fail(f"zotero:{uid}")  # counted before the fetch: a slow one still counts
+                text, version, cached = zotero.fetch(cfg, False, max_pages=zotero.HOSTED_PAGES,
+                                                     max_total=zotero.HOSTED_TOTAL)
+            finally:
+                with APP.streams_lock:
+                    APP.streams[uid] -= 1
+                    if APP.streams[uid] <= 0:
+                        del APP.streams[uid]
         except zotero.ZoteroError as exc:
             raise HttpError(exc.status, str(exc))
+        finally:
+            ZOTERO_SLOTS.release()
+        self.send_json({"text": text, "version": version, "cached": cached, "source": "web"})
 
     def assistant_stream(self, data: dict, key: str, model: str, record) -> None:
         """?stream: the gateway reads Anthropic's stream itself and relays the answer as NDJSON (ai.relay); usage is

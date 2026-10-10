@@ -7,6 +7,7 @@ import * as prose from "./prose.js";
 import { grammarSupport } from "./grammar.js";
 import { addBibLookup } from "./bib.js";
 import { refsPanel } from "./refs.js";
+import { zoteroShareNote } from "./zotero.js";
 import { aiPanel } from "./ai.js";
 import { reviewSupport } from "./review.js";
 import { namedLinks } from "./links.js";
@@ -1010,8 +1011,9 @@ async function pushGrammarSettings() {
   catch (e) { toast(el("span", { textContent: "Grammar settings: " + e.message })); }
   scheduleGrammar(0);
 }
-function grammarShareNote() {   // also the AI assistant's line (ai.js), when the owner has a key
-  return [grammarOnlyNote(), aiUi.shareNote()].filter(Boolean).join(" ");
+let zoteroNote = "";   // the Zotero line (zotero.js), refreshed when the Share dialog opens
+function grammarShareNote() {   // also the AI assistant's line (ai.js) and Zotero's, when the owner has a key
+  return [grammarOnlyNote(), aiUi.shareNote(), zoteroNote].filter(Boolean).join(" ");
 }
 function grammarOnlyNote() {
   return settings.grammar === "public" || settings.grammarShare
@@ -1355,7 +1357,11 @@ document.addEventListener("click", (e) => { if (!e.target.closest("#usersWrap"))
 let shareTimer;
 let sharing = false;  // DOCX export is off while sharing (pandoc reads any file the source names)
 const setSharing = (on) => { if (on !== sharing) { sharing = on; buildMenu(); } };
-async function openShare() { $("share").showModal(); await refreshShare(); $("shareBody").querySelector("select, button")?.focus(); }
+async function openShare() {
+  $("share").showModal();
+  if (role === "owner") api.zotero().then((z) => { zoteroNote = zoteroShareNote(z); const n = $("shareBody").querySelector("#shareGrammar"); if (n) n.textContent = grammarShareNote(); }).catch(() => {});
+  await refreshShare(); $("shareBody").querySelector("select, button")?.focus();
+}
 async function refreshShare() {
   clearTimeout(shareTimer);
   let info;
@@ -1386,7 +1392,7 @@ function renderShare(info) {
     const msg = el("p", { className: "err", role: "alert", hidden: !info.error, textContent: info.error || "" });
     body.replaceChildren(
       el("p", { textContent: "Start a tunnel and get two links to this document: one to read, one to edit together in real time. Each link holds a secret token and works until you stop sharing or quit." }),
-      el("label", { htmlFor: "shareProvider", textContent: "Tunnel" }), select, msg, el("p", { className: "mute", textContent: grammarShareNote() }), el("div", { className: "actions" }, start));
+      el("label", { htmlFor: "shareProvider", textContent: "Tunnel" }), select, msg, el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }), el("div", { className: "actions" }, start));
   } else if (info.status === "starting") {
     body.replaceChildren(el("p", { role: "status", textContent: `Starting ${info.provider}... this can take up to a minute.` }),
       el("div", { className: "actions" }, el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: async () => { await api.shareStop(); refreshShare(); } })));

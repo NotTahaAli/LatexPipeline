@@ -1560,19 +1560,39 @@ def zotero_call(fn, *args) -> dict:
 
 def zotero_info(role: str) -> dict:
     """The owner sees the settings (never the key); a shared-link editor only whether it may sync."""
-    info = zotero.info()
+    info, sandboxed = zotero.info(), ai_sandboxed()
     if role == "owner":
-        return {**info, "local_ok": not SHARE["on"], "can_sync": True, "can_configure": True}
-    allowed = role == "edit" and info["share_editors"] and info["configured"]
+        return {**info, "local_ok": not SHARE["on"], "can_sync": True, "can_configure": True, "sandboxed": sandboxed}
+    allowed = role == "edit" and info["share_editors"] and sandboxed and info["configured"]
     return {"guest": True, "can_sync": allowed, "configured": allowed, "mode": info["mode"], "local_ok": False,
             "reason": None if allowed else "View-only links cannot sync." if role != "edit"
+            else "Zotero sync for shared links needs sandboxed builds." if info["share_editors"] and not sandboxed
             else "The owner has not let shared editors sync from Zotero."}
+
+
+def zotero_settings(data: dict) -> dict:
+    """Owner only. Letting shared editors sync needs sandboxed builds, like the AI assistant: otherwise LuaLaTeX
+    from an edit link could read the stored key (zotero.json) and use it directly."""
+    if data.get("share_editors") is True and not ai_sandboxed():
+        raise ApiError("Shared editors can sync from Zotero only with sandboxed builds (serve.py --sandbox): "
+                       "otherwise LuaLaTeX from an edit link could read your API key.", 409)
+    return zotero_call(zotero.save_settings, data)
 
 
 def zotero_preview(data: dict) -> dict:
     """Owner, or a shared-link editor once the owner allowed it (check_permission); always the owner's key."""
     text, taken, others = zotero_call(zotero.check_request, data)
     return zotero_call(zotero.preview, text, taken, not SHARE["on"], others)
+
+
+def zotero_compare(data: dict) -> dict:
+    """Hosted: the gateway fetched the library with the person's key (/api/zotero/fetch) and the editor hands its
+    BibTeX here, so the CPU-bound comparison runs in this project's worker and not in the shared gateway."""
+    remote = data.get("remote")
+    if not isinstance(remote, str) or len(remote) > zotero.HOSTED_TOTAL:
+        raise ApiError("Send the Zotero export (up to 3 MB).", 400 if not isinstance(remote, str) else 413)
+    text, taken, others = zotero_call(zotero.check_request, data)
+    return {**zotero_call(zotero.compare, remote, text, taken, others), "source": "web"}
 
 
 def zotero_apply(data: dict) -> dict:
@@ -3215,10 +3235,15 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
     elif method == "POST" and path == "/api/zotero/preview" and not GATEWAY["secret"]:
         need_edit()  # The owner's key fetches; the owner opted in (share_editors), and the key never leaves here.
         scoped(doc)
-        if not zotero.info()["share_editors"]:
+        if not (zotero.info()["share_editors"] and ai_sandboxed()):  # the key is safe from LuaLaTeX only then
             raise ApiError("The owner has not let shared editors sync from Zotero.", 403)
         if not rate_ok("zotero-guest", 6, 60.0):  # All guests together: a guest cannot drain the owner's quota.
             raise ApiError("Too many Zotero syncs; wait a moment.", 429)
+    elif method == "POST" and path == "/api/zotero/compare" and GATEWAY["secret"]:
+        need_edit()  # No network: the gateway fetched; this only compares, bounded by zotero's budgets.
+        scoped(doc)
+        if not rate_ok("zotero-compare", 10, 60.0):
+            raise ApiError("Too many Zotero comparisons; wait a moment.", 429)
     elif method == "POST" and path == "/api/zotero/apply":
         need_edit()  # No network: a splice for the chosen entries, like /api/bib/edit.
         # Settings stay owner only (the default deny below); hosted workers fetch nothing (the gateway does).
@@ -3477,12 +3502,14 @@ class Handler(BaseHTTPRequestHandler):
             self.json(bib_edit(self.body()))
         elif url.path == "/api/bib/import" and name in DOCS:
             self.json(bib_import(self.body()))
+        elif url.path == "/api/zotero/compare" and name in DOCS:  # role checked in check_permission
+            self.json(zotero_compare(self.body()))
         elif url.path == "/api/zotero/apply" and name in DOCS:
             self.json(zotero_apply(self.body()))
         elif url.path == "/api/zotero/preview" and name in DOCS:  # role checked in check_permission
             self.json(zotero_preview(self.body()))
         elif url.path == "/api/zotero/settings" and self.role == "owner":
-            self.json(zotero_call(zotero.save_settings, self.body()))
+            self.json(zotero_settings(self.body()))
         elif url.path == "/api/ai" and name in DOCS:
             guest = ai_guest(self.token, self.user, self.client_address[0])
             if "stream" in query:

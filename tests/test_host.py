@@ -1490,8 +1490,8 @@ class Zotero(HostCase):
         return client.call("POST", "/api/account/zotero", {"library_type": "users", "library_id": "42",
                                                             "format": "bibtex", "key": self.KEY, **extra})
 
-    def preview(self, client, body=None, **kw):
-        return client.call("POST", f"/p/{self.pid}/api/zotero/preview?doc=Doc", body or {"text": self.BIB}, **kw)
+    def fetch(self, client, **kw):
+        return client.call("POST", f"/p/{self.pid}/api/zotero/fetch?doc=Doc", **kw)
 
     def test_account_settings_keep_the_key_server_side(self):
         editor = self.client("ed@x.org")
@@ -1520,57 +1520,84 @@ class Zotero(HostCase):
         actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'zotero%'")]
         self.assertEqual(actions, ["zotero_key_set", "zotero_key_removed"])
 
-    def test_editors_preview_with_their_own_key_and_no_worker(self):
+    def test_editors_fetch_with_their_own_key_and_no_worker(self):
+        """The gateway only fetches; comparing (CPU) is the worker's /api/zotero/compare (test_serve)."""
         editor = self.client("ed@x.org")
         status, info, _ = editor.call("GET", f"/p/{self.pid}/api/zotero")
         self.assertEqual((status, info["can_sync"], info["hosted"]), (200, False, True))
-        self.assertEqual(self.preview(editor)[0], 400)  # no key yet
+        self.assertEqual(self.fetch(editor)[0], 400)  # no key yet
         self.setup_key(editor)
         status, info, _ = editor.call("GET", f"/p/{self.pid}/api/zotero")
         self.assertEqual((info["can_sync"], info["has_key"]), (True, True))
         self.assertNotIn(self.KEY, json.dumps(info))
-        others = {"more.bib": "@misc{x,\n  title = {Other}\n}\n"}
-        status, prev, _ = self.preview(editor, {"text": self.BIB, "others": others})
-        self.assertEqual(status, 200, prev)
-        self.assertEqual(([c["key"] for c in prev["changed"]], prev["new"], prev["elsewhere"][0]["key"]),
-                         (["a"], [], "x"))
-        self.assertNotIn(self.KEY, json.dumps(prev))
+        with mock.patch.object(host.zotero, "compare", side_effect=AssertionError("no comparing in the gateway")):
+            status, got, _ = self.fetch(editor)
+        self.assertEqual((status, got["text"], got["version"], got["cached"]), (200, self.REMOTE, "3", False))
+        self.assertNotIn(self.KEY, json.dumps(got))
         self.assertEqual(self.calls[0][1]["Zotero-API-Key"], self.KEY)
         self.assertIn("/users/42/items/top", self.calls[0][0])
         self.assertNotIn(self.KEY, self.calls[0][0])
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/preview", {"text": ""})[0], 405)
 
     def test_viewers_outsiders_and_other_accounts(self):
         self.setup_key(self.client("ed@x.org"))
         viewer = self.client("vi@x.org")
         self.setup_key(viewer, key="ViewerKey123456")
         self.assertFalse(viewer.call("GET", f"/p/{self.pid}/api/zotero")[1]["can_sync"])
-        self.assertEqual(self.preview(viewer)[0], 403)
+        self.assertEqual(self.fetch(viewer)[0], 403)
         outsider = self.client("out@x.org")
         self.setup_key(outsider)
-        self.assertEqual(self.preview(outsider)[0], 404)  # not their project: 404, not 403
+        self.assertEqual(self.fetch(outsider)[0], 404)  # not their project: 404, not 403
         self.assertEqual(outsider.call("GET", f"/p/{self.pid}/api/zotero")[0], 404)
-        self.assertEqual(self.preview(Client(self))[0], 401)
-        self.assertEqual(self.preview(self.client("ed@x.org"), origin=False)[0], 403)
-        self.assertEqual(self.preview(self.client("ed@x.org"), origin="https://evil.example")[0], 403)
+        self.assertEqual(self.fetch(Client(self))[0], 401)
+        self.assertEqual(self.fetch(self.client("ed@x.org"), origin=False)[0], 403)
+        self.assertEqual(self.fetch(self.client("ed@x.org"), origin="https://evil.example")[0], 403)
         self.assertEqual(self.client("ed@x.org").call("POST", f"/p/{self.pid}/api/zotero")[0], 405)
         self.assertEqual(self.calls, [])
 
-    def test_rate_limit_bad_bodies_and_errors(self):
+    def test_rate_limit_and_errors(self):
         editor = self.client("ed@x.org")
         self.setup_key(editor)
-        self.assertEqual(self.preview(editor, {"text": 5})[0], 400)
-        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/preview", raw=b"[1]")[0], 400)
-        huge = b"x" * (host.zotero.MAX_REQUEST + 1)
-        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/preview", raw=huge)[0], 413)
+        huge = b"x" * (host.MAX_JSON + 1)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/fetch", raw=huge)[0], 413)
         host.zotero.get.side_effect = host.zotero.ZoteroError("Zotero refused the API key.", 502)
-        status, body, _ = self.preview(editor)
+        status, body, _ = self.fetch(editor)
         self.assertEqual((status, body["error"]), (502, "Zotero refused the API key."))
-        codes = [self.preview(editor)[0] for _ in range(10)]
-        self.assertEqual(codes.count(429), 2)  # 10 per account in 10 minutes, bad requests included
+        codes = [self.fetch(editor)[0] for _ in range(10)]
+        self.assertEqual(codes.count(429), 1)  # 10 per account in 10 minutes
         other = self.client("vi@x.org")
         self.app.db.run("UPDATE members SET role = 'editor' WHERE tenant_id = ?", self.tenant)
         self.setup_key(other)
-        self.assertEqual(self.preview(other)[0], 502)  # a separate allowance per account
+        self.assertEqual(self.fetch(other)[0], 502)  # a separate allowance per account
+
+    def test_a_big_library_is_capped_and_syncs_cannot_pile_up(self):
+        editor = self.client("ed@x.org")
+        self.setup_key(editor)
+        host.zotero.get.side_effect = lambda url, headers, **kw: self.calls.append(url) or (
+            200, {"last-modified-version": "3", "total-results": "50000"}, self.REMOTE.encode())
+        status, body, _ = self.fetch(editor)
+        self.assertEqual(status, 413)
+        self.assertEqual(len(self.calls), host.zotero.HOSTED_PAGES)  # not MAX_PAGES: one sync cannot take the minute
+        self.calls.clear()
+        held = [host.ZOTERO_SLOTS.acquire(blocking=False) for _ in range(4)]
+        try:
+            self.assertTrue(all(held))
+            status, body, res = self.fetch(editor)
+            self.assertEqual((status, res.getheader("Retry-After")), (503, "30"))  # server-wide, never waits
+        finally:
+            for _ in held:
+                host.ZOTERO_SLOTS.release()
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.app.streams[uid] = self.app.config["max_streams_per_user"]  # a sync counts like an open tab
+        try:
+            self.assertEqual(self.fetch(editor)[0], 429)
+        finally:
+            del self.app.streams[uid]
+        self.assertEqual(self.calls, [])
+        host.zotero.get.side_effect = None
+        host.zotero.get.return_value = (200, {"last-modified-version": "3", "total-results": "1"}, self.REMOTE.encode())
+        self.assertEqual(self.fetch(editor)[0], 200)
+        self.assertNotIn(uid, self.app.streams)  # released again
 
     def test_workers_never_get_a_zotero_key(self):
         self.setup_key(self.client("ed@x.org"))

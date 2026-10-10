@@ -2513,7 +2513,7 @@ class ZoteroApi(SharedState, ServerCase):
         self.addCleanup(tmp.cleanup)
         mock.patch.object(zotero, "config_path", return_value=Path(tmp.name) / "zotero.json").start()
         mock.patch.dict(os.environ).start()
-        os.environ.pop("ZOTERO_API_KEY", None)
+        mock.patch.dict(zotero._ENV, {"key": ""}).start()
         zotero.CACHE.clear()
         head = {"last-modified-version": "3", "total-results": "2"}
         self.get = mock.patch.object(zotero, "get", return_value=(200, head,
@@ -2573,6 +2573,7 @@ class ZoteroApi(SharedState, ServerCase):
         self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")[0], 200)
 
     def test_shared_editors_sync_with_the_owners_key_only_after_the_owner_opts_in(self):
+        mock.patch.object(serve, "ai_sandboxed", return_value=True).start()
         self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY, "share_editors": True})
         self.tokens = self.share_on()
         status, info = self.call("GET", "/api/zotero", role="edit")
@@ -2627,6 +2628,47 @@ class ZoteroApi(SharedState, ServerCase):
         hdrs = {"X-Host-Secret": "s" * 40, "X-Host-Role": "edit", "X-Host-User": "7;Ada"}
         self.assertEqual(self.request("GET", "/api/zotero", None, hdrs)[0], 403)
         self.assertEqual(self.request("POST", "/api/zotero/settings?doc=demo", {"library_id": "1"}, hdrs)[0], 403)
+        self.assertEqual(self.request("POST", "/api/zotero/preview?doc=demo", {"text": ""}, hdrs)[0], 403)
+
+    def test_gateway_workers_compare_what_the_gateway_fetched(self):
+        """Hosted: the CPU-bound comparison runs here (per project), never in the shared gateway; no network."""
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable("s" * 40, "demo")
+        edit = {"X-Host-Secret": "s" * 40, "X-Host-Role": "edit", "X-Host-User": "7;Ada"}
+        body = {"remote": self.REMOTE, "text": self.BIB, "others": {"more.bib": "@misc{x,\n  title = {Other}\n}\n"}}
+        status, out = self.request("POST", "/api/zotero/compare?doc=demo", body, edit)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(([c["key"] for c in out["changed"]], out["new"], out["elsewhere"][0]["key"]), (["a"], [], "x"))
+        self.assertEqual(self.get.call_count, 0)
+        view = {**edit, "X-Host-Role": "view"}
+        self.assertEqual(self.request("POST", "/api/zotero/compare?doc=demo", body, view)[0], 403)
+        self.assertEqual(self.request("POST", "/api/zotero/compare?doc=demo", {**body, "remote": 5}, edit)[0], 400)
+        big = {**body, "remote": "x" * (self.zotero.HOSTED_TOTAL + 1)}
+        self.assertEqual(self.request("POST", "/api/zotero/compare?doc=demo", big, edit)[0], 413)
+        codes = [self.request("POST", "/api/zotero/compare?doc=demo", body, edit)[0] for _ in range(10)]
+        self.assertEqual(codes.count(429), 3)  # 10 a minute per worker, the bad requests above included
+
+    def test_compare_is_for_gateway_workers_only(self):
+        self.tokens = self.share_on()
+        body = {"remote": self.REMOTE, "text": self.BIB}
+        self.assertEqual(self.call("POST", "/api/zotero/compare", body, role="edit")[0], 403)
+
+    def test_guest_sync_needs_sandboxed_builds(self):
+        """Without bubblewrap, LuaLaTeX from an edit link could read zotero.json: no opt-in, and an old one is void."""
+        mock.patch.object(serve, "ai_sandboxed", return_value=False).start()
+        opt_in = {"library_id": "42", "key": self.KEY, "share_editors": True}
+        status, body = self.call("POST", "/api/zotero/settings", opt_in)
+        self.assertEqual(status, 409)
+        self.assertIn("--sandbox", body["error"])
+        self.assertFalse(self.zotero.info()["share_editors"])
+        self.zotero.save_settings({"library_id": "42", "key": self.KEY, "share_editors": True})  # stored earlier
+        self.assertFalse(self.call("GET", "/api/zotero")[1]["sandboxed"])
+        self.tokens = self.share_on()
+        status, info = self.call("GET", "/api/zotero", role="edit")
+        self.assertEqual((info["can_sync"], info["reason"]),
+                         (False, "Zotero sync for shared links needs sandboxed builds."))
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="edit")[0], 403)
+        self.assertEqual(self.get.call_count, 0)
 
     def test_import_reads_ris(self):
         ris = "TY  - JOUR\nAU  - Doe, J\nTI  - A title here\nPY  - 2001\nER  -\n"

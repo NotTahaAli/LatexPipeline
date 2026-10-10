@@ -7,6 +7,13 @@
  * ctx = {api, el, doc(), box (the panel's form area), data() (the References data), scope(), text(path),
  *        splice(path, from, to, insert, expect), toast(msg), changed(), reload(), uid(prefix), authorLabel, yearOf}
  */
+/** The Share dialog's Zotero line for the owner: what an edit link means for a stored key. */
+export function zoteroShareNote(info) {
+  if (!info?.has_key || info.key_from_env) return "";
+  return info.sandboxed ? `Zotero: ${info.share_editors ? "edit links may sync with your API key (fetched here, never sent to them)." : "off for shared links."}`
+    : "Zotero: off for shared links. Builds are not sandboxed, so LuaLaTeX from an edit link can read your stored Zotero API key on this computer; share with --sandbox, or remove the key first.";
+}
+
 export function zoteroUi(ctx) {
   const { el, box } = ctx;
   const close = () => { box.hidden = true; box.replaceChildren(); };
@@ -39,14 +46,15 @@ export function zoteroUi(ctx) {
     const fmt = el("select", {}, new Option("BibTeX", "bibtex"), new Option("BibLaTeX", "biblatex"));
     fmt.value = info.format;
     const key = el("input", { type: "password", autocomplete: "off", spellcheck: false, placeholder: info.has_key ? "Stored; leave empty to keep it" : "Paste an API key" });
-    const share = el("input", { type: "checkbox", checked: !!info.share_editors });
+    const share = el("input", { type: "checkbox", checked: !!info.share_editors && info.sandboxed, disabled: !info.sandboxed });
     const out = el("p", { className: "refs-err", role: "alert", hidden: true });
     const libHint = el("span", { className: "mute rh" }), collHint = el("span", { className: "mute rh" });
     const libField = field("Library ID", lib), collField = field("Collection (optional)", coll);
     libField.append(libHint); collField.append(collHint);
     const keyField = field("API key", key, info.key_from_env ? "ZOTERO_API_KEY is set in the environment and is used instead." : "Create a read-only key at zotero.org/settings/keys/new. It is kept on this computer, outside the project, and never shown to collaborators.");
     const web = el("div", { className: "rgrid" }, field("Library type", type), libField, collField, keyField);
-    const shareBox = el("label", { className: "check" }, share, " Let editors of shared links sync from my Zotero library (your key stays on this computer; Better BibTeX is never used while sharing)");
+    const shareBox = el("div", {}, el("label", { className: "check" }, share, " Let editors of shared links sync from my Zotero library (the server fetches with your key; it is never sent to them. Better BibTeX is never used while sharing)"),
+      ...(info.sandboxed ? [] : [el("p", { className: "mute rh", textContent: "Needs sandboxed builds (serve.py --sandbox). Without them, LuaLaTeX from an edit link can read a stored key on this computer." })]));
     const sync = () => {
       const local = mode.value === "local";
       keyField.hidden = local;
@@ -83,7 +91,7 @@ export function zoteroUi(ctx) {
     const out = el("div", { className: "refs-imp-out", role: "status" });
     const go = el("button", { type: "submit", className: "btn primary", textContent: "Fetch from Zotero" });
     form.append(heading(form, "Sync from Zotero"),
-      el("p", { className: "mute rh", textContent: info.guest ? "Reads the owner's Zotero library (the owner's key stays on their computer). Nothing is written until you choose entries."
+      el("p", { className: "mute rh", textContent: info.guest ? "Reads the owner's Zotero library (the owner's server uses its key; it is never sent to you). Nothing is written until you choose entries."
         : info.mode === "local" ? `Reads the Better BibTeX export${info.collection ? ` of collection ${info.collection}` : ""} from Zotero on this computer.`
         : `Reads ${info.library_type === "groups" ? "group" : "user"} library ${info.library_id}${info.collection ? `, collection ${info.collection}` : ""} from api.zotero.org. Nothing is written until you choose entries.` }),
       field("Add to and update", fileSel, d.files.length > 1 ? "Entries already in the other .bib files are matched too and not added again." : ""), out,
@@ -96,7 +104,11 @@ export function zoteroUi(ctx) {
         const taken = d.entries.filter((e) => e.file !== path).map((e) => e.key);
         const others = {};
         for (const f of d.files) if (f.path !== path) others[f.path] = await ctx.text(f.path);
-        const r = await ctx.api.zoteroPreview(ctx.doc(), { text, taken, others });
+        let r;
+        if (info.hosted) {   // the gateway fetches with your key; this project's editor process compares
+          const f = await ctx.api.zoteroFetch(ctx.doc());
+          r = { ...(await ctx.api.zoteroCompare(ctx.doc(), { remote: f.text, text, taken, others })), cached: f.cached };
+        } else r = await ctx.api.zoteroPreview(ctx.doc(), { text, taken, others });
         out.replaceChildren(...result(r, path, text));
       } catch (e) { out.replaceChildren(note("refs-err", e.message)); } finally { go.disabled = false; }
     };
