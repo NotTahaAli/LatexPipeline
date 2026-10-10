@@ -748,11 +748,12 @@ function renderStatus() {
 
 function disclosure(head, more, open = false) {
   const li = el("li");
-  const btn = el("button", { className: "head", onclick: () => { const open = btn.getAttribute("aria-expanded") !== "true"; btn.setAttribute("aria-expanded", String(open)); body.hidden = !open; } }, icon("chev"), ...head);
+  const links = head.filter((n) => n.classList?.contains("where") && n.tagName === "A");   // A link cannot sit inside the toggle button.
+  const btn = el("button", { className: "head", onclick: () => { const open = btn.getAttribute("aria-expanded") !== "true"; btn.setAttribute("aria-expanded", String(open)); body.hidden = !open; } }, icon("chev"), ...head.filter((n) => !links.includes(n)));
   btn.firstChild.classList.add("chev");
   btn.setAttribute("aria-expanded", String(open));
   const body = el("div", { className: "more", hidden: !open }, ...more);
-  li.append(btn, body);
+  li.append(el("div", { className: "hrow" }, btn, ...links), body);
   return li;
 }
 

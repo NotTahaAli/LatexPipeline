@@ -219,7 +219,9 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 .chip:disabled{opacity:.5;cursor:default}
 .plist{list-style:none;margin:0;padding:6px 10px 10px}
 .plist li{border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:var(--panel2)}
-.plist .head{display:flex;gap:8px;align-items:flex-start;width:100%;padding:7px 10px;text-align:left;border-radius:8px}
+.plist .hrow{display:flex;align-items:flex-start}
+.plist .hrow>a.where{padding:8px 12px 0 0}
+.plist .head{flex:1;min-width:0;display:flex;gap:8px;align-items:flex-start;padding:7px 10px;text-align:left;border-radius:8px}
 .plist .head .chev{margin-top:3px;color:var(--mute);transition:transform .12s}
 .plist .head[aria-expanded=true] .chev{transform:rotate(90deg)}
 .plist .msg{flex:1;font-family:var(--mono);font-size:12.5px;word-break:break-word}
