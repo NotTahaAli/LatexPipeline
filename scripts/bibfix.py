@@ -220,6 +220,158 @@ def insert_fields(text: str, key: str, new: dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Whole entries: add, change, delete (the editor's References panel). Each returns one splice, so the editor
+# applies it to its open document; every byte outside the splice, and inside it every unchanged field, stays.
+# ---------------------------------------------------------------------------
+
+KEY = re.compile(r"[^\s,{}()\"#%'=~\\]+")
+FIELD_NAME = re.compile(r"[A-Za-z][\w:.+-]*")
+
+
+def _balanced_value(value: str) -> bool:
+    depth = 0
+    for char in value:
+        depth += (char == "{") - (char == "}")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def check_entry(kind: str, key: str, fields: dict) -> dict[str, str]:
+    """Lower-cased fields; raises ValueError for anything that would break the file."""
+    if not (isinstance(kind, str) and re.fullmatch(r"[A-Za-z]+", kind)) \
+            or kind.lower() in ("comment", "string", "preamble"):
+        raise ValueError(f"Bad entry type: {kind!r}")
+    if not (isinstance(key, str) and KEY.fullmatch(key)):
+        raise ValueError(f"Bad key: {key!r} (no spaces, commas, braces or quotes)")
+    if not isinstance(fields, dict):
+        raise ValueError("Fields must be a mapping.")
+    out: dict[str, str] = {}
+    for name, value in fields.items():
+        if not (isinstance(name, str) and FIELD_NAME.fullmatch(name)):
+            raise ValueError(f"Bad field name: {name!r}")
+        if not isinstance(value, str) or not _balanced_value(value):
+            raise ValueError(f"Unbalanced braces in {name}")
+        if value.strip():
+            out[name.lower()] = value.strip()
+    return out
+
+
+def _body(value: str, like: str = "{") -> str:
+    """value with the delimiters of the raw value it replaces (a bare word stays bare when it can)."""
+    if like[:1] == '"' and '"' not in value:
+        return '"' + value + '"'
+    if like[:1] not in ('"', "{") and re.fullmatch(r"\w+", value):
+        return value
+    return "{" + value + "}"
+
+
+def format_entry(kind: str, key: str, fields: dict[str, str], eol: str = "\n", indent: str = "  ") -> str:
+    lines = "".join(f"{eol}{indent}{name} = {_body(value)}," for name, value in fields.items())
+    return f"@{kind}{{{key},{lines}{eol}}}"
+
+
+def _field_cut(text: str, entry: Entry, field: Field) -> tuple[int, int]:
+    """The span that removes one field: its whole line when it stands alone on one."""
+    end = field.comma + 1 if field.comma >= 0 else field.value_end
+    line_start = text.rfind("\n", 0, field.name_start) + 1
+    newline = text.find("\n", end, entry.end)
+    if line_start > entry.start and not text[line_start:field.name_start].strip() and newline >= 0 \
+            and not text[end:newline].strip():
+        return line_start, newline + 1
+    while end < entry.end and text[end] in " \t":
+        end += 1
+    return field.name_start, end
+
+
+def replace_entry(text: str, key: str, kind: str, new_key: str, fields: dict) -> tuple[int, int, str]:
+    """(start, end, replacement) that turns entry `key` into @kind{new_key, fields}. Raises KeyError, ValueError."""
+    entry = find_entry(text, key)
+    if entry is None:
+        raise KeyError(key)
+    want = check_entry(kind, new_key, fields)
+    cuts: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for field in entry.fields:
+        if field.name in seen:
+            continue  # A repeated field (BibTeX keeps the first): left as it is.
+        seen.add(field.name)
+        if field.name not in want:
+            start, end = _field_cut(text, entry, field)
+            cuts.append((start, end, ""))
+        elif want[field.name] != field.value:
+            cuts.append((field.value_start, field.value_end,
+                         _body(want[field.name], text[field.value_start:field.value_end])))
+    piece = text[entry.start:entry.end]
+    for start, end, insert in sorted(cuts, reverse=True):
+        piece = piece[:start - entry.start] + insert + piece[end - entry.start:]
+    piece = insert_fields(piece, key, {name: value for name, value in want.items() if name not in seen})
+    head = re.match(r"@[ \t]*(\w+)[ \t\r\n]*[({]\s*([^,\s{}()]+)", piece)
+    if head.group(2) != new_key:
+        piece = piece[:head.start(2)] + new_key + piece[head.end(2):]
+    if head.group(1).lower() != kind.lower():
+        piece = piece[:head.start(1)] + kind + piece[head.end(1):]
+    return entry.start, entry.end, piece
+
+
+def delete_entry(text: str, key: str) -> tuple[int, int]:
+    """(start, end) that removes entry `key` with its line and one of the blank lines around it. Raises KeyError."""
+    entry = find_entry(text, key)
+    if entry is None:
+        raise KeyError(key)
+    start, end = entry.start, entry.end
+    line_start = text.rfind("\n", 0, start) + 1
+    if not text[line_start:start].strip():
+        start = line_start
+    newline = text.find("\n", end)
+    if not text[end:newline if newline >= 0 else len(text)].strip():
+        end = newline + 1 if newline >= 0 else len(text)
+        after = text.find("\n", end)
+        blank_before = start == 0 or not text[text.rfind("\n", 0, start - 1) + 1:start - 1].strip()
+        if after >= 0 and not text[end:after].strip() and blank_before:
+            end = after + 1
+    return start, end
+
+
+def append_entry(text: str, kind: str, key: str, fields: dict) -> tuple[int, str]:
+    """(index, insertion) that adds a new entry at the end, in the file's line endings and indent. Raises ValueError."""
+    fields = check_entry(kind, key, fields)
+    eol = "\r\n" if "\r\n" in text else "\n"
+    indent = "  "
+    entries = parse(text)
+    if entries and entries[-1].fields:
+        first = entries[-1].fields[0]
+        before = text[text.rfind("\n", 0, first.name_start) + 1:first.name_start]
+        indent = before if before.strip() == "" and before else indent
+    if not text.strip():
+        lead = ""
+    elif text.endswith("\n\n") or text.endswith("\r\n\r\n"):
+        lead = ""
+    elif text.endswith("\n"):
+        lead = eol
+    else:
+        lead = eol * 2
+    return len(text), lead + format_entry(kind, key, fields, eol, indent) + eol
+
+
+KINDS_FROM_CROSSREF = {"journal-article": "article", "proceedings-article": "inproceedings", "book": "book",
+                       "monograph": "book", "edited-book": "book", "book-chapter": "incollection",
+                       "dissertation": "phdthesis", "report": "techreport", "posted-content": "misc"}
+
+
+def entry_for_doi(doi: str) -> dict:
+    """{"type", "fields"} for a DOI from Crossref; raises BibLookupError."""
+    doi = clean_doi(doi)
+    if not re.fullmatch(r"10\.\S+/\S+", doi):
+        raise BibLookupError("That does not look like a DOI (10.xxxx/...).")
+    item = (get_json(f"{API}/{urllib.parse.quote(doi, safe='/')}") or {}).get("message") or {}
+    if not item:
+        raise BibLookupError("Crossref does not know this DOI.")
+    kind = KINDS_FROM_CROSSREF.get(item.get("type", ""), "misc")
+    return {"type": kind, "fields": map_item(item, kind)}
+
+
+# ---------------------------------------------------------------------------
 # Crossref
 # ---------------------------------------------------------------------------
 

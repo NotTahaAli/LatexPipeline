@@ -420,15 +420,21 @@ def bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def missing_bib_fields(kind: str, fields: dict[str, str]) -> list[str]:
+    """Required fields (BIB_REQUIRED) the entry lacks; none when it inherits them through crossref."""
+    if "crossref" in fields:
+        return []
+    return [need.split("|")[0] for need in BIB_REQUIRED.get(kind, ())
+            if not any(fields.get(name) for name in need.split("|"))]
+
+
 def entry_findings(rel: str, line: int, kind: str, key: str, body: str, dois: dict[str, str]) -> list[Finding]:
     fields = bib_fields(body)
     found: list[Finding] = []
-    if "crossref" not in fields:  # inherits its fields
-        missing = [need.split("|")[0] for need in BIB_REQUIRED.get(kind, ()) if not any(
-            fields.get(name) for name in need.split("|"))]
-        if missing:
-            found.append(Finding("missing-bib-field", rel, line,
-                                 f"@{kind} '{key}' lacks {', '.join(missing)}", key))
+    missing = missing_bib_fields(kind, fields)
+    if missing:
+        found.append(Finding("missing-bib-field", rel, line,
+                             f"@{kind} '{key}' lacks {', '.join(missing)}", key))
     year = fields.get("year", "")
     if year and not (re.fullmatch(r"\d{4}", year) and BIB_YEAR_FIRST <= int(year) <= datetime.date.today().year + 1):
         found.append(Finding("bib-year", rel, line, f"'{key}' has a suspicious year: {year!r}", key))

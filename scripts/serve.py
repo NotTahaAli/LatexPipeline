@@ -1252,11 +1252,7 @@ def grammar_check(name: str, text) -> dict:
                                      disabled=cfg.get("disabled_rules", []), max_wait=5.0)
     except grammar.GrammarError as exc:
         raise ApiError(str(exc), 429 if "limit" in str(exc) else 502)
-    astral = [i for i, char in enumerate(text) if ord(char) > 0xFFFF]
-
-    def u16(index: int) -> int:
-        return index + bisect.bisect_left(astral, index)
-
+    u16 = utf16_offsets(text)
     return {"mode": mode, "notice": grammar.PUBLIC_NOTICE if mode == "public" else None, "findings": [
         {"from": u16(f.offset), "to": u16(f.offset + f.length), "line": f.line, "col": f.col, "rule": f.rule,
          "message": f.message, "replacements": list(f.replacements)} for f in found]}
@@ -1292,6 +1288,137 @@ def bib_lookup(data: dict) -> dict:
         return bibfix.suggest_for(text, key)
     except bibfix.BibLookupError as exc:
         return {"fields": {}, "error": str(exc)}
+
+
+def utf16_offsets(text: str):
+    """index -> UTF-16 offset in `text` (what CodeMirror counts), O(log n) per call after one pass."""
+    astral = [i for i, char in enumerate(text) if ord(char) > 0xFFFF]
+    return lambda index: index + bisect.bisect_left(astral, index)
+
+
+BIB_MAX_FILES = 50
+BIB_MAX_TOTAL = 5_000_000
+
+
+def bib_overview(name: str, texts) -> dict:
+    """The References panel: every .bib entry in the document folder, every \\cite with its place, file problems.
+
+    `texts` maps .bib paths to the text the editor holds (unsaved edits included); offsets are UTF-16 into it."""
+    import ci_report
+    root = DOCS[name].parent
+    texts = texts if isinstance(texts, dict) else {}
+    sources: dict[str, str] = {}
+    for rel, text in ci_report.reachable_sources(root).items():
+        try:
+            resolve_in_doc(root, rel)
+        except ApiError:
+            continue  # \\input{../x} or a symlink out: not something a shared link may read.
+        sources[rel] = text
+    unused = {finding.subject for finding in ci_report.unused_bib_files(root, sources)}
+    files: list[dict] = []
+    entries: list[dict] = []
+    problems: list[str] = []
+    total = 0
+    for rel in (item["path"] for item in list_files(root) if item["path"].endswith(".bib")):
+        if len(files) >= BIB_MAX_FILES:
+            problems.append(f"Only the first {BIB_MAX_FILES} .bib files are listed.")
+            break
+        text = texts.get(rel)
+        if not isinstance(text, str):
+            try:
+                text = read_text_file(root, rel)["text"]
+            except ApiError as exc:
+                problems.append(f"{rel}: {exc}")
+                continue
+        if len(text) > BIB_MAX_CHARS or total + len(text) > BIB_MAX_TOTAL:
+            problems.append(f"{rel} is too large to list (1 MB per file, 5 MB in all).")
+            continue
+        total += len(text)
+        u16, line, at = utf16_offsets(text), 1, 0
+        parsed = bibfix.parse(text)
+        files.append({"path": rel, "used": rel not in unused, "entries": len(parsed)})
+        for entry in parsed:
+            line, at = line + text.count("\n", at, entry.start), entry.start
+            fields: dict[str, str] = {}
+            for field in entry.fields:
+                fields.setdefault(field.name, field.value)
+            entries.append({"key": entry.key, "type": entry.kind, "fields": fields, "file": rel, "line": line,
+                            "start": u16(entry.start), "end": u16(entry.end),
+                            "missing": ci_report.missing_bib_fields(entry.kind, fields)})
+    citations: dict[str, list[dict]] = {}
+    for rel, text in sources.items():
+        newlines = [i for i, char in enumerate(text) if char == "\n"]
+        u16 = utf16_offsets(text)
+        for match in ci_report.CITE.finditer(text):
+            for part in re.finditer(r"[^,]+", match.group(1)):
+                key = part.group(0).strip()
+                if not key or ci_report.is_macro_key(key):
+                    continue
+                pos = match.start(1) + part.start() + len(part.group(0)) - len(part.group(0).lstrip())
+                line = bisect.bisect_left(newlines, pos)
+                start = newlines[line - 1] + 1 if line else 0
+                citations.setdefault(key, []).append({"file": rel, "line": line + 1, "col": u16(pos) - u16(start) + 1})
+    return {"files": files, "entries": entries, "citations": citations, "problems": problems,
+            "nocite_all": any(ci_report.NOCITE_ALL.search(text) for text in sources.values()),
+            "required": {kind: [need.split("|")[0] for need in needs]
+                         for kind, needs in ci_report.BIB_REQUIRED.items()}}
+
+
+def bib_edit(data: dict) -> dict:
+    """{from, to, insert} (UTF-16) that adds, changes or deletes one entry of the .bib text the editor holds.
+
+    Like the lookup, nothing is written here: the editor applies the splice, so co-editing rooms stay consistent."""
+    text, op, key, entry = data.get("text"), data.get("op"), data.get("key"), data.get("entry") or {}
+    if not (isinstance(text, str) and isinstance(entry, dict)):
+        raise ApiError("Send the .bib text and the entry.", 400)
+    if len(text) > BIB_MAX_CHARS:
+        raise ApiError("This .bib file is too large to edit here (1 MB limit).", 413)
+    kind, new_key, fields = entry.get("type"), entry.get("key"), entry.get("fields")
+    try:
+        if op in ("add", "edit"):
+            bibfix.check_entry(kind, new_key, fields)
+            if new_key != key and any(other.key == new_key for other in bibfix.parse(text)):
+                raise ApiError(f"'{new_key}' is already in this file.", 409)
+        if op == "add":
+            start, insert = bibfix.append_entry(text, kind, new_key, fields)
+            end = start
+        elif op == "edit":
+            start, end, insert = bibfix.replace_entry(text, key, kind, new_key, fields)
+        elif op == "delete":
+            (start, end), insert = bibfix.delete_entry(text, key), ""
+        else:
+            raise ApiError("Unknown operation.", 400)
+    except KeyError:
+        raise ApiError(f"No entry '{key}' in this file any more. Refresh and try again.", 409)
+    except ValueError as exc:
+        raise ApiError(str(exc), 400)
+    u16 = utf16_offsets(text)
+    return {"from": u16(start), "to": u16(end), "insert": insert}
+
+
+def bib_import(data: dict) -> dict:
+    """Entries to add: parsed from pasted BibTeX, or from Crossref for a DOI (only the DOI leaves the machine)."""
+    bibtex, doi = data.get("bibtex"), data.get("doi")
+    if isinstance(doi, str) and doi.strip():
+        try:
+            return {"entries": [bibfix.entry_for_doi(doi)]}
+        except bibfix.BibLookupError as exc:
+            return {"entries": [], "error": str(exc)}
+    if not isinstance(bibtex, str) or len(bibtex) > BIB_MAX_CHARS:
+        raise ApiError("Paste BibTeX (up to 1 MB) or a DOI.", 400)
+    found = []
+    for entry in bibfix.parse(bibtex):
+        fields: dict[str, str] = {}
+        for field in entry.fields:
+            fields.setdefault(field.name, field.value)
+        found.append({"type": entry.kind, "key": entry.key, "fields": fields})
+    heads = sum(kind.lower() not in ("comment", "string", "preamble")
+                for kind in re.findall(r"@[ \t]*(\w+)[ \t\r\n]*[({]", bibtex))
+    skipped = max(heads - len(found), 0)
+    error = None if found and not skipped else (
+        f"{skipped} entr{'y' if skipped == 1 else 'ies'} could not be read (check braces, quotes and commas)."
+        if found else "No complete BibTeX entry found (check braces, quotes and commas).")
+    return {"entries": found, "error": error}
 
 
 def grammar_info(role: str = "owner") -> dict:
@@ -2164,7 +2291,12 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
             raise ApiError("Too many grammar checks; wait a moment.", 429)
     # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
     # link could otherwise put /etc/passwd into a download.
-    elif method == "POST" and path == "/api/bib/lookup":
+    elif method == "POST" and path == "/api/bib":
+        scoped(doc)  # Read-only (the sources and .bib files a view link can already read), POST to carry unsaved text.
+    elif method == "POST" and path == "/api/bib/edit":
+        need_edit()  # Computes a splice; the editor applies it and the normal save path writes the file.
+        scoped(doc)
+    elif method == "POST" and path in ("/api/bib/lookup", "/api/bib/import"):
         need_edit()  # Sends one DOI or title to Crossref, so a view-only link cannot start it.
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
@@ -2337,6 +2469,12 @@ class Handler(BaseHTTPRequestHandler):
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/bib/lookup" and name in DOCS:
             self.json(bib_lookup(self.body()))
+        elif url.path == "/api/bib" and name in DOCS:
+            self.json(bib_overview(name, self.body().get("texts")))
+        elif url.path == "/api/bib/edit" and name in DOCS:
+            self.json(bib_edit(self.body()))
+        elif url.path == "/api/bib/import" and name in DOCS:
+            self.json(bib_import(self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:
