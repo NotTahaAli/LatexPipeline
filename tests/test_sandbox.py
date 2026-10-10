@@ -30,6 +30,7 @@ class CommandTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LATEX_SANDBOX": "yes"}), self.assertRaises(sandbox.SandboxError):
             sandbox.spawn(["pdflatex"], Path("/d"), Path("/b"))
 
+    @unittest.skipIf(sandbox.resource is None, "the sandbox is Linux-only (no resource module here)")
     def test_wrapped_command_env_and_limits(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, ON), \
                 mock.patch.object(sandbox, "problem", return_value=None):
