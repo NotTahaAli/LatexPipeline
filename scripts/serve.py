@@ -2369,7 +2369,7 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         else:
             raise ApiError("Forbidden.", 403)
     elif method == "POST" and path == "/api/send":
-        return
+        return  # Every role may send bus messages: each handler (HANDLERS) checks the role itself, like on /ws.
     elif method == "POST" and path == "/rebuild":
         need_edit()
         scoped(doc)
@@ -2589,6 +2589,11 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 raise ApiError(message, 500)
             self.json({"ok": True})
+        elif url.path == "/forward":  # Owner only (check_permission): every open viewer jumps there.
+            found, box = forward(query)
+            box["doc"] = found
+            broadcast("forward", box)
+            self.json(box)
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
@@ -2688,11 +2693,9 @@ class Handler(BaseHTTPRequestHandler):
             if name not in DOCS:
                 raise SynctexError("Unknown document.")
             self.json(inverse(DOCS[name], query))
-        elif path == "/forward":
+        elif path == "/forward":  # Read-only: moving every open viewer is POST /forward.
             name, box = forward(query, None if self.role == "owner" else SHARE["doc"])
             box["doc"] = name
-            if "quiet" not in query:
-                broadcast("forward", box)
             self.json(box)
         else:
             self.reply(404, b"Not found", "text/plain")

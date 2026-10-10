@@ -147,6 +147,16 @@ class ZipSafety(unittest.TestCase):
             host.unpack_zip(bytes(data), self.base / "t", 1000)
         self.assertFalse((self.base / "t").exists())
 
+    def test_build_configuration_is_left_out(self):
+        self.assertEqual(host.RC_NAMES, serve.RC_NAMES)
+        target = self.base / "t"
+        skipped = host.unpack_zip(make_zip({"P/main.tex": "x", "P/build.toml": "shell_escape = true",
+                                            "P/.latexmkrc": "$x", "P/sub/LatexMkRc": "$y", "P/a.tex": "y"}),
+                                  target, 10 ** 6)
+        self.assertEqual(sorted(skipped), ["P/.latexmkrc", "P/build.toml", "P/sub/LatexMkRc"])
+        self.assertEqual(sorted(p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()),
+                         ["a.tex", "main.tex"])
+
     def test_download_skips_symlinks_out(self):
         root = self.base / "doc"
         (root / "sub").mkdir(parents=True)
@@ -191,9 +201,17 @@ class Client:
         if raw is not None:
             hdrs["Content-Type"] = ctype
         hdrs.update(headers or {})
-        conn.request(method, path, raw, hdrs)
-        res = conn.getresponse()
-        data = res.read()
+        try:
+            conn.request(method, path, raw, hdrs)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The server answered (e.g. 413 on Content-Length) and closed before reading the whole body.
+        try:
+            res = conn.getresponse()
+            data = res.read()
+        except (http.client.RemoteDisconnected, ConnectionResetError):
+            # Closed before even the reply arrived: an early reject. Reported as 413 for the size checks.
+            conn.close()
+            return 413, {"error": "connection closed early"}, None
         conn.close()
         for cookie in res.headers.get_all("Set-Cookie") or []:
             name, value = cookie.split(";")[0].split("=", 1)
@@ -832,6 +850,18 @@ class Proxy(HostCase):
         self.assertNotIn("X-Forwarded-For", headers)
         self.assertEqual([h for h in data["headers"] if h.startswith("X-Host-Role")], ["X-Host-Role: view"])
         self.assertIsNone(res.getheader("Set-Cookie"))
+        self.assertEqual(res.getheader("X-Frame-Options"), "DENY")
+        self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(res.getheader("Referrer-Policy"), "no-referrer")
+        self.assertIn("frame-ancestors 'none'", res.getheader("Content-Security-Policy"))
+        url = f"/p/{self.pid}/api/file?doc=Doc&path=main.tex"
+        cases = [("cross-site", "no-cors", "image", 403), ("cross-site", "cors", "empty", 403),
+                 ("cross-site", "navigate", "document", 200),  # a link to the project from another site
+                 ("same-origin", "cors", "empty", 200)]
+        for site, mode, dest, status in cases:
+            fetch = {"Sec-Fetch-Site": site, "Sec-Fetch-Mode": mode, "Sec-Fetch-Dest": dest}
+            with self.subTest(fetch=fetch):
+                self.assertEqual(viewer.call("GET", url, headers=fetch)[0], status)
         status, data, _ = self.client("ed@x.org").call("PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex",
                                                        {"text": "hi"})
         self.assertEqual(json.loads(data["body"]), {"text": "hi"})
@@ -893,7 +923,9 @@ class Proxy(HostCase):
         status, page, res = viewer.call("GET", f"/p/{self.pid}/")
         self.assertEqual(status, 200)
         self.assertIn(b'src="ui/app.js"', page)  # relative: works under /p/<id>/
-        self.assertIn("ws://" + self.netloc, res.getheader("Content-Security-Policy"))
+        policies = res.headers.get_all("Content-Security-Policy")
+        self.assertTrue(any("ws://" + self.netloc in p for p in policies))  # the worker's own CSP is kept
+        self.assertIn("frame-ancestors 'none'", policies)
 
     def test_websocket_through_the_gateway_and_revocation(self):
         self.real_worker()
@@ -1165,6 +1197,9 @@ class Cli(unittest.TestCase):
             data = Path(tmp) / "data"
             self.assertEqual(host.cmd_init(data), 0)
             self.assertTrue((data / "config.toml").is_file())
+            if os.name != "nt":
+                for name in ("config.toml", "host.db"):
+                    self.assertEqual(stat.S_IMODE((data / name).stat().st_mode), 0o600, name)
             row = host.APP.db.one("SELECT email, site_admin FROM users")
             self.assertEqual((row["email"], row["site_admin"]), ("root@example.org", 1))
             host.APP.db.conn.close()

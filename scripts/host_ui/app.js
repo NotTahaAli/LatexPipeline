@@ -201,8 +201,11 @@ async function tenantCard(tid) {
     field("Name for the upload", input("name", "text", { required: true, maxLength: 80 })),
     field("Zip file", input("file", "file", { required: true, accept: ".zip,application/zip" }), `main.tex at the top (or in one folder); up to ${t.limits.max_project_mb} MB.`),
   ], "Upload", async (v, f) => {
-    await api(`/api/tenants/${tid}/upload?name=${encodeURIComponent(v.name)}`, "POST", undefined, f.file.files[0]);
-    announce(`Uploaded ${v.name}.`); await refresh();
+    const r = await api(`/api/tenants/${tid}/upload?name=${encodeURIComponent(v.name)}`, "POST", undefined, f.file.files[0]);
+    await refresh();
+    const left = r.skipped?.length ? ` Left out (build settings cannot be uploaded): ${r.skipped.join(", ")}.` : "";
+    announce(`Uploaded ${v.name}.${left}`);
+    if (left) alert(`Uploaded ${v.name}.${left}`);
   }, "inline")) : null;
   const card = el("section", { className: "card", ariaLabel: t.name },
     el("div", { className: "head" }, el("h2", { textContent: t.name }),
@@ -375,7 +378,7 @@ async function route() {
     if (p.has("next")) { sessionStorage.setItem("next", p.get("next")); history.replaceState(null, "", "#login"); }
     if (p.has("invite")) return await invitePage(p.get("invite"));
     if (p.has("reset")) return resetPage(p.get("reset"));
-    if (p.has("error")) { history.replaceState(null, "", "#login"); return loginPage(p.get("error")); }
+    if (p.has("error")) { history.replaceState(null, "", "#login"); return loginPage(p.get("error").slice(0, 300)); }  // shown as text only
     if (hash === "signup") return me ? go("#home") : signupPage();
     if (!me) return loginPage();
     if (sessionStorage.getItem("next")) return afterLogin();

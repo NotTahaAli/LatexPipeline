@@ -345,6 +345,17 @@ class ServerCase(TempDoc):
 
 
 class HttpApi(ServerCase):
+    def test_forward_search_moves_other_viewers_only_on_post(self):
+        box = {"page": 1, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+        with mock.patch.object(serve, "forward", lambda query, only=None: ("demo", dict(box))):
+            rev = serve.BUS.rev
+            self.assertEqual(self.request("GET", "/forward?doc=demo&file=main.tex&line=1")[0], 200)
+            self.assertEqual([m for m in serve.BUS.since(rev) if m["type"] == "forward"], [])  # a GET changes nothing
+            self.assertEqual(self.request("POST", "/forward?doc=demo&file=main.tex&line=1")[0], 200)
+            self.assertEqual([m["data"]["doc"] for m in serve.BUS.since(rev) if m["type"] == "forward"], ["demo"])
+            cross = {"Origin": "https://evil.example"}
+            self.assertEqual(self.request("POST", "/forward?doc=demo&file=main.tex&line=1", headers=cross)[0], 403)
+
     def test_health(self):
         status, data = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
@@ -531,6 +542,18 @@ class GatewayMode(SharedState, ServerCase):
         reply = serve.handle_client_message({"type": "bye"}, "c1", "edit", "8;Bob")  # Bob saw c1 in presence
         self.assertEqual(reply["type"], "error")
         self.assertIn("c1", serve.CLIENTS)
+
+    def test_view_role_bus_messages_over_long_poll_cannot_write(self):
+        def send(*messages):
+            return self.as_("view", "POST", "/api/send?cid=v1", {"messages": list(messages)})[1]["replies"]
+
+        joined = send({"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}})
+        self.assertEqual(joined[0]["type"], "y-state")
+        replies = send({"type": "y-update", "data": {"room": "demo\nmain.tex", "u": "AAA"}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "build.toml", "aid": 1}})
+        self.assertEqual([r["data"]["status"] for r in replies], [403, 403])
+        self.assertEqual(serve.ROOMS["demo\nmain.tex"]["log"], [])
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
 
     def test_host_header_is_not_checked_but_origin_is(self):
         self.assertEqual(self.as_("edit", "GET", "/api/health", headers={"Host": "latex.example.org"})[0], 200)
@@ -788,7 +811,8 @@ class ShareHttp(SharedState, ServerCase):
             ("GET", "/api/files?doc=second"), ("GET", "/api/file?doc=second&path=main.tex"), ("GET", "/pdf/second"),
             ("GET", "/api/warnings?doc=second"),
             ("GET", "/events"), ("GET", "/api/share"), ("GET", "/forward?doc=demo&file=main.tex&line=1"),
-            ("POST", "/rebuild?doc=demo"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
+            ("POST", "/rebuild?doc=demo"), ("POST", "/forward?doc=demo&file=main.tex&line=1"),
+            ("POST", "/api/share"), ("POST", "/api/share/stop"),
             ("POST", "/api/share/regenerate"), ("PUT", "/api/file?doc=demo&path=main.tex"),
         ]
         for method, path in denied:

@@ -294,7 +294,7 @@ What people can do:
 | Editor | create projects (from the `build.py` templates or a zip), edit and build them live with others, download, delete |
 | Viewer | open projects read-only, download them as a zip |
 
-Everyone except the operator is treated as untrusted: LaTeX source is code, so workers always build with the [sharing restrictions](#sharing) (`-norc`, no shell escape, paranoid reads and writes, no build-config edits from the browser) inside the sandbox. A user of another workspace gets `404` for every URL of a project.
+The gateway adds `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` and `frame-ancestors 'none'` to every proxied response (on top of the editor's own CSP) and refuses cross-site sub-resource requests under `/p/` (only a top-level link from another site is let through). Everyone except the operator is treated as untrusted: LaTeX source is code, so workers always build with the [sharing restrictions](#sharing) (`-norc`, no shell escape, paranoid reads and writes, no build-config edits from the browser) inside the sandbox. A user of another workspace gets `404` for every URL of a project.
 
 ### Install and first start
 

@@ -423,18 +423,21 @@ def slug_for(name: str) -> str:
 
 MAX_ZIP_ENTRIES = 5000
 SKIP_IN_ZIP = re.compile(r"(^|/)(__MACOSX|\.git|\.DS_Store|Thumbs\.db)(/|$)")
+RC_NAMES = {".latexmkrc", "latexmkrc", "build.toml"}  # serve.RC_NAMES: build configuration that can run programs
 
 
-def zip_members(archive: zipfile.ZipFile, max_bytes: int) -> list[tuple[zipfile.ZipInfo, str]]:
+def zip_members(archive: zipfile.ZipFile, max_bytes: int) -> tuple[list[tuple[zipfile.ZipInfo, str]], list[str]]:
     """
     Validate an uploaded archive and map its files to paths inside the project. Refuses absolute paths, "..",
     backslashes, control characters, symlinks, encrypted entries, too many entries and too many bytes; a single
-    top-level folder around main.tex is dropped. Returns [(info, path inside the project)].
+    top-level folder around main.tex is dropped. Build configuration files (RC_NAMES) are left out: workers ignore
+    them anyway, and the browser cannot edit them. Returns ([(info, path inside the project)], [skipped names]).
     """
     infos = [i for i in archive.infolist() if not SKIP_IN_ZIP.search(i.filename)]
     if len(infos) > MAX_ZIP_ENTRIES:
         raise HttpError(413, f"The archive has more than {MAX_ZIP_ENTRIES} entries.")
     files: list[tuple[zipfile.ZipInfo, str]] = []
+    skipped: list[str] = []
     total = 0
     for info in infos:
         name = info.filename
@@ -449,6 +452,9 @@ def zip_members(archive: zipfile.ZipFile, max_bytes: int) -> list[tuple[zipfile.
         if any(part in ("", ".", "..") for part in parts) or len(parts) > 20:
             raise HttpError(400, f"Unsafe path in the archive: {name[:80]!r}")
         if name.endswith("/"):
+            continue
+        if parts[-1].lower() in RC_NAMES:
+            skipped.append(name[:240])
             continue
         total += info.file_size
         if total > max_bytes:
@@ -467,16 +473,19 @@ def zip_members(archive: zipfile.ZipFile, max_bytes: int) -> list[tuple[zipfile.
         if rel.casefold() in seen:
             raise HttpError(400, f"The archive lists {rel[:80]!r} twice.")
         seen.add(rel.casefold())
-    return files
+    return files, skipped
 
 
-def unpack_zip(data, target: Path, max_bytes: int) -> None:
-    """Unpack bytes or a seekable file into target (which must not exist). Counts real bytes, not claimed sizes."""
+def unpack_zip(data, target: Path, max_bytes: int) -> list[str]:
+    """
+    Unpack bytes or a seekable file into target (which must not exist). Counts real bytes, not claimed sizes.
+    Returns the build configuration files left out.
+    """
     try:
         archive = zipfile.ZipFile(io.BytesIO(data) if isinstance(data, bytes) else data)
     except (zipfile.BadZipFile, ValueError, OSError):
         raise HttpError(400, "That file is not a zip archive.")
-    files = zip_members(archive, max_bytes)
+    files, skipped = zip_members(archive, max_bytes)
     target.mkdir(parents=True)
     base = target.resolve()
     written = 0
@@ -501,6 +510,7 @@ def unpack_zip(data, target: Path, max_bytes: int) -> None:
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise
+    return skipped
 
 
 def zip_folder(root: Path, out) -> None:
@@ -898,7 +908,11 @@ CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' 
 FORWARD = ("Host", "Origin", "Content-Type", "Content-Length", "Accept", "Accept-Language", "User-Agent",
            "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "If-None-Match")
 DROP_RESPONSE = {"set-cookie", "connection", "keep-alive", "transfer-encoding", "server", "date",
-                 "strict-transport-security"}
+                 "strict-transport-security", "x-frame-options", "x-content-type-options", "referrer-policy"}
+# Added to every proxied response. The worker's own CSP stays; a second CSP header is enforced as well (browsers
+# apply both), so this can only narrow it.
+PROXY_HEADERS = ["X-Frame-Options: DENY", "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer",
+                 "Content-Security-Policy: frame-ancestors 'none'"]
 QUOTA_PATHS = {"/api/file", "/api/upload", "/api/fs"}
 
 
@@ -1161,6 +1175,10 @@ class Handler(BaseHTTPRequestHandler):
         if not match:
             raise HttpError(404, "Not found.")
         pid, rest = match.group(1), match.group(2)
+        upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
+        if self.command == "GET" and not upgrade and self.headers.get("Sec-Fetch-Site") == "cross-site" and not (
+                self.headers.get("Sec-Fetch-Mode") == "navigate" and self.headers.get("Sec-Fetch-Dest") == "document"):
+            raise HttpError(403, "Cross-site request refused.")  # Another site's <img>, fetch or <script>.
         if not self.session or self.session["stage"] != "full":
             if self.command == "GET" and rest in (None, "/"):
                 self.redirect("/#next=" + quote(f"/p/{pid}/"))
@@ -1174,7 +1192,6 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(f"/p/{pid}/")
             return
         role = "edit" if tenant_role_ in EDIT_ROLES else "view"
-        upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
         if self.command not in ("GET", "POST", "PUT"):
             raise HttpError(405, "Method not allowed.")
         if (self.command != "GET" or upgrade) and not self.origin_ok():
@@ -1230,6 +1247,8 @@ class Handler(BaseHTTPRequestHandler):
             switching = len(status) > 1 and status[1] == "101" and upgrade
             out = [rows[0]] + [r for r in rows[1:] if r.split(":", 1)[0].strip().lower() not in DROP_RESPONSE]
             out.append("Connection: Upgrade" if switching else "Connection: close")
+            if not switching:
+                out += PROXY_HEADERS
             if APP.https:
                 out.append("Strict-Transport-Security: max-age=63072000")
             self.wfile.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1") + body)
@@ -1718,11 +1737,12 @@ def api_project_upload(h: Handler, tid: str) -> None:
                 spool.write(chunk)
                 left -= len(chunk)
             spool.seek(0)
-            project = new_project(h, tid, name, lambda target: unpack_zip(spool, target, limit))
+            skipped: list[str] = []
+            project = new_project(h, tid, name, lambda target: skipped.extend(unpack_zip(spool, target, limit)))
     finally:
         IMPORTS.release()
     audit_log(APP, "project_uploaded", h.user["id"], h.ip, tid, f"{project['id']} {name}")
-    h.ok({"id": project["id"]})
+    h.ok({"id": project["id"], "skipped": skipped})
 
 
 @route("GET", r"/api/projects/([0-9a-f]{16})/zip")
@@ -2023,7 +2043,7 @@ def auth_callback(h: Handler, name: str) -> None:
         target = finish_sign_in(h, name)
     except HttpError as exc:
         audit_log(APP, "oauth_failed", h.session["id"] if h.session else None, h.ip, detail=f"{name}: {exc.message}")
-        h.redirect("/#error=" + quote(exc.message), [clear])
+        h.redirect("/#error=" + quote(exc.message[:300]), [clear])
         return
     h.redirect(target, [clear, *h.pending_cookies])
 
@@ -2142,6 +2162,17 @@ def sandbox_works() -> bool:
         return False
 
 
+def private(*paths: Path) -> None:
+    """Owner-only (600): config.toml may hold client secrets, host.db password hashes. SQLite gives its -wal and
+    -shm files the database's mode."""
+    for path in paths:
+        try:
+            if os.name != "nt" and path.stat().st_mode & 0o077:
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def cmd_init(data: Path) -> int:
     data.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -2152,6 +2183,7 @@ def cmd_init(data: Path) -> int:
         print(f"Wrote {config}: set public_url (and providers) before serving.")
     global APP
     APP = App(data, load_config(data), sandbox=False)
+    private(config, data / "host.db")
     print(f"Database {data / 'host.db'} at schema version {APP.db.version()}.")
     email = os.environ.get("LP_ADMIN_EMAIL") or (input("Site admin email: ") if sys.stdin.isatty() else "")
     if not email:
@@ -2190,6 +2222,7 @@ def cmd_serve(data: Path, insecure: bool) -> int:
         build.error(f"No database in {data}: run `host.py init --data {data}` first.")
         return 2
     APP = App(data, load_config(data), sandbox=not insecure)
+    private(data / "config.toml", data / "host.db")
     host, port = APP.config["listen"], APP.config["port"]
     server = Server((host, port), Handler, APP.config["max_connections"])
     stop = threading.Event()
