@@ -297,6 +297,22 @@ class Basics(HostCase):
             with self.subTest(path=path):
                 self.assertEqual(client.call("GET", path)[0], 404)
 
+    def test_fonts_from_an_allow_list_without_a_session(self):
+        fonts = self.data / "fonts"
+        fonts.mkdir()
+        (fonts / "newsreader.woff2").write_bytes(b"wOF2font")
+        (fonts / "other.woff2").write_bytes(b"x")
+        mock.patch.object(host, "FONTS_DIR", fonts).start()
+        self.addCleanup(mock.patch.stopall)
+        client = self.client()
+        status, body, res = client.call("GET", "/fonts/newsreader.woff2")
+        self.assertEqual((status, body, res.getheader("Content-Type")), (200, b"wOF2font", "font/woff2"))
+        self.assertIn("font-src 'self'", res.getheader("Content-Security-Policy"))
+        for path in ("/fonts/source-sans-3.woff2", "/fonts/other.woff2", "/fonts/..%2fhost.db", "/fonts/../host.py",
+                     "/fonts/%2e%2e%2fhost.py", "/fonts/"):
+            with self.subTest(path=path):
+                self.assertEqual(client.call("GET", path)[0], 404)
+
 
 class Connections(HostCase):
     def extra_config(self):
