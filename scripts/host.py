@@ -61,7 +61,10 @@ SERVE = SCRIPT_DIR / "serve.py"
 CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
+    "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10,
 }
+CONFIG_RANGES = {"max_connections": (8, 100000), "max_upload_mb": (1, 10000), "max_streams_per_user": (1, 1000),
+                 "signups_per_ip_hour": (1, 100000)}
 CONFIG_TEMPLATE = """\
 # scripts/host.py settings. Restart host.py after editing. Site settings (sign-up, quotas) are on the admin page.
 public_url = "http://localhost:8080"  # the URL people open; https:// turns on Secure cookies and HSTS
@@ -71,6 +74,10 @@ trust_proxy = false                   # true behind Caddy on this machine: clien
 site_name = "LaTeX Studio"
 session_days = 14                     # a login lasts at most this long
 session_idle_hours = 12               # and ends after this long without a request
+max_connections = 256                 # open client connections at once; more get 503 at once
+max_upload_mb = 50                    # largest zip upload (unpacked size is capped by the project quota)
+max_streams_per_user = 8              # open editor connections (WebSocket, long-poll) per account
+signups_per_ip_hour = 10              # account sign-ups from one address (IPv6: one /64) per hour
 
 # Sign-in providers (optional). Put secrets in the environment: client_secret_env names the variable.
 # Redirect URI to register with the provider: <public_url>/auth/<name>/callback
@@ -132,6 +139,9 @@ def load_config(data: Path) -> dict:
     if url.scheme not in ("http", "https") or not url.netloc or url.path not in ("", "/"):
         raise ConfigError(f"{path}: public_url must look like https://latex.example.org (no path)")
     config["public_url"] = f"{url.scheme}://{url.netloc}"
+    for key, (low, high) in CONFIG_RANGES.items():
+        if not (isinstance(config[key], int) and not isinstance(config[key], bool) and low <= config[key] <= high):
+            raise ConfigError(f"{path}: {key} must be a whole number from {low} to {high}")
     for name, provider in config["providers"].items():
         if not re.fullmatch(r"[a-z0-9-]{1,30}", name) or not isinstance(provider, dict):
             raise ConfigError(f"{path}: provider names are lower-case letters, digits and dashes")
@@ -437,10 +447,10 @@ def zip_members(archive: zipfile.ZipFile, max_bytes: int) -> list[tuple[zipfile.
     return files
 
 
-def unpack_zip(data: bytes, target: Path, max_bytes: int) -> None:
-    """Unpack into target (which must not exist). Counts real bytes, not the sizes the archive claims."""
+def unpack_zip(data, target: Path, max_bytes: int) -> None:
+    """Unpack bytes or a seekable file into target (which must not exist). Counts real bytes, not claimed sizes."""
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
+        archive = zipfile.ZipFile(io.BytesIO(data) if isinstance(data, bytes) else data)
     except (zipfile.BadZipFile, ValueError, OSError):
         raise HttpError(400, "That file is not a zip archive.")
     files = zip_members(archive, max_bytes)
@@ -801,6 +811,37 @@ def route(method: str, pattern: str, need: str = "user"):
         ROUTES.append((method, re.compile(pattern), need, fn))
         return fn
     return register
+
+
+class Server(ThreadingHTTPServer):
+    """A thread per connection, at most `limit` at once: further connections get an immediate 503."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, limit: int) -> None:
+        self.slots = threading.BoundedSemaphore(limit)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address) -> None:
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\n"
+                                b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1519,13 +1560,30 @@ def api_project_create(h: Handler, tid: str) -> None:
     h.ok({"id": project["id"]})
 
 
+IMPORTS = threading.BoundedSemaphore(2)  # zip uploads spooled and unpacked at once
+
+
 @route("POST", r"/api/tenants/([0-9a-f]{16})/upload")
 def api_project_upload(h: Handler, tid: str) -> None:
     need_role(h, tid, EDIT_ROLES)
     limit = APP.settings()["max_project_mb"] * 1024 * 1024
-    data = h.read_exact(h.body_size(limit))
+    size = h.body_size(APP.config["max_upload_mb"] * 1024 * 1024)
     name = clean_name((h.query.get("name") or [""])[0], "Project name")
-    project = new_project(h, tid, name, lambda target: unpack_zip(data, target, limit))
+    if not IMPORTS.acquire(timeout=5):
+        raise HttpError(503, "Other uploads are being unpacked. Try again in a minute.", {"Retry-After": "30"})
+    try:
+        with tempfile.TemporaryFile(dir=APP.data) as spool:  # On disk, never the whole upload in memory.
+            left = size
+            while left:
+                chunk = h.rfile.read(min(65536, left))
+                if not chunk:
+                    raise HttpError(400, "The request body ended early.")
+                spool.write(chunk)
+                left -= len(chunk)
+            spool.seek(0)
+            project = new_project(h, tid, name, lambda target: unpack_zip(spool, target, limit))
+    finally:
+        IMPORTS.release()
     audit_log(APP, "project_uploaded", h.user["id"], h.ip, tid, f"{project['id']} {name}")
     h.ok({"id": project["id"]})
 
@@ -1993,13 +2051,15 @@ def cmd_serve(data: Path, insecure: bool) -> int:
         return 2
     APP = App(data, load_config(data), sandbox=not insecure)
     host, port = APP.config["listen"], APP.config["port"]
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
+    server = Server((host, port), Handler, APP.config["max_connections"])
     stop = threading.Event()
     threading.Thread(target=housekeeping, args=(stop,), daemon=True).start()
     import signal
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
     build.info(f"Gateway on http://{host}:{server.server_address[1]}/ for {APP.config['public_url']}")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        build.error(f"listen = {host!r}: the gateway should sit behind a TLS proxy (Caddy) on 127.0.0.1; it has no "
+                    "TLS and no slow-client timeouts of its own.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

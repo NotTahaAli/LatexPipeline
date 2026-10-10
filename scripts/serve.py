@@ -3066,11 +3066,14 @@ def main() -> int:
     first = build.select_documents(documents, args.docs)
     if first:
         address += "#" + build.doc_name(first[0]).replace(" ", "%20")
-    if args.gateway:
-        print(f"LP_GATEWAY_PORT={port}", flush=True)  # host.py reads this line.
     build.info(f"Serving {address}  (Ctrl+C to stop)")
 
     threading.Thread(target=watcher, args=(latexmk, args.docs), daemon=True).start()
+    if args.gateway:
+        deadline = time.monotonic() + 10
+        while not DOCS and time.monotonic() < deadline:  # The watcher registers the document first thing.
+            time.sleep(0.02)
+        print(f"LP_GATEWAY_PORT={port}", flush=True)  # host.py reads this line.
     threading.Thread(target=fs_watcher, daemon=True).start()
     threading.Thread(target=housekeeping, daemon=True).start()
     threading.Thread(target=server.serve_forever, daemon=True).start()

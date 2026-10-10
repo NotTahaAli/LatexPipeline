@@ -318,6 +318,10 @@ sudoedit /var/lib/latex-host/data/config.toml        # public_url = "https://lat
 | `trust_proxy` | `false` | `true` behind a proxy on this machine: client addresses (for login throttling and the audit log) come from `X-Forwarded-For`. |
 | `site_name` | `LaTeX Studio` | Page titles and the authenticator app label. |
 | `session_days`, `session_idle_hours` | `14`, `12` | A login lasts at most this long, and ends after this long without a request. |
+| `max_connections` | `256` | Client connections the gateway serves at once; more get `503` straight away. |
+| `max_upload_mb` | `50` | Largest zip upload. At most two uploads are spooled to disk and unpacked at once. |
+| `max_streams_per_user` | `8` | Open editor connections (WebSocket, long-poll) per account; more get `429`. |
+| `signups_per_ip_hour` | `10` | Sign-ups from one address per hour (IPv6: per `/64`). |
 | `[providers.<name>]` | none | Sign-in providers, see below. |
 
 Site settings live in the database and are changed on the Site admin page: sign-up (`invite_only` by default; `open`, where each new person gets their own workspace; or `open_domains`, which needs a provider that confirms the email), linking providers to existing accounts by email, projects per workspace, megabytes per project, open projects on the server and per workspace (each worker builds one document at a time, so this also caps concurrent builds), idle timeout and build time limit. The megabytes per project count the document plus its build output and caches (`.out/`, `.cache/`, `.home/`); the project's worker measures them afresh on every save, co-editing save, upload and new file (`507` when full; shrinking and deleting always work), and a build that goes over loses what it wrote and reports a quota error. A changed quota applies to workers started after the change.
@@ -345,12 +349,27 @@ Sign-in uses the authorization code flow with PKCE, a state bound to the browser
 
 ### TLS with Caddy, and systemd
 
-`/etc/caddy/Caddyfile` (Caddy gets and renews the certificate; WebSockets and long requests pass through):
+The TLS proxy is required, not optional: `host.py` speaks plain HTTP, listens on 127.0.0.1 by default (it warns when `listen` is anything else) and has only coarse slow-client protection of its own (a socket timeout and `max_connections`). Let the proxy terminate TLS and time out slow clients. `/etc/caddy/Caddyfile` (Caddy gets and renews the certificate; WebSockets and long-polls pass through):
 
 ```caddyfile
+{
+    servers {
+        timeouts {
+            read_header 10s   # slow-loris: a client must send its headers quickly
+            read_body 5m      # zip uploads (max_upload_mb) on slow links
+            idle 2m
+        }
+    }
+}
+
 latex.example.org {
     encode gzip
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8080 {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 90s   # longer than the editor's 25 s long-poll
+        }
+    }
 }
 ```
 

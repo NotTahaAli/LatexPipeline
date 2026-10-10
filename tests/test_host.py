@@ -212,8 +212,7 @@ class HostCase(unittest.TestCase):
         self.data = Path(tmp.name).resolve()
         mock.patch.dict(host.SCRYPT, {"n": 2 ** 10}).start()
         self.addCleanup(mock.patch.stopall)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), host.Handler)
-        self.server.daemon_threads = True
+        self.server = host.Server(("127.0.0.1", 0), host.Handler, self.extra_config().get("max_connections", 256))
         self.port = self.server.server_address[1]
         self.netloc = f"127.0.0.1:{self.port}"
         self.origin = f"http://{self.netloc}"
@@ -266,6 +265,31 @@ class Basics(HostCase):
         for path in ("/ui/..%2fhost.db", "/ui/.hidden", "/ui/nope.js", "/host.db"):
             with self.subTest(path=path):
                 self.assertEqual(client.call("GET", path)[0], 404)
+
+
+class Connections(HostCase):
+    def extra_config(self):
+        return {"max_connections": 8}
+
+    def test_connections_beyond_the_limit_get_503(self):
+        idle = [socket.create_connection(("127.0.0.1", self.port)) for _ in range(8)]
+        for sock in idle:
+            self.addCleanup(sock.close)
+        time.sleep(0.2)
+        status, _, res = self.client().call("GET", "/")
+        self.assertEqual((status, res.getheader("Retry-After")), (503, "5"))
+        for sock in idle:
+            sock.close()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if self.client().call("GET", "/")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        else:
+            self.fail("slots were not given back")
 
 
 class Https(HostCase):
@@ -546,6 +570,20 @@ class Workspaces(HostCase):
         big = make_zip({"main.tex": "x" * (2 * 1024 * 1024)})
         self.assertEqual(editor.call("POST", f"/api/tenants/{self.a}/upload?name=Big", raw=big,
                                      ctype="application/zip")[0], 413)
+
+    def test_upload_cap_and_concurrent_imports(self):
+        editor = self.client("editor@a.org")
+        self.app.config["max_upload_mb"] = 1
+        big = os.urandom(1024 * 1024 + 1)
+        self.assertEqual(editor.call("POST", f"/api/tenants/{self.a}/upload?name=Big", raw=big,
+                                     ctype="application/zip")[0], 413)
+        good = make_zip({"main.tex": "x"})
+        with mock.patch.object(host.IMPORTS, "acquire", lambda timeout: False):  # two imports already running
+            status, _, res = editor.call("POST", f"/api/tenants/{self.a}/upload?name=Busy", raw=good,
+                                         ctype="application/zip")
+        self.assertEqual((status, res.getheader("Retry-After")), (503, "30"))
+        self.assertEqual(editor.call("POST", f"/api/tenants/{self.a}/upload?name=Fine", raw=good,
+                                     ctype="application/zip")[0], 200)
 
     def test_site_admin(self):
         self.user("root@example.org", site_admin=True)
@@ -973,7 +1011,8 @@ class Cli(unittest.TestCase):
             data = Path(tmp)
             for text in ('public_url = "ftp://x"', 'nope = 1', 'public_url = "https://x.org/sub"',
                          '[providers.x]\ntype = "saml"\nclient_id = "a"',
-                         '[providers.g]\ntype = "oidc"\nclient_id = "a"\nissuer = "http://insecure"'):
+                         '[providers.g]\ntype = "oidc"\nclient_id = "a"\nissuer = "http://insecure"',
+                         'max_connections = 0', 'max_upload_mb = "50"', 'max_streams_per_user = true'):
                 (data / "config.toml").write_text(text)
                 with self.subTest(text=text), self.assertRaises(host.ConfigError):
                     host.load_config(data)
