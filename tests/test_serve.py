@@ -456,8 +456,14 @@ class SharedState(unittest.TestCase):
     def setUp(self):
         saved = dict(serve.SHARE)
         self.addCleanup(lambda: (serve.SHARE.clear(), serve.SHARE.update(saved)))
-        serve.SHARE.update(on=False, tokens={}, doc=None, public=None, hosts=set(), port=0, tunnel=None)
+        serve.SHARE.update(on=False, tokens={}, doc=None, public=None, hosts=set(), port=0, tunnel=None, links=[])
         self.addCleanup(serve.share_env, False)
+        links_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(links_dir.cleanup)
+        self.links_file = Path(links_dir.name) / "config" / "share-links.json"  # never the real config folder
+        patcher = mock.patch.object(serve.named, "FILE", self.links_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for table in (serve.ROOMS, serve.CLIENTS, serve.RATE):
             table.clear()
             self.addCleanup(table.clear)
@@ -491,6 +497,20 @@ class GatewayMode(SharedState, ServerCase):
         self.assertEqual(self.as_("owner", "GET", "/api/health")[0], 401)  # never the owner
         self.assertEqual(self.as_("edit", "GET", "/api/health", user="no-separator")[0], 401)
         self.assertEqual(self.as_("edit", "GET", "/api/health")[0], 200)
+
+    def test_named_links_do_not_exist_behind_the_gateway(self):
+        links = []
+        link = serve.named.create(links, "Alice", "edit", "demo")
+        serve.named.save(links)
+        serve.SHARE["links"] = serve.named.load()  # even a loaded record is never consulted here
+        cookie = {"Cookie": f"{serve.cookie_name()}={link['token']}"}
+        self.assertEqual(self.request("GET", "/api/health", headers=cookie)[0], 401)
+        self.assertEqual(self.request("GET", f"/?token={link['token']}")[0], 401)
+        self.assertIsNone(serve.identity_for_token(link["token"]))
+        for path in ("/api/share/links", "/api/share/links/revoke"):
+            self.assertEqual(self.as_("edit", "POST", path, {"name": "Eve", "role": "edit", "id": link["id"]})[0], 403)
+        self.assertEqual(self.as_("edit", "GET", "/api/config")[1]["name"], "Ada")  # the account, as before
+        self.assertEqual(len(serve.named.load()), 1)
 
     def test_share_tokens_and_cookies_do_not_authenticate(self):
         self.assertEqual(self.request("GET", "/?token=anything")[0], 401)
@@ -1231,9 +1251,11 @@ class Rooms(SharedState):
         serve.handle_client_message({"type": "hello", "data": {"name": "Bob", "color": "javascript:1"}}, "b", "view")
         users = serve.presence()["users"]
         got = [(u["name"], u["role"], u["color"]) for u in users]
-        self.assertEqual(got, [("Ada", "edit", "#112233"), ("Bob", "view", "#0969da")])
+        # Anonymous links: the name each browser chose, marked as unverified.
+        self.assertEqual(got, [("Ada (unverified name)", "edit", "#112233"),
+                               ("Bob (unverified name)", "view", "#0969da")])
         serve.client_gone("a")
-        self.assertEqual([u["name"] for u in serve.presence()["users"]], ["Bob"])
+        self.assertEqual([u["name"] for u in serve.presence()["users"]], ["Bob (unverified name)"])
 
     def test_bye_removes_the_client_and_hands_over_leadership(self):
         self.join("a")
@@ -3124,6 +3146,200 @@ class ReviewApi(SharedState, ServerCase):
         self.assertEqual(sorted(t["path"] for t in self.get()[1]["threads"]), ["main.tex", "part/ch.tex"])
 
 
+class GroupedSuggestions(SharedState, ServerCase):
+    """One multi-cursor edit is one suggestion with several ranges, accepted, rejected and re-anchored together."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+
+    @staticmethod
+    def part(at, quote, insert):
+        return {"anchor": {"from": at, "to": at + len(quote), "quote": quote, "prefix": "", "suffix": ""},
+                "insert": insert}
+
+    def op(self, body):
+        return self.request("POST", "/api/review?doc=demo", {"name": "Ann", "key": "a" * 32, **body})
+
+    def test_a_group_is_one_item(self):
+        first, second = self.part(0, "\\section", "\\chapter"), self.part(12, "hello", "Hello")
+        status, made = self.op({"op": "suggest", "path": "main.tex", **first, "more": [second]})
+        self.assertEqual(status, 200)
+        self.assertEqual((made["item"]["insert"], made["item"]["more"]), ("\\chapter", [second]))
+        moved = {**second["anchor"], "from": 13, "to": 18}
+        self.assertEqual(self.op({"op": "reanchor", "items": [{"id": made["item"]["id"], "part": 1, "anchor": moved},
+                                                             {"id": made["item"]["id"], "part": 5, "anchor": moved},
+                                                             {"id": made["item"]["id"], "part": True,
+                                                              "anchor": moved}]})[1]["moved"], 1)
+        listed = self.request("GET", "/api/review?doc=demo")[1]["suggestions"][0]
+        self.assertEqual((listed["anchor"]["from"], listed["more"][0]["anchor"]["from"]), (0, 13))
+        status, gone = self.op({"op": "reject", "ids": [made["item"]["id"]]})
+        self.assertEqual((status, len(gone["removed"][0]["more"])), (200, 1))  # both ranges at once
+
+    def test_bad_groups_are_refused(self):
+        a, b = self.part(0, "\\section", "x"), self.part(3, "ction", "y")
+        same = self.part(5, "", "x")
+        for more, why in (([b], "overlap"), ([self.part(0, "", "z")], "out of order"), (["x"], "not a part"),
+                          ([same, same], "two insertions at one place"), ("nope", "not a list"),
+                          ([self.part(20, "", "w")] * serve.review.MAX_PARTS, "too many"),
+                          ([self.part(20, "", "w" * serve.review.MAX_INSERT)], "too long together")):
+            with self.subTest(why=why):
+                base = a if why != "two insertions at one place" else self.part(0, "", "q")
+                self.assertEqual(self.op({"op": "suggest", "path": "main.tex", **base, "more": more})[0], 400)
+        noop = self.part(0, "\\section", "\\section")
+        same_text = self.part(12, "hello", "hello")
+        self.assertEqual(self.op({"op": "suggest", "path": "main.tex", **noop, "more": [same_text]})[0], 400)
+        one_change = self.part(12, "hello", "")  # one real change is enough
+        self.assertEqual(self.op({"op": "suggest", "path": "main.tex", **noop, "more": [one_change]})[0], 200)
+
+
+class NamedLinks(SharedState, ServerCase):
+    """Named share links: one token per person, the name from the link, revocable at once; owner-only records."""
+
+    ws, send, read_until = ShareHttp.ws, ShareHttp.send, ShareHttp.read_until
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        other = self.base / "second"
+        other.mkdir()
+        (other / "main.tex").write_text("secret doc", encoding="utf-8")
+        mock.patch.dict(serve.DOCS, {"second": other / "main.tex"}).start()
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        serve.SHARE["port"] = self.port
+        self.tokens = dict(self.share_on())
+        for who, name, role in (("alice", "Alice", "edit"), ("rev", "Reviewer 2", "view")):
+            status, info = self.get("POST", "/api/share/links", "owner", {"name": name, "role": role})
+            self.assertEqual(status, 200)
+            link = next(x for x in info["named"] if x["name"] == name)
+            self.tokens[who] = link["url"].split("token=")[1].split("#")[0]
+            setattr(self, who + "_id", link["id"])
+
+    def get(self, method, path, role=None, body=None, headers=None):
+        hdrs = dict(headers or {})
+        if role:
+            hdrs["Cookie"] = f"{serve.cookie_name()}={self.tokens[role]}"
+        return self.request(method, path, body, hdrs)
+
+    def test_only_the_owner_mints_lists_and_revokes(self):
+        for role in ("edit", "view", "alice", "rev"):
+            with self.subTest(role=role):
+                self.assertEqual(self.get("POST", "/api/share/links", role, {"name": "Eve", "role": "edit"})[0], 403)
+                self.assertEqual(self.get("POST", "/api/share/links/revoke", role, {"id": self.alice_id})[0], 403)
+                self.assertEqual(self.get("GET", "/api/share", role)[0], 403)  # the links carry tokens
+        self.assertEqual(self.get("POST", "/api/share/links", None, {"name": "Eve", "role": "edit"})[0], 401)
+        for body in ({"name": "", "role": "edit"}, {"name": "x" * 41, "role": "edit"},
+                     {"name": "a\x00b", "role": "edit"}, {"name": "Eve", "role": "owner"},
+                     {"name": ["Eve"], "role": "view"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.get("POST", "/api/share/links", "owner", body)[0], 400)
+        info = self.get("GET", "/api/share", "owner")[1]
+        self.assertEqual(sorted((x["name"], x["role"]) for x in info["named"]),
+                         [("Alice", "edit"), ("Reviewer 2", "view")])
+        stored = json.loads(self.links_file.read_text("utf-8"))
+        self.assertEqual((stored["version"], len(stored["links"])), (1, 2))
+        self.assertFalse(str(self.links_file).startswith(str(self.root)))  # never in a document directory
+        if os.name != "nt":
+            self.assertEqual(self.links_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.links_file.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.get("POST", "/api/share/links/revoke", "owner", {"id": "nope"})[0], 404)
+
+    def test_links_survive_regenerate_and_restart_but_only_for_their_document(self):
+        serve.share_regenerate()
+        self.assertEqual(serve.identity_for_token(self.tokens["alice"]), ("edit", f"link-{self.alice_id};Alice"))
+        self.assertIsNone(serve.role_for_token(self.tokens["edit"]))  # the anonymous ones changed
+        serve.share_disable()
+        self.share_on("demo")
+        self.assertEqual(serve.role_for_token(self.tokens["rev"]), "view")  # persisted, sharing the same document
+        serve.share_disable()
+        self.share_on("second")
+        self.assertIsNone(serve.role_for_token(self.tokens["alice"]))  # a link names one document
+        self.assertEqual(self.get("POST", "/api/share/links", "owner", {"name": "Bob", "role": "view"})[0], 401)
+
+    def test_names_come_from_the_link_not_the_request(self):
+        anchor = {"from": 12, "to": 17, "quote": "hello", "prefix": "", "suffix": ""}
+        forged = {"X-Host-User": "9;Mallory", "X-Host-Role": "edit", "X-Host-Secret": "s" * 40,
+                  "X-Forwarded-User": "Mallory"}
+        status, made = self.get("POST", "/api/review?doc=demo", "alice",
+                                {"op": "comment", "path": "main.tex", "anchor": anchor, "text": "x", "name": "Mallory",
+                                 "key": "m" * 32}, forged)
+        self.assertEqual((status, made["item"]["comments"][0]["name"]), (200, "Alice"))
+        self.assertEqual(self.get("POST", "/api/send?cid=c-alice", "alice", {"messages": [
+            {"type": "hello", "data": {"name": "Mallory", "doc": "demo"}}]})[0], 200)
+        self.get("POST", "/api/send?cid=c-anon", "edit", {"messages": [{"type": "hello", "data": {"name": "Alice",
+                                                                                              "doc": "demo"}}]})
+        names = sorted(u["name"] for u in serve.presence("view")["users"])
+        self.assertEqual(names, ["Alice", "Alice (unverified name)"])
+        self.assertEqual(self.get("PUT", "/api/file?doc=demo&path=main.tex&cid=c-anon", "alice", {"text": "v2"})[0],
+                         200)  # someone else's client id does not lend its name
+        versions = self.get("GET", "/api/history?doc=demo", "rev")[1]["versions"]
+        self.assertEqual(versions[0]["authors"], ["Alice"])
+        self.assertEqual(self.get("GET", "/api/poll?cid=c-alice", "rev")[0], 403)  # Reviewer 2 cannot take Alice's id
+        self.assertEqual(self.get("GET", "/api/poll?cid=c-alice", "edit")[0], 403)
+        self.assertEqual(self.get("GET", "/api/config", "alice")[1]["name"], "Alice")
+        self.assertIsNone(self.get("GET", "/api/config", "edit")[1]["name"])
+        self.assertEqual(self.get("POST", "/api/review?doc=demo", "rev", {"op": "comment", "path": "main.tex",
+                                  "anchor": anchor, "text": "x"})[0], 403)  # a named view link is still view-only
+        mine = self.get("GET", "/api/review?doc=demo&key=" + "m" * 32, "alice")[1]["threads"][0]["comments"][0]
+        self.assertTrue(mine["mine"])
+        other = self.get("GET", "/api/review?doc=demo&key=" + "m" * 32, "edit")[1]["threads"][0]["comments"][0]
+        self.assertFalse(other["mine"])  # the browser key Alice sent is not what makes her the author
+
+    def test_revoking_ends_the_sessions_at_once(self):
+        sock, stream, _ = self.ws("alice", cid="w-alice")
+        self.read_until(stream, "state")
+        self.send(sock, {"type": "hello", "data": {"name": "x", "doc": "demo"}})
+        self.read_until(stream, "presence")
+        began = time.monotonic()
+        self.assertEqual(self.get("POST", "/api/share/links/revoke", "owner", {"id": self.alice_id})[0], 200)
+        for _ in range(50):  # no message from us: the server closes it
+            frame = serve.ws_read(stream.read)
+            if frame is None or frame[0] == 0x8:
+                break
+        else:
+            self.fail("socket stayed open after the link was revoked")
+        self.assertLess(time.monotonic() - began, 3.0)
+        sock.close()
+        self.assertFalse([c for c in serve.CLIENTS.values() if (c.get("user") or "").startswith("link-")
+                          and c["user"].endswith(";Alice")])
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/api/health", headers={"Host": f"127.0.0.1:{self.port}",
+                                                    "Cookie": f"{serve.cookie_name()}={self.tokens['alice']}"})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 401)
+        self.assertIn("Max-Age=0", res.getheader("Set-Cookie"))  # the browser forgets it
+        self.assertEqual(self.get("GET", "/api/health", "rev")[0], 200)  # the other links keep working
+        self.assertEqual(self.get("GET", "/api/health", "edit")[0], 200)
+
+    def test_a_poll_in_flight_ends_when_the_link_is_revoked(self):
+        result = {}
+        path = f"/api/poll?cid=p-rev&since={serve.BUS.rev}"
+        thread = threading.Thread(target=lambda: result.update(r=self.get("GET", path, "rev")))
+        thread.start()
+        time.sleep(0.3)
+        self.get("POST", "/api/share/links/revoke", "owner", {"id": self.rev_id})
+        thread.join(5)
+        self.assertEqual(result["r"][0], 401)
+
+    def test_the_bus_never_carries_tokens_and_shared_roles_see_only_the_shared_document(self):
+        self.get("POST", "/api/send?cid=c-alice", "alice", {"messages": [{"type": "hello", "data": {"doc": "demo"}}]})
+        serve.bind_client("o1", "owner")
+        serve.handle_client_message({"type": "hello", "data": {"name": "Me", "doc": "second"}}, "o1")
+        self.get("POST", "/api/share/links/revoke", "owner", {"id": self.rev_id})
+        dump = json.dumps(serve.BUS.since(None))
+        for token in self.tokens.values():
+            self.assertNotIn(token, dump)
+        self.assertNotIn(self.tokens["alice"], json.dumps(serve.presence()))
+        seen = serve.visible([{"type": "presence", "topic": "sys", "data": serve.presence(), "rev": 1}], "edit")
+        users = [u["name"] for u in seen[0]["data"]["users"]]
+        self.assertIn("Alice", users)
+        self.assertNotIn("Me", users)  # the owner is in another document
+        self.assertEqual(serve.visible([{"type": "share", "data": {"named": []}, "rev": 1}], "edit"), [])
+
+
 class HostedHistoryAndReview(SharedState, ServerCase):
     """Behind the gateway: authors are the accounts, and history and review data count toward the quota."""
 
@@ -3292,7 +3508,7 @@ class HistoryAndReviewLimits(SharedState, ServerCase):
         self.assertEqual(self.call("POST", "/api/review?doc=demo", {"op": "release", "ids": [sid], "key": key_b,
                                                                     "name": "Bo"})[1]["released"], 1)
         (back,) = self.call("GET", f"/api/review?doc=demo&key={key_a}")[1]["suggestions"]
-        self.assertEqual((back["id"], back["name"], back["mine"]), (sid, "Ann", True))
+        self.assertEqual((back["id"], back["name"], back["mine"]), (sid, "Ann (unverified name)", True))
 
     def test_unreadable_or_damaged_review_data_is_never_overwritten(self):
         anchor = {"from": 0, "to": 1, "quote": "\\", "prefix": "", "suffix": ""}

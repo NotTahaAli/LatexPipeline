@@ -104,8 +104,12 @@ export class Room {
     this.undo = new Y.UndoManager(this.ytext);
     const u = this.collab.user();
     this.awareness.setLocalStateField("user", { name: u.name, color: u.color, colorLight: u.color + "33" });
+    // While a Yjs transaction runs, every editor change comes from it (the binding applies what already happened to
+    // the shared text): suggest mode lets those through, by this and not by guessing (review.js ctx.fromYjs).
+    this.ydoc.on("beforeTransaction", (tr) => { this.yTx = tr; });
+    this.ydoc.on("afterTransaction", () => { this.yTx = null; });
     this.ydoc.on("update", (update, origin) => {
-      if (origin !== REMOTE && this.canEdit) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(update) } });
+      if (origin !== REMOTE && this.canEdit && !this.held) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(update) } });
       this.touch();
     });
     this.awareness.on("update", (_c, origin) => {
@@ -147,8 +151,9 @@ export class Room {
     for (const u of Object.values(d.aware || {})) AP.applyAwarenessUpdate(this.awareness, dec(u), REMOTE);
     // Whatever the server lacks (our seed, edits made offline) goes up as one update.
     const missing = Y.encodeStateAsUpdate(this.ydoc, Y.encodeStateVector(server));
+    if (this.held) this.held.sv = Y.encodeStateVector(server);   // sent by hold(false), without the held text
     server.destroy();
-    if (this.canEdit && missing.length > 2) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(missing) } });
+    if (this.canEdit && missing.length > 2 && !this.held) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(missing) } });
     this.collab.channel.send({ type: "y-aware", topic: "y", data: { room: this.rid, u: enc(AP.encodeAwarenessUpdate(this.awareness, [this.awareness.clientID])) } });
     this.ready = true;
     for (const u of this.buffer.splice(0)) Y.applyUpdate(this.ydoc, dec(u), REMOTE);
@@ -167,7 +172,32 @@ export class Room {
     this.collab.onRebind?.(this);
   }
 
-  onRemote(u) { if (this.ready) Y.applyUpdate(this.ydoc, dec(u), REMOTE); else this.buffer.push(u); }
+  onRemote(u) {
+    if (this.held) this.held.remote.push(u);
+    else if (this.ready) Y.applyUpdate(this.ydoc, dec(u), REMOTE);
+    else this.buffer.push(u);
+  }
+
+  /**
+   * hold(true): keep this client's edits to itself (not sent, not saved) and others' edits waiting, while an IME
+   * composition in suggest mode puts text into the editor that is taken out again before hold(false). Then the net
+   * change since hold(true) goes out as one update (the composed text is only a deleted range in it), the waiting
+   * edits are applied, and the composition is dropped from the shared undo history.
+   */
+  hold(on) {
+    if (on) {
+      if (!this.held) { this.undo.stopCapturing?.(); this.held = { sv: Y.encodeStateVector(this.ydoc), remote: [], undo: this.undo.undoStack?.length }; }
+      return;
+    }
+    const h = this.held;
+    if (!h) return;
+    this.held = null;
+    if (h.undo != null) { this.undo.undoStack.splice(h.undo); this.undo.stopCapturing?.(); }
+    const mine = Y.encodeStateAsUpdate(this.ydoc, h.sv);
+    if (this.canEdit && mine.length > 2) this.collab.channel.send({ type: "y-update", topic: "y", data: { room: this.rid, u: enc(mine) } });
+    for (const u of h.remote) this.onRemote(u);
+    this.touch();
+  }
   onAware(u) { AP.applyAwarenessUpdate(this.awareness, dec(u), REMOTE); }
   onGone(aid) { if (aid != null) AP.removeAwarenessStates(this.awareness, [aid], REMOTE); }
 
@@ -225,7 +255,7 @@ export class Room {
   }
 
   touch() {
-    if (this.isLeader && this.savedText !== null) this.scheduleSave();
+    if (this.isLeader && this.savedText !== null && !this.held) this.scheduleSave();
     this.collab.onChange?.(this);
   }
 
@@ -233,7 +263,7 @@ export class Room {
 
   async save(opts = {}) {
     clearTimeout(this.saveTimer);
-    if (!this.isLeader || this.saving || this.savedText === null) return;
+    if (!this.isLeader || this.saving || this.savedText === null || this.held) return;
     const text = this.text();
     if (text === this.savedText) return;
     this.saving = true; this.error = null; this.collab.onChange?.(this);

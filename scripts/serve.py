@@ -54,6 +54,7 @@ import hints
 import history
 import preview
 import review
+import share_links as named
 import zotero
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
@@ -1764,8 +1765,10 @@ def forward(query: dict, only: str | None = None) -> tuple[str, dict]:
 
 SHARE: dict = {
     "on": False, "tokens": {}, "doc": None, "provider": None, "public": None, "hosts": set(), "status": "off",
-    "error": None, "tunnel": None, "port": 0, "gen": 0,
+    "error": None, "tunnel": None, "port": 0, "gen": 0, "links": [],
 }
+# Named links (share_links.py): one token per person, the name set by the owner. SHARE["links"] is the file's
+# content, loaded when sharing starts and kept in step by share_link_create/revoke (this process is the only writer).
 SHARE_LOCK = threading.Lock()
 ROLES = ("owner", "edit", "view")
 # --gateway (scripts/host.py): one worker per project, reached only through the gateway, which authenticates the
@@ -1818,16 +1821,27 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def role_for_token(token: str | None) -> str | None:
-    """owner when sharing is off; otherwise the role whose token matches. Compares every token, in constant time."""
+def identity_for_token(token: str | None) -> tuple[str, str | None] | None:
+    """
+    (role, user) for a token: ("owner", None) when sharing is off; an anonymous link is (role, None); a named link
+    is (role, "link-<id>;<name>"), the same shape as an account behind the gateway, so every author and presence
+    name comes from the link. None when nothing matches. Compares every token, in constant time.
+    """
     if not SHARE["on"]:
-        return "owner"
+        return "owner", None
     found = None
     probe = (token or "").encode("utf-8", "replace")
     for role, good in list(SHARE["tokens"].items()):
         if hmac.compare_digest(probe, good.encode()) and token:
-            found = role
-    return found
+            found = role, None
+    link = None if GATEWAY["secret"] else named.find(list(SHARE["links"]), token, SHARE["doc"])
+    return (link["role"], named.user_of(link)) if link else found
+
+
+def role_for_token(token: str | None) -> str | None:
+    """owner when sharing is off; otherwise the role whose token matches (anonymous or named link)."""
+    found = identity_for_token(token)
+    return found[0] if found else None
 
 
 def gateway_enable(secret: str, doc: str, timeout: int | None = None) -> None:
@@ -1835,7 +1849,7 @@ def gateway_enable(secret: str, doc: str, timeout: int | None = None) -> None:
     global SHARE_TIMEOUT
     GATEWAY["secret"] = secret.encode()
     SETTINGS["check_host"] = False  # Loopback only, and every request must carry the secret instead.
-    SHARE.update(on=True, doc=doc, provider="gateway", status="ready", tokens={}, public=None, hosts=set())
+    SHARE.update(on=True, doc=doc, provider="gateway", status="ready", tokens={}, public=None, hosts=set(), links=[])
     share_env(True)
     if timeout:
         SHARE_TIMEOUT = timeout
@@ -1905,7 +1919,7 @@ def share_enable(doc: str | None, provider: str, port: int) -> int:
         SHARE["gen"] = SHARE.get("gen", 0) + 1
         SHARE.update(
             on=True, doc=doc, provider=provider, status="starting", error=None, public=None, port=port,
-            tokens={"owner": new_token(), "edit": new_token(), "view": new_token()},
+            tokens={"owner": new_token(), "edit": new_token(), "view": new_token()}, links=named.load(),
         )
         return SHARE["gen"]
 
@@ -1921,25 +1935,73 @@ def share_disable(error: str | None = None) -> None:
 
 
 def share_regenerate() -> None:
-    """New view and edit tokens: every link handed out so far stops working, connections included."""
+    """New anonymous view and edit tokens: those links stop working, connections included. Named links stay."""
     with SHARE_LOCK:
         if SHARE["on"]:
             SHARE["tokens"].update(edit=new_token(), view=new_token())
 
 
-def share_links() -> dict:
+def link_url(token: str) -> str:
     base = SHARE["public"] or f"http://localhost:{SHARE['port']}"
     frag = "#" + SHARE["doc"].replace(" ", "%20") if SHARE["doc"] else ""
+    return f"{base.rstrip('/')}/?token={token}{frag}"
+
+
+def share_links() -> dict:
     tokens = SHARE["tokens"]
-    return {role: f"{base.rstrip('/')}/?token={tokens[role]}{frag}" for role in ("view", "edit") if role in tokens}
+    return {role: link_url(tokens[role]) for role in ("view", "edit") if role in tokens}
 
 
 def share_info() -> dict:
+    """Owner only (check_permission): the links carry their tokens."""
+    mine = [link for link in SHARE["links"] if link["doc"] == SHARE["doc"]] if SHARE["on"] else []
     return {
         "on": SHARE["on"], "status": SHARE["status"], "error": SHARE["error"], "provider": SHARE["provider"],
         "url": SHARE["public"], "doc": SHARE["doc"], "links": share_links() if SHARE["on"] else {},
+        "named": [{"id": link["id"], "name": link["name"], "role": link["role"], "created": link["created"],
+                   "url": link_url(link["token"])} for link in mine],
         "providers": [{"name": n, "available": a, "hint": TUNNELS[n]["hint"]} for n, a in tunnel_status().items()],
     }
+
+
+def share_link_create(data: dict) -> dict:
+    """POST /api/share/links (owner): a named link to the shared document."""
+    with SHARE_LOCK:
+        if not SHARE["on"] or not SHARE["doc"]:
+            raise ApiError("Start sharing first.", 409)
+        links = named.load()  # the file, not the cache: never lose a record written by another run
+        try:
+            named.create(links, data.get("name"), data.get("role"), SHARE["doc"])
+            named.save(links)
+        except named.LinkError as exc:
+            raise ApiError(str(exc), 400)
+        except OSError as exc:
+            raise ApiError(f"Could not save the link: {exc}", 500)
+        SHARE["links"] = links
+    return share_info()
+
+
+def share_link_revoke(data: dict) -> dict:
+    """POST /api/share/links/revoke (owner): the link stops working at once, open connections included."""
+    with SHARE_LOCK:
+        links = named.load()
+        gone = [link for link in links if link["id"] == data.get("id")]
+        if not gone:
+            raise ApiError("No such link.", 404)
+        links = [link for link in links if link not in gone]
+        try:
+            named.save(links)
+        except OSError as exc:
+            raise ApiError(f"Could not save the links: {exc}", 500)
+        SHARE["links"] = links
+    users = {named.user_of(link) for link in gone}
+    with COLLAB_LOCK:
+        clients = [cid for cid, c in CLIENTS.items() if c.get("user") in users]
+    for cid in clients:
+        client_gone(cid)  # leaves its rooms; the presence message wakes every socket and poll, which then close
+    if not clients:
+        publish_presence()
+    return share_info()
 
 
 # --- Tunnels: one subprocess each, public URL read from its output --------------------------------------------
@@ -2280,8 +2342,8 @@ def on_hello(message: dict, client: str, role: str) -> dict:
     data = message.get("data") or {}
     with COLLAB_LOCK:
         record = CLIENTS[client]
-        # Behind the gateway the name is the account's, not whatever the browser claims.
-        record["name"] = (record.get("user") or "").partition(";")[2][:40] or str(data.get("name") or "Guest")[:40]
+        # An account's or a named link's name, not whatever the browser claims; anonymous guests are marked.
+        record["name"] = display_name(role, record.get("user"), data.get("name"))
         color = str(data.get("color") or "")
         record["color"] = color if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "#0969da"
         path = data.get("path")
@@ -2510,13 +2572,13 @@ def review_store(name: str) -> review.Review:
 
 
 def author_name(role: str, user: str | None, client: str | None = None) -> str:
-    """Display name: the account's behind the gateway, else what the client said in hello."""
+    """Display name: an account's or a named link's, else the one hello recorded (display_name)."""
     if user:
-        return user.partition(";")[2] or "Someone"
+        return display_name(role, user, None)
     record = CLIENTS.get(client or "") if trusted_client(client, role, user) else None
     if record and record.get("name"):
         return record["name"]
-    return ROLE_NAMES.get(role, role)
+    return display_name(role, None, None)
 
 
 def trusted_client(client: str | None, role: str, user: str | None) -> str | None:
@@ -2894,13 +2956,24 @@ def history_clean(name: str, data: dict) -> dict:
     return {"removed": removed}
 
 
-def reviewer(role: str, user: str | None, data: dict) -> dict:
-    """Who is commenting: the account behind the gateway, the owner, or a link guest known by a browser secret."""
+def display_name(role: str, user: str | None, claimed) -> str:
+    """
+    The name others see. An account (gateway) or a named link: its own name, whatever the browser says. The owner:
+    what the owner's browser says. An anonymous link: what its browser says, marked as unverified.
+    """
     if user:
-        uid, _, uname = user.partition(";")
-        return {"key": "u:" + uid, "name": uname or "Someone"}
-    name = data.get("name")
-    name = name.strip()[:40] if isinstance(name, str) and name.strip() else ROLE_NAMES.get(role, role)
+        return user.partition(";")[2][:80] or "Someone"
+    name = claimed.strip()[:40] if isinstance(claimed, str) and claimed.strip() else None
+    if role == "owner":
+        return name or ROLE_NAMES["owner"]
+    return f"{name} (unverified name)" if name else "Guest (unverified name)"
+
+
+def reviewer(role: str, user: str | None, data: dict) -> dict:
+    """Who is commenting: an account or a named link (user), the owner, or an anonymous guest (a browser secret)."""
+    if user:
+        return {"key": "u:" + user.partition(";")[0], "name": display_name(role, user, None)}
+    name = display_name(role, None, data.get("name"))
     if role == "owner":
         return {"key": "owner", "name": name}
     key = data.get("key")
@@ -3251,7 +3324,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
         morsel = jar.get(cookie_name())
         self.token = morsel.value if morsel else None
-        return role_for_token(self.token)
+        found = identity_for_token(self.token)
+        self.user = found[1] if found else None  # a named link: its name, never one the request carries
+        return found[0] if found else None
+
+    def revoked(self) -> bool:
+        """This request's link no longer works (revoked, regenerated, sharing stopped). The gateway closes its own."""
+        return False if GATEWAY["secret"] else identity_for_token(self.token) != (self.role, self.user)
 
     def allowed(self) -> bool:
         """Refuse foreign Host headers (DNS rebinding) while bound to loopback."""
@@ -3317,11 +3396,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.role = self.authenticate()
             if self.role is None:
+                # A cookie that no longer works (revoked link) is dropped from the browser too.
+                gone = {"Set-Cookie": f"{cookie_name()}=; Path=/; Max-Age=0"} if self.token else {}
                 if "text/html" in self.headers.get("Accept", "") and not url.path.startswith("/api/"):
                     # A browser tab gets a readable page, not bare text.
-                    self.reply(401, UNAUTHORIZED_PAGE, "text/html; charset=utf-8")
+                    self.reply(401, UNAUTHORIZED_PAGE, "text/html; charset=utf-8", gone)
                 else:
-                    self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain")
+                    self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain", gone)
                 return
             check_permission(self.role, self.command, unquote(url.path), query, self.admin)
             method()
@@ -3444,6 +3525,10 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/share/stop":
             share_disable()
             self.json(share_info())
+        elif url.path == "/api/share/links":  # owner only: check_permission denies every other role
+            self.json(share_link_create(self.body()))
+        elif url.path == "/api/share/links/revoke":
+            self.json(share_link_revoke(self.body()))
         else:
             self.reply(404, b"Not found", "text/plain")
 
@@ -3481,6 +3566,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "cleanup": self.role == "owner" or self.admin,
+                       "name": display_name(self.role, self.user, None) if self.user else None,  # set by link/account
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
         elif path == "/api/zotero" and not GATEWAY["secret"]:
@@ -3612,6 +3698,8 @@ class Handler(BaseHTTPRequestHandler):
         if not bind_client(str(query.get("cid", ["?"])[0])[:64], self.role, self.user):
             raise ApiError("Client id belongs to another session.", 403)
         events = BUS.wait(since, POLL_HOLD) if since is not None else BUS.since(None)
+        if self.revoked():  # revoked while waiting: nothing more for this link
+            raise ApiError("This link no longer works.", 401)
         bind_client(str(query.get("cid", ["?"])[0])[:64], self.role, self.user)
         # rev is where the client resumes: filtered-out messages still advance it, so it cannot spin on them.
         self.json({"rev": events[-1]["rev"] if events else since, "events": visible(events, self.role)})
@@ -3637,7 +3725,7 @@ class Handler(BaseHTTPRequestHandler):
             since = int(query["since"][0]) if "since" in query else None
         except ValueError:
             since = None
-        role, token, user = self.role, self.token, self.user
+        role, user = self.role, self.user
         send_lock = threading.Lock()
         alive = threading.Event()
 
@@ -3646,15 +3734,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(ws_encode(opcode, payload))
                 self.wfile.flush()
 
-        def revoked() -> bool:  # Tokens regenerated or sharing stopped. The gateway closes its own sockets.
-            return False if GATEWAY["secret"] else role_for_token(token) != role
+        revoked = self.revoked  # link revoked, tokens regenerated or sharing stopped
 
         def pump() -> None:  # Bus -> socket.
             cursor = since
             try:
                 while not alive.is_set() and not STOP.is_set() and not revoked():
                     messages = BUS.since(cursor) if cursor is None else BUS.wait(cursor, 5.0)
-                    if alive.is_set():
+                    if alive.is_set() or revoked():  # a revoke publishes presence, which wakes this wait
                         break
                     bind_client(client, role, user)  # Keeps the client "seen" while the socket idles.
                     for message in visible(messages, role):

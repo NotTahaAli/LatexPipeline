@@ -46,6 +46,25 @@ export function locate(text, a) {
   return bestScore >= need ? { from: best, to: best + len } : null;
 }
 
+/** The ranges of a suggestion, [{anchor, insert}]: one, or several for a group made by one multi-cursor edit. */
+export const partsOf = (s) => [{ anchor: s.anchor, insert: s.insert }, ...(s.more || [])];
+
+/**
+ * Where suggestions accepted together go in `text`. A group applies whole or not at all: when one of its parts is
+ * gone or overlaps an edit already placed, the whole item comes back in `failed`.
+ * Returns {ok: [{from, to, insert, item}] in document order, failed: [item]}.
+ */
+export function placeGroups(text, items) {
+  const ok = [], failed = [];
+  for (const item of items) {
+    const edits = partsOf(item).map((p) => { const at = locate(text, p.anchor); return at && { ...at, insert: p.insert, item }; });
+    const own = disjoint(edits.filter(Boolean));
+    if (edits.includes(null) || own.clash.length || disjoint([...ok, ...own.ok]).clash.length) failed.push(item);
+    else ok.push(...own.ok);
+  }
+  return { ok: disjoint(ok).ok, failed };
+}
+
 /** Non-overlapping edits {from, to, ...} to apply together, in document order; the rest come back as `clash`. */
 export function disjoint(edits) {
   const ok = [], clash = [];

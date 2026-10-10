@@ -127,6 +127,13 @@ button.tip:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
 .link-row>.mute{font-size:12.5px}
 .link-line{display:flex;gap:8px}
 .link-line input{flex:1;min-width:0;font:12px var(--mono)}
+.named-links{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--rule);padding-top:12px}
+.named-links h3{margin:0;font:600 15px var(--serif)}
+.named-list{display:flex;flex-direction:column;gap:12px;margin:0;padding:0;list-style:none}
+.named-list .btn.danger{align-self:flex-start}
+.named-new{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.named-new input[type=text]{flex:1 1 140px;min-width:0}
+.rv-group{margin:0;font-size:12px}
 #revoked{position:fixed;inset:0;z-index:90;background:color-mix(in srgb,var(--paper) 88%,transparent);display:grid;place-items:center;text-align:center;padding:24px}
 #revoked>div{background:var(--surface);border:1px solid var(--rule);border-radius:10px;box-shadow:var(--shadow);padding:28px 32px;max-width:440px}
 #revoked h2{font:600 24px var(--serif);margin:0 0 8px}
