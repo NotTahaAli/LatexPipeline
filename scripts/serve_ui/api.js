@@ -33,6 +33,7 @@ export const api = {
   inverse: (doc, page, x, y) => call(`synctex/edit?${qs({ doc, page, x, y })}`),
   rawUrl: (doc, path) => `api/raw?${qs({ doc, path })}`,
   imageUrl: (doc, name, from) => `api/image?${qs({ doc, name, from })}`,
+  upload: (doc, file, name) => call(`api/upload?${qs({ doc, name })}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }),
   fs: (doc, op, path, to) => call(`api/fs?${qs(to == null ? { doc, op, path } : { doc, op, path, to })}`, { method: "POST" }),
   focus: (doc, path) => call(`api/focus?${qs({ doc, path })}`, { method: "POST" }),
   pdfUrl: (doc, v, focus) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}${focus ? "&focus=1" : ""}`,

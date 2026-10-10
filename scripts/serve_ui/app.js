@@ -16,7 +16,7 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, spell: true }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
@@ -49,7 +49,7 @@ function applyAppearance() {
 // ---- CodeMirror ---------------------------------------------------------------------------
 const { EditorState, Compartment, Prec } = S;
 const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
-const keysC = new Compartment(), visualC = new Compartment();
+const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment();
 
 const latexComplete = (ctx) => {
   const ref = ctx.matchBefore(/\\(?:ref|eqref|cref|Cref|autoref|pageref)\{[^}]*/);
@@ -73,6 +73,10 @@ function extensionsFor(tab) {
     lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
     room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
     readOnly ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
+    readOnly ? [] : EditorView.domEventHandlers({
+      paste: (e, v) => dropImages(e.clipboardData?.files, e, v.state.selection.main.head),
+      drop: (e, v) => dropImages(e.dataTransfer?.files, e, v.posAtCoords({ x: e.clientX, y: e.clientY }) ?? v.state.selection.main.head),
+    }),
     errField,
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
@@ -80,7 +84,8 @@ function extensionsFor(tab) {
     L.StreamLanguage.define(stex),
     L.syntaxHighlighting(HL.classHighlighter),
     EditorView.lineWrapping,
-    EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, spellcheck: "false", tabindex: "0" }),
+    EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, tabindex: "0" }),
+    spellC.of(spellAttr()),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
       ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
@@ -90,6 +95,14 @@ function extensionsFor(tab) {
     visualTheme,
     EditorView.updateListener.of(onUpdate),
   ];
+}
+
+// Spell check (the browser's own, no dictionary shipped) only where the text is prose: visual mode, and the paragraph panel.
+// In source mode every line is LaTeX, so it stays off; in visual mode commands and keys are marked spellcheck=false.
+const spellAttr = () => EditorView.contentAttributes.of({ spellcheck: settings.spell && settings.visual ? "true" : "false" });
+function applySpell() {
+  view?.dispatch({ effects: spellC.reconfigure(spellAttr()) });
+  $("proseBody").spellcheck = !!settings.spell;
 }
 
 function onUpdate(u) {
@@ -106,6 +119,35 @@ function onUpdate(u) {
 }
 
 const proseEdit = S.Annotation.define();
+
+// ---- figures: drop or paste an image into the editor; it is saved into the document and \includegraphics is inserted ----------
+const UPLOAD_OK = /^(image\/(png|jpeg)|application\/pdf)$/;
+function dropImages(list, event, pos) {
+  const all = [...(list || [])];
+  if (!all.length) return false;   // Plain text paste or a text drop: CodeMirror handles it.
+  event.preventDefault();
+  const good = all.filter((f) => UPLOAD_OK.test(f.type));
+  if (good.length < all.length) toast(el("span", { textContent: "Only png, jpg and pdf images can be added (svg and gif cannot be used by LaTeX here)." }));
+  uploadImages(good, pos);
+  return true;
+}
+async function uploadImages(fs, pos) {
+  const tab = active;
+  for (const f of fs) {
+    try {
+      const name = f.name && f.name !== "image.png" ? f.name : `pasted-${Date.now()}.${f.type === "image/jpeg" ? "jpg" : f.type === "application/pdf" ? "pdf" : "png"}`;
+      const { path } = await api.upload(cur, f, name);
+      if (active !== tab) { toast(el("span", { textContent: `Saved ${path}.` })); continue; }
+      const text = `\\includegraphics[width=0.8\\linewidth]{${path}}\n`;
+      pos = Math.min(pos, view.state.doc.length);
+      view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length }, scrollIntoView: true });
+      pos += text.length;
+      toast(el("span", { textContent: `Saved ${path} and inserted it.` }));
+      loadFiles(); if (settings.visual) loadRefs();
+    } catch (e) { toast(el("span", { textContent: `${f.name || "Image"}: ${e.message}` })); }
+  }
+  view.focus();
+}
 
 let nudged = 0;
 function nudgeReadOnly() {   // Typing into a locked editor must not look like a bug.
@@ -150,7 +192,9 @@ async function applyConfig() {
   view.dispatch({ effects: [
     keysC.reconfigure(Prec.high(keys)),
     visualC.reconfigure(settings.visual && active?.kind === "text" ? [visualField, env] : []),
+    spellC.reconfigure(spellAttr()),
   ] });
+  $("proseBody").spellcheck = !!settings.spell;
   $("cm").classList.toggle("visual", !!settings.visual);
   $("visualBtn").setAttribute("aria-checked", settings.visual ? "true" : "false");
 }
@@ -972,7 +1016,7 @@ function openSettings() {
   $("sAutosave").value = settings.autosave; $("sTheme").value = settings.theme; $("sKeys").value = settings.keys;
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
-  $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
+  $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
   $("settings").showModal();
   $("sName").focus();
 }
@@ -989,6 +1033,7 @@ bind("sFont", (n) => settings.font = Math.max(10, Math.min(28, +n.value || 14)))
 bind("sZoom", (n) => pdfView.setZoom((+n.value || 133) / 100));
 bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
+bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
 $("focusBtn").onclick = () => previewChapter();
 for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { if (e.target === $(d)) $(d).close(); });

@@ -16,6 +16,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import build
@@ -663,6 +664,27 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=mkdir&path=made2", "owner")[0], 200)
         self.assertEqual(self.get("POST", "/api/fs?doc=second&op=newfile&path=x.tex", "owner")[0], 200)
         self.assertEqual(self.get("POST", "/api/fs?doc=demo&op=newfile&path=../escape.tex", "edit")[0], 400)
+
+    def test_uploads_need_the_edit_link_and_the_shared_document(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 20
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+
+        def post(doc, role):
+            hdrs = {"Host": f"127.0.0.1:{self.port}", "Content-Type": "image/png"}
+            if role:
+                hdrs["Cookie"] = f"{serve.cookie_name()}={self.tokens[role]}"
+            conn.request("POST", f"/api/upload?doc={doc}&name=up.png", png, hdrs)
+            res = conn.getresponse()
+            res.read()
+            return res.status
+
+        self.assertEqual(post("demo", None), 401)
+        self.assertEqual(post("demo", "view"), 403)
+        self.assertEqual(post("second", "edit"), 403)
+        self.assertFalse((self.root / "up.png").exists())
+        self.assertEqual(post("demo", "edit"), 200)
+        self.assertTrue((self.root / "up.png").is_file())
+        conn.close()
 
     def test_rebuilds_are_rate_limited_for_editors_only(self):
         limit = serve.REBUILD_LIMIT[0]
@@ -1562,6 +1584,63 @@ class FileOps(SharedState, ServerCase):
         config = {"rev": 3, "topic": "doc", "type": "y-closed", "data": {"room": "demo\nbuild.toml"}}
         self.assertEqual([m["rev"] for m in serve.visible([mine, other, config], "edit")], [1])
         self.assertEqual([m["rev"] for m in serve.visible([mine, other, config], "view")], [1])
+
+
+class Upload(SharedState, ServerCase):
+    PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 20
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+
+    def up(self, name, data, ctype="image/png"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", f"/api/upload?doc=demo&name={quote(name, safe='%')}", data,
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": ctype})
+        res = conn.getresponse()
+        body = json.loads(res.read())
+        conn.close()
+        return res.status, body
+
+    def test_images_land_in_figures_when_it_exists_and_names_never_collide(self):
+        status, body = self.up("plot.png", self.PNG)
+        self.assertEqual((status, body["path"]), (200, "plot.png"))  # no Figures/ yet: the document directory
+        (self.root / "Figures").mkdir()
+        self.assertEqual(self.up("My Plot (1).PNG", self.PNG)[1]["path"], "Figures/My_Plot_1.png")
+        self.assertEqual(self.up("My Plot (1).PNG", self.PNG)[1]["path"], "Figures/My_Plot_1-1.png")
+        self.assertEqual(self.up("a.jpg", b"\xff\xd8\xff\xe0xx")[0], 200)
+        self.assertEqual(self.up("d.pdf", b"%PDF-1.4 x")[0], 200)
+        self.assertEqual((self.root / "Figures/My_Plot_1.png").read_bytes(), self.PNG)
+
+    def test_only_real_png_jpg_pdf_and_safe_names(self):
+        for name, data, status in (("x.svg", b"<svg onload=alert(1)>", 415), ("x.gif", b"GIF89a", 415),
+                                   ("x.tex", b"\\x", 415),
+                                   ("x.png", b"<html>", 415), ("x.pdf", self.PNG, 415), ("x.png", b"", 413),
+                                   ("noext", self.PNG, 415)):
+            with self.subTest(name=name):
+                self.assertEqual(self.up(name, data)[0], status)
+        with self.assertRaises(serve.ApiError) as big:  # The HTTP handler refuses by Content-Length before reading.
+            serve.save_upload("demo", "x.png", self.PNG + b"0" * serve.MAX_UPLOAD)
+        self.assertEqual(big.exception.status, 413)
+        for name in ("../../evil.png", "..%2F..%2Fevil.png", "a%5C..%5Cevil.png", "%2Fetc%2Fevil.png",
+                     ".latexmkrc.png"):
+            with self.subTest(name=name):
+                status, body = self.up(name, self.PNG)
+                self.assertEqual(status, 200)
+                self.assertNotIn("..", body["path"])
+                self.assertNotIn("/", body["path"])
+                self.assertTrue((self.root / body["path"]).is_file())
+        self.assertFalse((self.base / "evil.png").exists())
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.suffix == ".svg"), [])
+
+    def test_upload_tells_browsers_and_never_overwrites(self):
+        rev = serve.BUS.rev
+        self.write("plot.png", "mine")
+        status, body = self.up("plot.png", self.PNG)
+        self.assertEqual(body["path"], "plot-1.png")
+        self.assertEqual((self.root / "plot.png").read_text(), "mine")
+        fs = [m["data"] for m in serve.BUS.since(rev) if m["type"] == "fs"]
+        self.assertEqual(fs[-1]["changed"], ["plot-1.png"])
 
 
 class FocusPreview(ServerCase):

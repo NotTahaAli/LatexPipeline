@@ -19,6 +19,9 @@ const DISPLAY = /\\\[([\s\S]*?)\\\]|\$\$([\s\S]*?)\$\$/g;
 const INLINE = /(?<![\\$])\$(?!\$)((?:\\.|[^$\\\n])+?)\$|\\\(([\s\S]*?)\\\)/g;
 const STYLE_CLASS = { textbf: "v-bold", emph: "v-emph", textit: "v-emph", textsl: "v-emph", underline: "v-under", texttt: "v-mono", textsc: "v-caps" };
 const HEAD_CLASS = { part: "v-h0", chapter: "v-h1", section: "v-h2", subsection: "v-h3", subsubsection: "v-h4", paragraph: "v-h5" };
+// Commands and the arguments that name things (labels, keys, files) are not prose: the browser's spell checker skips them.
+const CODE = /\\[A-Za-z@]+\*?(?:\[[^\]]*\])*(?:\{(?:[^{}]*)\})?(?<=\\(?:label|ref|eqref|autoref|cref|Cref|pageref|nameref|cite[a-z]*|input|include|includegraphics|usepackage|documentclass|begin|end|bibliography|bibliographystyle|url|href|newcommand|renewcommand|def|setlength|vspace|hspace)(?:\*|\[[^\]]*\])*\{[^{}]*\}|\\[A-Za-z@]+\*?)/g;
+const NO_SPELL = Decoration.mark({ attributes: { spellcheck: "false" } });
 const MAX_CHARS = 600000;
 
 function matchBrace(text, open) {
@@ -131,7 +134,7 @@ function build(st) {
       const from = m.index, to = from + m[0].length;
       if (inTaken(from)) continue;
       taken.push([from, to]);
-      if (touched(from, to)) { add(from, to, Decoration.mark({ class: "v-math-src" })); continue; }
+      if (touched(from, to)) { add(from, to, Decoration.mark({ class: "v-math-src", attributes: { spellcheck: "false" } })); continue; }
       const [tex, display] = pick(m);
       add(from, to, Decoration.replace({ widget: new MathWidget(tex, display, from), block: display }));
     }
@@ -202,6 +205,8 @@ function build(st) {
     const url = env.imageUrl?.(m[1]);
     if (url) add(to, to, Decoration.widget({ widget: new ImageWidget(url, m[1]), side: 1 }));
   }
+
+  for (const m of text.matchAll(CODE)) if (!inTaken(m.index)) add(m.index, m.index + m[0].length, NO_SPELL);
 
   ranges.sort((a, b) => a.from - b.from || (a.deco.startSide - b.deco.startSide) || a.to - b.to);
   const builder = new RangeSetBuilder();

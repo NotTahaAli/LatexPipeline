@@ -845,6 +845,44 @@ def fs_operation(doc: str, op, rel, to=None) -> dict:
     return {"ok": True, "path": to if op == "rename" else rel}
 
 
+# --- Figure upload: drag and drop or paste into the editor ----------------------------------------------------
+
+# png, jpg and pdf only: svg can carry script and TeX cannot read it anyway. The bytes must match the type.
+UPLOAD_TYPES = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff", ".pdf": b"%PDF-"}
+MAX_UPLOAD = 8 * 1024 * 1024
+
+
+def save_upload(doc: str, name, data: bytes) -> dict:
+    """Store an image in the document (in Figures/ when it exists) under a safe, unused name."""
+    root = DOCS[doc].parent
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", posixpath.basename(str(name or "").replace("\\", "/")))
+    stem, ext = posixpath.splitext(base)
+    stem, ext = stem.strip("._-") or "image", ext.lower()
+    if ext not in UPLOAD_TYPES:
+        raise ApiError("Only png, jpg and pdf images can be added.", 415)
+    if not data or len(data) > MAX_UPLOAD:
+        raise ApiError(f"Images can be up to {MAX_UPLOAD // (1024 * 1024)} MB.", 413)
+    if not data.startswith(UPLOAD_TYPES[ext]):
+        raise ApiError("That file is not really a png, jpg or pdf.", 415)
+    folder = "Figures" if (root / "Figures").is_dir() and not (root / "Figures").is_symlink() else ""
+    with WRITE_LOCK:
+        for n in range(100):
+            rel = posixpath.join(folder, f"{stem[:80]}{'' if n == 0 else '-' + str(n)}{ext}")
+            target = fs_path(root, rel)
+            try:
+                handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            except FileExistsError:
+                continue
+            with os.fdopen(handle, "wb") as out:
+                out.write(data)
+            break
+        else:
+            raise ApiError("Too many files with that name.", 409)
+    close_rooms(doc, rel, below=False)
+    broadcast("fs", {"doc": doc, "changed": [rel], "removed": []})
+    return {"ok": True, "path": rel}
+
+
 def find_image(root: Path, name: str, origin: str = "") -> Path | None:
     """Resolve an \\includegraphics name like LaTeX would: as given, with extensions, in \\graphicspath dirs."""
     paths = [""]
@@ -1948,6 +1986,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if any(is_rc((query.get(key) or [""])[0]) for key in ("path", "to")):
             raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
+    elif method == "POST" and path == "/api/upload":
+        need_edit()
+        scoped(doc)
+        if not rate_ok("upload", 30, 60.0):
+            raise ApiError("Too many uploads; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2101,6 +2144,14 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 FORCE.add(name)
             self.json({"ok": True})
+        elif url.path == "/api/upload" and name in DOCS:
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                size = -1
+            if not 0 < size <= MAX_UPLOAD:
+                raise ApiError("Bad or oversized image.", 413)
+            self.json(save_upload(name, query.get("name", [""])[0], self.rfile.read(size)))
         elif url.path == "/api/fs" and name in DOCS:
             op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
             self.json(fs_operation(name, op, rel, to))
