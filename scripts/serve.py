@@ -43,7 +43,7 @@ import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import bibfix
 import build
@@ -450,7 +450,7 @@ def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -
     name = build.doc_name(main_tex)
     publish(name, status="building", started=time.time())
     with BUILD_LOCK:
-        entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record)
+        entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record, validate=False)
     remember_build(entry)
     try:
         log_text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
@@ -1275,6 +1275,9 @@ def grammar_settings(data: dict) -> dict:
     return grammar_info()
 
 
+BIB_MAX_CHARS = 1_000_000
+
+
 def bib_lookup(data: dict) -> dict:
     """Crossref suggestions for one entry of the .bib text the editor holds, with the edit that applies them.
 
@@ -1283,6 +1286,8 @@ def bib_lookup(data: dict) -> dict:
     text, key = data.get("text"), data.get("key")
     if not (isinstance(text, str) and isinstance(key, str)):
         raise ApiError("Send the .bib text and the entry key.", 400)
+    if len(text) > BIB_MAX_CHARS:
+        raise ApiError("This .bib file is too large to look up (1 MB limit).", 413)
     try:
         return bibfix.suggest_for(text, key)
     except bibfix.BibLookupError as exc:
@@ -2059,13 +2064,31 @@ READ_API = {
 }
 
 
+def attachment_header(filename: str) -> str:
+    """Content-Disposition with an ASCII fallback name and the real one as RFC 5987 filename*."""
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', "_", filename)
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+_VENDOR_WARNED = [False]
+
+
 def vendor_files() -> dict:
-    """url -> file name of the offline copies, or {} when scripts/vendor_ui.py has not run (then the CDNs are used)."""
+    """url -> file name of the offline copies, or {} when vendor/ is missing or does not cover the import map."""
     try:
         files = json.loads((VENDOR_DIR / "manifest.json").read_text("utf-8"))["files"]
-        return {url: info["file"] for url, info in files.items()}
+        local = {url: info["file"] for url, info in files.items()}
+        page = (UI_DIR / "index.html").read_text("utf-8")
+        block = re.search(r'<script type="importmap">(.*?)</script>', page, re.S).group(1)
+        wanted = list(json.loads(block)["imports"].values())
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {}
+    if all(url in local for url in wanted):
+        return local
+    if not _VENDOR_WARNED[0]:
+        _VENDOR_WARNED[0] = True
+        print("vendor/ is out of date; run scripts/vendor_ui.py", file=sys.stderr)
+    return {}
 
 
 def localize(page: bytes) -> bytes:
@@ -2107,7 +2130,9 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
     if method == "GET":
         if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll"):
             return
-        if path.startswith(("/pdf/", "/log/", "/docx/")):
+        if path.startswith("/docx/"):
+            raise ApiError("Only the owner can download the DOCX export.", 403)
+        if path.startswith(("/pdf/", "/log/")):
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
             scoped(doc)
@@ -2137,12 +2162,12 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("grammar", 30, 60.0):
             raise ApiError("Too many grammar checks; wait a moment.", 429)
-    # POST /api/docx has no branch on purpose: owner only. Pandoc reads any file a \input names, so an edit link
-    # could otherwise put /etc/passwd into a download.
+    # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
+    # link could otherwise put /etc/passwd into a download.
     elif method == "POST" and path == "/api/bib/lookup":
         need_edit()  # Sends one DOI or title to Crossref, so a view-only link cannot start it.
         scoped(doc)
-        if not rate_ok("bib", 30, 60.0):
+        if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
             raise ApiError("Too many lookups; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
@@ -2315,6 +2340,8 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:
+            if SHARE["on"]:
+                raise ApiError("DOCX export is off while sharing: pandoc reads any file the source names.", 409)
             ok, message = build.export_docx(DOCS[name])
             if not ok:
                 raise ApiError(message, 500)
@@ -2470,9 +2497,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not built yet", "text/plain")
             return
         types = {"pdf": "application/pdf", "docx": DOCX_TYPE}
-        save = f'attachment; filename="{posixpath.basename(name)}.docx"'
         self.reply(200, body, types.get(kind, "text/plain; charset=utf-8"),
-                   {"Content-Disposition": save} if kind == "docx" else None)
+                   {"Content-Disposition": attachment_header(posixpath.basename(name) + ".docx")}
+                   if kind == "docx" else None)
 
     # --- transports -------------------------------------------------------
 

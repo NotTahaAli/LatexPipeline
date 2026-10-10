@@ -21,7 +21,7 @@ export function addBibLookup(li, f, ctx) {
       const apply = el("button", { type: "button", className: "btn", textContent: "Apply" });
       apply.onclick = async () => {
         if (await ctx.text(f.path) !== text) { out.replaceChildren(el("span", { className: "mute", textContent: "The file changed; look up again." })); return; }
-        await ctx.apply(f.path, r.at, r.insert);
+        if (!(await ctx.apply(f.path, r.at, r.insert, text))) { out.replaceChildren(el("span", { className: "mute", textContent: "The file changed; look up again." })); return; }
         out.replaceChildren(el("span", { className: "ok-mark", textContent: "Added" }), el("span", { className: "mute", textContent: ` ${names.join(", ")} (from Crossref, ${r.source}).` }));
         btn.hidden = true;
       };

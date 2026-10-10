@@ -854,17 +854,28 @@ class ShareHttp(SharedState, ServerCase):
         with mock.patch.object(build, "export_docx", return_value=(True, "out/demo.docx")) as export:
             for who in (None, "view", "edit"):
                 self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            # Even the owner is refused while sharing: pandoc would read files the shared source names.
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)
             export.assert_not_called()
+            serve.SHARE["on"] = False
             self.assertEqual(self.get("POST", url, "owner")[0], 200)
             export.assert_called_once()
         with mock.patch.object(build, "export_docx", return_value=(False, "pandoc was not found")):
             status, reply = self.get("POST", url, "owner")
             self.assertEqual((status, reply["error"]), (500, "pandoc was not found"))
+        serve.SHARE["on"] = True
         (self.root / "demo.docx").write_bytes(b"PK")
         with mock.patch.object(build, "docx_path_for", return_value=self.root / "demo.docx"):
-            self.assertEqual(self.get("GET", "/docx/demo", "view")[0], 200)
-            self.assertEqual(self.get("GET", "/docx/second", "view")[0], 403)
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/docx/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/docx/demo", "owner")[0], 200)
             self.assertEqual(self.get("GET", "/docx/demo")[0], 401)
+
+    def test_docx_download_name_has_an_ascii_fallback_and_a_utf8_name(self):
+        header = serve.attachment_header("Отчёт 1.docx")
+        header.encode("ascii")
+        self.assertEqual(header, 'attachment; filename="_____ 1.docx"; '
+                                 "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82%201.docx")
 
     def test_previews_count_against_the_rebuild_limit_of_editors(self):
         with mock.patch.object(serve, "start_focus", return_value=1.0):
@@ -1971,7 +1982,11 @@ class VendoredUi(ServerCase):
         for name, text in files.items():
             (vendor / name).write_text(text)
         url = re.search(r'"(https://[^"]+)"', (UI_DIR / "index.html").read_text("utf-8")).group(1)
-        manifest = {"files": {url: {"file": "a.js"}, "https://x/b.css": {"file": "b.css"}}}
+        page = (UI_DIR / "index.html").read_text("utf-8")
+        block = re.search(r'<script type="importmap">(.*?)</script>', page, re.S).group(1)
+        urls = list(json.loads(block)["imports"].values())
+        manifest = {"files": {u: {"file": "a.js" if u == url else f"n{i}.js"} for i, u in enumerate(urls)}}
+        manifest["files"]["https://x/b.css"] = {"file": "b.css"}
         (vendor / "manifest.json").write_text(json.dumps(manifest))
         mock.patch.object(serve, "VENDOR_DIR", vendor).start()
         return url
@@ -1982,6 +1997,18 @@ class VendoredUi(ServerCase):
         self.assertIn("https://esm.sh", policy)
         self.assertIn(b"https://esm.sh/", body)
         self.assertEqual(self.get("/ui/vendor/a.js")[0], 404)
+
+    def test_a_vendor_dir_that_misses_an_import_falls_back_to_the_cdns(self):
+        url = self.vendor(**{"a.js": "export {}"})
+        manifest = json.loads((self.root / "vendor/manifest.json").read_text())
+        del manifest["files"][next(u for u in manifest["files"] if u != url and u.startswith("https://esm.sh"))]
+        (self.root / "vendor/manifest.json").write_text(json.dumps(manifest))
+        serve._VENDOR_WARNED[0] = False
+        with mock.patch("sys.stderr") as err:
+            status, policy, body = self.get("/")
+        self.assertIn("https://esm.sh", policy)
+        self.assertIn(url.encode(), body)
+        self.assertIn("out of date", "".join(c.args[0] for c in err.write.call_args_list))
 
     def test_vendored_page_uses_local_files_and_self_only_csp(self):
         url = self.vendor(**{"a.js": "export {}", "b.css": "x{}", "unlisted.js": "no"})
@@ -2054,9 +2081,15 @@ class BibLookupApi(SharedState, ServerCase):
 
     def test_lookups_are_rate_limited_for_shared_roles(self):
         self.tokens = self.share_on()
-        serve.RATE.pop("bib", None)
-        codes = [self.lookup(role="edit")[0] for _ in range(32)]
+        codes = [self.lookup(role="edit")[0] for _ in range(12)]
         self.assertEqual(codes.count(429), 2)
+        # Guests have their own key and a smaller share, so the owner's lookups still fit.
+        self.assertNotIn("bib", serve.RATE)
+        self.assertEqual(self.lookup(role="owner")[0], 200)
+
+    def test_oversized_text_is_refused(self):
+        self.assertEqual(self.lookup({"text": "x" * (serve.BIB_MAX_CHARS + 1), "key": "k"})[0], 413)
+        self.assertEqual(self.lookup({"text": "x" * serve.BIB_MAX_CHARS, "key": "k"})[0], 200)
 
 
 class UiWiring(unittest.TestCase):

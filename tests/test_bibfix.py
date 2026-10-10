@@ -29,7 +29,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(entries[1].fields[0].value, "a, } b")
 
     def test_unbalanced_entry_is_skipped(self):
-        self.assertEqual([e.key for e in bibfix.parse("@article{a, title={oops\n@article{b, year=1}")], ["b"])
+        # BibTeX swallows the rest of the file after an unterminated value, and so does parse (in linear time).
+        self.assertEqual([e.key for e in bibfix.parse("@article{z, year=1}\n@article{a, title={oops\n@article{b, year=1}")], ["z"])
 
 
 class InsertTests(unittest.TestCase):
@@ -47,6 +48,23 @@ class InsertTests(unittest.TestCase):
     def test_quote_style_and_uppercase_names(self):
         got = bibfix.insert_fields('@article{k,\n  TITLE="T"\n}', "k", {"year": '2"1'})
         self.assertEqual(got, '@article{k,\n  TITLE="T",\n  YEAR="2\'\'1"\n}')
+
+    def test_unterminated_braces_parse_in_linear_time(self):
+        import time
+        started = time.monotonic()
+        self.assertEqual(bibfix.parse("@a{k,f={" * 8192), [])  # 64 KB
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_inline_entry_is_not_column_aligned(self):
+        text = "@article{k, title = {A study}, year = {2000}}"
+        self.assertEqual(bibfix.insert_fields(text, "k", {"doi": "10.1/x"}),
+                         "@article{k, title = {A study}, year = {2000}, doi = {10.1/x}}")
+
+    def test_year_only_from_a_plausible_int(self):
+        for parts in ([[2020]], [[2020, 5]]):
+            self.assertEqual(bibfix._year({"issued": {"date-parts": parts}}), "2020")
+        for parts in ([["2020"]], [[True]], [[20200]], [[0]], [[None]], [], ["x"], [[2020.5]]):
+            self.assertEqual(bibfix._year({"issued": {"date-parts": parts}}), "", parts)
 
     def test_inline_entry(self):
         self.assertEqual(bibfix.insert_fields("@misc{k, title={T}}", "k", {"year": "1"}), "@misc{k, title={T}, year={1}}")

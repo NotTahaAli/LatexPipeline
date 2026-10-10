@@ -814,7 +814,12 @@ const bibCtx = {
     if (!t) return (await api.read(cur, path)).text;
     return t === active ? view.state.doc.toString() : t.collab ? t.collab.text() : t.state.doc.toString();
   },
-  async apply(path, at, insert) { await openFile(path); view.dispatch({ changes: { from: at, insert }, userEvent: "input.complete" }); },
+  async apply(path, at, insert, text) {
+    await openFile(path);
+    if (view.state.doc.toString() !== text) return false;  // Edited while the file opened: the offsets no longer fit.
+    view.dispatch({ changes: { from: at, insert }, userEvent: "input.complete" });
+    return true;
+  },
 };
 
 async function loadLint() {
@@ -1141,6 +1146,7 @@ function buildMenu() {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
     const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
+    if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
     return b;
   }));
 }
@@ -1194,6 +1200,8 @@ $("usersBtn").onclick = (e) => { e.stopPropagation(); const open = $("usersList"
 document.addEventListener("click", (e) => { if (!e.target.closest("#usersWrap")) { $("usersList").hidden = true; $("usersBtn").setAttribute("aria-expanded", "false"); } });
 
 let shareTimer;
+let sharing = false;  // DOCX export is off while sharing (pandoc reads any file the source names)
+const setSharing = (on) => { if (on !== sharing) { sharing = on; buildMenu(); } };
 async function openShare() { $("share").showModal(); await refreshShare(); $("shareBody").querySelector("select, button")?.focus(); }
 async function refreshShare() {
   clearTimeout(shareTimer);
@@ -1201,6 +1209,7 @@ async function refreshShare() {
   try { info = await api.share(); } catch (e) { $("shareBody").textContent = e.message; return; }
   renderShare(info);
   $("shareBtn").classList.toggle("on", info.on);
+  setSharing(!!info.on);
   if ($("share").open && info.on && info.status === "starting") shareTimer = setTimeout(refreshShare, 1000);
 }
 function linkRow(label, url, note) {
@@ -1245,7 +1254,7 @@ $("shareBtn").onclick = openShare;
 $("share").addEventListener("click", (e) => { if (e.target === $("share")) $("share").close(); });
 $("share").addEventListener("close", () => clearTimeout(shareTimer));
 if (readOnly || role !== "owner") $("shareBtn").hidden = true;
-else api.share().then((i) => $("shareBtn").classList.toggle("on", i.on)).catch(() => {});
+else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
 // Roles: say who you are, and keep what you cannot do visible but disabled, with the reason.
 if (role !== "owner") {
   const chip = $("roleChip");

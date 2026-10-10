@@ -24,6 +24,7 @@ API = "https://api.crossref.org/works"
 USER_AGENT = "LatexPipeline (https://github.com/NotTahaAli/LatexPipeline)"
 MIN_SIMILARITY = 0.9
 LIMITER = grammar.Limiter(requests=30, size=1, window=60.0)  # size is unused: one hit per lookup
+LOOKUP_WAIT = 0.0  # seconds get_json may wait for the rate limit; 0 refuses at once (the server), the CLI raises it
 CACHE: collections.OrderedDict = collections.OrderedDict()
 CACHE_SIZE = 200
 CACHE_LOCK = threading.Lock()
@@ -154,6 +155,8 @@ def parse(text: str) -> list[Entry]:
                 break
             vstart = _skip_ws(text, eq + 1)
             vend = _value_end(text, vstart)
+            if vend >= len(text):
+                return out  # Unterminated: BibTeX swallows the rest; rescanning per '@' would be quadratic.
             after = _skip_ws(text, vend)
             comma = after if after < len(text) and text[after] == "," else -1
             fields.append(Field(name.group(0).lower(), _plain(text[vstart:vend]), name.start(), name.end(),
@@ -200,7 +203,7 @@ def edit_for(text: str, key: str, new: dict[str, str]) -> tuple[int, str] | None
     lines = []
     for name, value in new.items():
         shown = name.upper() if upper else name.lower()
-        pad = " " * max(eq_col - len(shown), 1 if spaced else 0) if spaced else ""
+        pad = " " * max(eq_col - len(shown), 1) if spaced and not inline else (" " if spaced else "")
         body = '"' + value.replace('"', "''") + '"' if quote else "{" + value + "}"
         lines.append(f"{shown}{pad}={gap}{body}")
     sep = " " if inline else eol + indent
@@ -226,7 +229,7 @@ def get_json(url: str, timeout: float = 15.0) -> dict:
         if url in CACHE:
             return CACHE[url]
     try:
-        LIMITER.acquire(0, 0)
+        LIMITER.acquire(0, LOOKUP_WAIT)
     except grammar.GrammarError:
         raise BibLookupError("Too many Crossref lookups; wait a moment.")
     request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
@@ -264,8 +267,9 @@ def _norm(title: str) -> str:
 def _year(item: dict) -> str:
     for name in ("issued", "published-print", "published-online", "published"):
         parts = (item.get(name) or {}).get("date-parts") or [[None]]
-        if parts[0] and parts[0][0]:
-            return str(parts[0][0])
+        year = parts[0][0] if isinstance(parts[0], list) and parts[0] else None
+        if isinstance(year, int) and not isinstance(year, bool) and 1000 <= year <= 2999:
+            return str(year)
     return ""
 
 

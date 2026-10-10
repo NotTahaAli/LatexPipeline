@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,6 +172,21 @@ class LintCommandTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = ci_report.cmd_lint(args)
         return code, out.getvalue()
+
+    def test_strict_ignores_info_suggestions_and_lookups_wait_for_the_limiter(self):
+        (self.doc / "main.tex").write_text("\\cite{k}\\bibliography{refs}\n", encoding="utf-8")
+        (self.doc / "refs.bib").write_text("@article{k, title={T}, year={2000}}\n", encoding="utf-8")
+        (self.doc / ci_report.BASELINE_NAME).write_text(
+            "unused-figure:Figures/old.pdf\nmissing-bib-field:refs.bib:k\nmissing-doi:refs.bib:k\n", encoding="utf-8")
+        suggestion = {"fields": {"doi": "10.1/x"}}
+        with mock.patch.object(ci_report.bibfix, "suggest_for", return_value=suggestion), \
+                mock.patch.object(ci_report.bibfix, "LOOKUP_WAIT", 0.0):
+            code, output = self.run_lint(strict=True, bib_lookup=True)
+            self.assertEqual(ci_report.bibfix.LOOKUP_WAIT, 60.0)
+        report = json.loads(ci_report.LINT_PATH.read_text(encoding="utf-8"))["documents"]["doc"]["findings"]
+        self.assertIn("bib-suggestion", [f["kind"] for f in report])
+        self.assertEqual([f["kind"] for f in report], ["bib-suggestion"])
+        self.assertEqual(code, 0, output)
 
     def test_strict_fails_then_baseline_suppresses(self):
         code, output = self.run_lint(strict=True)

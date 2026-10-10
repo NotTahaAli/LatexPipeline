@@ -420,6 +420,30 @@ class NewTemplateTests(unittest.TestCase):
                 self.assertEqual({p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}, expected)
                 self.assertEqual(build.new_document("doc", template), 1)
 
+    def test_nothing_is_written_when_any_target_file_exists(self):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            folder = root / "files" / "doc"
+            folder.mkdir(parents=True)
+            (folder / "refs.bib").write_text("mine")
+            self.assertEqual(build.new_document("doc", "report"), 1)
+            self.assertEqual([p.name for p in folder.rglob("*") if p.is_file()], ["refs.bib"])
+            self.assertEqual((folder / "refs.bib").read_text(), "mine")
+
+    def test_verapdf_only_when_validating(self):
+        with fake_repo() as root, mock.patch.object(build.shutil, "which", return_value="verapdf"), \
+                mock.patch.object(build, "verapdf_note", return_value="ran") as note:
+            pdf = root / "a.pdf"
+            pdf.write_bytes(b"%PDF-1.7\n<pdfaid:part>2</pdfaid:part>\n/OutputIntents [1 0 R]\n")
+            self.assertEqual(build.pdfa_check(pdf, "a-2b", validate=False)[:14], "PDF/A a-2b: XM")
+            note.assert_not_called()
+            self.assertEqual(build.pdfa_check(pdf, "a-2b"), "ran")
+
+    def test_template_needs_new_and_docx_excludes_watch_and_focus(self):
+        for argv in (["--template", "report"], ["--docx", "--watch"], ["--docx", "--focus", "x"]):
+            with mock.patch.object(build.sys, "argv", ["build.py", *argv]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build.parse_args()
+
     def test_article_is_unchanged(self):
         with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
             build.new_document("a_b")
@@ -437,6 +461,15 @@ class NewTemplateTests(unittest.TestCase):
 
 
 class DocxExportTests(unittest.TestCase):
+    def test_error_is_the_last_real_stderr_line_and_output_is_decoded_as_utf8(self):
+        with fake_repo() as root:
+            main = write_doc(root, "a", "x")
+            done = mock.Mock(returncode=1, stderr="[WARNING] meh\n\nError: cannot open ../x\n[WARNING] later\n")
+            with mock.patch.object(build.shutil, "which", return_value="/bin/pandoc"), \
+                    mock.patch.object(build.subprocess, "run", return_value=done) as run:
+                self.assertEqual(build.export_docx(main), (False, "Error: cannot open ../x"))
+            self.assertEqual((run.call_args[1]["encoding"], run.call_args[1]["errors"]), ("utf-8", "replace"))
+
     def test_pandoc_command_and_prune(self):
         with fake_repo() as root:
             main = write_doc(root, "a", "x")
