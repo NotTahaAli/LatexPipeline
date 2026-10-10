@@ -25,6 +25,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Changed
 
+- Editor UX pass: usable on phones (editor and PDF stack, top bar fits, More menu spans the screen), themed find/replace panel (dark mode), "Build failed" note no longer covers the zoom buttons, scrollable drawer tabs, DOCX export feedback, Home/End in the More menu, and contrast fixes (axe: 0 violations).
 - **Faster builds** on `bench/sample-report` (303 pages, 25 TikZ figures, 4 CPUs): cold build 93 s to 65 s, one-line text edit 47 s to 20 s, `--focus` preview 1.7 s.
 - **Faster CI**: TeX Live comes from a cache (restore about 12 s) filled by a parallel `texlive-cache` job; on a miss the build uses trimmed apt (about 70 s). The build job takes about 19 s warm and about 70 s cold.
 - `sample-report` moved from `files/` to `bench/` and is built with `--source bench`. CI never builds it, and the next publish deletes it from the `pdfs` release.

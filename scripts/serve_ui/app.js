@@ -614,7 +614,8 @@ async function loadPdf() {
 let focusView = null;   // {path} while the person asked for a chapter preview of that file
 const isChapter = (tab) => tab?.kind === "text" && tab.path.endsWith(".tex") && tab.path !== "main.tex";
 async function exportDocx() {
-  try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); }
+  toast(el("span", { textContent: "Converting to DOCX with pandoc..." }));
+  try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
   catch (e) { toast(el("span", { textContent: e.message })); }
 }
 async function previewChapter(quiet) {
@@ -792,14 +793,14 @@ function renderProblems() {
   d.errors.forEach((e, i) => {
     const more = [];
     if (e.hint) more.push(el("div", { className: "hint", textContent: e.hint }));
-    if (e.excerpt) more.push(el("pre", { textContent: e.excerpt }));
+    if (e.excerpt) more.push(el("pre", { textContent: e.excerpt, tabIndex: 0 }));
     if (!more.length) more.push(el("span", { className: "mute", textContent: "No further details." }), logLink.cloneNode(true));
     list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: e.message }), whereLink(e.file, e.line)], more, i === 0));   // The first error opens by itself; the rest stay one line each.
   });
   if (!list.length && d.status === "failed") {
     loadExcerpt(d);
     list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: "The build failed, but LaTeX did not name a file and line." })],
-      [...(excerpt ? [el("pre", { textContent: excerpt })] : []), logLink.cloneNode(true)], true));
+      [...(excerpt ? [el("pre", { textContent: excerpt, tabIndex: 0 })] : []), logLink.cloneNode(true)], true));
   }
   if (!list.length) list.push(el("li", { className: "none" }, el("span", { className: "ok-mark", textContent: "No errors" }), el("span", { className: "mute", textContent: d.status === "building" ? " Building..." : " in the last build." }),
     ...(d.warnings ? [" ", el("button", { className: "link", textContent: `See ${d.warnings} ${d.warnings === 1 ? "warning" : "warnings"}`, onclick: () => setDrawer(true, "warnings") })] : [])));
@@ -902,7 +903,7 @@ function renderWarnings() {
   const shown = warnings.filter((w) => warnFilter === "all" || warnGroup(w) === warnFilter);
   $("warnList").replaceChildren(...(shown.length ? shown.map((w) => {
     const where = w.file ? whereLink(w.file, w.line) : el("span", { className: "where mute", textContent: w.source });
-    const more = [...(w.hint ? [el("div", { className: "hint", textContent: w.hint })] : []), ...(w.excerpt && w.excerpt !== w.message ? [el("pre", { textContent: w.excerpt })] : [])];
+    const more = [...(w.hint ? [el("div", { className: "hint", textContent: w.hint })] : []), ...(w.excerpt && w.excerpt !== w.message ? [el("pre", { textContent: w.excerpt, tabIndex: 0 })] : [])];
     if (!more.length) more.push(el("span", { className: "mute", textContent: `${w.source}${w.file ? ` - ${w.file}:${w.line}` : ""}` }));
     return disclosure([el("span", { className: "sev " + w.level }), el("span", { className: "msg", textContent: w.message }), where], more);
   }) : [el("li", { className: "none" }, el("span", { className: "ok-mark", textContent: "No warnings" }), el("span", { className: "mute", textContent: " in the last build." }))]));
@@ -1156,6 +1157,8 @@ $("moreMenu").addEventListener("keydown", (e) => {
   const items = [...$("moreMenu").querySelectorAll("button")], i = items.indexOf(document.activeElement);
   if (e.key === "ArrowDown") { items[(i + 1) % items.length].focus(); e.preventDefault(); }
   else if (e.key === "ArrowUp") { items[(i - 1 + items.length) % items.length].focus(); e.preventDefault(); }
+  else if (e.key === "Home") { items[0].focus(); e.preventDefault(); }
+  else if (e.key === "End") { items[items.length - 1].focus(); e.preventDefault(); }
   else if (e.key === "Escape") { closeMenu(); $("moreBtn").focus(); e.stopPropagation(); }
 });
 document.addEventListener("click", (e) => { if (!e.target.closest(".menu-wrap")) closeMenu(); });
