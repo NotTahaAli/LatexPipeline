@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import bisect
 import collections
 import hashlib
 import hmac
@@ -45,6 +46,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import build
+import grammar
 import hints
 
 PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168"
@@ -1199,6 +1201,84 @@ def lint(doc_name: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Grammar (LanguageTool, see grammar.py)
+# ---------------------------------------------------------------------------
+
+# Owner settings, kept in memory (the owner's browser sends them again on every load). "auto" follows build.toml,
+# and without that a local server if one answers. Public mode sends text to languagetool.org.
+GRAMMAR: dict = {"mode": "auto", "url": None, "share_public": False}
+GRAMMAR_MAX_CHARS = 400_000
+_PROBES: dict = {}
+
+
+def cached_probe(base: str) -> bool:
+    now = time.monotonic()
+    when, found = _PROBES.get(base, (-60.0, False))
+    if now - when > (30 if found else 10):
+        found = grammar.probe(base)
+        _PROBES[base] = (now, found)
+    return found
+
+
+def grammar_plan(name: str) -> tuple[str, str | None, dict]:
+    """(mode, endpoint, build.toml settings) for a document. Raises ApiError when public mode is not allowed."""
+    try:
+        cfg = build.read_settings(DOCS[name])
+        grammar.validate_settings(cfg)
+    except (build.ConfigError, grammar.GrammarError, OSError):
+        cfg = {}
+    mode = GRAMMAR["mode"] if GRAMMAR["mode"] != "auto" else cfg.get("grammar")
+    try:
+        mode, url = grammar.resolve(mode, GRAMMAR["url"] or cfg.get("grammar_url"), probe_fn=cached_probe)
+    except grammar.GrammarError as exc:
+        raise ApiError(str(exc), 400)
+    if mode == "public" and SHARE["on"] and not GRAMMAR["share_public"]:
+        raise ApiError("Public grammar checking is off while sharing. The owner can allow it in Settings.", 403)
+    return mode, url, cfg
+
+
+def grammar_check(name: str, text) -> dict:
+    """Findings for the text of one open file, positioned in UTF-16 units like the editor counts."""
+    if not isinstance(text, str) or len(text) > GRAMMAR_MAX_CHARS:
+        raise ApiError("Bad or oversized text.", 413)
+    mode, url, cfg = grammar_plan(name)
+    if mode == "off":
+        return {"mode": "off", "findings": [], "notice": "Grammar check is off: start a LanguageTool server "
+                f"({grammar.DEFAULT_LOCAL}) or pick a mode in Settings."}
+    try:
+        found = grammar.check_source(text, "", url=url, public=mode == "public", lang=cfg.get("lang", "en-US"),
+                                     disabled=cfg.get("disabled_rules", []), max_wait=5.0)
+    except grammar.GrammarError as exc:
+        raise ApiError(str(exc), 429 if "limit" in str(exc) else 502)
+    astral = [i for i, char in enumerate(text) if ord(char) > 0xFFFF]
+
+    def u16(index: int) -> int:
+        return index + bisect.bisect_left(astral, index)
+
+    return {"mode": mode, "notice": grammar.PUBLIC_NOTICE if mode == "public" else None, "findings": [
+        {"from": u16(f.offset), "to": u16(f.offset + f.length), "line": f.line, "col": f.col, "rule": f.rule,
+         "message": f.message, "replacements": list(f.replacements)} for f in found]}
+
+
+def grammar_settings(data: dict) -> dict:
+    mode, url = data.get("mode", "auto"), data.get("url") or None
+    if mode not in grammar.MODES:
+        raise ApiError("Unknown grammar mode.", 400)
+    if url is not None:
+        try:
+            grammar.endpoint(url if isinstance(url, str) else "")
+        except grammar.GrammarError as exc:
+            raise ApiError(str(exc), 400)
+    GRAMMAR.update(mode=mode, url=url, share_public=bool(data.get("share_public")))
+    return grammar_info()
+
+
+def grammar_info(role: str = "owner") -> dict:
+    info = {"mode": GRAMMAR["mode"], "share_public": GRAMMAR["share_public"]}
+    return {**info, "url": GRAMMAR["url"]} if role == "owner" else info
+
+
+# ---------------------------------------------------------------------------
 # SyncTeX
 # ---------------------------------------------------------------------------
 
@@ -2015,6 +2095,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("upload", 30, 60.0):
             raise ApiError("Too many uploads; wait a moment.", 429)
+    elif method == "POST" and path == "/api/grammar":
+        need_edit()  # Sends text to LanguageTool, so a view-only link cannot start it.
+        scoped(doc)
+        if not rate_ok("grammar", 30, 60.0):
+            raise ApiError("Too many grammar checks; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2179,6 +2264,10 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/fs" and name in DOCS:
             op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
             self.json(fs_operation(name, op, rel, to))
+        elif url.path == "/api/grammar" and name in DOCS:
+            self.json(grammar_check(name, self.body().get("text")))
+        elif url.path == "/api/grammar/settings" and self.role == "owner":
+            self.json(grammar_settings(self.body()))
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
@@ -2233,7 +2322,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             self.json(health(self.role))
         elif path == "/api/config":
-            self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"], "role": self.role, "collab": True})
+            self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"], "role": self.role, "collab": True,
+                       "grammar": grammar_info(self.role)})
         elif path == "/api/share":
             self.json(share_info())
         elif path == "/ws":

@@ -162,6 +162,7 @@
       <button role="tab" id="dtab-problems" aria-controls="dpanel-problems" aria-selected="true"><svg class="ic"><use href="#i-alert"/></svg>Problems <span id="problemCount" class="count"></span></button>
       <button role="tab" id="dtab-warnings" aria-controls="dpanel-warnings" aria-selected="false"><svg class="ic"><use href="#i-alert"/></svg>Warnings <span id="warnCount" class="count"></span></button>
       <button role="tab" id="dtab-lint" aria-controls="dpanel-lint" aria-selected="false">Lint <span id="lintCount" class="count"></span></button>
+      <button role="tab" id="dtab-grammar" aria-controls="dpanel-grammar" aria-selected="false">Grammar <span id="grammarCount" class="count"></span></button>
       <button role="tab" id="dtab-log" aria-controls="dpanel-log" aria-selected="false"><svg class="ic"><use href="#i-log"/></svg>Log</button>
     </div>
     <span class="spacer"></span>
@@ -173,6 +174,10 @@
     <ul id="warnList" class="plist"></ul>
   </div>
   <div id="dpanel-lint" role="tabpanel" aria-labelledby="dtab-lint" hidden><ul id="lintList" class="plist"></ul></div>
+  <div id="dpanel-grammar" role="tabpanel" aria-labelledby="dtab-grammar" hidden>
+    <p id="grammarNote" class="gnote" role="status"></p>
+    <ul id="grammarList" class="plist"></ul>
+  </div>
   <div id="dpanel-log" tabindex="0" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
 </section>
 
@@ -228,6 +233,23 @@
         <label for="sVisual">Visual mode</label>
         <label class="check"><input id="sVisual" type="checkbox"> On by default</label>
       </div>
+    </details>
+    <details class="set-more" id="sGrammarBox">
+      <summary>Grammar</summary>
+      <div class="fields">
+        <label for="sGrammar">Grammar check</label>
+        <select id="sGrammar">
+          <option value="auto">Automatic (a local LanguageTool server if one runs)</option>
+          <option value="off">Off</option>
+          <option value="local">Local LanguageTool server</option>
+          <option value="public">Public LanguageTool API (sends text to languagetool.org)</option>
+        </select>
+        <label for="sGrammarUrl">Local server URL</label>
+        <input id="sGrammarUrl" type="text" placeholder="http://localhost:8081" autocomplete="off" spellcheck="false">
+        <label for="sGrammarShare">While sharing</label>
+        <label class="check"><input id="sGrammarShare" type="checkbox"> Allow the public API while sharing (text from everyone with a link goes to languagetool.org)</label>
+      </div>
+      <p id="sGrammarNote" class="mute"></p>
     </details>
     <details class="set-more">
       <summary>PDF preview</summary>

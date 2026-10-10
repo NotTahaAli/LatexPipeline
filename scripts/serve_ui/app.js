@@ -4,6 +4,7 @@ import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
 import * as prose from "./prose.js";
+import { grammarSupport } from "./grammar.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -16,7 +17,7 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, spell: true }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
@@ -49,6 +50,7 @@ function applyAppearance() {
 // ---- CodeMirror ---------------------------------------------------------------------------
 const { EditorState, Compartment, Prec } = S;
 const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
+const GR = grammarSupport(S, V);
 const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment();
 
 const latexComplete = (ctx) => {
@@ -78,6 +80,7 @@ function extensionsFor(tab) {
       drop: (e, v) => dropImages(e.dataTransfer?.files, e, v.posAtCoords({ x: e.clientX, y: e.clientY }) ?? v.state.selection.main.head),
     }),
     errField,
+    readOnly ? [] : GR.extension,
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
@@ -111,6 +114,7 @@ function onUpdate(u) {
     active.dirty = !u.state.doc.eq(active.savedDoc);
     if (!active.fromDisk) { renderTabs(); showSaveState(); scheduleAutosave(); }
   }
+  if (u.docChanged) scheduleGrammar();
   if (u.docChanged || u.selectionSet) {
     const head = u.state.selection.main.head, line = u.state.doc.lineAt(head);
     $("cursorPos").textContent = `Ln ${line.number}, Col ${head - line.from + 1}`;
@@ -256,6 +260,7 @@ async function activate(tab, line, opts = {}) {
   renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors(); renderFocus();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
+  renderGrammar(); scheduleGrammar(tab.kind === "text" ? 400 : -1);
 }
 
 function gotoLine(line) {
@@ -807,6 +812,60 @@ async function loadLint() {
   } catch (e) { $("lintList").replaceChildren(el("li", { className: "none", textContent: e.message })); }
 }
 
+// ---- grammar: LanguageTool through the server, checked 2 s after typing stops --------------------------------------
+// The mode lives on the server (owner setting, build.toml, or a local server found on its own); view-only links cannot run checks.
+let grammarTimer, grammarRun = 0, grammarInfo = { mode: null, notice: null, error: null, busy: false };
+const grammarMode = () => role === "owner" ? settings.grammar : (config.grammar?.mode || "auto");
+const checkable = (tab) => tab && tab.kind === "text" && /\.tex$/i.test(tab.path);
+function scheduleGrammar(delay = 2000) {
+  clearTimeout(grammarTimer);
+  if (delay >= 0 && !readOnly && checkable(active) && grammarMode() !== "off") grammarTimer = setTimeout(runGrammar, delay);
+}
+async function runGrammar() {
+  const tab = active;
+  if (readOnly || !checkable(tab) || grammarMode() === "off") { renderGrammar(); return; }
+  const doc = view.state.doc, run = ++grammarRun;
+  grammarInfo = { ...grammarInfo, busy: true, error: null }; renderGrammar();
+  try {
+    const res = await api.grammar(cur, doc.toString());
+    if (run !== grammarRun) return;
+    grammarInfo = { mode: res.mode, notice: res.notice, error: null, busy: false };
+    if (active === tab && view.state.doc.eq(doc)) GR.set(view, res.findings);   // Typed meanwhile: the next check is already scheduled.
+  } catch (e) { if (run === grammarRun) grammarInfo = { ...grammarInfo, error: e.message, busy: false }; }
+  renderGrammar();
+}
+function renderGrammar() {
+  const ranges = !readOnly && checkable(active) ? GR.list(view) : [];
+  $("grammarCount").textContent = ranges.length || "";
+  const note = readOnly ? "View-only links cannot run grammar checks."
+    : !checkable(active) ? "Open a .tex file to check its grammar."
+    : grammarMode() === "off" ? "Grammar check is off (Settings, Grammar)."
+    : grammarInfo.busy ? "Checking..." : grammarInfo.error ? grammarInfo.error
+    : grammarInfo.mode === "off" ? (grammarInfo.notice || "Grammar check is off.")
+    : grammarInfo.mode === "public" ? grammarInfo.notice
+    : grammarInfo.mode ? "Checked with a LanguageTool server on this machine; the text does not leave it." : "";
+  $("grammarNote").textContent = note;
+  $("grammarList").replaceChildren(...(ranges.length ? ranges.map((r) => {
+    const f = r.finding;
+    const jump = el("a", { className: "where", href: "#", textContent: `${f.line}:${f.col}`, onclick: (e) => { e.preventDefault(); view.dispatch({ selection: { anchor: r.from }, effects: EditorView.scrollIntoView(r.from, { y: "center" }) }); view.focus(); } });
+    const fixes = f.replacements.map((t) => el("button", { type: "button", className: "btn", textContent: t || "(delete)", onclick: () => { const now = GR.list(view).find((x) => x.finding === f); if (now) GR.apply(view, now, t); renderGrammar(); } }));
+    return el("li", {}, el("div", { className: "row" }, el("span", { className: "sev info" }), el("span", { className: "msg", textContent: f.message }), jump),
+      ...(fixes.length ? [el("div", { className: "fixes" }, ...fixes)] : []), el("div", { className: "fixes mute", textContent: f.rule }));
+  }) : grammarInfo.mode && grammarInfo.mode !== "off" && !grammarInfo.busy && !grammarInfo.error ? [el("li", { className: "none", textContent: "No grammar findings." })] : []));
+}
+async function pushGrammarSettings() {
+  if (role !== "owner") return;
+  try { await api.grammarSettings({ mode: settings.grammar, url: settings.grammarUrl.trim() || null, share_public: settings.grammarShare }); }
+  catch (e) { toast(el("span", { textContent: "Grammar settings: " + e.message })); }
+  scheduleGrammar(0);
+}
+function grammarShareNote() {
+  return settings.grammar === "public" || settings.grammarShare
+    ? (settings.grammarShare ? "Grammar: the public LanguageTool API is allowed while sharing, so text from everyone with a link is sent to languagetool.org."
+      : "Grammar: public mode is switched off while sharing; allow it in Settings, Grammar.")
+    : "Grammar checks use a local LanguageTool server only; public mode stays off while sharing.";
+}
+
 // Warnings parsed from the LaTeX log on the server; kinds are filterable, each row jumps to its source line.
 const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"]];
 const warnGroup = (w) => w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
@@ -847,15 +906,16 @@ function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
   $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
   for (const b of ["status", "errBadge"]) $(b).setAttribute("aria-expanded", String(open));
-  for (const n of ["problems", "warnings", "lint", "log"]) {
+  for (const n of ["problems", "warnings", "lint", "grammar", "log"]) {
     $("dtab-" + n).setAttribute("aria-selected", String(ui.drawerTab === n));
     $("dpanel-" + n).hidden = ui.drawerTab !== n;
   }
   if (open && ui.drawerTab === "warnings") loadWarnings();
   if (open && ui.drawerTab === "lint") loadLint();
+  if (open && ui.drawerTab === "grammar") { renderGrammar(); runGrammar(); }
   if (open && ui.drawerTab === "log") loadLog();
 }
-for (const n of ["problems", "warnings", "lint", "log"]) $("dtab-" + n).onclick = () => setDrawer(true, n);
+for (const n of ["problems", "warnings", "lint", "grammar", "log"]) $("dtab-" + n).onclick = () => setDrawer(true, n);
 const toggleDrawer = () => setDrawer(!ui.drawer);
 $("status").onclick = toggleDrawer;
 $("errBadge").onclick = () => setDrawer(true, "problems");
@@ -967,6 +1027,7 @@ const COMMANDS = [
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
+  { id: "grammar", title: "Show grammar findings", run: () => setDrawer(true, "grammar") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
   { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
@@ -1018,6 +1079,8 @@ function openSettings() {
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
   $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
+  $("sGrammarBox").hidden = role !== "owner";
+  $("sGrammar").value = settings.grammar; $("sGrammarUrl").value = settings.grammarUrl; $("sGrammarShare").checked = settings.grammarShare; grammarSettingsNote();
   $("settings").showModal();
   $("sName").focus();
 }
@@ -1036,6 +1099,16 @@ bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
+function grammarSettingsNote() {
+  $("sGrammarNote").textContent = settings.grammar === "public" ? "Public mode sends the text of the file you are editing to languagetool.org (api.languagetool.org), in paragraph batches within its free limits. Nothing is sent in the other modes."
+    : "A local LanguageTool server keeps the text on this machine (docker run -p 8081:8010 erikvl87/languagetool). The URL can also come from LANGUAGETOOL_URL or build.toml (grammar_url).";
+}
+bind("sGrammar", (n) => {
+  if (n.value === "public" && !confirm("Public mode sends the text of the file you are editing to languagetool.org. Use it?")) { n.value = settings.grammar; return; }
+  settings.grammar = n.value; grammarSettingsNote(); pushGrammarSettings();
+});
+bind("sGrammarUrl", (n) => { settings.grammarUrl = n.value; pushGrammarSettings(); });
+bind("sGrammarShare", (n) => { settings.grammarShare = n.checked; pushGrammarSettings(); });
 $("focusBtn").onclick = () => previewChapter();
 for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { if (e.target === $(d)) $(d).close(); });
 
@@ -1043,7 +1116,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
+  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);
@@ -1131,7 +1204,7 @@ function renderShare(info) {
     const msg = el("p", { className: "err", role: "alert", hidden: !info.error, textContent: info.error || "" });
     body.replaceChildren(
       el("p", { textContent: "Start a tunnel and get two links to this document: one to read, one to edit together in real time. Each link holds a secret token and works until you stop sharing or quit." }),
-      el("label", { htmlFor: "shareProvider", textContent: "Tunnel" }), select, msg, el("div", { className: "actions" }, start));
+      el("label", { htmlFor: "shareProvider", textContent: "Tunnel" }), select, msg, el("p", { className: "mute", textContent: grammarShareNote() }), el("div", { className: "actions" }, start));
   } else if (info.status === "starting") {
     body.replaceChildren(el("p", { role: "status", textContent: `Starting ${info.provider}... this can take up to a minute.` }),
       el("div", { className: "actions" }, el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: async () => { await api.shareStop(); refreshShare(); } })));
@@ -1142,6 +1215,7 @@ function renderShare(info) {
       linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline."),
       linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Shell escape stays off, but LuaLaTeX can still run code on this computer: share only with people you trust."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
+      el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }),
       el("div", { className: "actions" },
         el("button", { type: "button", className: "btn", id: "shareRegen", textContent: "New links", title: "Revoke both links and make new ones", onclick: async () => { if (confirm("Everyone using the current links loses access. Make new links?")) { await api.shareRegenerate(); refreshShare(); } } }),
         el("button", { type: "button", className: "btn danger", id: "shareStop", textContent: "Stop sharing", onclick: async () => { await api.shareStop(); refreshShare(); } })));
@@ -1255,4 +1329,5 @@ view = new EditorView({ state: EditorState.create({ doc: "" }), parent: $("cm") 
 applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); buildMenu(); showTips();
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
+pushGrammarSettings();
 window.__app = { get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };

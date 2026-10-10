@@ -210,7 +210,7 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 .drawer-bar{display:flex;align-items:center;padding-right:8px}
 .drawer-bar .side-tabs{border:0;flex:none}
 #dpanel-problems,#dpanel-warnings,#dpanel-lint,#dpanel-log{flex:0 1 auto;min-height:0;overflow:auto}
-#drawer[data-tab=log],#drawer[data-tab=lint],#drawer[data-tab=warnings]{height:min(38vh,340px)}
+#drawer[data-tab=log],#drawer[data-tab=lint],#drawer[data-tab=grammar],#drawer[data-tab=warnings]{height:min(38vh,340px)}
 #dpanel-log,#dpanel-lint,#dpanel-warnings{flex:1}
 .wfilter{display:flex;gap:6px;flex-wrap:wrap;padding:8px 10px 0}
 .chip{height:24px;padding:0 10px;border-radius:99px;border-color:var(--line);background:var(--panel2);font-size:12px;color:var(--mute)}
@@ -309,3 +309,12 @@ kbd{font:12px var(--mono);background:var(--panel2);border:1px solid var(--line);
 }
 @media(max-width:700px){#work{flex-direction:column}#editorPane{flex:1 1 50%}#pdfPane{flex:1 1 50%}#splitter{display:none}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.cm-grammar{text-decoration:underline wavy var(--acc);text-underline-offset:3px}
+.cm-grammar-tip{max-width:360px;padding:8px 10px;font-size:13px}
+.cm-grammar-tip .fixes{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.cm-grammar-tip .rule,.gnote{color:var(--mute);font-size:12px}
+.cm-grammar-tip .rule{margin-top:6px}
+.gnote{margin:0;padding:8px 14px 0}
+.plist .row{display:flex;align-items:flex-start;gap:8px;padding:7px 10px}
+.plist .fixes{display:flex;gap:6px;flex-wrap:wrap;padding:0 10px 8px 26px}

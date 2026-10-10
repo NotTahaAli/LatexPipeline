@@ -1791,6 +1791,144 @@ class FocusPreview(ServerCase):
         self.assertIn("boom", serve.STATE["demo"]["focus"]["error"])
 
 
+class GrammarApi(SharedState, ServerCase):
+    """POST /api/grammar: roles, sharing and the public-mode guard. LanguageTool itself is mocked."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import grammar
+        self.grammar = grammar
+        grammar.CACHE.clear()
+        saved = dict(serve.GRAMMAR)
+        self.addCleanup(lambda: (serve.GRAMMAR.clear(), serve.GRAMMAR.update(saved)))
+        serve.GRAMMAR.update(mode="local", url=None, share_public=False)
+        serve._PROBES.clear()
+
+        def reply(url, fields, proxy=False):
+            self.calls.append((url, proxy))
+            text = fields["text"]
+            at = text.find("bad")
+            return {"matches": [] if at < 0 else [{
+                "message": "Bad word", "offset": self.grammar.to_utf16(text, at), "length": 3,
+                "replacements": [{"value": "good"}],
+                "rule": {"id": "R", "category": {"id": "GRAMMAR"}}}]}
+
+        self.calls = []
+        mock.patch.object(grammar, "post_form", side_effect=reply).start()
+
+    def check(self, text="A bad \\emph{word}. \U0001F600 bad", role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/grammar?doc={doc}", {"text": text}, hdrs)
+
+    def test_findings_are_positioned_in_utf16_units(self):
+        status, body = self.check()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "local")
+        first = body["findings"][0]
+        self.assertEqual((first["from"], first["to"], first["line"], first["col"]), (2, 5, 1, 3))
+        self.assertEqual(first["replacements"], ["good"])
+        self.assertEqual(self.calls[0], ("http://localhost:8081/v2/check", False))
+
+    def test_astral_text_before_a_finding_shifts_utf16_offsets(self):
+        status, body = self.check("\U0001F600 bad")
+        self.assertEqual((body["findings"][0]["from"], body["findings"][0]["to"]), (3, 6))
+
+    def test_off_returns_a_hint_and_asks_nobody(self):
+        serve.GRAMMAR["mode"] = "off"
+        status, body = self.check()
+        self.assertEqual((status, body["mode"], body["findings"]), (200, "off", []))
+        self.assertEqual(self.calls, [])
+
+    def test_auto_follows_the_probe_and_build_toml(self):
+        serve.GRAMMAR["mode"] = "auto"
+        with mock.patch.object(self.grammar, "probe", return_value=False):
+            self.assertEqual(self.check()[1]["mode"], "off")
+        serve._PROBES.clear()
+        with mock.patch.object(self.grammar, "probe", return_value=True):
+            self.assertEqual(self.check()[1]["mode"], "local")
+        self.write("build.toml", 'grammar = "off"\n')
+        self.assertEqual(self.check()[1]["mode"], "off")
+
+    def test_public_mode_says_so_and_goes_through_the_proxy_path(self):
+        serve.GRAMMAR["mode"] = "public"
+        _, body = self.check()
+        self.assertIn("languagetool.org", body["notice"])
+        self.assertEqual(self.calls[0], (self.grammar.PUBLIC_URL, True))
+
+    def test_bad_input(self):
+        self.assertEqual(self.request("POST", "/api/grammar?doc=demo", {"text": 5})[0], 413)
+        huge = {"text": "x" * (serve.GRAMMAR_MAX_CHARS + 1)}
+        self.assertEqual(self.request("POST", "/api/grammar?doc=demo", huge)[0], 413)
+        self.assertEqual(self.request("POST", "/api/grammar?doc=nope", {"text": "x"})[0], 404)
+        self.grammar.post_form.side_effect = self.grammar.GrammarError("LanguageTool is not reachable: refused")
+        status, body = self.check()
+        self.assertEqual(status, 502)
+        self.assertIn("not reachable", body["error"])
+
+    def test_view_role_cannot_check_edit_role_can(self):
+        self.share_on()
+        self.tokens = serve.SHARE["tokens"]
+        self.assertEqual(self.check(role="view")[0], 403)
+        self.assertEqual(self.check(role="edit")[0], 200)
+        self.assertEqual(self.check(role="edit", doc="demo2")[0], 403)  # not the shared document
+        self.assertEqual(self.check(role="owner")[0], 200)
+
+    def test_public_is_refused_while_sharing_unless_the_owner_allowed_it(self):
+        self.tokens = self.share_on()
+        serve.GRAMMAR["mode"] = "public"
+        status, body = self.check(role="edit")
+        self.assertEqual(status, 403)
+        self.assertIn("while sharing", body["error"])
+        self.assertEqual(self.check(role="owner")[0], 403)
+        self.assertEqual(self.calls, [])
+        serve.GRAMMAR["share_public"] = True
+        self.assertEqual(self.check(role="edit")[0], 200)
+        serve.GRAMMAR["mode"] = "local"  # local mode is not restricted
+        serve.GRAMMAR["share_public"] = False
+        self.assertEqual(self.check(role="edit")[0], 200)
+
+    def test_build_toml_public_is_also_refused_while_sharing(self):
+        self.tokens = self.share_on()
+        serve.GRAMMAR["mode"] = "auto"
+        self.write("build.toml", 'grammar = "public"\n')
+        self.assertEqual(self.check(role="edit")[0], 403)
+
+    def test_settings_are_owner_only_and_validated(self):
+        self.tokens = self.share_on()
+        body = {"mode": "public", "url": "http://localhost:9", "share_public": True}
+        for role in ("view", "edit"):
+            self.assertEqual(self.request("POST", "/api/grammar/settings", body,
+                                          {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"})[0], 403)
+        self.assertEqual(serve.GRAMMAR["mode"], "local")
+        owner = {"Cookie": f"{serve.cookie_name()}={self.tokens['owner']}"}
+        status, info = self.request("POST", "/api/grammar/settings", body, owner)
+        self.assertEqual((status, info["mode"], info["url"], info["share_public"]),
+                         (200, "public", "http://localhost:9", True))
+        for bad in ({"mode": "cloud"}, {"mode": "local", "url": "file:///etc/passwd"}, {"url": 3}):
+            self.assertEqual(self.request("POST", "/api/grammar/settings", bad, owner)[0], 400)
+
+    def test_config_shows_the_mode_but_the_url_only_to_the_owner(self):
+        self.tokens = self.share_on()
+        serve.GRAMMAR["url"] = "http://secret-host:1"
+        hdr = lambda role: {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"}  # noqa: E731
+        self.assertEqual(self.request("GET", "/api/config", headers=hdr("owner"))[1]["grammar"]["url"], "http://secret-host:1")
+        self.assertNotIn("url", self.request("GET", "/api/config", headers=hdr("view"))[1]["grammar"])
+
+    def test_checks_are_rate_limited(self):
+        self.assertEqual({self.check()[0] for _ in range(32)}, {200})  # the owner is not limited
+        self.tokens = self.share_on()
+        serve.RATE.pop("grammar", None)
+        codes = [self.check(role="edit")[0] for _ in range(32)]
+        self.assertEqual(codes.count(429), 2)
+
+    def test_bus_messages_stay_whitelisted(self):
+        """No grammar message type exists: anything unknown is dropped for shared roles."""
+        msgs = [{"rev": 1, "topic": "x", "type": "grammar", "data": {"doc": "demo"}}]
+        self.share_on()
+        self.assertEqual(serve.visible(msgs, "edit"), [])
+
+
 class UiWiring(unittest.TestCase):
     """No browser here: check that the scripts only reach for elements the page has, and the page stays accessible."""
 

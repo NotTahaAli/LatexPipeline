@@ -112,9 +112,22 @@ externalize = false      # default: true; see "Large documents"
 pdfa = "2b"              # default: off; PDF/A-2b, see "PDF/A"
 lang = "en-US"           # document language, written into the PDF/A metadata
 timeout = 600            # default: 600; seconds (10 to 7200) before a latexmk run is killed; --timeout sets the default, sharing caps it at 300
+grammar = "auto"         # default: auto; off, local or public, see "Grammar"
+grammar_url = "http://localhost:8081"  # a LanguageTool server (default; LANGUAGETOOL_URL also works)
+disabled_rules = ["MORFOLOGIK_RULE_EN_US"]  # LanguageTool rule ids to ignore
 ```
 
 An invalid `build.toml` or unknown engine fails that document only, and the reason is at the top of its log.
+
+### Grammar
+
+Grammar and style checks come from [LanguageTool](https://languagetool.org). `scripts/grammar.py` reduces the LaTeX to prose (no comments, commands, math, `verbatim`, `lstlisting`, `minted` or `tikzpicture`; headings, captions, footnotes and the text of `\emph{}` and `\textbf{}` stay) and remembers where every character came from, so a finding is `file:line:col`. `\ref` and `\cite` become a number, math becomes `X`. Spacing and quote rules that misfire on extracted text are ignored, as is the Typography category.
+
+* **Local server** (default when one answers `/v2/languages` within 300 ms): `docker run -d -p 8081:8010 erikvl87/languagetool`, or the LanguageTool zip with `java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8081`. URL: `grammar_url` in `build.toml`, else `LANGUAGETOOL_URL`, else `http://localhost:8081`. The text never leaves your machine, and local requests bypass any proxy.
+* **Public API** (`grammar = "public"` in `build.toml`, or Settings > Grammar in the editor): **your text is sent to languagetool.org** (`https://api.languagetool.org/v2/check`). It is never chosen automatically. Requests are paragraph batches of at most 15 KB, throttled below the free tier (20 requests and 75 KB a minute), and cached by paragraph, so re-checking an edited file only sends the changed paragraphs.
+* `grammar = "off"` or nothing found: no check, no network. The language is `lang` from `build.toml` (default `en-US`).
+
+`python scripts/ci_report.py lint --grammar` adds the findings to the lint report, annotations and `.lint-baseline` like the other lint findings (as notices; a server that cannot be reached is skipped with a message). The workflow does not pass `--grammar`. In GitHub Actions `grammar = "public"` is ignored unless `GRAMMAR_PUBLIC_OK=1` is set too.
 
 ### PDF/A
 
@@ -146,6 +159,8 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 **Chapters, files and figures.** "Preview chapter" (status bar, or the command palette) builds only the chapter you are editing with `build.build_focus`, keeping the numbering and references of the full document, and shows it with a "Chapter preview" bar and a "Back to full PDF" button; Settings can build it after each save. Jump-to-PDF is off while it is shown. The first preview of a document builds the whole thing once. The Files tab has new file, new folder, rename/move (F2) and delete (Delete key, with a confirmation); `main.tex`, dotfiles and, over a share link, build-config files cannot be touched, and open co-editing rooms of a renamed or deleted file are closed. Drop or paste a png, jpg or pdf into the editor to save it (into `Figures/` if it exists) and insert `\includegraphics`; up to 8 MB, content checked, svg refused. Spell check (the browser's own, no dictionary shipped) underlines misspelled words in visual mode and the paragraph panel only, never LaTeX commands or keys; Settings turns it off. Shared links: view cannot start previews or change files, edit can for the shared document only.
 
+**Grammar.** The Problems panel has a Grammar tab. The open `.tex` file is checked 2 s after you stop typing (the text of the buffer, saved or not); findings are wavy underlines, and hovering one shows the message and up to three replacements to click (no replacement is offered where the span holds commands or math). Settings > Grammar (owner only) picks automatic, off, local or public, the local server URL, and whether the public API may be used while sharing. See [Grammar](#grammar) for what each mode sends where. Public mode asks for confirmation when chosen.
+
 **Editing together.** Everyone who opens the same document edits it live (Yjs): you see each other's cursors and selections with names and colours, and a stack of avatars in the top bar opens the list of people. The server only relays the changes. One editor per file, the "leader", saves to disk through the normal atomic save; if the leader leaves, another takes over. If you change a file outside the editor (git, vim) while it is open, the change is merged into the shared text instead of overwriting anyone's typing. If the connection drops, you can keep typing; the edits merge when it returns, over WebSocket or the long-poll fallback.
 
 **Sharing.** `python scripts/serve.py --share [cloudflared|ngrok|localtunnel|pinggy|localhost.run|auto]` (or Share in the top bar) starts a tunnel and prints two links for the first document: a view link (read-only source, PDF and outline) and an edit link (edit the document's files and rebuild it). `auto` picks the first installed of cloudflared, ngrok, npx localtunnel, then ssh (pinggy, localhost.run); with none installed it tells you what to install. No link works after you stop sharing or quit.
@@ -158,6 +173,7 @@ Security while sharing:
 
 * Every request needs a token, loopback included. A tunnel connects to the server from 127.0.0.1, so "local" proves nothing; your own browser gets a private third token as a cookie when sharing starts. Tokens are random 32-byte URL-safe strings, compared in constant time. A link sets an HttpOnly, SameSite=Lax cookie on the first visit and redirects to a URL without the token. New links ("New links" in the Share dialog) disconnect everyone on the old ones.
 * The view role cannot save, rebuild, or see other documents (their messages, cursors and names included), in the UI or the API; it can open existing files of the shared document. The edit role can create and change any file of the shared document (text, `.tex`, `.bib`, `.cls`, ...) and rebuild it, but never `build.toml`, `latexmkrc` or `.latexmkrc`, not even through live co-editing. Rebuilds are rate limited (6 a minute). Each client and room is capped in count and size.
+* Grammar checks need the edit role (the view role cannot start one; 30 a minute) and only for the shared document. Settings are owner-only. While sharing, public mode is refused for everyone, build.toml's `grammar = "public"` included, unless the owner ticked "Allow the public API while sharing"; the Share dialog says which applies. The server never sends the local URL to non-owners.
 * Builds while sharing are restricted, because LaTeX source is code:
   * Shell escape is off (`shell_escape=f`) for the whole server, and `latexmk` runs with `-norc`, so no `latexmkrc` is read. A `build.toml` whose `latexmk_args` enable shell escape, name programs or code to run (`-e`, `-r`, `-pdflatex=...`, `-latexoption`, `-pretex`, `-usepretex`, `-cnf-line`), or move the output (`-outdir`, `-auxdir`, `-jobname`) fails the build.
   * LuaLaTeX stays allowed, but Lua can write files even with shell escape off, so **an edit link to a document that uses (or is switched to) LuaLaTeX can run code on your computer**. The Share dialog says so. Give edit links only to people you trust; view links are safe.
