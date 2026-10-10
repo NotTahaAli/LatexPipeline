@@ -848,6 +848,7 @@ def build_document(
                 touched = figures.touched(last)
                 if not figures.names() or touched:
                     say("Listing figures ...")
+                    figures.recorded = time.time()
                     run(figures.discover_command(), "figures")
                     if errors:  # Timed out: no figures, no plain rebuild.
                         return -1, ""
@@ -863,6 +864,7 @@ def build_document(
                     if attempt and not changed:
                         return 0, ""
                     extra = [f"-usepretex={meta}{figures.main_pretex}", f"-jobname={main_tex.stem}"]
+                    figures.recorded = time.time()
                     code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
                     if code != 0:
                         return code, ""

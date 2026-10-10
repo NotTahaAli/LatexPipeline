@@ -210,7 +210,7 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 Nothing here needs a change to the document.
 
-**TikZ/pgfplots figures are compiled once and cached.** If a document uses `tikz` or `pgfplots` (in `main.tex`, a class, a package or a chapter), `build.py` switches on TikZ's `external` library through `latexmk -usepretex`. A first run lists the figures, they are compiled in parallel (about one process per CPU, shared between the documents built at once; no `make` and no shell escape needed), and the text passes then include the finished PDFs. Figures are cached in `.latex-cache/_figcache/` by the hash of their source, so an edit re-typesets only the text, and renumbering or moving a figure costs nothing. Figures are listed again only when the figure text of a file changed (its `tikzpicture` environments and lines that mention tikz, pgf or axis), so a text edit next to a figure costs one LaTeX pass. The cache is also invalidated when the preamble, a file the preamble `\input`s, a local `.cls`/`.sty`/`.csv`/`.dat`/`.tikz` file, the TeX engine or the TikZ/pgfplots packages change, and figures nobody uses any more are deleted. Works with `pdflatex`, `xelatex` and `lualatex`. Documents without TikZ are built as before, and so are documents with `remember picture`, `overlay` or `tikzmark` pictures, which cannot be cut out as figures. If the figures cannot be made, the document is built again without externalization and its log says so (a LaTeX error in the text does not trigger that second build).
+**TikZ/pgfplots figures are compiled once and cached.** If a document uses `tikz` or `pgfplots` (in `main.tex`, a class, a package or a chapter), `build.py` switches on TikZ's `external` library through `latexmk -usepretex`. A first run lists the figures, they are compiled in parallel (about one process per CPU, shared between the documents built at once; no `make` and no shell escape needed), and the text passes then include the finished PDFs. Figures are cached in `.latex-cache/_figcache/` by the hash of their source, so an edit re-typesets only the text, and renumbering or moving a figure costs nothing. Figures are listed again only when the figure text of a file changed (its `tikzpicture` environments and lines that mention tikz, pgf or axis), so a text edit next to a figure costs one LaTeX pass. A figure job skips the `\input` files before and after its figure that define nothing (no `\newcommand`, `\def`, `\setlength`, `\tikzset`, ... outside their pictures) and sets the counters to what the last full run recorded after them. It does so only when no file of the document changed since that run started; a figure that fails this way is compiled again reading every file. The cache is also invalidated when the preamble, a file the preamble `\input`s, a local `.cls`/`.sty`/`.csv`/`.dat`/`.tikz` file, the TeX engine or the TikZ/pgfplots packages change, and figures nobody uses any more are deleted. Works with `pdflatex`, `xelatex` and `lualatex`. Documents without TikZ are built as before, and so are documents with `remember picture`, `overlay` or `tikzmark` pictures, which cannot be cut out as figures. If the figures cannot be made, the document is built again without externalization and its log says so (a LaTeX error in the text does not trigger that second build).
 
 Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to recompile every figure):
 
@@ -227,13 +227,15 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 
 | Step | before | after |
 | --- | --- | --- |
-| cold build (`--force`) | 93 s | 65 s |
-| one-line text edit | 47 s | 20 s |
+| cold build (`--force`) | 93 s | 55 s |
+| one-line text edit | 47 s | 13 s |
 | one-line text edit in a file that holds a figure | n/a | 13 s (was 23 s) |
 | edit one figure | 24 s | 23 s |
 | `--focus Chapters/chapter5` | n/a | 1.7 s |
 
-Not adopted, because they did not pay off: a precompiled preamble format (saves about 1.5 s of a 23 s pass), parallel BibTeX (the ten units take 0.2 s together), and splicing separately built chapters into the full PDF (needs a PDF library; `pdfunite` drops the outline and breaks cross-chapter links).
+The last two optimizations were measured on a busier machine (median of 3): `--force` 87 s to 55 s (figures 35 s to 14 s), a text edit in a file holding a figure 23 s to 13 s, other text edits unchanged at 13 s (one LaTeX pass).
+
+Not adopted, because they did not pay off: a precompiled preamble format (saves about 1.2 s of a 12 s pass, changed the page count out of the box and hides the class from `-recorder`), `-draftmode` or `\pdfcompresslevel=0` for intermediate passes and dropping SyncTeX (no gain above the 1 s noise), parallel BibTeX (the ten units take 0.2 s together), and splicing separately built chapters into the full PDF (needs a PDF library; `pdfunite` drops the outline and breaks cross-chapter links).
 
 ---
 
