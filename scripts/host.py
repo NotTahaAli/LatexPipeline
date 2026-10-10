@@ -49,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
+import ai
 import build
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -67,8 +68,10 @@ SERVE = SCRIPT_DIR / "serve.py"
 CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
-    "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10,
+    "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
 }
+AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
+                     "daily_per_user": 50, "daily_per_workspace": 500}
 CONFIG_RANGES = {"max_connections": (8, 100000), "max_upload_mb": (1, 10000), "max_streams_per_user": (1, 1000),
                  "signups_per_ip_hour": (1, 100000)}
 CONFIG_TEMPLATE = """\
@@ -99,6 +102,15 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # label = "GitHub"
 # client_id = "..."
 # client_secret_env = "GITHUB_CLIENT_SECRET"
+
+# AI assistant in the editor (optional). Off unless enabled. The gateway makes the Anthropic API calls itself;
+# project workers never get the key. Editors' text, logs and questions are sent to api.anthropic.com.
+# [ai]
+# enabled = true
+# model = "claude-opus-5-5"            # or claude-sonnet-5-5, claude-haiku-5-5
+# api_key_env = "ANTHROPIC_API_KEY"    # the environment variable holding the key
+# daily_per_user = 50                  # requests per person per day (UTC)
+# daily_per_workspace = 500            # requests per workspace per day
 """
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
@@ -155,7 +167,27 @@ def load_config(data: Path) -> dict:
             raise ConfigError(f"{path}: provider {name} needs type = \"oidc\" or \"github\" and a client_id")
         if provider["type"] == "oidc" and not str(provider.get("issuer", "")).startswith("https://"):
             raise ConfigError(f"{path}: provider {name} needs an https:// issuer")
+    if not isinstance(config["ai"], dict) or set(config["ai"]) - set(AI_DEFAULTS):
+        raise ConfigError(f"{path}: [ai] takes only {', '.join(AI_DEFAULTS)}")
+    config["ai"] = cfg = {**AI_DEFAULTS, **config["ai"]}
+    if not isinstance(cfg["enabled"], bool) or not ai.MODEL_NAME.fullmatch(str(cfg["model"])) \
+            or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key")):
+        raise ConfigError(f"{path}: [ai] needs enabled = true/false, a Claude model id and text for the key settings")
+    for key in ("daily_per_user", "daily_per_workspace"):
+        if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 1_000_000):
+            raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000")
     return config
+
+
+def ai_config() -> dict:
+    return {**AI_DEFAULTS, **APP.config.get("ai", {})}
+
+
+def ai_key() -> str | None:
+    """The operator's Anthropic key: config.toml api_key, else the variable api_key_env names (taken out of this
+    process's environment by ai.env_key, so nothing it starts inherits it)."""
+    cfg = ai_config()
+    return cfg["api_key"] or (ai.env_key(cfg["api_key_env"]) if cfg["api_key_env"] else None)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +235,12 @@ MIGRATIONS = [
         id INTEGER PRIMARY KEY, at REAL NOT NULL, user_id INTEGER, ip TEXT, action TEXT NOT NULL, tenant_id TEXT,
         detail TEXT);
     CREATE INDEX audit_at ON audit(at);
+    """,
+    """
+    CREATE TABLE ai_usage(
+        day TEXT NOT NULL, user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(day, user_id, tenant_id));
     """,
 ]
 
@@ -1206,6 +1244,9 @@ class Handler(BaseHTTPRequestHandler):
         if (self.command != "GET" or upgrade) and not self.origin_ok():
             raise HttpError(403, "Cross-site request refused.")
         size = self.body_size(MAX_PROXY_BODY)
+        if rest == "/api/ai":
+            self.assistant(project, role, size)
+            return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
@@ -1224,6 +1265,55 @@ class Handler(BaseHTTPRequestHandler):
                     APP.streams[self.session["id"]] -= 1
                     if APP.streams[self.session["id"]] <= 0:
                         del APP.streams[self.session["id"]]
+
+    def assistant(self, project: dict, role: str, size: int) -> None:
+        """/p/<id>/api/ai stops here: the gateway holds the operator's key and the daily quotas, so the worker (and
+        the LaTeX it runs) never sees either. GET says whether the editor may show the assistant."""
+        cfg, key = ai_config(), ai_key()
+        on = bool(cfg["enabled"] and key)
+        uid, tid, day = self.session["id"], project["tenant_id"], time.strftime("%Y-%m-%d", time.gmtime())
+
+        def left() -> int:
+            mine = APP.db.one("SELECT COALESCE(SUM(requests), 0) AS n FROM ai_usage WHERE day = ? AND user_id = ?",
+                              day, uid)["n"]
+            team = APP.db.one("SELECT COALESCE(SUM(requests), 0) AS n FROM ai_usage WHERE day = ? AND tenant_id = ?",
+                              day, tid)["n"]
+            return max(0, min(cfg["daily_per_user"] - mine, cfg["daily_per_workspace"] - team))
+
+        reason = ("View-only members cannot use the assistant." if role != "edit"
+                  else "The AI assistant is off on this server." if not on
+                  else "The daily AI limit is reached; try again tomorrow." if not left() else None)
+        if self.command == "GET":
+            self.send_json({"enabled": reason is None, "model": cfg["model"], "notice": ai.NOTICE, "hosted": True,
+                            "left": left() if on else 0, "reason": reason})
+            return
+        if self.command != "POST":
+            raise HttpError(405, "Method not allowed.")
+        if reason:
+            raise HttpError(429 if role == "edit" and on else 403, reason)
+        if size > ai.MAX_BODY:
+            raise HttpError(413, "The request is too large for the assistant.")
+        if "json" not in self.headers.get("Content-Type", ""):
+            raise HttpError(415, "Expected application/json.")
+        try:
+            data = json.loads(self.read_exact(size) or b"{}")
+        except ValueError:
+            raise HttpError(400, "Bad JSON.")
+        if not isinstance(data, dict):
+            raise HttpError(400, "Expected a JSON object.")
+        with APP.db.tx():  # count first: a failed or slow request still uses up its share
+            if not left():
+                raise HttpError(429, "The daily AI limit is reached; try again tomorrow.")
+            APP.db.run("INSERT INTO ai_usage(day, user_id, tenant_id, requests) VALUES (?, ?, ?, 1) "
+                       "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1", day, uid, tid)
+        try:
+            result = ai.ask(data, key=key, model=cfg["model"], owner=False)
+        except ai.AiError as exc:
+            raise HttpError(exc.status, str(exc))
+        APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
+                   "WHERE day = ? AND user_id = ? AND tenant_id = ?",
+                   result["usage"]["input"], result["usage"]["output"], day, uid, tid)
+        self.send_json(result)
 
     def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
         worker = APP.workers.acquire(project)
@@ -1815,8 +1905,18 @@ def api_admin(h: Handler) -> None:
                        "LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT 300")
     with APP.workers.lock:
         workers = len(APP.workers.running)
+    cfg = ai_config()
+    usage = APP.db.all(
+        "SELECT u.email, t.name AS workspace, SUM(a.requests) AS requests, SUM(a.input_tokens) AS input_tokens, "
+        "SUM(a.output_tokens) AS output_tokens, MAX(a.day) AS last_day FROM ai_usage a "
+        "LEFT JOIN users u ON u.id = a.user_id LEFT JOIN tenants t ON t.id = a.tenant_id WHERE a.day >= ? "
+        "GROUP BY a.user_id, a.tenant_id ORDER BY requests DESC LIMIT 200",
+        time.strftime("%Y-%m-%d", time.gmtime(time.time() - 29 * 86400)))
     h.ok({"settings": APP.settings(), "tenants": tenants, "users": users, "audit": audit, "workers": workers,
-          "sandbox": APP.sandbox, "modes": SIGNUP_MODES})
+          "sandbox": APP.sandbox, "modes": SIGNUP_MODES,
+          "ai": {"enabled": bool(cfg["enabled"] and ai_key()), "configured": cfg["enabled"], "model": cfg["model"],
+                 "daily_per_user": cfg["daily_per_user"], "daily_per_workspace": cfg["daily_per_workspace"],
+                 "usage": usage}})
 
 
 @route("POST", r"/api/admin/settings", "admin")

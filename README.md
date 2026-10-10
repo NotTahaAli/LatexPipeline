@@ -199,6 +199,13 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 **Grammar.** The Problems panel has a Grammar tab. The open `.tex` file is checked 2 s after you stop typing (the text of the buffer, saved or not); findings are wavy underlines, and hovering one shows the message and up to three replacements to click (no replacement is offered where the span holds commands or math). Settings > Grammar (owner only) picks automatic, off, local or public, the local server URL, and whether the public API may be used while sharing. See [Grammar](#grammar) for what each mode sends where. Public mode asks for confirmation when chosen.
 
+**AI assistant.** The sidebar's Assistant tab (or "Toggle AI assistant" and the "AI: ..." commands in Ctrl+K) uses the Anthropic Messages API (`scripts/ai.py`, default model `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` in its settings). It is **off until the owner turns it on** in the panel's settings, which asks for confirmation because **the text you ask about is sent to Anthropic** (`api.anthropic.com`): the selection and 2,000 characters around it, the open file and the outline for a question, or the build error, about 40 lines of log and the source around the error line (plus the top of `main.tex`) for Explain. Nothing else is sent, and nothing is sent until you click.
+
+* Selection actions: Rewrite, Shorten, Fix grammar, Translate (into a language you name). "Write LaTeX at cursor" turns a description (a table, an equation, a TikZ figure) into LaTeX. "Ask" answers questions about the open file, with the last six turns as context. "Explain with AI" in a Problems row (or "Explain first error") explains a build error and may propose a fix.
+* Every answer is shown as a diff first; **nothing is applied until you click** Replace selection, Insert at cursor or Apply, which goes into the editor like typing (undo, co-editing and autosave as usual). If the text changed in the meantime the change is refused. Answers are plain text, never HTML; proposed fixes must quote text that occurs once in the part of the file the model saw, may only touch files that were sent, never `build.toml` or `latexmkrc` unless you are the owner, and anything that would run programs or write files (`\write18`, `\directlua`, `\openout`, `\input|`) is dropped. The document is treated as data: instructions inside it are not followed.
+* The key: `ANTHROPIC_API_KEY` in the environment of `serve.py` (it is taken out of the environment at start, so no build inherits it), or pasted into the settings, which stores it in `~/.config/latex-pipeline/ai.json` (or `$XDG_CONFIG_HOME`), mode 600, outside every project. It is never sent to a browser, to people you share with, or over the co-editing channel.
+* Limits: at most 20 requests a minute for the whole server, replies of at most 8,000 tokens, files up to 120,000 characters. Answers come in one piece (no streaming).
+
 **Editing together.** Everyone who opens the same document edits it live (Yjs): you see each other's cursors and selections with names and colours, and a stack of avatars in the top bar opens the list of people. The server only relays the changes. One editor per file, the "leader", saves to disk through the normal atomic save; if the leader leaves, another takes over. If you change a file outside the editor (git, vim) while it is open, the change is merged into the shared text instead of overwriting anyone's typing. If the connection drops, you can keep typing; the edits merge when it returns, over WebSocket or the long-poll fallback.
 
 ### Sharing
@@ -216,6 +223,7 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 * Zotero settings and fetching (they use the owner's API key and network) are owner-only; a shared link, even with edit, gets 403 for them, and Better BibTeX sync is refused while sharing. The edit role may apply a chosen splice (`/api/zotero/apply`, no network).
 * Bib lookups and DOI imports (Crossref, sends only a DOI or title) need the edit role, 30 a minute, and only for the shared document. Applying happens in the editor, not on the server. The References list is readable with the view role; adding, editing and deleting entries need the edit role. `.bib` files over 1 MB (5 MB and 50 files in all) are not listed.
 * Grammar checks need the edit role (the view role cannot start one; 30 a minute) and only for the shared document. Settings are owner-only. While sharing, public mode is refused for everyone, build.toml's `grammar = "public"` included, unless the owner ticked "Allow the public API while sharing"; the Share dialog says which applies. The server never sends the local URL to non-owners.
+* The AI assistant is off for shared links unless the owner ticks "Let people with an edit link use it while sharing" (it uses the owner's key). Then the edit role may use it, for the shared document only, 10 requests a minute and 100 per server run in all; the view role never. Settings are owner-only, and edits to build configuration are never proposed to non-owners.
 * Builds while sharing are restricted, because LaTeX source is code:
   * Shell escape is off (`shell_escape=f`) for the whole server, and `latexmk` runs with `-norc`, so no `latexmkrc` is read. A `build.toml` whose `latexmk_args` enable shell escape, name programs or code to run (`-e`, `-r`, `-pdflatex=...`, `-latexoption`, `-pretex`, `-usepretex`, `-cnf-line`), or move the output (`-outdir`, `-auxdir`, `-jobname`) fails the build.
   * LuaLaTeX stays allowed, but Lua can write files even with shell escape off, so **an edit link to a document that uses (or is switched to) LuaLaTeX can run code on your computer**. The Share dialog says so. Give edit links only to people you trust; view links are safe. On Linux, `serve.py --share --sandbox` confines that code ([sandboxed builds](#sandboxed-builds)).
@@ -354,6 +362,21 @@ client_secret_env = "GITHUB_CLIENT_SECRET"
 ```
 
 Sign-in uses the authorization code flow with PKCE, a state bound to the browser and (OIDC) a nonce; the ID token comes straight from the token endpoint over verified TLS and its issuer, audience, expiry and nonce are checked. Only verified email addresses are accepted (GitHub: the verified primary one). A provider account is linked to an existing account from that account's page ("Connect"), or automatically when the site admin allows it and the existing account's email is confirmed (it signed up through a provider or an invite sent to that address); a password account is never taken over by someone who merely owns the same address at a provider. Two-step sign-in still applies.
+
+### AI assistant
+
+Off unless the operator enables it in `config.toml`:
+
+```toml
+[ai]
+enabled = true
+model = "claude-opus-5-5"            # or claude-sonnet-5-5, claude-haiku-5-5
+api_key_env = "ANTHROPIC_API_KEY"    # environment variable with the key (or api_key = "..." in the file)
+daily_per_user = 50                  # requests per person per day (UTC); 0 turns them off
+daily_per_workspace = 500            # requests per workspace per day
+```
+
+The gateway answers `/p/<project>/api/ai` itself and makes the call to Anthropic; the project's worker never sees the key or the request (workers get a minimal environment, and the key is taken out of the gateway's own environment at start). Editors may use it, viewers may not; every request counts against both daily limits before it is sent. The site admin page shows requests and tokens per person and workspace for the last 30 days. Usage is billed to the operator's key, and members' text is sent to Anthropic, so tell your users.
 
 ### TLS with Caddy, and systemd
 
