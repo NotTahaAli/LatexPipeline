@@ -402,3 +402,19 @@ class GlobalInputsTests(unittest.TestCase):
         for name in ("build.py", "accel.py", "hints.py", "publish_release.py", "ci_report.py"):
             text = (self.ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)
+
+
+@unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+class ParanoidReadsTests(unittest.TestCase):
+    """serve.py builds shared documents with openin_any=p/openout_any=p, which refuse ".." paths."""
+
+    def test_plain_and_tikz_documents_build(self):
+        tikz = "\\usepackage{tikz}\\begin{document}\\begin{tikzpicture}\\node{A};\\end{tikzpicture}\\end{document}\n"
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.dict(os.environ, {"openin_any": "p", "openout_any": "p"}):
+            for name, body in (("plain", "\\begin{document}Hi\\end{document}\n"), ("pic", tikz)):
+                main = write_doc(root, name, "\\documentclass{article}" + body)
+                report, text = build.build_document(main, shutil.which("latexmk"), live=False)
+                self.assertTrue(report["ok"], (name, report["errors"]))
+                self.assertNotIn("rebuilt without it", text)  # Externalization itself must work.
+                self.assertEqual(build.build_document(main, shutil.which("latexmk"), live=False)[0]["ok"], True)

@@ -186,6 +186,10 @@ def write_inject(build_dir: Path, doc_dir: Path, name: str, text: str) -> str:
     """Write build_dir/name and return the TeX that inputs it from the document's directory."""
     path = build_dir / name
     path.write_text(text, encoding="utf-8")
+    if os.environ.get("openin_any") == "p":
+        # Paranoid reads (serve.py while sharing) refuse "..", but TeX Live also looks in the
+        # -output-directory, which is build_dir (figure jobs get a copy in their own one).
+        return rf"\input{{{name}}}"
     return rf"\input{{{tex_path(path, doc_dir)}}}"
 
 
@@ -289,6 +293,7 @@ class Figures:
             made(".aux").parent.mkdir(parents=True)
             for aux in self.build_dir.glob("*.aux"):  # Lets \ref and \cite inside the figure resolve.
                 shutil.copy(aux, work / aux.name)
+            shutil.copy(self.build_dir / "_inject.tex", work / "_inject.tex")  # See write_inject.
             if (work / f"{self.stem}.aux").exists():
                 shutil.copy(work / f"{self.stem}.aux", made(".aux"))
             try:
