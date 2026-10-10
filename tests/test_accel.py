@@ -1,8 +1,10 @@
 """Pure logic in scripts/accel.py: the recorded \\input tree and --focus selection."""
 
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -66,6 +68,23 @@ class TikzDetectionTests(unittest.TestCase):
             self.assertTrue(accel.uses_tikz(root))
 
 
+class TouchedTests(unittest.TestCase):
+    def test_only_figure_text_counts_as_a_figure_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc, cache = Path(tmp) / "doc", Path(tmp) / "cache"
+            doc.mkdir()
+            cache.mkdir()
+            (doc / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\\input{a}\\end{document}\n")
+            chapter = doc / "a.tex"
+            chapter.write_text("Text.\n\\begin{tikzpicture}\\node{A};\\end{tikzpicture}\n")
+            figures = accel.Figures(doc / "main.tex", cache, "pdflatex", False, 1)
+            self.assertTrue(figures.touched(0.0))  # No snapshot yet: any file with a figure.
+            chapter.write_text("More text.\n\\begin{tikzpicture}\\node{A};\\end{tikzpicture}\n")
+            self.assertFalse(figures.touched(0.0))
+            chapter.write_text("More text.\n\\begin{tikzpicture}\\node{B};\\end{tikzpicture}\n")
+            self.assertTrue(figures.touched(0.0))
+
+
 HEAD = "\\documentclass{article}\n\\usepackage{tikz}\n\\pagestyle{empty}\n"
 
 
@@ -87,12 +106,15 @@ class ExternalizedBuildTests(unittest.TestCase):
 
     def write(self, name, text):
         (self.doc / name).write_text(text, encoding="utf-8")
+        # Older than the runs, so figure jobs may skip files (Figures.plan_skips).
+        os.utime(self.doc / name, (time.time() - 10, time.time() - 10))
 
     def render(self):
         """One externalized build in the same cache; returns the PDF text."""
         figures = accel.Figures(self.doc / "main.tex", self.build, "pdflatex", False, 2)
         tex = ["pdflatex", "-interaction=batchmode", "-halt-on-error", f"-output-directory={self.build}"]
         quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "check": True}
+        figures.recorded = time.time()
         subprocess.run(figures.discover_command(), cwd=self.doc, **quiet)
         for _ in range(2):
             changed, errors = figures.sync(lambda text: None)
@@ -134,6 +156,20 @@ class ExternalizedBuildTests(unittest.TestCase):
         self.write("main.tex", HEAD + "\\begin{document}\n" + pic("two") + "\\end{document}\n")
         self.render()
         self.assertEqual(len(list(self.figures.cache.glob("*.pdf"))), 1)
+
+    def test_figure_jobs_skip_text_files_but_keep_counters_and_definitions(self):
+        self.write("a.tex", "\\section{One} Text.\n")
+        self.write("b.tex", "\\newcommand{\\lbl}{bee}\\section{Two}\n")
+        self.write("c.tex", pic("\\thesection-\\lbl"))
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{a}\\input{b}\\input{c}\n\\end{document}\n")
+        self.render()
+        self.write("a.tex", "\\section{One} Text, edited.\n")  # Recompile the figure from the recorded tree.
+        self.figures.wipe()
+        words = self.render()
+        skips = self.figures.skips["tikz/main-figure0"]
+        self.assertIn("pgfx@s@a\\endcsname", skips)
+        self.assertNotIn("pgfx@s@b\\endcsname", skips)
+        self.assertIn("2-bee", words)
 
     def test_pictures_that_need_the_page_disable_externalization(self):
         self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}[remember picture,overlay]"
