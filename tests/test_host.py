@@ -1020,6 +1020,10 @@ class SignInProviders(HostCase):
         mock.patch.object(host, "http_json", self.provider).start()
         self.app.save_settings({"signup_mode": "open"})
 
+    def test_discovery_works_on_a_freshly_booted_machine(self):
+        with mock.patch.object(host.time, "monotonic", return_value=5.0):  # uptime under the cache hour
+            self.assertEqual(host.discover("idp", self.app.config["providers"]["idp"]), self.provider.meta)
+
     def start(self, client, name="idp", query=""):
         status, _, res = client.call("GET", f"/auth/{name}/start{query}")
         self.assertEqual(status, 302)

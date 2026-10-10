@@ -787,8 +787,8 @@ class App:
         Size of the project area (document, .out, .cache, .home), cached for a few seconds: only a cheap early
         reject. The worker enforces the quota itself on every write, under its write lock, with a fresh size.
         """
-        when, size = self.sizes.get(project["id"], (0.0, 0))
-        if time.monotonic() - when > 5:
+        when, size = self.sizes.get(project["id"], (None, 0))
+        if when is None or time.monotonic() - when > 5:
             size = folder_bytes(self.project_root(project))
             self.sizes[project["id"]] = (time.monotonic(), size)
         return size
@@ -1923,9 +1923,9 @@ def provider_secret(name: str, provider: dict) -> str:
 
 def discover(name: str, provider: dict) -> dict:
     """The issuer's /.well-known/openid-configuration, cached for an hour; its issuer must be the configured one."""
-    when, meta = APP.discovery.get(name, (0.0, {}))
-    if time.monotonic() - when < 3600:
-        return meta
+    cached = APP.discovery.get(name)  # (when, meta); no default timestamp: monotonic() starts near 0 at boot
+    if cached and time.monotonic() - cached[0] < 3600:
+        return cached[1]
     issuer = provider["issuer"]
     meta = http_json("GET", issuer.rstrip("/") + "/.well-known/openid-configuration")
     if not isinstance(meta, dict) or meta.get("issuer") != issuer:
