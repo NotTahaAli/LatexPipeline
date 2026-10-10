@@ -44,7 +44,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 * A LaTeX distribution that includes `latexmk`:
   * Windows: [MiKTeX](https://miktex.org/) or [TeX Live](https://www.tug.org/texlive/)
   * macOS: [MacTeX](https://www.tug.org/mactex/)
-  * Debian/Ubuntu: `sudo apt install latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff`
+  * Debian/Ubuntu: `sudo apt install latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex texlive-extra-utils texlive-bibtex-extra biber chktex latexdiff`
 * Optional: [uv](https://docs.astral.sh/uv/); [pandoc](https://pandoc.org/installing.html) for DOCX export
 
 Check that it works with `latexmk --version`. If the command isn't found, add your LaTeX installation to `PATH` and restart the terminal.

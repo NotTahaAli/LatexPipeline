@@ -132,7 +132,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
             latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
-            texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff
+            texlive-xetex texlive-luatex texlive-extra-utils texlive-bibtex-extra biber chktex latexdiff
           for f in fmtutil fmtutil-sys; do
             sudo rm -f /usr/bin/$f
             sudo dpkg-divert --remove --rename /usr/bin/$f
