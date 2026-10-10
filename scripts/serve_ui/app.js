@@ -5,6 +5,7 @@ import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
 import * as prose from "./prose.js";
 import { grammarSupport } from "./grammar.js";
+import { addBibLookup } from "./bib.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -801,14 +802,28 @@ function renderProblems() {
   $("problems").replaceChildren(...list);
 }
 
+// Bib "Look up" (bib.js): the text comes from the open tab if there is one, and the edit goes into the editor, not to disk.
+const bibCtx = {
+  api, get doc() { return cur; },
+  async text(path) {
+    const t = tabs.get(path);
+    if (!t) return (await api.read(cur, path)).text;
+    return t === active ? view.state.doc.toString() : t.collab ? t.collab.text() : t.state.doc.toString();
+  },
+  async apply(path, at, insert) { await openFile(path); view.dispatch({ changes: { from: at, insert }, userEvent: "input.complete" }); },
+};
+
 async function loadLint() {
   $("lintList").replaceChildren(el("li", { className: "none", textContent: "Checking..." }));
   try {
     const { findings } = await api.lint(cur);
     $("lintCount").textContent = findings.length || "";
-    $("lintList").replaceChildren(...(findings.length ? findings.map((f) =>
-      disclosure([el("span", { className: "sev " + f.level }), el("span", { className: "msg", textContent: f.message }), ...(f.line ? [whereLink(f.path, f.line)] : [el("span", { className: "where mute", textContent: f.path })])],
-        [el("span", { className: "mute", textContent: `${f.kind} - ${f.path}${f.line ? ":" + f.line : ""}` })])) : [el("li", { className: "none", textContent: "No lint findings." })]));
+    $("lintList").replaceChildren(...(findings.length ? findings.map((f) => {
+      const li = disclosure([el("span", { className: "sev " + f.level }), el("span", { className: "msg", textContent: f.message }), ...(f.line ? [whereLink(f.path, f.line)] : [el("span", { className: "where mute", textContent: f.path })])],
+        [el("span", { className: "mute", textContent: `${f.kind} - ${f.path}${f.line ? ":" + f.line : ""}` })]);
+      if (f.kind === "missing-bib-field" && !readOnly) addBibLookup(li, f, bibCtx);
+      return li;
+    }) : [el("li", { className: "none", textContent: "No lint findings." })]));
   } catch (e) { $("lintList").replaceChildren(el("li", { className: "none", textContent: e.message })); }
 }
 

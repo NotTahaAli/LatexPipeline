@@ -7,7 +7,8 @@ Subcommands:
 - summary     Markdown table of this run's documents, for $GITHUB_STEP_SUMMARY.
 - lint        Structural checks (labels, references, figures, bib), overfull boxes from
               the cached log, chktex and word counts into out/lint-report.json. --grammar adds
-              LanguageTool findings (grammar.py).
+              LanguageTool findings (grammar.py); --bib-lookup suggests missing bib fields
+              from Crossref (bibfix.py).
               Findings are GitHub annotations in Actions; --strict fails on them.
 - diff        latexdiff of every document changed since --base, PDFs into --out
               (keep --out outside out/, so the PDFs are not published to the release).
@@ -31,6 +32,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
+import bibfix
 import grammar
 from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, ConfigError, read_settings, size_text
 from hints import overfull_boxes
@@ -290,7 +292,8 @@ class Finding(NamedTuple):
 
     def as_dict(self) -> dict:
         return {"kind": self.kind, "path": self.path, "line": self.line,
-                "message": self.message, "level": self.level, "fingerprint": self.fingerprint}
+                "message": self.message, "level": self.level, "fingerprint": self.fingerprint,
+                "subject": self.subject}
 
 
 def line_of(text: str, position: int) -> int:
@@ -509,6 +512,25 @@ def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[F
     return findings
 
 
+def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]:
+    """For entries lacking required fields: info findings naming what Crossref can fill in (sends a DOI or title)."""
+    out = []
+    for finding in findings:
+        if finding.kind != "missing-bib-field":
+            continue
+        try:
+            text = (doc_dir / finding.path).read_text(encoding="utf-8", errors="replace")
+            found = bibfix.suggest_for(text, finding.subject)["fields"]
+        except (OSError, bibfix.BibLookupError) as error:
+            print(f"{finding.path}: no suggestion for '{finding.subject}': {error}")
+            continue
+        if found:
+            shown = ", ".join(f"{name} = {{{value}}}" for name, value in found.items())
+            out.append(Finding("bib-suggestion", finding.path, finding.line,
+                               f"Crossref suggests for '{finding.subject}': {shown}", finding.subject, level="info"))
+    return out
+
+
 def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
     """LanguageTool findings for every .tex file the document pulls in. Quiet and empty when grammar is off."""
     try:
@@ -605,6 +627,8 @@ def cmd_lint(args: argparse.Namespace) -> int:
         findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt)
         if getattr(args, "grammar", False):
             findings += grammar_findings(name, doc_dir)
+        if getattr(args, "bib_lookup", False):
+            findings += bib_lookup_findings(doc_dir, findings)
         suppressed = 0
         if args.update_baseline:
             write_baseline(doc_dir, findings)
@@ -753,6 +777,9 @@ def main() -> int:
 
     lint.add_argument("--grammar", action="store_true",
                       help="also check the prose with LanguageTool (see README; off by default)")
+
+    lint.add_argument("--bib-lookup", action="store_true",
+                      help="suggest missing bib fields from Crossref (sends DOIs and titles; off by default)")
 
     diff = commands.add_parser("diff", help="latexdiff of changed documents")
     diff.add_argument("--base", required=True, help="git ref to compare against")

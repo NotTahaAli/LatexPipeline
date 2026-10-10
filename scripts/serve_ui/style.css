@@ -318,3 +318,10 @@ kbd{font:12px var(--mono);background:var(--panel2);border:1px solid var(--line);
 .gnote{margin:0;padding:8px 14px 0}
 .plist .row{display:flex;align-items:flex-start;gap:8px;padding:7px 10px}
 .plist .fixes{display:flex;gap:6px;flex-wrap:wrap;padding:0 10px 8px 26px}
+.plist .bib-lookup{align-self:flex-start;margin:6px 8px 0 0;opacity:0}
+.plist .hrow:hover .bib-lookup,.plist .hrow:focus-within .bib-lookup,.plist .bib-lookup:focus-visible{opacity:1}
+@media (hover:none){.plist .bib-lookup{opacity:1}}
+.plist .bib-result{margin-bottom:6px}
+.plist .bib-diff{margin:0 0 8px}
+.plist .bib-diff .add{color:var(--ok,#1a7f37);white-space:pre-wrap;word-break:break-word}
+.plist .bib-result .fixes{padding:0;align-items:center}
