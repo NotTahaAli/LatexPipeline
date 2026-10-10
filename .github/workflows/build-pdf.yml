@@ -60,26 +60,16 @@ jobs:
         with:
           fetch-depth: 0  # --changed-since needs history.
 
-      # The .debs are cached, so a run with the same workflow skips the download.
-      - name: Restore apt package cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: apt-latex-${{ runner.os }}-${{ hashFiles('.github/workflows/build-pdf.yml') }}
-
-      # Keep this package list identical to README.md and AGENTS.md.
+      # TeX Live from tug.org under ~/texlive, cached (about 12 s when the cache hits,
+      # against about 60 s for apt). Keep these packages in step with the apt list in README.md.
+      # A new TeX Live release changes the install; set `cache_version` to force a fresh tree.
       - name: Install LaTeX
-        run: |
-          mkdir -p "$RUNNER_TEMP/apt-archives/partial"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" \
-            -o APT::Sandbox::User=root \
-            latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
-            texlive-xetex texlive-luatex texlive-extra-utils chktex latexdiff
-          # apt leaves root-owned files, and a lock file, that actions/cache cannot save.
-          sudo chown -R "$USER" "$RUNNER_TEMP/apt-archives"
-          rm -f "$RUNNER_TEMP/apt-archives/lock"
+        uses: zauguin/install-texlive@6671d0c62046c7e349fe154d5208fe746b07e037 # v4.4.0
+        with:
+          packages: >
+            scheme-basic collection-latexrecommended collection-latexextra collection-fontsrecommended
+            collection-mathscience collection-plaingeneric collection-binextra collection-xetex
+            collection-luatex latexmk chktex texcount latexdiff
 
       # latexmk's working files from the previous run, so an edit reruns only
       # the LaTeX passes it needs. A new key per run keeps the newest cache.

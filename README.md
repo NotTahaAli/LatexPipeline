@@ -211,7 +211,7 @@ The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on
 
 [`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when anything under `files/` or `scripts/`, the workflow itself, or the Python project files change. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
 
-* **build** installs TeX Live, compiles only the documents that changed, and uploads the resulting PDFs and logs as the `pdfs` run artifact. What counts as changed depends on the trigger:
+* **build** installs TeX Live (from tug.org via `zauguin/install-texlive`, cached; the package list lives in the workflow), compiles only the documents that changed, and uploads the resulting PDFs and logs as the `pdfs` run artifact. What counts as changed depends on the trigger:
   * Push to the default branch: everything changed since the last fully successful publish. Runs that were skipped or failed get caught up.
   * Pull requests: changed since the base branch.
   * A document is also changed when a changed file is in its recorded `.fls` inputs, restored from `.latex-cache`.
