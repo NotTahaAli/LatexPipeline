@@ -2012,6 +2012,53 @@ class VendoredUi(ServerCase):
         self.assertNotIn(b"ttf", css)
 
 
+class BibLookupApi(SharedState, ServerCase):
+    """POST /api/bib/lookup: roles, rate limit and the reply shape. Crossref itself is mocked."""
+
+    TEXT = "@article{k,\n  doi = {10.1000/xyz_123},\n  year = {2019}\n}\n"
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import bibfix
+        self.bibfix = bibfix
+        work = json.loads((Path(__file__).parent / "fixtures" / "crossref_work.json").read_text(encoding="utf-8"))
+        self.fetch = mock.patch.object(bibfix, "get_json", return_value=work).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def lookup(self, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/bib/lookup?doc={doc}", body or {"text": self.TEXT, "key": "k"}, hdrs)
+
+    def test_returns_fields_and_an_edit_for_the_editor(self):
+        status, body = self.lookup()
+        self.assertEqual(status, 200)
+        self.assertIn("journal", body["fields"])
+        self.assertNotIn("year", body["fields"])
+        self.assertEqual(self.TEXT[:body["at"]] + body["insert"] + self.TEXT[body["at"]:],
+                         self.bibfix.insert_fields(self.TEXT, "k", body["fields"]))
+
+    def test_unknown_entry_and_bad_input(self):
+        status, body = self.lookup({"text": self.TEXT, "key": "zz"})
+        self.assertEqual((status, body["fields"]), (200, {}))
+        self.assertIn("zz", body["error"])
+        self.assertEqual(self.lookup({"text": 5, "key": "k"})[0], 400)
+        self.assertEqual(self.lookup(doc="nope")[0], 404)
+
+    def test_view_role_cannot_look_up_edit_role_can(self):
+        self.tokens = self.share_on()
+        self.assertEqual(self.lookup(role="view")[0], 403)
+        self.assertEqual(self.fetch.call_count, 0)
+        self.assertEqual(self.lookup(role="edit")[0], 200)
+        self.assertEqual(self.lookup(role="edit", doc="demo2")[0], 403)
+
+    def test_lookups_are_rate_limited_for_shared_roles(self):
+        self.tokens = self.share_on()
+        serve.RATE.pop("bib", None)
+        codes = [self.lookup(role="edit")[0] for _ in range(32)]
+        self.assertEqual(codes.count(429), 2)
+
+
 class UiWiring(unittest.TestCase):
     """No browser here: check that the scripts only reach for elements the page has, and the page stays accessible."""
 

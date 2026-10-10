@@ -45,6 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import bibfix
 import build
 import grammar
 import hints
@@ -1274,6 +1275,20 @@ def grammar_settings(data: dict) -> dict:
     return grammar_info()
 
 
+def bib_lookup(data: dict) -> dict:
+    """Crossref suggestions for one entry of the .bib text the editor holds, with the edit that applies them.
+
+    Only a DOI or a title leaves the machine (see bibfix.py). The editor applies the edit to its open document,
+    so co-editing rooms stay consistent and nothing is written here."""
+    text, key = data.get("text"), data.get("key")
+    if not (isinstance(text, str) and isinstance(key, str)):
+        raise ApiError("Send the .bib text and the entry key.", 400)
+    try:
+        return bibfix.suggest_for(text, key)
+    except bibfix.BibLookupError as exc:
+        return {"fields": {}, "error": str(exc)}
+
+
 def grammar_info(role: str = "owner") -> dict:
     info = {"mode": GRAMMAR["mode"], "share_public": GRAMMAR["share_public"]}
     return {**info, "url": GRAMMAR["url"]} if role == "owner" else info
@@ -2124,6 +2139,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
             raise ApiError("Too many grammar checks; wait a moment.", 429)
     # POST /api/docx has no branch on purpose: owner only. Pandoc reads any file a \input names, so an edit link
     # could otherwise put /etc/passwd into a download.
+    elif method == "POST" and path == "/api/bib/lookup":
+        need_edit()  # Sends one DOI or title to Crossref, so a view-only link cannot start it.
+        scoped(doc)
+        if not rate_ok("bib", 30, 60.0):
+            raise ApiError("Too many lookups; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2290,6 +2310,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json(fs_operation(name, op, rel, to))
         elif url.path == "/api/grammar" and name in DOCS:
             self.json(grammar_check(name, self.body().get("text")))
+        elif url.path == "/api/bib/lookup" and name in DOCS:
+            self.json(bib_lookup(self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:

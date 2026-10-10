@@ -28,6 +28,7 @@ export const api = {
   warnings: (doc) => call(`api/warnings?${qs({ doc })}`),
   lint: (doc) => call(`api/lint?${qs({ doc })}`),
   grammar: (doc, text) => call(`api/grammar?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }),
+  bibLookup: (doc, text, key) => call(`api/bib/lookup?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, key }) }),
   grammarSettings: (s) => call("api/grammar/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(s) }),
   health: () => call("api/health"),
   rebuild: (doc) => call(`rebuild?${qs({ doc })}`, { method: "POST" }),
