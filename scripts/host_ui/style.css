@@ -262,3 +262,12 @@ main.withside{display:flex;gap:40px;align-items:flex-start}
   td.actions .btn{margin:2px 0 2px 4px}
   .codes{grid-template-columns:minmax(0,1fr)}
 }
+
+/* consent page for AI clients (MCP) */
+fieldset.card{display:grid;gap:10px}
+fieldset.card legend{float:left;margin-bottom:6px}
+.consent-ws{padding:10px 0;border-top:1px solid var(--rule)}
+.consent-ws .tag{margin-left:8px}
+.consent-projects{list-style:none;margin:8px 0 0;padding:0 0 0 26px;display:grid;gap:6px}
+.hint.block{display:block}
+.sect > div > p{overflow-wrap:anywhere}

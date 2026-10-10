@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import io
 import json
@@ -19,10 +20,12 @@ import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import ai
 import host
+import host_mcp
 import serve
 
 
@@ -1396,6 +1399,358 @@ class Cli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sys, "stderr", io.StringIO()) as err:
             self.assertEqual(host.cmd_serve(Path(tmp), insecure=True), 2)  # no database yet
         self.assertIn("WITHOUT the bubblewrap sandbox", err.getvalue())
+
+
+# --- AI clients over MCP: OAuth 2.1 server and /mcp (host_mcp.py) ---------------------------------------------------
+
+CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+VERIFIER = "v" * 43 + "-._~0123456789"
+
+
+def pkce(verifier: str = VERIFIER) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+
+
+class McpOff(HostCase):
+    def test_everything_is_off_unless_the_operator_enables_it(self):
+        anon = Client(self)
+        for method, path in (("GET", "/.well-known/oauth-protected-resource"),
+                             ("GET", "/.well-known/oauth-authorization-server"), ("POST", "/oauth/register"),
+                             ("GET", "/oauth/authorize?client_id=x"), ("POST", "/oauth/token"), ("POST", "/mcp")):
+            self.assertEqual(anon.call(method, path, origin=False)[0], 404, path)
+        self.user("ed@x.org")
+        self.assertEqual(self.client("ed@x.org").call("GET", "/api/oauth/grants")[0], 404)
+
+    def test_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "config.toml").write_text("[mcp]\nenabled = true\ncalls_per_minute = 30\n")
+            self.assertEqual(host.load_config(data)["mcp"]["calls_per_minute"], 30)
+            for text in ('[mcp]\nenabled = "yes"', "[mcp]\nnope = 1", "[mcp]\ncalls_per_minute = 0"):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+        self.assertIn("[mcp]", host.CONFIG_TEMPLATE)
+
+
+class Mcp(HostCase):
+    def extra_config(self):
+        return {"mcp": {**host_mcp.DEFAULTS, "enabled": True}}
+
+    def setUp(self):
+        super().setUp()
+        host_mcp.THROTTLES.clear()
+        self.addCleanup(host_mcp.THROTTLES.clear)
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("ot@x.org", "admin", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        self.opid = Workspaces.make_project(self, self.client("ot@x.org"), self.other, "Secret", "article")
+        self.resource = self.origin + "/mcp"
+
+    # --- helpers ---
+
+    def anon(self, method, path, body=None, form=None, headers=None, origin=False):
+        raw = urlencode(form).encode() if form is not None else None
+        return Client(self).call(method, path, body, raw=raw, headers=headers, origin=origin,
+                                 ctype="application/x-www-form-urlencoded" if form is not None else "application/json")
+
+    def register(self, uris=(CALLBACK,), name="Test Client"):
+        status, data, _ = self.anon("POST", "/oauth/register", {"client_name": name, "redirect_uris": list(uris),
+                                                                "grant_types": ["authorization_code", "refresh_token"],
+                                                                "token_endpoint_auth_method": "none"})
+        self.assertEqual(status, 201, data)
+        return data["client_id"]
+
+    def authorize(self, cid, redirect=CALLBACK, scope="read write review", **extra):
+        params = {"response_type": "code", "client_id": cid, "redirect_uri": redirect, "state": "st-1",
+                  "code_challenge": pkce(), "code_challenge_method": "S256", "resource": self.resource,
+                  "scope": scope, **extra}
+        status, _, res = self.anon("GET", "/oauth/authorize?" + urlencode({k: v for k, v in params.items()
+                                                                           if v is not None}))
+        self.assertEqual(status, 302)
+        return res.getheader("Location")
+
+    def consent(self, location, email="ed@x.org", scopes=("write", "review"), tenants=(), projects=None,
+                allow=True):
+        rid = location.split("#oauth=", 1)[1]
+        browser = self.client(email)
+        status, data, _ = browser.call("POST", f"/api/oauth/requests/{rid}", {
+            "allow": allow, "scopes": list(scopes), "tenants": list(tenants),
+            "projects": [self.pid] if projects is None else list(projects)})
+        self.assertEqual(status, 200, data)
+        return parse_qs(urlsplit(data["redirect"]).query)
+
+    def exchange(self, cid, code, verifier=VERIFIER, redirect=CALLBACK, **extra):
+        return self.anon("POST", "/oauth/token", form={"grant_type": "authorization_code", "code": code,
+                                                       "code_verifier": verifier, "client_id": cid,
+                                                       "redirect_uri": redirect, "resource": self.resource, **extra})
+
+    def connect(self, email="ed@x.org", scopes=("write", "review"), **kw):
+        cid = self.register()
+        query = self.consent(self.authorize(cid), email, scopes, **kw)
+        status, tokens, _ = self.exchange(cid, query["code"][0])
+        self.assertEqual(status, 200, tokens)
+        return cid, tokens
+
+    def mcp(self, token, message, headers=None, origin=False):
+        hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2025-06-18", **(headers or {})}
+        return Client(self).call("POST", "/mcp", message, headers=hdrs, origin=origin)
+
+    def tool(self, token, name, **args):
+        status, data, _ = self.mcp(token, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                           "params": {"name": name, "arguments": args}})
+        self.assertEqual(status, 200, data)
+        return data["result"]
+
+    fake_worker, real_worker = Proxy.fake_worker, Proxy.real_worker
+
+    def worker(self):
+        self.real_worker()
+        mock.patch.dict(serve.HISTORY, {"dir": str(self.data / "hist")}).start()
+        mock.patch.object(serve, "RATE", {}).start()
+
+    # --- tests ---
+
+    def test_discovery_metadata_and_the_401_challenge(self):
+        status, prm, _ = self.anon("GET", "/.well-known/oauth-protected-resource/mcp")
+        self.assertEqual((prm["resource"], prm["authorization_servers"]), (self.resource, [self.origin]))
+        self.assertEqual(self.anon("GET", "/.well-known/oauth-protected-resource")[1], prm)
+        meta = self.anon("GET", "/.well-known/oauth-authorization-server")[1]
+        self.assertEqual(meta["issuer"], self.origin)
+        self.assertEqual(meta["code_challenge_methods_supported"], ["S256"])
+        self.assertEqual(meta["token_endpoint_auth_methods_supported"], ["none"])
+        self.assertTrue(meta["authorization_response_iss_parameter_supported"])
+        self.assertTrue(meta["registration_endpoint"].endswith("/oauth/register"))
+        status, _, res = self.mcp("nope", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers={
+            "Authorization": ""})
+        self.assertEqual(status, 401)
+        self.assertIn(f'resource_metadata="{self.origin}/.well-known/oauth-protected-resource/mcp"',
+                      res.getheader("WWW-Authenticate"))
+        browser = self.client("ed@x.org")  # a signed-in browser's cookie is no credential here
+        self.assertEqual(browser.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0], 401)
+        status, _, res = self.mcp("mcpa_wrong", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertIn('error="invalid_token"', res.getheader("WWW-Authenticate"))
+        self.assertEqual(self.anon("GET", "/mcp")[0], 405)
+
+    def test_registration_validates_redirect_uris(self):
+        for good in (CALLBACK, "https://chatgpt.com/connector_platform_oauth_redirect", "http://127.0.0.1:33418/",
+                     "http://localhost/callback", "http://[::1]:7777/oauth/callback",
+                     "cursor://anysphere.cursor-mcp/oauth/callback", "vscode://github.copilot-chat/oauth"):
+            self.register([good])
+        for bad in ([], ["http://evil.example/cb"], ["javascript:alert(1)"], ["https://x.org/cb#frag"],
+                    ["data:text/html,x"], ["file:///etc/passwd"], ["https://user@x.org/cb"], ["/relative"],
+                    ["https://x.org/a b"], "https://x.org", ["https://x.org/" + "a" * 2100], [CALLBACK] * 11):
+            status, data, _ = self.anon("POST", "/oauth/register", {"redirect_uris": bad})
+            self.assertEqual((status, data["error"]), (400, "invalid_redirect_uri"), bad)
+        status, data, _ = self.anon("POST", "/oauth/register", {"redirect_uris": [CALLBACK],
+                                                                "grant_types": ["client_credentials"]})
+        self.assertEqual(status, 400)
+        name = self.app.db.one("SELECT name FROM oauth_clients WHERE id = ?",
+                               self.register(name="Evil\x1b[31m <script>"))["name"]
+        self.assertEqual(name, "Evil [31m script")
+        self.app.config["mcp"]["registrations_per_ip_hour"] = 1
+        host_mcp.THROTTLES.clear()
+        self.register()
+        self.assertEqual(self.anon("POST", "/oauth/register", {"redirect_uris": [CALLBACK]})[0], 429)
+
+    def test_authorize_checks_client_redirect_pkce_and_resource(self):
+        cid = self.register([CALLBACK, "http://127.0.0.1/callback"])
+        self.assertIn("#oauth-error=", self.authorize("mcp_unknown"))
+        self.assertIn("#oauth-error=", self.authorize(cid, redirect="https://evil.example/cb"))
+        self.assertIn("#oauth=", self.authorize(cid, redirect="http://127.0.0.1:51234/callback"))  # any port
+        self.assertIn("#oauth-error=", self.authorize(cid, redirect="http://127.0.0.1:51234/other"))
+        for extra, error in (({"code_challenge_method": "plain"}, "invalid_request"),
+                             ({"code_challenge": None}, "invalid_request"),
+                             ({"response_type": "token"}, "unsupported_response_type"),
+                             ({"resource": "https://other.example/mcp"}, "invalid_target")):
+            location = self.authorize(cid, **extra)
+            self.assertTrue(location.startswith(CALLBACK + "?"), location)
+            query = parse_qs(urlsplit(location).query)
+            self.assertEqual((query["error"], query["state"], query["iss"]), ([error], ["st-1"], [self.origin]))
+
+    def test_consent_needs_a_session_and_csrf_and_may_be_declined(self):
+        rid = self.authorize(self.register()).split("#oauth=", 1)[1]
+        anon = Client(self)
+        self.assertEqual(anon.call("GET", f"/api/oauth/requests/{rid}")[0], 401)
+        self.assertEqual(anon.call("POST", f"/api/oauth/requests/{rid}", {"allow": True})[0], 401)
+        browser = self.client("ed@x.org")
+        status, info, _ = browser.call("GET", f"/api/oauth/requests/{rid}")
+        self.assertEqual((status, info["client"], info["returns_to"]), (200, "Test Client", "claude.ai"))
+        self.assertEqual([w["id"] for w in info["workspaces"]], [self.tenant])  # not the other workspace
+        token, browser.csrf = browser.csrf, None
+        self.assertEqual(browser.call("POST", f"/api/oauth/requests/{rid}", {"allow": True})[0], 403)
+        browser.csrf = token
+        self.assertEqual(browser.call("POST", f"/api/oauth/requests/{rid}", {"allow": True}, origin="https://evil")[0],
+                         403)
+        status, data, _ = browser.call("POST", f"/api/oauth/requests/{rid}", {
+            "allow": True, "projects": [self.opid]})  # a project in a workspace the person is not in
+        self.assertEqual(status, 404)
+        query = self.consent(f"#oauth={rid}", allow=False)
+        self.assertEqual((query["error"], query["state"]), (["access_denied"], ["st-1"]))
+        self.assertEqual(browser.call("GET", f"/api/oauth/requests/{rid}")[0], 410)  # used up
+
+    def test_tokens_codes_and_pkce(self):
+        cid = self.register()
+        code = self.consent(self.authorize(cid))["code"][0]
+        status, data, _ = self.exchange(cid, code, verifier="w" * 43)
+        self.assertEqual((status, data["error"]), (400, "invalid_grant"))
+        cid2 = self.register()
+        code = self.consent(self.authorize(cid2))["code"][0]
+        self.assertEqual(self.exchange(cid, code)[1]["error"], "invalid_grant")  # another client's code
+        code = self.consent(self.authorize(cid2))["code"][0]
+        self.assertEqual(self.exchange(cid2, code, redirect="https://claude.ai/other")[1]["error"], "invalid_grant")
+        code = self.consent(self.authorize(cid2))["code"][0]
+        status, tokens, res = self.exchange(cid2, code)
+        self.assertEqual((status, tokens["token_type"], tokens["expires_in"]), (200, "Bearer", 3600))
+        self.assertEqual(res.getheader("Cache-Control"), "no-store")
+        self.assertEqual(self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 200)
+        status, data, _ = self.exchange(cid2, code)  # the code again: the grant it made is revoked
+        self.assertEqual((status, data["error"]), (400, "invalid_grant"))
+        self.assertEqual(self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 401)
+        stored = [r["token_hash"] for r in self.app.db.all("SELECT token_hash FROM oauth_tokens")]
+        self.assertNotIn(tokens["access_token"], stored)  # only hashes are kept
+        self.assertEqual(self.exchange(cid2, "x", resource="https://other.example/mcp")[1]["error"], "invalid_target")
+        self.assertEqual(self.anon("POST", "/oauth/token", form={"grant_type": "password"})[1]["error"],
+                         "unsupported_grant_type")
+        status, data, _ = self.exchange("mcp_gone", code)  # a deleted registration: the app registers again
+        self.assertEqual((status, data["error"]), (401, "invalid_client"))
+
+    def test_refresh_tokens_rotate_and_a_reused_one_revokes(self):
+        cid, first = self.connect()
+        status, second, _ = self.anon("POST", "/oauth/token", form={
+            "grant_type": "refresh_token", "refresh_token": first["refresh_token"], "client_id": cid})
+        self.assertEqual(status, 200, second)
+        self.assertNotEqual(second["refresh_token"], first["refresh_token"])
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        self.assertEqual(self.mcp(second["access_token"], ping)[0], 200)
+        status, data, _ = self.anon("POST", "/oauth/token", form={
+            "grant_type": "refresh_token", "refresh_token": first["refresh_token"], "client_id": cid})
+        self.assertEqual((status, data["error"]), (400, "invalid_grant"))
+        self.assertEqual(self.mcp(second["access_token"], ping)[0], 401)  # the whole connection is gone
+        self.assertEqual(self.anon("POST", "/oauth/token", form={
+            "grant_type": "refresh_token", "refresh_token": second["refresh_token"], "client_id": cid})[0], 400)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit")]
+        self.assertIn("mcp_refresh_reused", actions)
+
+    def test_tokens_are_bound_to_this_resource_and_user(self):
+        _, tokens = self.connect()
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        self.app.db.run("UPDATE oauth_tokens SET resource = 'https://other.example/mcp'")
+        self.assertEqual(self.mcp(tokens["access_token"], ping)[0], 401)
+        _, tokens = self.connect()
+        self.app.db.run("UPDATE oauth_tokens SET expires = 0 WHERE kind = 'access'")
+        self.assertEqual(self.mcp(tokens["access_token"], ping)[0], 401)
+        _, tokens = self.connect()
+        self.app.db.run("UPDATE users SET disabled = 1 WHERE email = 'ed@x.org'")
+        self.assertEqual(self.mcp(tokens["access_token"], ping)[0], 401)
+
+    def test_scopes_narrow_the_tools(self):
+        _, tokens = self.connect(scopes=())
+        self.assertEqual(tokens["scope"], "read")
+        status, data, _ = self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in data["result"]["tools"]}
+        self.assertIn("read_file", names)
+        self.assertFalse({"edit_file", "build", "add_comment"} & names)
+        status, data, res = self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                                               "params": {"name": "edit_file", "arguments": {}}})
+        self.assertEqual(status, 403)
+        self.assertIn('error="insufficient_scope"', res.getheader("WWW-Authenticate"))
+        self.assertIn('scope="read write"', res.getheader("WWW-Authenticate"))
+        _, tokens = self.connect(scopes=("review",))
+        self.assertEqual(tokens["scope"], "read review")
+        cid = self.register()
+        query = self.consent(self.authorize(cid, scope="read"), scopes=("write", "review"))  # cannot widen
+        self.assertEqual(self.exchange(cid, query["code"][0])[1]["scope"], "read")
+
+    def test_tools_run_in_the_worker_with_role_and_grant(self):
+        self.worker()
+        _, tokens = self.connect()
+        token = tokens["access_token"]
+        projects = self.tool(token, "list_projects")["structuredContent"]["projects"]
+        self.assertEqual([(p["project"], p["access"]) for p in projects], [(self.pid, ["read", "write", "review"])])
+        self.assertIn("documentclass", self.tool(token, "read_file", project=self.pid, path="main.tex")["content"][0]
+                      ["text"])
+        done = self.tool(token, "edit_file", project=self.pid, path="main.tex", old_text="\\begin{document}",
+                         new_text="\\begin{document}\nMCP was here.")
+        self.assertFalse(done["isError"], done)
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        self.assertIn("MCP was here.", (source / "main.tex").read_text())
+        self.assertEqual(serve.history_store("Doc").versions("main.tex")[0]["authors"], ["Ed via Test Client"])
+        self.assertTrue(self.tool(token, "edit_file", project=self.pid, path="build.toml", old_text="a",
+                                  new_text="b")["isError"])
+        found = self.tool(token, "search", query="MCP was here")["structuredContent"]["results"]
+        self.assertEqual(found[0]["id"], f"{self.pid}::main.tex")
+        self.assertIn("MCP was here", self.tool(token, "fetch", id=found[0]["id"])["structuredContent"]["text"])
+        for name, args in (("read_file", {"project": self.opid, "path": "main.tex"}),
+                           ("fetch", {"id": f"{self.opid}::main.tex"})):
+            out = self.tool(token, name, **args)  # another workspace: like a project that does not exist
+            self.assertTrue(out["isError"])
+            self.assertNotIn("Secret", json.dumps(out))
+        comment = self.tool(token, "add_comment", project=self.pid, path="main.tex", quote="MCP was here.",
+                            comment="Check this")
+        self.assertFalse(comment["isError"], comment)
+        actions = [r["detail"] for r in self.app.db.all("SELECT detail FROM audit WHERE action = 'mcp_tool' "
+                                                        "ORDER BY id")]
+        self.assertEqual(len(actions), 3)
+        self.assertTrue(actions[0].startswith("Test Client: edit_file"))
+
+    def test_viewers_and_whole_workspace_grants(self):
+        self.worker()
+        _, tokens = self.connect(email="vi@x.org", tenants=[self.tenant], projects=[])
+        token = tokens["access_token"]
+        projects = self.tool(token, "list_projects")["structuredContent"]["projects"]
+        self.assertEqual([(p["project"], p["access"]) for p in projects], [(self.pid, ["read"])])
+        out = self.tool(token, "edit_file", project=self.pid, path="main.tex", old_text="document", new_text="x")
+        self.assertTrue(out["isError"])
+        self.assertIn("viewer", out["content"][0]["text"])
+        pid2 = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Later", "article")
+        self.assertEqual(len(self.tool(token, "list_projects")["structuredContent"]["projects"]), 2)  # new ones too
+        self.app.db.run("DELETE FROM members WHERE user_id = (SELECT id FROM users WHERE email = 'vi@x.org')")
+        self.assertEqual(self.tool(token, "list_projects")["structuredContent"]["projects"], [])
+        self.assertTrue(self.tool(token, "read_file", project=pid2, path="main.tex")["isError"])
+
+    def test_account_lists_and_revokes_connections(self):
+        cid, tokens = self.connect()
+        browser = self.client("ed@x.org")
+        status, data, _ = browser.call("GET", "/api/oauth/grants")
+        self.assertEqual(status, 200)
+        grant = data["grants"][0]
+        self.assertEqual((grant["client"], grant["projects"], data["endpoint"]),
+                         ("Test Client", ["Doc"], self.resource))
+        self.assertEqual(self.client("vi@x.org").call("DELETE", f"/api/oauth/grants/{grant['id']}")[0], 404)
+        self.assertEqual(browser.call("DELETE", f"/api/oauth/grants/{grant['id']}")[0], 200)
+        self.assertEqual(self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 401)
+        cid, tokens = self.connect()
+        self.assertEqual(self.anon("POST", "/oauth/revoke", form={"token": tokens["refresh_token"],
+                                                                   "client_id": cid})[0], 200)
+        self.assertEqual(self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 401)
+        self.assertEqual(self.anon("POST", "/oauth/revoke", form={"token": "unknown", "client_id": cid})[0], 200)
+
+    def test_endpoint_rules_origin_protocol_and_rate(self):
+        _, tokens = self.connect()
+        token = tokens["access_token"]
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        self.assertEqual(self.mcp(token, listing, origin="https://evil.example")[0], 403)
+        self.assertEqual(self.mcp(token, listing, origin=True)[0], 200)
+        status, data, res = self.mcp(token, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}})
+        self.assertEqual((status, data["result"]["protocolVersion"]), (200, "2025-06-18"))
+        self.assertIsNone(res.getheader("Mcp-Session-Id"))
+        self.assertEqual(self.mcp(token, {"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
+        modern = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}
+        self.assertEqual(self.mcp(token, modern, headers={"MCP-Protocol-Version": "2026-07-28",
+                                                          "Mcp-Method": "tools/list"})[0], 200)
+        self.assertEqual(self.mcp(token, modern, headers={"MCP-Protocol-Version": "2026-07-28",
+                                                          "Mcp-Method": "tools/call"})[0], 400)
+        self.assertEqual(self.mcp(token, listing, headers={"MCP-Protocol-Version": "1999-01-01"})[0], 400)
+        host_mcp.THROTTLES.clear()
+        self.app.config["mcp"]["calls_per_minute"] = 2
+        self.assertEqual([self.mcp(token, listing)[0] for _ in range(3)], [200, 200, 429])
 
 
 if __name__ == "__main__":
