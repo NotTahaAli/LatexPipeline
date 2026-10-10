@@ -15,12 +15,39 @@ export class PdfView {
     });
   }
 
+  /** [document, page number] shown at box i: the full PDF, or a live preview spliced over some of its pages. */
+  source(i) {
+    const s = this.splice;
+    if (!s || i < s.from) return [this.pdf, i + 1];
+    if (i < s.from + s.doc.numPages) return [s.doc, i - s.from + 1];
+    return [this.pdf, i - s.doc.numPages + s.count + 1];
+  }
+
+  /** Box index of full-PDF page n (1-based); a page under the splice maps to the splice's first box. */
+  index(n) {
+    const s = this.splice;
+    if (!s || n <= s.from) return n - 1;
+    return n <= s.from + s.count ? s.from : n - 1 - s.count + s.doc.numPages;
+  }
+
+  /** Show s.doc in place of s.count full pages from box s.from (null: the full PDF again), in place, without a blank. */
+  setSplice(s) {
+    if (!this.pdf) return;
+    const top = this.viewer.scrollTop, first = this.sizes[0];
+    this.splice = s;
+    const n = this.pdf.numPages + (s ? s.doc.numPages - s.count : 0);
+    this.sizes = Array.from({ length: n }, (_, i) => this.sizes[i] || first);
+    this.layout();
+    this.els.forEach((el, i) => { el.classList.toggle("spliced", !!s && i >= s.from && i < s.from + s.doc.numPages); if (el.querySelector("canvas")) this.render(i); });
+    this.viewer.scrollTop = top;
+  }
+
   async render(i) {
-    const el = this.els[i], doc = this.pdf;
+    const el = this.els[i], [doc, n] = this.source(i);
     if (!el || !doc) return;
     const token = el.token = (el.token || 0) + 1;
-    const page = await doc.getPage(i + 1);
-    if (token !== el.token || doc !== this.pdf) return;
+    const page = await doc.getPage(n);
+    if (token !== el.token || doc !== this.source(i)[0]) return;
     this.setSize(i, page.getViewport({ scale: 1 }));
     const vp = page.getViewport({ scale: this.zoom * (window.devicePixelRatio || 1) });
     const canvas = document.createElement("canvas");
@@ -65,7 +92,10 @@ export class PdfView {
     while (this.els.length > this.sizes.length) { const el = this.els.pop(); this.io.unobserve(el); el.remove(); }
   }
 
-  clear() { this.pdf = null; this.version = null; this.sizes = []; this.layout(); }
+  clear() { this.pdf = null; this.version = null; this.splice = null; this.sizes = []; this.layout(); }
+
+  /** Full-PDF page number of box i, or null for a page of a spliced live preview. */
+  fullPage(i) { const [doc, n] = this.source(i); return doc === this.pdf ? n : null; }
 
   async load(url, version) {
     await this.ready;
@@ -78,7 +108,8 @@ export class PdfView {
     const top = this.viewer.scrollTop;
     const old = this.sizes;
     // Estimate every page from the first one (documents are nearly uniform); real sizes fill in as pages render.
-    this.pdf = next; this.version = version;
+    this.pdf = next; this.version = version; this.splice = null;
+    this.els.forEach((el) => el.classList.remove("spliced"));
     this.sizes = Array.from({ length: next.numPages }, (_, i) => old[i] || [v.width, v.height]);
     this.firstDone = false;
     this.layout();
@@ -97,13 +128,15 @@ export class PdfView {
   fit() { this.fitMode = true; if (this.sizes.length) this.setZoom((this.viewer.clientWidth - 40) / this.sizes[0][0], true); }
 
   async pageSize(i) {   // Exact size of page i (needed for a precise forward-search jump).
-    const page = await this.pdf.getPage(i + 1);
+    const [doc, n] = this.source(i);
+    const page = await doc.getPage(n);
     this.setSize(i, page.getViewport({ scale: 1 }));
   }
 
   async reveal(b) {   // Scroll to a SyncTeX box and highlight it.
-    await this.pageSize(b.page - 1);
-    const el = this.els[b.page - 1];
+    const i = this.index(b.page);
+    await this.pageSize(i);
+    const el = this.els[i];
     if (!el) return;
     const hit = document.createElement("div");
     hit.className = "hit";

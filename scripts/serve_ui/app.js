@@ -10,6 +10,7 @@ import { refsPanel } from "./refs.js";
 import { aiPanel } from "./ai.js";
 import { reviewSupport } from "./review.js";
 import { historyPanel } from "./history.js";
+import { LivePreview } from "./preview.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -22,7 +23,7 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
@@ -142,6 +143,7 @@ function onUpdate(u) {
     if (!active.fromDisk) { renderTabs(); showSaveState(); scheduleAutosave(); }
   }
   if (u.docChanged) scheduleGrammar();
+  if (u.docChanged && u.transactions.some((t) => t.annotation(S.Transaction.userEvent))) live.edited();   // Own typing, not a co-editor's.
   if (u.docChanged || u.selectionSet) {
     const head = u.state.selection.main.head, line = u.state.doc.lineAt(head);
     $("cursorPos").textContent = `Ln ${line.number}, Col ${head - line.from + 1}`;
@@ -405,6 +407,7 @@ let autoFocusTimer;
 async function onFsEvent(msg) {
   if (msg.doc !== cur) return;
   loadFiles();
+  if (live.last?.meta.overlay === false && msg.changed.includes(active?.path)) live.edited();   // Previewed from disk: again once saved.
   if (settings.focusAuto && !readOnly && isChapter(active) && msg.changed.includes(active.path)) {   // "Build it after each save"
     clearTimeout(autoFocusTimer); autoFocusTimer = setTimeout(() => isChapter(active) && previewChapter(true), 600);
   }
@@ -643,7 +646,25 @@ async function loadPdf() {
   }
   pdfView.focused = !!f;
   if (pdfView.fitMode) pdfView.fit();
+  liveOff.clear();
+  if (!f) await live.afterLoad(d.started);
 }
+
+// ---- live preview: the chapter being typed, spliced over its pages a moment after typing stops (preview.js) ----------
+const liveOff = new Set();   // files the server said cannot be previewed live, until the next full PDF
+const live = new LivePreview(pdfView, {
+  doc: () => cur,
+  tab: () => isChapter(active) ? { path: active.path, text: view.state.doc.toString() } : null,
+  enabled: () => settings.live && !readOnly && !shownFocus() && isChapter(active) && !liveOff.has(cur + ":" + active.path),
+  onState: (st) => {
+    const node = $("liveState");
+    if (st.off) { if (active) liveOff.add(cur + ":" + active.path); node.hidden = true; return; }   // Not a chapter, no full build yet, ...
+    node.hidden = false;
+    node.classList.toggle("busy", !!st.busy); node.classList.toggle("bad", !!st.error);
+    node.textContent = st.busy ? "Live: typesetting" : st.error ? "Live: error" : `Live: ${st.seconds.toFixed(1)} s`;
+    node.title = st.error || (st.busy ? "Typesetting the chapter you are editing" : `Chapter typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}; the full PDF follows on save`);
+  },
+});
 
 // ---- chapter preview: build only the chapter being edited; the chip says so and leads back to the full PDF ----------
 let focusView = null;   // {path} while the person asked for a chapter preview of that file
@@ -715,9 +736,10 @@ const toCursor = () => !onFocusPdf() && active?.kind === "text" && forwardSearch
 
 async function inverse(e) {
   const page = e.target.closest(".page"); if (!page || onFocusPdf()) return;
-  const r = page.getBoundingClientRect(), z = pdfView.zoom;
+  const r = page.getBoundingClientRect(), z = pdfView.zoom, n = pdfView.fullPage(+page.dataset.i);
+  if (n == null) { toast(el("span", { textContent: "This page is a live preview. The jump works once the full PDF is back (after the build)." })); return; }
   try {
-    const res = await api.inverse(cur, +page.dataset.i + 1, (e.clientX - r.left) / z, (e.clientY - r.top) / z);
+    const res = await api.inverse(cur, n, (e.clientX - r.left) / z, (e.clientY - r.top) / z);
     const link = el("a", { href: res.link, textContent: "Open in VS Code" });
     toast(el("span", { textContent: `${res.rel || res.file}:${res.line}  ` }), link);
     if (settings.inverse === "vscode" || !res.rel) location.href = res.link; else await openFile(res.rel, res.line);
@@ -1220,6 +1242,7 @@ function openSettings() {
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
   $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
+  $("sLive").checked = settings.live; $("sLive").disabled = readOnly;
   $("sGrammarBox").hidden = role !== "owner";
   $("sGrammar").value = settings.grammar; $("sGrammarUrl").value = settings.grammarUrl; $("sGrammarShare").checked = settings.grammarShare; grammarSettingsNote();
   $("settings").showModal();
@@ -1240,6 +1263,7 @@ bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
+bind("sLive", (n) => { settings.live = n.checked; if (!n.checked) { live.stop(); $("liveState").hidden = true; } });
 function grammarSettingsNote() {
   $("sGrammarNote").textContent = settings.grammar === "public" ? "Public mode sends the text of the file you are editing to languagetool.org (api.languagetool.org), in paragraph batches within its free limits. Nothing is sent in the other modes."
     : "A local LanguageTool server keeps the text on this machine (docker run -p 8081:8010 erikvl87/languagetool). The URL can also come from LANGUAGETOOL_URL or build.toml (grammar_url).";

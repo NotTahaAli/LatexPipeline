@@ -1,5 +1,6 @@
 """serve.py: path safety, atomic writes, outline and word counts, message bus, WebSocket frames, HTTP API."""
 
+import collections
 import http.client
 import importlib.util
 import io
@@ -1059,6 +1060,24 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("POST", "/api/focus?doc=second&path=main.tex", "owner")[0], 200)
             self.assertEqual(started, [("demo", "main.tex"), ("demo", "main.tex"), ("second", "main.tex")])
 
+    def test_live_preview_needs_the_edit_role_and_only_for_the_shared_document(self):
+        calls = []
+        def fake(name, client, data):
+            calls.append((name, data["path"]))
+            return {"ok": True}, b"%PDF-1.5"
+        with mock.patch.object(serve, "live_preview", side_effect=fake):
+            url, body = "/api/preview?doc=demo&cid=a", {"path": "Chapters/one.tex", "text": "x"}
+            self.assertEqual(self.get("POST", url, None, body)[0], 401)
+            self.assertEqual(self.get("POST", url, "view", body)[0], 403)
+            self.assertEqual(self.get("POST", "/api/preview?doc=second&cid=a", "edit", body)[0], 403)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.get("POST", url, "edit", body), (200, b"%PDF-1.5"))
+            self.assertEqual(self.get("POST", "/api/preview?doc=second&cid=a", "owner", body)[0], 200)
+            self.assertEqual(calls, [("demo", "Chapters/one.tex"), ("second", "Chapters/one.tex")])
+            serve.RATE["preview"] = collections.deque([time.monotonic()] * 120)  # A guest cannot run LaTeX in a loop.
+            self.addCleanup(serve.RATE.pop, "preview", None)
+            self.assertEqual(self.get("POST", url, "edit", body)[0], 429)
+
     def test_docx_export_is_owner_only_and_the_download_follows_the_pdf_rule(self):
         url = "/api/docx?doc=demo"
         with mock.patch.object(build, "export_docx", return_value=(True, "out/demo.docx")) as export:
@@ -1928,6 +1947,49 @@ class Upload(SharedState, ServerCase):
         self.assertEqual((self.root / "plot.png").read_text(), "mine")
         fs = [m["data"] for m in serve.BUS.since(rev) if m["type"] == "fs"]
         self.assertEqual(fs[-1]["changed"], ["plot-1.png"])
+
+
+class LivePreviewApi(ServerCase):
+    """POST /api/preview: which files, and how the PDF and its description come back (the TeX side is mocked)."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("Chapters/one.tex", "chapter one\n")
+        self.write("build.toml", "")
+        mock.patch.object(serve.preview, "has_snapshot", return_value=True).start()
+        self.warm = mock.Mock()
+        mock.patch.object(serve.preview, "warm_for", return_value=self.warm).start()
+
+    def post(self, rel, text="typed"):
+        return self.request("POST", "/api/preview?doc=demo&cid=c1", {"path": rel, "text": text})
+
+    def test_only_chapter_files_of_the_document(self):
+        for rel, status in (("main.tex", 400), ("build.toml", 400), ("notes.txt", 400), ("../x.tex", 400),
+                            ("Chapters/none.tex", 404), (None, 400)):
+            with self.subTest(rel=rel):
+                self.assertEqual(self.post(rel)[0], status)
+        bad = {"path": "Chapters/one.tex", "text": 3}
+        self.assertEqual(self.request("POST", "/api/preview?doc=demo", bad)[0], 400)
+        self.warm.compile.assert_not_called()
+
+    def test_the_pdf_comes_back_with_its_description_and_errors_as_json(self):
+        self.warm.compile.return_value = {"ok": True, "pdf": b"%PDF-1.5 x", "log": "long", "errors": [], "seconds": 0.5}
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/preview?doc=demo&cid=c1", json.dumps({"path": "Chapters/one.tex", "text": "t"}),
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": "application/json"})
+        res = conn.getresponse()
+        body, kind, meta = res.read(), res.getheader("Content-Type"), json.loads(res.getheader("X-Preview"))
+        conn.close()
+        self.assertEqual((res.status, kind, body), (200, "application/pdf", b"%PDF-1.5 x"))
+        self.assertEqual(meta, {"ok": True, "errors": [], "seconds": 0.5})  # No log, no PDF in the header.
+        self.warm.compile.assert_called_with("c1", "Chapters/one.tex", "t")
+        error = {"file": "Chapters/one.tex", "line": 2, "message": "Undefined control sequence.", "hint": None}
+        self.warm.compile.return_value = {"ok": False, "pdf": None, "log": "", "seconds": 0.2, "errors": [error]}
+        status, reply = self.post("Chapters/one.tex")
+        self.assertEqual((status, reply["ok"], reply["errors"][0]["line"]), (200, False, 2))
+        self.assertTrue(reply["errors"][0]["hint"])
+        self.warm.compile.side_effect = serve.preview.PreviewError("not a chapter")
+        self.assertEqual(self.post("Chapters/one.tex"), (409, {"error": "not a chapter"}))
 
 
 class FocusPreview(ServerCase):

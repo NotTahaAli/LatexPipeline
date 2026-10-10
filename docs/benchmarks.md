@@ -34,11 +34,22 @@ Other tools, measured earlier the same day (this pipeline at 092eac7 measured 74
 
 Tiny document (`files/test`, 2 pages), measured: cold 0.77 s here against 0.62 s for plain latexmk, no-op 0.24 against 0.14, text edit 0.85 against 0.71. The wrapper costs 0.1 to 0.25 s on small documents.
 
+## Live preview
+
+Edit-to-PDF latency of the editor's live preview (`scripts/preview.py`): one word changed in the unsaved buffer, `POST /api/preview` until the chapter's PDF has arrived, median of 5 after one warm-up, load average 0.9 to 1.8. The TeX process has its preamble loaded before the request; cached TikZ figures are reused. `--focus` (wall time of `build.py --source bench sample-report --focus ...`, same session) for comparison. Method, browser timings and limits: [realtime.md](realtime.md).
+
+| part | `--focus` | **live preview** (request to PDF) |
+|---|---|---|
+| `Chapters/chapter5` (20 pages, edit in `subsection1.tex`) | 2.02 s | **0.69 s** (min 0.64) |
+| `Chapters/chapter3` (22 pages, 2 pgfplots figures, edit in `subsection3.tex`) | 3.14 s | **0.81 s** (min 0.74) |
+
+In the browser, keystroke to spliced pages is the request time plus the 700 ms pause and about 0.1 to 0.2 s of PDF.js work (`tests/preview_e2e.py`, chapter 3, with the autosave's full builds running alongside: 1.76 s median at load 0.8 to 1.6, 2.27 s at load 3). TeXpresso, measured the same way on its own protocol: 0.62 s median for an edit near the page it shows, but no PDF output (see realtime.md).
+
 ## Where we win, tie and lose
 
 * **Win, cold build:** about 39% faster than plain latexmk (60.7 vs 99.3 s) because figures compile in parallel and are cached, and latexmk's extra passes are avoided.
 * **Win, text edits:** about 2x faster than plain latexmk (12.9 vs 25.1 s) for edits in files with or without figures, because the text pass includes finished figure PDFs instead of re-typesetting them.
-* **Win, `--focus`:** 1.8 s for a chapter preview; none of the other tools has an equivalent. It is a preview, not the full PDF.
+* **Win, `--focus`:** 1.8 s for a chapter preview; none of the other tools has an equivalent. It is a preview, not the full PDF. The editor's live preview typesets the same chapter from the unsaved text in 0.7 to 0.8 s.
 * **Win, no-op on Overleaf-style or always-full builds:** 0.4 s against 26 s (Overleaf's rc forces a pass) or 77 s (naive, arara).
 * **Win, figure edit:** 16.0 vs 27.5 s for plain latexmk (was a loss, 28.3 vs 25.4 s). The old flow typeset the whole document once in draft mode to list the figures (11 s of 25), compiled the figure (1.3 s), then ran the text pass (12 s). Now only the files whose figure text changed are listed (the files that define nothing are skipped, as in a figure job; 1.5 s), the figure is compiled (1.3 s) and the text pass runs. The listing is a guess that the text pass checks: it compares every figure with its `.md5` and sets a mismatching one inline, and the build loop then syncs and runs again. It falls back to the full listing when a figure was added or removed in the changed file, a non-`.tex` input changed, or the `\input` tree is not known. Floor: one text pass (12 s) plus the figure job; there is none lower without changing what a pass does.
 * **Tie, no-op:** 0.12 s against plain latexmk's 0.12 s.

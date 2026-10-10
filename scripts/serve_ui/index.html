@@ -174,6 +174,7 @@
       <button id="zIn" class="icon" aria-label="Zoom in" title="Zoom in"><svg class="ic"><use href="#i-plus"/></svg></button>
       <button id="zFit" class="icon" aria-label="Fit width" title="Fit width"><svg class="ic"><use href="#i-fit"/></svg></button>
       <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
+      <span id="liveState" class="live-state" hidden></span>
     </div>
     <div id="focusNote" class="focus-note" role="status" hidden></div>
     <div id="pdfNote" class="pdf-note" hidden></div>
@@ -291,6 +292,7 @@
         <div class="field"><label for="sZoom">Zoom (%)</label><input id="sZoom" type="number" min="30" max="500" step="10"></div>
         <div class="field"><label for="sInverse">Double-click in PDF</label><select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select></div>
         <label class="check wide"><input id="sFocusAuto" type="checkbox"> Build the chapter preview after each save</label>
+        <label class="check wide"><input id="sLive" type="checkbox"> Live preview: update the chapter you type in, in the PDF, as you pause</label>
       </div>
     </details>
     <div class="actions"><button type="button" class="btn ghost" id="sCheat">Keyboard shortcuts</button><button class="btn primary" value="close">Done</button></div>
