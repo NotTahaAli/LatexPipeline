@@ -2072,6 +2072,19 @@ class Mcp(HostCase):
             self.assertTrue(out["isError"], name)
             self.assertIn("viewer", out["content"][0]["text"])
 
+    def test_own_comments_are_per_connection(self):
+        self.worker()
+        first, second = self.connect()[1]["access_token"], self.connect()[1]["access_token"]  # same name, account
+        tid = self.tool(first, "add_comment", project=self.pid, path="main.tex", quote="\\begin{document}",
+                        comment="From the first")["structuredContent"]["id"]
+        comment = self.tool(first, "list_reviews", project=self.pid)["structuredContent"]["threads"][0]
+        cid = serve.review_store("Doc").load()["threads"][0]["comments"][0]["id"]
+        self.assertEqual(comment["comments"][0]["name"], "Ed via Test Client")
+        out = self.tool(second, "delete_comment", project=self.pid, thread=tid, comment=cid)
+        self.assertTrue(out["isError"])
+        self.assertIn("this AI client wrote", out["content"][0]["text"])
+        self.assertFalse(self.tool(first, "delete_comment", project=self.pid, thread=tid, comment=cid)["isError"])
+
     def test_zotero_uses_the_persons_own_library(self):
         self.worker()
         token = self.connect()[1]["access_token"]
@@ -2086,6 +2099,13 @@ class Mcp(HostCase):
             self.assertEqual([e["key"] for e in out["structuredContent"]["new"]], ["z"], out)
             self.assertFalse(self.tool(token, "zotero_apply", project=self.pid, path="refs.bib", add="z")["isError"])
             self.assertEqual(fetched.call_args.kwargs["max_pages"], zotero.HOSTED_PAGES)
+            self.assertEqual(fetched.call_count, 1)  # apply reused the preview's library
+            host_mcp.ZOTERO_CACHE.clear()
+            uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+            self.app.streams[uid] = self.app.config["max_streams_per_user"]  # tabs and syncs count together
+            out = self.tool(token, "zotero_sync_preview", project=self.pid, path="refs.bib")
+            self.assertIn("Too many open", out["content"][0]["text"])
+            del self.app.streams[uid]
             self.assertNotIn("k" * 24, json.dumps(out))
         source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
         self.assertIn("From Zotero", (source / "refs.bib").read_text())

@@ -58,6 +58,8 @@ CODE_SECONDS = 120
 REQUEST_SECONDS = 600
 MAX_GRANTS_PER_USER = 50
 SEARCHES_PER_MINUTE, SEARCH_BYTES, SEARCH_PROJECTS = 10, 16 * 1024 * 1024, 20
+ZOTERO_REUSE = 120.0  # seconds a connection's fetched Zotero library is reused (preview, then apply)
+ZOTERO_CACHE: dict = {}  # (user id, grant id) -> (monotonic time, BibTeX); at most 100 entries
 MAX_BODY = 8 * 1024 * 1024
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 # Private-use schemes (RFC 8252 7.1): reverse-DNS names (com.example.app), plus the short ones these editors use.
@@ -641,7 +643,8 @@ class Hosted:
             text, cut = mcp_tools.read_for_fetch(H.APP.project_source(project), rel)
             return mcp_tools.result({"id": args["id"], "title": f"{project['name']}: {rel}", "text": text,
                                      "url": f"{issuer()}/p/{pid}/",
-                                     "metadata": {"project": pid, "path": rel, "truncated": cut}})
+                                     "metadata": {"project": pid, "path": rel, "truncated": cut}},
+                                    limit=2 * mcp_tools.MAX_FETCH + 10000)
         pid = args.pop("project")
         if pid not in reachable:
             raise mcp_tools.ToolError(f"No project {pid!r} in this connection. list_projects shows the ones you "
@@ -663,17 +666,33 @@ class Hosted:
         cfg = H.zotero_settings(uid)
         if not zotero.configured(cfg):
             raise mcp_tools.ToolError("Add your Zotero library and API key on the Account page first.")
+        cached = ZOTERO_CACHE.get((uid, self.grant["id"]))
+        if cached and time.monotonic() - cached[0] < ZOTERO_REUSE:  # zotero_apply right after the preview
+            return cached[1]
         if H.APP.zotero_syncs.full(f"zotero:{uid}"):
             raise mcp_tools.ToolError("Too many Zotero syncs; wait a few minutes.")
         if not H.ZOTERO_SLOTS.acquire(blocking=False):
             raise mcp_tools.ToolError("The server is busy syncing with Zotero; try again in a minute.")
         try:
-            H.APP.zotero_syncs.fail(f"zotero:{uid}")
-            text, _, _ = zotero.fetch(cfg, False, max_pages=zotero.HOSTED_PAGES, max_total=zotero.HOSTED_TOTAL)
+            with H.APP.streams_lock:  # a sync holds a thread like an open editor tab (Handler.zotero_sync)
+                if H.APP.streams[uid] >= H.APP.config["max_streams_per_user"]:
+                    raise mcp_tools.ToolError("Too many open editor tabs or syncs. Close some and try again.")
+                H.APP.streams[uid] += 1
+            try:
+                H.APP.zotero_syncs.fail(f"zotero:{uid}")
+                text, _, _ = zotero.fetch(cfg, False, max_pages=zotero.HOSTED_PAGES, max_total=zotero.HOSTED_TOTAL)
+            finally:
+                with H.APP.streams_lock:
+                    H.APP.streams[uid] -= 1
+                    if H.APP.streams[uid] <= 0:
+                        del H.APP.streams[uid]
         except zotero.ZoteroError as exc:
             raise mcp_tools.ToolError(str(exc))
         finally:
             H.ZOTERO_SLOTS.release()
+        if len(ZOTERO_CACHE) >= 100:
+            ZOTERO_CACHE.clear()
+        ZOTERO_CACHE[(uid, self.grant["id"])] = (time.monotonic(), text)
         return text
 
     def new_project(self, args: dict) -> dict:
@@ -712,7 +731,7 @@ class Hosted:
                                      **({"remote": remote} if remote is not None else {})}).encode(),
                          {"Host": f"127.0.0.1:{worker.port}", "Content-Type": "application/json",
                           "X-Host-Secret": worker.secret, "X-Host-Role": role,
-                          "X-Host-User": quote(f"{self.user['id']};{who}", ";")})
+                          "X-Host-User": quote(f"{self.user['id']}-g{self.grant['id'][:16]};{who}", ";")})
             res = conn.getresponse()
             raw = res.read(16 * 1024 * 1024)
         except (OSError, http.client.HTTPException):

@@ -74,7 +74,8 @@ class Local:
             text, cut = t.read_for_fetch(s.DOCS[doc].parent, rel)
             return t.result({"id": args["id"], "title": f"{doc}: {rel}", "text": text,
                              "url": (s.DOCS[doc].parent / rel).resolve().as_uri(),
-                             "metadata": {"project": doc, "path": rel, "truncated": cut}})
+                             "metadata": {"project": doc, "path": rel, "truncated": cut}},
+                            limit=2 * t.MAX_FETCH + 10000)  # JSON doubles LaTeX's backslashes
         if name == "new_document_from_template":
             return t.new_local_document(s, args["name"], args.get("template", "article"))
         doc = args.pop("project")

@@ -45,6 +45,7 @@ MAX_TEXT_OUT = 100_000  # characters of text one tool result carries
 MAX_FETCH = 200_000  # characters of one file through fetch
 MAX_IMAGE = 2_000_000  # bytes of one rendered page (PNG)
 MAX_ITEMS = 500
+DIFF_ROWS, DIFF_LINE = 600, 300  # version_diff: rows, and characters of each line
 SEARCH_BYTES = 64 * 1024 * 1024  # text a search reads at most
 TEXT_SUFFIXES = (".tex", ".bib", ".cls", ".sty", ".bst", ".txt", ".md", ".def", ".cfg", ".ltx", ".clo", ".bbx",
                  ".cbx", ".lbx", ".tikz", ".pgf", ".csv")
@@ -201,12 +202,14 @@ TOOLS = [
           {"thread": _s("string", "The thread id.", maxLength=40),
            "reopen": _s("boolean", "Reopen instead of resolving (default false).")}, ["thread"], read_only=False),
     _tool("delete_comment", "Delete your comment", "review",
-          "Delete a comment this AI client wrote (other people's comments cannot be deleted).",
+          "Delete a comment this AI client wrote through this connection (hosted) or under this client's name "
+          "(local); other people's comments cannot be deleted.",
           {"thread": _s("string", "The thread id.", maxLength=40), "comment": _s("string", "The comment id.",
                                                                                   maxLength=40)},
           ["thread", "comment"], read_only=False, destructive=True),
     _tool("withdraw_suggestion", "Withdraw your suggestion", "review",
-          "Withdraw a suggestion this AI client made. Accepting or rejecting other people's suggestions is for people.",
+          "Withdraw a suggestion this AI client made (hosted: through this connection; local: under this client's "
+          "name). Accepting or rejecting other people's suggestions is for people.",
           {"id": _s("string", "The suggestion id (list_reviews).", maxLength=40)}, ["id"], read_only=False,
           destructive=True),
     _tool("grammar_check", "Check grammar", "review",
@@ -348,14 +351,20 @@ def check_args(schema: dict, args) -> dict:
     return clean
 
 
-def result(data, text: str | None = None) -> dict:
-    """A tool result: structured data plus the same as JSON text (clients that ignore structuredContent)."""
+def result(data, text: str | None = None, limit: int | None = None) -> dict:
+    """A tool result: structured data plus the same as JSON text (clients that ignore structuredContent). Both stay
+    under `limit` characters (MAX_TEXT_OUT): structured data that is too large is left out, the text is cut."""
+    limit = limit or MAX_TEXT_OUT
     body = text if text is not None else json.dumps(data, ensure_ascii=False, indent=1)
-    if len(body) > MAX_TEXT_OUT:
-        body = body[:MAX_TEXT_OUT] + "\n[... cut: the answer was too long]"
     out: dict = {"content": [{"type": "text", "text": body}], "isError": False}
     if data is not None:
-        out["structuredContent"] = data
+        if len(json.dumps(data, ensure_ascii=False, separators=(",", ":"))) <= limit:
+            out["structuredContent"] = data
+        elif text is None:
+            body += "\n[the answer was too long: ask for less, e.g. one file or a smaller range]"
+    if len(body) > limit:
+        body = body[:limit] + "\n[... cut: the answer was too long]"
+    out["content"][0]["text"] = body
     return out
 
 
@@ -982,9 +991,14 @@ class Doc:
         return result({"thread": thread, "resolved": not reopen})
 
     def own(self, item: dict) -> bool:
-        """Made by this caller through MCP: the same account (or the local owner) and this client's name."""
-        who = self.s.reviewer(self.role, self.user, {"name": self.author, "key": "x" * 16})["key"]
-        return item.get("author") == who and item.get("name") == self.author
+        """Made through this connection. Hosted, the gateway puts the OAuth grant into the user id
+        ("<uid>-g<grant>"), so the review author key is per connection. Locally everything is the owner's, so
+        it is the client's name as stored (display_name may shorten it): another local client calling itself the
+        same could match, which only the owner could set up."""
+        who = self.s.reviewer(self.role, self.user, {"name": self.author, "key": "x" * 16})
+        if item.get("author") != who["key"]:
+            return False
+        return self.user is not None or item.get("name") == who["name"]
 
     def t_delete_comment(self, thread: str, comment: str) -> dict:
         self.need_edit("review")
@@ -1045,7 +1059,16 @@ class Doc:
 
     def t_version_diff(self, id: int, path: str | None = None, against: str = "current") -> dict:  # noqa: A002
         self.need_rate("history-read")
-        return result(self.s.history_diff(self.name, self.role, id, path, against))
+        found = self.s.history_diff(self.name, self.role, id, path, against)
+        rows, hunks = 0, []
+        for hunk in found["hunks"]:
+            if rows + len(hunk) > DIFF_ROWS:
+                found["truncated"] = True
+                break
+            rows += len(hunk)
+            hunks.append([[op, old, new, line[:DIFF_LINE] + ("..." if len(line) > DIFF_LINE else "")]
+                          for op, old, new, line in hunk])
+        return result({**found, "hunks": hunks})
 
     def t_restore_version(self, id: int, path: str | None = None) -> dict:  # noqa: A002
         self.need_edit("history")

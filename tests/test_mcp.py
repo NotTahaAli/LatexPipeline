@@ -587,6 +587,32 @@ class Parity(DocCase):
         self.assertEqual(spot["structuredContent"], {"path": "chapters/one.tex", "line": 2})
         self.assertTrue(self.call("source_for_pdf_position", project="thesis", page=1, x="1", y=2)["isError"])
 
+    def test_structured_results_are_capped_too(self):
+        out = mcp_tools.result({"text": "x" * (mcp_tools.MAX_TEXT_OUT + 10)})
+        self.assertNotIn("structuredContent", out)
+        self.assertLess(len(out["content"][0]["text"]), mcp_tools.MAX_TEXT_OUT + 100)
+        self.assertIn("structuredContent", mcp_tools.result({"text": "small"}))
+        long = "\n".join(f"line {i} " + "y" * 2000 for i in range(1500))
+        (self.root / "big.tex").write_text(long, "utf-8")
+        self.ok("edit_file", project="thesis", path="big.tex", old_text="line", new_text="LINE", replace_all=True)
+        first = self.ok("list_versions", project="thesis", path="big.tex")["structuredContent"]["versions"][-1]["id"]
+        out = self.ok("version_diff", project="thesis", id=first, path="big.tex")
+        self.assertLessEqual(len(json.dumps(out)), 3 * mcp_tools.MAX_TEXT_OUT)
+        diff = out.get("structuredContent")
+        if diff is not None:
+            self.assertTrue(diff["truncated"])
+            self.assertLessEqual(sum(len(h) for h in diff["hunks"]), mcp_tools.DIFF_ROWS)
+            self.assertTrue(all(len(row[3]) <= mcp_tools.DIFF_LINE + 3 for h in diff["hunks"] for row in h))
+
+    def test_own_items_with_a_long_client_name(self):
+        self.local.client = "A very long client name that goes on and on"  # stored names are cut to 40
+        tid = self.ok("add_comment", project="thesis", path="main.tex", quote="Hello world",
+                      comment="x")["structuredContent"]["id"]
+        cid = serve.review_store("thesis").load()["threads"][0]["comments"][0]["id"]
+        self.ok("delete_comment", project="thesis", thread=tid, comment=cid)
+        sid = self.ok("add_suggestion", project="thesis", path="main.tex", quote="Hello", replacement="Hi")
+        self.ok("withdraw_suggestion", project="thesis", id=sid["structuredContent"]["id"])
+
     def test_export_and_new_documents(self):
         hosted = {t["name"] for t in mcp_tools.tools_for(("write", "review"))}
         self.assertNotIn("export_docx", hosted)
