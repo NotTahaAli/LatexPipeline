@@ -2332,6 +2332,25 @@ def localize(page: bytes) -> bytes:
                   if m.group(1).decode() in local else m.group(0), page)
 
 
+# Same tokens as ui/style.css; the CSP of an HTML reply allows inline styles, and there is no script.
+UNAUTHORIZED_PAGE = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unauthorized - LaTeX Studio</title>
+<style>
+:root{--bg:#f4f5f7;--panel:#fff;--fg:#1f2328;--mute:#59636e;--line:#dfe3e8;--bad:#cf222e;color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a20;--fg:#e6e9ee;--mute:#a1abb8;--line:#2b3039;--bad:#ff7b72}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);
+font:14px/1.45 system-ui,-apple-system,
+"Segoe UI",Roboto,sans-serif}
+main{max-width:420px;margin:16px;padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+h1{margin:0 0 8px;font-size:18px}p{margin:0;color:var(--mute)}b{color:var(--bad)}
+</style></head><body><main><h1>Unauthorized</h1>
+<p><b>401.</b> Open the full share link you were sent, including the part after <code>?token=</code>.
+This address on its own does not grant access.</p>
+</main></body></html>
+"""
+
+
 def csp(page: bytes, host: str) -> str:
     """Only our own files, the pinned CDNs (none when vendored), this origin's sockets; import map by hash."""
     cdns = "" if vendor_files() else " " + CDNS
@@ -2533,7 +2552,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self.role = self.authenticate()
             if self.role is None:
-                self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain")
+                if "text/html" in self.headers.get("Accept", "") and not url.path.startswith("/api/"):
+                    # A browser tab gets a readable page, not bare text.
+                    self.reply(401, UNAUTHORIZED_PAGE, "text/html; charset=utf-8")
+                else:
+                    self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain")
                 return
             check_permission(self.role, self.command, unquote(url.path), query)
             method()

@@ -35,6 +35,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Changed
 
+- Editor: the More menu is grouped (Panels, Build, Document, Session, Help); the chapter preview opens at its first page and the full PDF returns to where you were reading; the build pill's tooltip says "Building... N s (last build took M s)" during a build; browsers that open a share link without a token get a small themed 401 page (API clients still get plain text); on phones the error and warning badges collapse into one count chip and the top bar stays on one row.
 - `serve.py`: `GET /forward` no longer moves every open PDF viewer (it only answers with the position); `POST /forward` (owner only) does. A GET with side effects could be triggered by any web page.
 - Editor UX pass: usable on phones (editor and PDF stack, top bar fits, More menu spans the screen), themed find/replace panel (dark mode), "Build failed" note no longer covers the zoom buttons, scrollable drawer tabs, DOCX export feedback, Home/End in the More menu, and contrast fixes (axe: 0 violations).
 - **Faster builds** on `bench/sample-report` (303 pages, 25 TikZ figures, 4 CPUs): cold build 93 s to 65 s, one-line text edit 47 s to 20 s, `--focus` preview 1.7 s.
