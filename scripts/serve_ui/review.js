@@ -3,17 +3,22 @@
 // quote and context (anchors.js): CodeMirror maps them through edits while a file is open, and an editor whose
 // mapped anchor no longer matches its quote sends the new one back. Accepting a suggestion claims it on the server
 // first (only one person can), then applies the edit through the open document, so co-editing rooms stay in sync.
+// One multi-cursor edit is one suggestion with several ranges (anchors.js partsOf), accepted or rejected whole.
 // Every bit of user text is rendered with textContent.
-import { makeAnchor, locate, disjoint } from "./anchors.js";
+import { makeAnchor, locate, partsOf, placeGroups } from "./anchors.js";
 import { ago } from "./history.js";
 
 const FILTERS = [["comments", "Comments"], ["suggestions", "Suggestions"], ["resolved", "Resolved"]];
 const IDLE_COMMIT = 1500;   // ms of no typing before a suggestion in progress is sent
+const UNDO_GROUP = 600;     // ms: keystrokes closer together than this are one undo step in suggest mode
+const UNDO_DEPTH = 100;
 const clip = (s, n = 280) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 /**
  * ctx = {api, el, icon, doc(), canEdit, me() -> {name, key}, view(), activePath(), openFile(path, line, opts),
- *        showPanel(), toast(msg), live(msg), onCount(n)}
+ *        showPanel(), toast(msg), live(msg), onCount(n),
+ *        fromYjs() -> true while the co-editing binding applies a change that already happened to the shared text,
+ *        hold(on) -> keep the editor's text from co-editors and the disk while an IME composition is in progress}
  */
 export function reviewSupport(S, V, ctx) {
   const { el } = ctx;
@@ -55,17 +60,22 @@ export function reviewSupport(S, V, ctx) {
     }
     for (const s of data.suggestions) {
       if (s.path !== path) continue;
-      const at = locate(text, s.anchor);
-      if (at) marks.push(...suggestionDeco(at.from, at.to, s.insert, { id: s.id, kind: "s" }, s.id === activeId ? " active" : ""));
+      partsOf(s).forEach((p, part) => {
+        const at = locate(text, p.anchor);
+        if (at) marks.push(...suggestionDeco(at.from, at.to, p.insert, { id: s.id, part, kind: "s" }, s.id === activeId ? " active" : ""));
+      });
     }
     view.dispatch({ effects: setItems.of(V.Decoration.set(marks, true)) });
   }
 
-  /** id -> {from, to} as the open file has them now (mapped through every edit since the last refresh). */
-  function places(state) {
+  /**
+   * id -> {from, to} as the open file has them now (mapped through every edit since the last refresh); a grouped
+   * suggestion spans all of its parts. With byPart, the key is "id:part" and each range is its own.
+   */
+  function places(state, byPart = false) {
     const out = new Map();
     state.field(itemsField, false)?.between(0, state.doc.length, (from, to, value) => {
-      const id = value.spec.id, old = out.get(id);
+      const id = byPart ? `${value.spec.id}:${value.spec.part || 0}` : value.spec.id, old = out.get(id);
       const range = value.spec.widget ? { from: to, to } : { from, to };
       out.set(id, old ? { from: Math.min(old.from, range.from), to: Math.max(old.to, range.to) } : range);
     });
@@ -78,14 +88,18 @@ export function reviewSupport(S, V, ctx) {
   function reanchor() {
     const view = ctx.view();
     if (!ctx.canEdit || !view) return;
-    const text = view.state.doc.toString(), path = ctx.activePath(), now = places(view.state), items = [];
+    const text = view.state.doc.toString(), path = ctx.activePath(), now = places(view.state, true), items = [];
     for (const item of [...data.threads, ...data.suggestions]) {
-      const at = item.path === path && now.get(item.id);
-      if (!at || String(item.id).startsWith("tmp")) continue;
-      const found = locate(text, item.anchor);
-      if (found && found.from === at.from && found.to === at.to) continue;
-      item.anchor = makeAnchor(text, at.from, at.to);
-      items.push({ id: item.id, anchor: item.anchor });
+      if (item.path !== path || String(item.id).startsWith("tmp")) continue;
+      const parts = item.comments ? [item] : [item, ...(item.more || [])];   // the objects that hold each anchor
+      parts.forEach((p, part) => {
+        const at = now.get(`${item.id}:${part}`);
+        if (!at) return;
+        const found = locate(text, p.anchor);
+        if (found && found.from === at.from && found.to === at.to) return;
+        p.anchor = makeAnchor(text, at.from, at.to);
+        items.push({ id: item.id, ...(part ? { part } : {}), anchor: p.anchor });
+      });
     }
     if (items.length) send({ op: "reanchor", items }).catch(() => {});
   }
@@ -124,81 +138,190 @@ export function reviewSupport(S, V, ctx) {
   });
 
   // ---- suggest mode: typing makes a suggestion instead of changing the text ---------------------------------------
+  // The state of the open file: the draft being typed ({id, path, parts: [{from, to, insert}]}, one part per
+  // cursor), and suggest mode's own undo stack. past/future hold {draft} (an earlier draft, mapped through every
+  // change like the draft itself) and {sent: box} (a suggestion sent to the server; box.item once it is saved).
   const bypass = S.Annotation.define();   // edits that must go through even in suggest mode (accept, restore)
-  const setDraft = S.StateEffect.define();
-  const draftField = S.StateField.define({
-    create: () => null,
-    update(d, tr) {
-      for (const e of tr.effects) if (e.is(setDraft)) return e.value;
-      if (d && tr.docChanged) { const from = tr.changes.mapPos(d.from, -1); return { ...d, from, to: Math.max(from, tr.changes.mapPos(d.to, 1)) }; }
-      return d;
+  const setSug = S.StateEffect.define();
+  const finish = S.StateEffect.define();  // a draft is done: send it (box = {d, doc})
+  let draftIds = 0;
+
+  const mapDraft = (d, changes) => d && {
+    ...d, parts: d.parts.map((p) => { const from = changes.mapPos(p.from, -1); return { ...p, from, to: Math.max(from, changes.mapPos(p.to, 1)) }; }),
+  };
+  const mapStep = (s, changes) => ("draft" in s ? { ...s, draft: mapDraft(s.draft, changes) } : s);
+  const sugField = S.StateField.define({
+    create: () => ({ draft: null, past: [], future: [], at: 0 }),
+    update(v, tr) {
+      for (const e of tr.effects) if (e.is(setSug)) return e.value;
+      if (!tr.docChanged) return v;
+      return { ...v, draft: mapDraft(v.draft, tr.changes), past: v.past.map((s) => mapStep(s, tr.changes)), future: v.future.map((s) => mapStep(s, tr.changes)) };
     },
     provide: (f) => V.EditorView.decorations.compute([f], (state) => {
-      const d = state.field(f);
-      return d ? V.Decoration.set(suggestionDeco(d.from, d.to, d.insert, { id: "draft", kind: "d" }, " draft"), true) : V.Decoration.none;
+      const d = state.field(f).draft;
+      return d ? V.Decoration.set(d.parts.flatMap((p) => suggestionDeco(p.from, p.to, p.insert, { id: "draft", kind: "d" }, " draft")), true) : V.Decoration.none;
     }),
   });
+  const draftOf = (state) => state.field(sugField, false)?.draft ?? null;
+  const live = (d) => { const parts = d.parts.filter((p) => p.to > p.from || p.insert); return parts.length ? { ...d, parts } : null; };
+  const cursors = (parts) => S.EditorSelection.create(parts.map((p) => S.EditorSelection.cursor(p.to)));
+  const pushStep = (past, step) => [...past, step].slice(-UNDO_DEPTH);
+  // A sent draft is one undo step (withdraw it): its typing steps (tagged with its id) are folded into that.
+  const sentStep = (past, box) => pushStep(past.filter((s) => s.of !== box.d.id), { sent: box });
+
+  /** The draft d grown by this edit (typing on, deleting on, with one cursor per part), or null if it does not continue d. */
+  function extend(d, changes, st, tr) {
+    const ranges = st.selection.ranges;
+    if (!d || d.parts.length !== changes.length || ranges.length !== changes.length) return null;
+    const parts = [];
+    for (let i = 0; i < changes.length; i++) {
+      const c = changes[i], p = d.parts[i], n = c.to - c.from;
+      if (!ranges[i].empty || ranges[i].head !== p.to) return null;
+      if (tr.isUserEvent("delete.backward") && !c.insert && c.to === p.to) parts.push(p.insert ? { ...p, insert: Array.from(p.insert).slice(0, -1).join("") } : { ...p, from: Math.max(0, p.from - n) });
+      else if (tr.isUserEvent("delete.forward") && !c.insert && c.from === p.to) parts.push({ ...p, to: Math.min(st.doc.length, p.to + n) });
+      else if (tr.isUserEvent("input") && c.from === c.to && c.from === p.to) parts.push({ ...p, insert: p.insert + c.insert });
+      else return null;
+    }
+    return { ...d, parts };
+  }
+
+  // IME composition (CJK input, dead keys, phone keyboards): the browser owns the text being composed, so it goes
+  // into the editor as usual, but held back from co-editors and the disk (ctx.hold); when the composition ends the
+  // text is taken out again and typed once more, which suggest mode turns into a suggestion like any other typing.
+  let ime = null;   // {base: the text before, changes: what the composition did to it}
+  function endIme(view) {
+    const p = ime;
+    if (!p || !view || view.composing) return;
+    ime = null;
+    try {
+      view.dispatch({ changes: p.changes.invert(p.base), annotations: [bypass.of(true), S.Transaction.addToHistory.of(false)] });
+      if (view.state.doc.eq(p.base) && !p.changes.empty) view.dispatch({ changes: p.changes, userEvent: "input.type", scrollIntoView: true });
+    } finally {
+      ctx.hold?.(false);
+    }
+  }
 
   const filterTr = S.EditorState.transactionFilter.of((tr) => {
-    // Every change while suggesting becomes a suggestion: typing, undo and redo, commands, panels. Only what must go
-    // through does (accept, restore, reloads: the bypass annotation) and, in a co-editing room, changes without a
-    // user event, which are the other people's edits arriving (our own dispatches all carry one).
-    if (!suggesting || !tr.docChanged || tr.annotation(bypass) || (ctx.shared?.() && tr.annotation(S.Transaction.userEvent) == null)) return tr;
-    const st = tr.startState, d = st.field(draftField, false), sel = st.selection.main, changes = [];
+    // Every change while suggesting becomes a suggestion: typing, commands, panels. What goes through: edits that
+    // must (accept, restore, reloads: the bypass annotation), and changes the co-editing binding applies because
+    // the shared text already changed (another person's edit, a merge from disk: ctx.fromYjs, from the Yjs
+    // transaction in progress, so no guessing from missing user events).
+    if (!suggesting || !tr.docChanged || tr.annotation(bypass) || ctx.fromYjs?.()) return tr;
+    if (ime || ctx.view()?.composing || tr.isUserEvent("input.type.compose")) {
+      if (!ime) { ime = { base: tr.startState.doc, changes: tr.changes }; ctx.hold?.(true); }
+      else ime.changes = ime.changes.compose(tr.changes);
+      return tr;
+    }
+    const st = tr.startState, v = st.field(sugField, false), d = v?.draft ?? null, changes = [], now = Date.now();
+    if (!v) return tr;
     tr.changes.iterChanges((from, to, _f, _t, ins) => changes.push({ from, to, insert: ins.toString() }));
-    const c = changes[0], n = c.to - c.from;
-    let next = null;
-    if (changes.length === 1 && d && sel.empty && sel.head === d.to) {   // Keep extending the suggestion being typed.
-      if (tr.isUserEvent("delete.backward") && !c.insert) next = d.insert ? { ...d, insert: Array.from(d.insert).slice(0, -1).join("") } : { ...d, from: Math.max(0, d.from - n) };
-      else if (tr.isUserEvent("delete.forward") && !c.insert) next = { ...d, to: Math.min(st.doc.length, d.to + n) };
-      else if (tr.isUserEvent("input") && c.from === c.to && c.from === d.to) next = { ...d, insert: d.insert + c.insert };
+    let past = v.past, next = extend(d, changes, st, tr), sel;
+    const effects = [];
+    if (next) {   // One undo step per burst of typing.
+      if (now - v.at > UNDO_GROUP || past[past.length - 1]?.of !== d.id) past = pushStep(past, { draft: d, of: d.id });
+      sel = cursors(next.parts);
+    } else {
+      if (d) { const box = { d, doc: st.doc }; effects.push(finish.of(box)); past = sentStep(past, box); }
+      next = { id: ++draftIds, path: ctx.activePath(), parts: changes };
+      past = pushStep(past, { draft: null, of: next.id });
+      sel = cursors(changes);
     }
-    const done = [];
-    if (!next) {
-      if (d) done.push(d);
-      const path = ctx.activePath();
-      if (changes.length === 1) next = { ...c, path };
-      else done.push(...changes.map((x) => ({ ...x, path })));
-    }
-    if (next && next.from === next.to && !next.insert) next = null;
-    if (done.length) queueMicrotask(() => done.forEach((x) => commit(x, st.doc)));
-    return { effects: setDraft.of(next), selection: { anchor: next ? next.to : sel.head }, scrollIntoView: true };
+    next = live(next);
+    effects.push(setSug.of({ draft: next, past, future: [], at: now }));
+    return { effects, selection: sel, scrollIntoView: true };
   });
 
   let idle;
   const listener = V.EditorView.updateListener.of((u) => {
     if (u.docChanged) reanchorSoon();
-    const d = u.state.field(draftField, false);
-    if (!d) return;
+    for (const tr of u.transactions) for (const e of tr.effects) if (e.is(finish)) commit(e.value);
+    if (ime && !u.view.composing) setTimeout(() => endIme(ctx.view()), 0);
+    const d = draftOf(u.state);
+    if (!d || ime) return;
     const head = u.state.selection.main.head;
-    if (u.selectionSet && (head < d.from || head > d.to)) { flush(u.view); return; }   // Moved away: send it now.
-    if (u.startState.field(draftField, false) !== d) { clearTimeout(idle); idle = setTimeout(() => flush(ctx.view()), IDLE_COMMIT); }
+    if (u.selectionSet && !d.parts.some((p) => head >= p.from && head <= p.to)) { setTimeout(() => flush(ctx.view()), 0); return; }   // Moved away: send it now.
+    if (draftOf(u.startState) !== d) { clearTimeout(idle); idle = setTimeout(() => flush(ctx.view()), IDLE_COMMIT); }
   });
+  const imeEnd = V.EditorView.domEventHandlers({ compositionend: (_e, view) => { setTimeout(() => endIme(view), 0); return false; } });
 
   /** Send the suggestion being typed, if any (before a tab switch, on idle, when suggest mode goes off). */
   function flush(view = ctx.view()) {
     clearTimeout(idle);
-    const d = view?.state.field(draftField, false);
+    if (!view) return;
+    if (ime) endIme(view);
+    const v = view.state.field(sugField, false), d = v?.draft;
     if (!d) return;
-    view.dispatch({ effects: setDraft.of(null) });
-    commit(d, view.state.doc);
+    const box = { d, doc: view.state.doc };
+    view.dispatch({ effects: [setSug.of({ ...v, draft: null, past: sentStep(v.past, box) }), finish.of(box)] });
   }
 
-  async function commit(d, doc) {
-    const anchor = makeAnchor(doc.toString(), d.from, d.to);
-    if (anchor.quote === d.insert) return;
-    const item = { id: "tmp" + ++temp, path: d.path, anchor, insert: d.insert, name: ctx.me().name, mine: true, time: Date.now() / 1000 };
+  /** Send a finished draft; box.item is the saved suggestion afterwards (undo withdraws it), box.dead if nothing came of it. */
+  async function commit(box) {
+    const text = box.doc.toString();
+    const parts = box.d.parts.map((p) => ({ anchor: makeAnchor(text, p.from, p.to), insert: p.insert }));
+    if (parts.every((p) => p.anchor.quote === p.insert)) { box.dead = true; return; }
+    const [first, ...more] = parts, path = box.d.path;
+    const body = { path, anchor: first.anchor, insert: first.insert, ...(more.length ? { more } : {}) };
+    const item = { id: "tmp" + ++temp, ...body, name: ctx.me().name, mine: true, time: Date.now() / 1000 };
     data.suggestions.push(item);
     redraw();
     try {
-      const r = await send({ op: "suggest", path: d.path, anchor, insert: d.insert });
+      const r = await send({ op: "suggest", ...body });
+      box.item = r.item;
       data.suggestions = data.suggestions.map((s) => (s === item ? r.item : s));
     } catch (e) {
+      box.dead = true;
       data.suggestions = data.suggestions.filter((s) => s !== item);
       ctx.toast(`Suggestion not saved: ${e.message}`);
     }
     redraw();
   }
+
+  // ---- suggest mode's undo and redo: your own drafts and suggestions only, never the shared text ------------------
+  function undo(view) {
+    if (!suggesting || !view) return false;
+    if (ime) return true;
+    let v = view.state.field(sugField, false);
+    while (v?.past.length && v.past[v.past.length - 1].sent?.dead) v = { ...v, past: v.past.slice(0, -1) };   // never saved
+    const step = v?.past[v.past.length - 1];
+    if (!step) { ctx.live("Nothing to undo in suggest mode"); return true; }
+    const past = v.past.slice(0, -1);
+    if ("draft" in step) {
+      view.dispatch({ effects: setSug.of({ ...v, draft: step.draft, past, future: [...v.future, { draft: v.draft, of: step.of }], at: 0 }), ...(step.draft ? { selection: cursors(step.draft.parts) } : {}) });
+      ctx.live(step.draft ? "Suggestion shortened" : "Suggestion removed");
+      return true;
+    }
+    const box = step.sent;
+    if (!box.item) { ctx.toast("That suggestion is still being saved; undo again in a moment."); return true; }
+    view.dispatch({ effects: setSug.of({ ...v, past, future: [...v.future, { sent: box }] }) });
+    send({ op: "reject", ids: [box.item.id] }).then(() => { ctx.live("Suggestion withdrawn"); load(); },
+      (e) => { box.dead = true; ctx.toast(`Not withdrawn: ${e.message}`); });
+    return true;
+  }
+
+  function redo(view) {
+    if (!suggesting || !view) return false;
+    if (ime) return true;
+    const v = view.state.field(sugField, false), step = v?.future[v.future.length - 1];
+    if (!step || step.sent?.dead) { ctx.live("Nothing to redo in suggest mode"); return true; }
+    const future = v.future.slice(0, -1);
+    if ("draft" in step) {
+      view.dispatch({ effects: setSug.of({ ...v, draft: step.draft, past: pushStep(v.past, { draft: v.draft, of: step.of }), future, at: 0 }), ...(step.draft ? { selection: cursors(step.draft.parts) } : {}) });
+      return true;
+    }
+    // A withdrawn suggestion comes back with the same text, found again by its anchors.
+    const old = step.sent.item, box = { d: null, item: null };
+    view.dispatch({ effects: setSug.of({ ...v, past: pushStep(v.past, { sent: box }), future }) });
+    const body = { path: old.path, anchor: old.anchor, insert: old.insert, ...(old.more ? { more: old.more } : {}) };
+    send({ op: "suggest", ...body }).then((r) => { box.item = r.item; ctx.live("Suggestion restored"); load(); },
+      (e) => { box.dead = true; ctx.toast(`Suggestion not restored: ${e.message}`); });
+    return true;
+  }
+  const undoKeys = S.Prec.high(V.keymap.of([
+    { key: "Mod-z", run: undo, preventDefault: true },
+    { key: "Mod-y", run: redo, preventDefault: true },
+    { key: "Mod-Shift-z", run: redo, preventDefault: true },
+  ]));
 
   function setSuggest(on) {
     if (!ctx.canEdit) return;
@@ -259,10 +382,8 @@ export function reviewSupport(S, V, ctx) {
       await ctx.openFile(path, 0, { noFocus: true });
       const view = ctx.view();
       if (ctx.activePath() !== path) { failed.push(...items); continue; }
-      const text = view.state.doc.toString();
-      const edits = items.map((s) => { const at = locate(text, s.anchor); if (!at) failed.push(s); return at && { ...at, insert: s.insert, s }; }).filter(Boolean);
-      const { ok, clash } = disjoint(edits);
-      failed.push(...clash.map((e) => e.s));
+      const { ok, failed: missed } = placeGroups(view.state.doc.toString(), items);   // a group applies whole or not at all
+      failed.push(...missed);
       if (ok.length) view.dispatch({ changes: ok.map(({ from, to, insert }) => ({ from, to, insert })), annotations: bypass.of(true), userEvent: "input.review" });
     }
     if (failed.length) await send({ op: "release", ids: failed.map((s) => s.id) }).catch(() => {});   // Back as they were: same id and author.
@@ -341,13 +462,17 @@ export function reviewSupport(S, V, ctx) {
   function suggestionNode(s) {
     const li = el("li", { className: "rv-item" + (s.id === activeId ? " active" : "") });
     li.dataset.id = s.id;
-    const change = el("p", { className: "rv-change" },
-      ...(s.anchor.quote ? [el("del", { textContent: clip(s.anchor.quote) })] : []),
-      ...(s.anchor.quote && s.insert ? [" "] : []),
-      ...(s.insert ? [el("ins", { textContent: clip(s.insert) })] : []));
-    change.setAttribute("aria-label", s.anchor.quote && s.insert ? `Replace "${clip(s.anchor.quote, 80)}" with "${clip(s.insert, 80)}"` : s.insert ? `Insert "${clip(s.insert, 80)}"` : `Delete "${clip(s.anchor.quote, 80)}"`);
+    const parts = partsOf(s);
+    const changes = parts.map(({ anchor: { quote }, insert }) => {
+      const shown = el("span", {}, ...(quote ? [el("del", { textContent: clip(quote) })] : []), ...(quote && insert ? [" "] : []),
+        ...(insert ? [el("ins", { textContent: clip(insert) })] : []));
+      shown.setAttribute("aria-hidden", "true");
+      const say = quote && insert ? `Replace "${clip(quote, 80)}" with "${clip(insert, 80)}"` : insert ? `Insert "${clip(insert, 80)}"` : `Delete "${clip(quote, 80)}"`;
+      return el("p", { className: "rv-change" }, el("span", { className: "sr", textContent: say }), shown);
+    });
     const pending = String(s.id).startsWith("tmp");
-    li.append(el("div", { className: "rv-head" }, where(s), el("span", { className: "rv-who" }, el("b", { textContent: s.name }), stamp(s.time))), change);
+    li.append(el("div", { className: "rv-head" }, where(s), el("span", { className: "rv-who" }, el("b", { textContent: s.name }), stamp(s.time))),
+      ...(parts.length > 1 ? [el("p", { className: "mute rv-group", textContent: `One edit in ${parts.length} places, accepted or rejected together:` })] : []), ...changes);
     if (ctx.canEdit) {
       const yes = btn("Accept", () => decide([s.id], true)), no = btn(s.mine ? "Withdraw" : "Reject", () => decide([s.id], false));
       yes.disabled = no.disabled = pending;
@@ -406,7 +531,7 @@ export function reviewSupport(S, V, ctx) {
   }
 
   return {
-    extension: [itemsField, draftField, filterTr, listener, gutter],
+    extension: [itemsField, sugField, filterTr, listener, imeEnd, undoKeys, gutter],
     bypass, mount, load, changed, refresh, flush, startComment, setSuggest, focusItem,
     get suggesting() { return suggesting; },
     reset() { data = { threads: [], suggestions: [], moderator: false }; activeId = null; composing = null; replyOpen.clear(); render(); },

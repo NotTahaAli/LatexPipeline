@@ -116,4 +116,51 @@ for (const leader of [true, false]) {
   assert.deepEqual(ok.map((e) => e.from), [0, 3, 5]);
   assert.deepEqual(clash.map((e) => e.from), [6]);
 }
+// 9. Grouped suggestions (one multi-cursor edit): placed whole or not at all, never half applied.
+{
+  const { makeAnchor, partsOf, placeGroups } = await import(pathToFileURL(path.join(path.dirname(path.resolve(process.argv[2])), "anchors.js")).href);
+  const text = "alpha beta gamma delta epsilon zeta";
+  const part = (word, insert) => { const at = text.indexOf(word); return { anchor: makeAnchor(text, at, at + word.length), insert }; };
+  const group = { id: "g", ...part("alpha", "ALPHA"), more: [part("gamma", "GAMMA"), part("epsilon", "EPSILON")] };
+  assert.deepEqual(partsOf(group).map((p) => p.insert), ["ALPHA", "GAMMA", "EPSILON"]);
+  assert.deepEqual(partsOf({ id: "s", ...part("beta", "B") }).length, 1);
+  const moved = "Intro: " + text;
+  let r = placeGroups(moved, [group]);
+  assert.deepEqual(r.ok.map((e) => moved.slice(e.from, e.to)), ["alpha", "gamma", "epsilon"], "every part found after the text moved");
+  assert.deepEqual(r.failed, []);
+  const gone = text.replace("gamma", "GAM");   // one part's text is gone: the whole group stays open
+  assert.deepEqual(placeGroups(gone, [group]), { ok: [], failed: [group] });
+  const single = { id: "s", ...part("gamma", "G") };   // overlaps the group's second part: the later item fails whole
+  r = placeGroups(text, [group, single]);
+  assert.deepEqual(r.failed, [single]);
+  assert.equal(r.ok.length, 3);
+  r = placeGroups(text, [single, group]);
+  assert.deepEqual(r.failed, [group]);
+  assert.deepEqual(r.ok.map((e) => e.item.id), ["s"]);
+  const other = { id: "o", ...part("zeta", "Z") };
+  r = placeGroups(text, [group, other]);
+  assert.deepEqual(r.ok.map((e) => e.from), [...r.ok.map((e) => e.from)].sort((a, b) => a - b), "document order");
+  assert.equal(r.ok.length, 4);
+}
+// 10. hold(): while an IME composition is in suggest mode, nothing goes out or to disk and remote edits wait.
+{
+  writes = 0;
+  const { room } = make({ read: async () => ({ text: "room text", version: "1", eol: "\n" }), write: async () => { writes++; return { version: "2" }; } });
+  await room.becomeLeader();
+  room.ready = true;
+  room.hold(true);
+  room.ytext.doc.t = "room text composing";
+  room.touch(); await wait(30);
+  assert.equal(writes, 0, "saved while composing");
+  await room.save();
+  assert.equal(writes, 0);
+  room.onRemote("AAAA");
+  assert.equal(room.held.remote.length, 1, "remote update applied during a composition");
+  room.ytext.doc.t = "room text";   // the composition was taken out again
+  room.hold(false);
+  assert.equal(room.held, null);
+  room.ytext.doc.t = "room text, typed later";
+  room.touch(); await wait(30);
+  assert.equal(writes, 1, "saving resumes after the composition");
+}
 console.log("collab ok");

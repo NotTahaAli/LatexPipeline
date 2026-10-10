@@ -6,6 +6,9 @@ text by offsets plus the quoted text and a little context on each side (see serv
 survives edits elsewhere and is found again after the text moves. Nothing here touches the document: accepting a
 suggestion only claims it (removes it, once); the editor that claimed it applies the edit through its open
 document, like every other edit, so co-editing rooms stay consistent.
+
+A suggestion is one change {anchor, insert}, or a group made by one multi-cursor edit: the first range in anchor and
+insert, the others in "more" ([{anchor, insert}], in document order). A group is accepted or rejected as a whole.
 """
 
 from __future__ import annotations
@@ -22,7 +25,8 @@ MAX_THREADS = 1000
 MAX_SUGGESTIONS = 2000
 MAX_COMMENTS = 200  # per thread
 MAX_TEXT = 4000  # a comment
-MAX_INSERT = 20000  # a suggestion's new text
+MAX_INSERT = 20000  # a suggestion's new text (all of its parts together)
+MAX_PARTS = 200  # ranges of one grouped suggestion (one multi-cursor edit)
 MAX_QUOTE = 20000  # the anchored text
 MAX_CONTEXT = 64
 MAX_OFFSET = 4 * 1024 * 1024
@@ -54,6 +58,25 @@ def anchor(value) -> dict:
     return {"from": start, "to": end, "quote": _text(value.get("quote"), MAX_QUOTE, "selection", True),
             "prefix": _text(value.get("prefix", ""), MAX_CONTEXT, "anchor", True),
             "suffix": _text(value.get("suffix", ""), MAX_CONTEXT, "anchor", True)}
+
+
+def suggestion_parts(args: dict) -> list:
+    """The validated ranges of a suggestion: [{anchor, insert}], in document order and not overlapping."""
+    more = args.get("more") or []
+    if not isinstance(more, list) or len(more) >= MAX_PARTS:
+        raise ReviewError(f"A suggestion has at most {MAX_PARTS} parts.")
+    parts = [{"anchor": anchor(p.get("anchor") if isinstance(p, dict) else None),
+              "insert": _text(p.get("insert", "") if isinstance(p, dict) else None, MAX_INSERT, "suggestion", True)}
+             for p in [args, *more]]
+    if sum(len(p["insert"]) for p in parts) > MAX_INSERT:
+        raise ReviewError(f"Bad suggestion (up to {MAX_INSERT} characters).")
+    if all(p["anchor"]["quote"] == p["insert"] for p in parts):
+        raise ReviewError("That suggestion changes nothing.")
+    for a, b in zip(parts, parts[1:]):
+        x, y = a["anchor"], b["anchor"]
+        if y["from"] < x["to"] or y["from"] == x["to"] == x["from"] == y["to"]:
+            raise ReviewError("The parts of a suggestion must be in order and must not overlap.")
+    return parts
 
 
 class Review:
@@ -165,12 +188,11 @@ class Review:
                 if len(suggestions) >= MAX_SUGGESTIONS:
                     raise ReviewError(f"This document has {MAX_SUGGESTIONS} open suggestions; accept or reject some.",
                                       409)
-                spot = anchor(args.get("anchor"))
-                insert = _text(args.get("insert", ""), MAX_INSERT, "suggestion", True)
-                if spot["quote"] == insert:
-                    raise ReviewError("That suggestion changes nothing.")
-                item = {"id": secrets.token_hex(6), "path": args["path"], "anchor": spot, "insert": insert,
+                parts = suggestion_parts(args)
+                item = {"id": secrets.token_hex(6), "path": args["path"], **parts[0],
                         "author": who["key"], "name": who["name"], "time": now}
+                if len(parts) > 1:
+                    item["more"] = parts[1:]
                 suggestions.append(item)
                 result = {"item": item}
             elif op in ("accept", "reject", "release"):
@@ -199,6 +221,11 @@ class Review:
                 moved = 0
                 for entry in items:
                     target = by_id.get(entry.get("id")) if isinstance(entry, dict) else None
+                    part = entry.get("part", 0) if target is not None else 0
+                    if part:  # a later range of a grouped suggestion
+                        more = target.get("more") or []
+                        ok = isinstance(part, int) and not isinstance(part, bool) and 0 < part <= len(more)
+                        target = more[part - 1] if ok else None
                     if target is not None:
                         spot = anchor(entry.get("anchor"))
                         if len(spot["quote"]) > len(target["anchor"]["quote"]):

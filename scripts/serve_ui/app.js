@@ -9,6 +9,7 @@ import { addBibLookup } from "./bib.js";
 import { refsPanel } from "./refs.js";
 import { aiPanel } from "./ai.js";
 import { reviewSupport } from "./review.js";
+import { namedLinks } from "./links.js";
 import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
 
@@ -48,6 +49,7 @@ const config = await api.config().catch(() => ({ role: "owner" }));
 const role = config.role, readOnly = role === "view";
 const me = store.json("user", null) || (() => { const u = { name: "Guest " + (100 + Math.floor(Math.random() * 900)), color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }; store.set("user", u); return u; })();
 if (!me.key) { me.key = Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join(""); store.set("user", me); }   // marks your own review comments on link shares
+if (config.name) me.name = config.name;   // a named link or an account: the server's name is the one others see
 
 // ---- toast ------------------------------------------------------------------------------
 function toast(...kids) { const t = $("toast"); t.replaceChildren(...kids); t.hidden = false; clearTimeout(t.t); t.t = setTimeout(() => t.hidden = true, 5000); }
@@ -70,8 +72,11 @@ const REV = reviewSupport(S, V, {
   api, el, icon, canEdit: !readOnly, doc: () => cur, me: () => me, view: () => view,
   activePath: () => (active?.kind === "text" ? active.path : null), openFile: (p, line, opts) => openFile(p, line, opts),
   showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
-  onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(), shared: () => !!active?.collab,
+  onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
+  fromYjs: () => !!active?.collab?.yTx,
+  hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
 });
+let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
 function toggleSuggest() {
   if (readOnly) return;
   REV.setSuggest(!REV.suggesting);
@@ -119,8 +124,6 @@ function extensionsFor(tab) {
     spellC.of(spellAttr()),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
-      // Shared undo changes the Yjs text directly, past suggest mode's filter: not while suggesting.
-      ...(room ? ["Mod-z", "Mod-y", "Mod-Shift-z"].map((key) => ({ key, run: () => REV.suggesting && (toast(el("span", { textContent: "Undo is off in suggest mode: withdraw the suggestion in the Review tab instead." })), true) })) : []),
       ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
     ]),
     SR.search({ top: true }),
@@ -390,6 +393,7 @@ async function saveTab(tab, opts) {
   if (!tab || tab.kind !== "text" || tab.saving) return;
   if (tab.collab) return tab.collab.save(opts);
   clearTimeout(autosaveTimer);
+  if (imeHold && tab === active) { scheduleAutosave(); return; }   // text being composed in suggest mode is not saved
   const doc = tab === active ? view.state.doc : tab.state.doc;
   if (!tab.dirty && !tab.conflict) return;
   tab.saving = true; tab.error = null; showSaveState();
@@ -1365,8 +1369,8 @@ async function refreshShare() {
   setSharing(!!info.on);
   if ($("share").open && info.on && info.status === "starting") shareTimer = setTimeout(refreshShare, 1000);
 }
-function linkRow(label, url, note) {
-  const input = el("input", { type: "text", readOnly: true, value: url, id: "link-" + label.split(" ")[0].toLowerCase() });
+function linkRow(label, url, note, id = "link-" + label.split(" ")[0].toLowerCase()) {
+  const input = el("input", { type: "text", readOnly: true, value: url, id });
   input.setAttribute("aria-label", label);
   const copy = el("button", { type: "button", className: "btn", textContent: "Copy", onclick: async () => {
     try { await navigator.clipboard.writeText(url); copy.textContent = "Copied"; } catch { input.select(); copy.textContent = "Press Ctrl+C"; }
@@ -1394,13 +1398,14 @@ function renderShare(info) {
     const notes = [info.provider === "ngrok" && "ngrok's free plan shows a warning page first; visitors click Visit Site once.", info.provider === "localtunnel" && "localtunnel may ask visitors for a tunnel password (your public IP)."].filter(Boolean);
     body.replaceChildren(
       el("p", { textContent: `Sharing ${info.doc || "the document"} through ${info.provider}.` }),
-      linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline."),
-      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it."),
+      linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline. Anyone with it picks their own name, shown as unverified."),
+      linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Names are unverified too."),
+      namedLinks(info, { el, api, linkRow, refresh: refreshShare }),
       el("p", { className: "caution" }, el("b", { textContent: "Share edit links only with people you trust." }), " Shell escape stays off, but LuaLaTeX can still run code on this computer."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
       el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }),
       el("div", { className: "actions" },
-        el("button", { type: "button", className: "btn", id: "shareRegen", textContent: "New links", title: "Revoke both links and make new ones", onclick: async () => { if (confirm("Everyone using the current links loses access. Make new links?")) { await api.shareRegenerate(); refreshShare(); } } }),
+        el("button", { type: "button", className: "btn", id: "shareRegen", textContent: "New links", title: "Revoke the view and edit links above and make new ones (named links stay)", onclick: async () => { if (confirm("Everyone using the view and edit links loses access. Named links keep working. Make new links?")) { await api.shareRegenerate(); refreshShare(); } } }),
         el("button", { type: "button", className: "btn danger", id: "shareStop", textContent: "Stop sharing", onclick: async () => { await api.shareStop(); refreshShare(); } })));
   }
 }
@@ -1413,7 +1418,7 @@ else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSh
 if (role !== "owner") {
   const chip = $("roleChip");
   chip.hidden = false; chip.className = "role " + role;
-  chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: readOnly ? "View only" : "Can edit" }));
+  chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: (readOnly ? "View only" : "Can edit") + (config.name && !config.hosted ? ` as ${config.name}` : "") }));
   chip.title = config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
     : readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
   chip.tabIndex = 0;
