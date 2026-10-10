@@ -2240,7 +2240,7 @@ class VendoredUi(ServerCase):
         body, needed = vendor_ui.rewrite("https://esm.sh/a@1/x.mjs",
             b'import"/node/p.mjs";export*from"../b.mjs";import("@codemirror/state")')
         self.assertEqual(needed, ["https://esm.sh/node/p.mjs", "https://esm.sh/b.mjs"])
-        self.assertIn(f'"/ui/vendor/{vendor_ui.local_name(needed[1])}"'.encode(), body)
+        self.assertIn(f'"./{vendor_ui.local_name(needed[1])}"'.encode(), body)
         self.assertIn(b'import("@codemirror/state")', body)
         css, needed = vendor_ui.rewrite("https://cdn/d/k.css",
             b'@font-face{src:url(fonts/a.woff2) format("woff2"),url(fonts/a.woff) format("woff"),'

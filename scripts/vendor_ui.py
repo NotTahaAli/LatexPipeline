@@ -46,7 +46,7 @@ def rewrite(url: str, body: bytes) -> tuple[bytes, list[str]]:
         target = urljoin(url, spec)
         if target not in needed:
             needed.append(target)
-        return f"/ui/vendor/{local_name(target)}"
+        return f"./{local_name(target)}"  # all files sit in one folder: relative works under any path prefix
 
     if url.endswith(".css"):
         text = CSS_FALLBACK.sub("", text)
