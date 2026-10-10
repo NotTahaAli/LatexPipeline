@@ -74,6 +74,19 @@ class Pure(unittest.TestCase):
         self.assertEqual(throttle.wait("k", now=2000), 0)  # the window passed
         self.assertEqual(throttle.wait("other", now=40), 0)
 
+    def test_ip_keys_group_ipv6_by_64(self):
+        self.assertEqual(host.ip_key("2001:db8:1:2:aaaa::1"), host.ip_key("2001:db8:1:2:bbbb::9"))
+        self.assertNotEqual(host.ip_key("2001:db8:1:2::1"), host.ip_key("2001:db8:1:3::1"))
+        self.assertEqual(host.ip_key("203.0.113.7"), "203.0.113.7")
+        self.assertEqual(host.ip_key("::ffff:203.0.113.7"), "203.0.113.7")
+        self.assertEqual(host.ip_key("not an ip"), "not an ip")
+        throttle = host.Throttle(2, 3600)
+        throttle.fail("k", now=0)
+        self.assertFalse(throttle.full("k", now=1))
+        throttle.fail("k", now=1)
+        self.assertTrue(throttle.full("k", now=100))
+        self.assertFalse(throttle.full("k", now=3602))
+
     def test_names_emails_and_slugs(self):
         self.assertEqual(host.norm_email("  Ada@Example.ORG "), "ada@example.org")
         for bad in ("", "ada", "a@b", "a b@c.d", "x" * 250 + "@a.bc"):
@@ -534,6 +547,12 @@ class Workspaces(HostCase):
         tenants = solo.call("GET", "/api/me")[1]["user"]["tenants"]
         self.assertEqual([(t["name"], t["role"]) for t in tenants], [("Solo's workspace", "admin")])
         self.assertEqual(Client(self).call("POST", "/api/signup", body)[0], 409)
+        self.app.signups = host.Throttle(2, 3600)  # signups_per_ip_hour = 2
+        for n in range(2):
+            Client(self).call("POST", "/api/signup", {**body, "email": f"x{n}@y.org"})
+        self.assertEqual(Client(self).call("POST", "/api/signup", {**body, "email": "x9@y.org"})[0], 429)
+        with self.assertRaises(host.HttpError):  # one workspace per person
+            host.personal_tenant(self.app, self.app.db.one("SELECT id FROM users WHERE email = 'x0@y.org'")["id"], "X")
 
     def test_members_roles_and_last_admin(self):
         admin = self.client("admin@a.org")
@@ -618,6 +637,80 @@ class Workspaces(HostCase):
         self.assertEqual(self.client().login("viewer@a.org", "brand-new-pass")[0], 200)
 
 
+class WorkerPool(HostCase):
+    """Starting outside the lock, one start per project, and fair-share eviction when the server is full."""
+
+    def setUp(self):
+        super().setUp()
+        self.spawned: list[str] = []
+        self.gates: dict[str, threading.Event] = {}
+
+        def spawn(project):
+            self.spawned.append(project["id"])
+            gate = self.gates.get(project["id"])
+            if gate:
+                gate.wait(10)
+            return mock.Mock(poll=lambda: None, pid=0), 1, "s"
+
+        mock.patch.object(self.app.workers, "_spawn", spawn).start()
+        mock.patch.object(host.Workers, "_kill", staticmethod(lambda w: None)).start()
+
+    @staticmethod
+    def project(pid, tenant):
+        return {"id": pid, "tenant_id": tenant, "slug": "doc"}
+
+    def test_a_slow_start_blocks_only_its_own_project(self):
+        self.gates["p1"] = threading.Event()
+        got = []
+        first = threading.Thread(target=lambda: got.append(self.app.workers.acquire(self.project("p1", "a"))))
+        second = threading.Thread(target=lambda: got.append(self.app.workers.acquire(self.project("p1", "a"))))
+        first.start()
+        time.sleep(0.1)
+        second.start()
+        other = self.app.workers.acquire(self.project("p2", "a"))  # does not wait for p1
+        self.assertEqual(other.project["id"], "p2")
+        self.assertEqual(got, [])
+        self.gates["p1"].set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(len(got), 2)
+        self.assertIs(got[0], got[1])
+        self.assertEqual(self.spawned.count("p1"), 1)
+        self.assertEqual(got[0].active, 2)
+
+    def test_full_server_evicts_from_the_tenant_with_the_most_workers(self):
+        self.app.save_settings({"max_workers": 2, "max_workers_per_tenant": 2})
+        workers = self.app.workers
+        a1 = workers.acquire(self.project("a1", "A"))
+        workers.acquire(self.project("a2", "A"))
+        a1.used -= 100  # least recently active
+        workers.acquire(self.project("b1", "B"))  # busy everywhere: A gives one up
+        self.assertEqual(sorted(workers.running), ["a2", "b1"])
+        with self.assertRaises(host.HttpError) as busy:  # B has its share already; A keeps its last one
+            workers.acquire(self.project("b2", "B"))
+        self.assertEqual(busy.exception.status, 503)
+        workers.acquire(self.project("c1", "C"))  # C has none: one of the others gives one up
+        self.assertEqual(len(workers.running), 2)
+        self.assertIn("c1", workers.running)
+        self.assertIn("worker_evicted", [r["action"] for r in self.app.db.all("SELECT action FROM audit")])
+
+    def test_idle_workers_go_first_and_a_failed_start_is_not_kept(self):
+        self.app.save_settings({"max_workers": 1})
+        idle = self.app.workers.acquire(self.project("a1", "A"))
+        self.app.workers.release(idle)
+        self.app.workers.acquire(self.project("b1", "B"))
+        self.assertEqual(list(self.app.workers.running), ["b1"])
+        with mock.patch.object(self.app.workers, "_spawn", side_effect=host.HttpError(502, "no")):
+            with self.assertRaises(host.HttpError):
+                self.app.workers.acquire(self.project("b2", "B"))  # evicts nothing: b1 is busy and B's only one
+        with mock.patch.object(self.app.workers, "_spawn", side_effect=OSError("boom")), \
+                mock.patch("traceback.print_exc"):
+            self.app.save_settings({"max_workers": 2})
+            with self.assertRaises(host.HttpError):
+                self.app.workers.acquire(self.project("c1", "C"))
+        self.assertEqual(list(self.app.workers.running), ["b1"])
+
+
 class Upstream(threading.Thread):
     """A fake worker that answers every request with what it received."""
 
@@ -658,7 +751,9 @@ class Proxy(HostCase):
 
     def fake_worker(self, port, secret="w" * 43):
         project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
-        worker = host.Worker(project, mock.Mock(poll=lambda: None), port, secret)
+        worker = host.Worker(project)
+        worker.proc, worker.port, worker.secret = mock.Mock(poll=lambda: None), port, secret
+        worker.ready.set()
         mock.patch.object(self.app.workers, "acquire", lambda p: worker).start()
         mock.patch.object(self.app.workers, "release", lambda w: None).start()
         return worker
@@ -695,6 +790,24 @@ class Proxy(HostCase):
         self.app.save_settings({"max_project_mb": 1})
         big = "x" * (1024 * 1024 + 10)
         self.assertEqual(editor.call("PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex", {"text": big})[0], 507)
+
+    def test_open_streams_per_user_are_capped(self):
+        upstream = Upstream()
+        upstream.start()
+        self.addCleanup(upstream.sock.close)
+        self.fake_worker(upstream.port)
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        editor = self.client("ed@x.org")
+        self.app.streams[uid] = self.app.config["max_streams_per_user"]
+        self.assertEqual(editor.call("GET", f"/p/{self.pid}/api/poll?cid=a")[0], 429)
+        self.assertEqual(editor.call("GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 200)  # not a stream
+        self.assertEqual(self.client("vi@x.org").call("GET", f"/p/{self.pid}/api/poll?cid=b")[0], 200)
+        self.app.streams[uid] -= 1
+        self.assertEqual(editor.call("GET", f"/p/{self.pid}/api/poll?cid=a")[0], 200)
+        deadline = time.monotonic() + 5  # The handler gives its slot back just after the response.
+        while self.app.streams[uid] != self.app.config["max_streams_per_user"] - 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.app.streams[uid], self.app.config["max_streams_per_user"] - 1)
 
     def real_worker(self):
         """serve.py's gateway handler in this process, standing in for a worker."""

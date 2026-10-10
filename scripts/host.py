@@ -24,6 +24,7 @@ import getpass
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -361,9 +362,26 @@ class Throttle:
             if len(self.hits) > 100000:  # Memory stays bounded under a spray of addresses.
                 self.hits = {k: v for k, v in self.hits.items() if v}
 
+    def full(self, key: str, now: float | None = None) -> bool:
+        """`limit` hits inside the window already: a hard cap, no backoff."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            return len(self._recent(key, now)) >= self.limit
+
     def clear(self, key: str) -> None:
         with self.lock:
             self.hits.pop(key, None)
+
+
+def ip_key(ip: str) -> str:
+    """The throttling key of a client address: IPv6 by /64 (one subscriber usually holds a whole /64)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6 and addr.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(getattr(addr, "ipv4_mapped", None) or addr)
 
 
 # ---------------------------------------------------------------------------
@@ -510,16 +528,19 @@ def folder_bytes(root: Path) -> int:
 # ---------------------------------------------------------------------------
 
 class Worker:
-    def __init__(self, project: dict, proc: subprocess.Popen, port: int, secret: str) -> None:
-        self.project, self.proc, self.port, self.secret = project, proc, port, secret
+    def __init__(self, project: dict) -> None:
+        self.project, self.proc, self.port, self.secret = project, None, 0, ""
         self.active = 0
         self.used = time.monotonic()
+        self.ready = threading.Event()  # set once started (or failed: error)
+        self.error: HttpError | None = None
 
 
 class Workers:
     """
     Start on first use, stop after the idle timeout, cap how many run (globally and per tenant). A worker builds
-    one document at a time, so these caps also bound concurrent builds.
+    one document at a time, so these caps also bound concurrent builds. Starting and stopping happen outside the
+    lock: a placeholder entry makes other requests for the same project wait for that start only.
     """
 
     def __init__(self, app: App) -> None:
@@ -528,37 +549,86 @@ class Workers:
         self.running: dict[str, Worker] = {}
 
     def acquire(self, project: dict) -> Worker:
-        # ponytail: starting a worker holds the lock (a second or two); per-project locks if that ever queues.
+        victims: list[Worker] = []
         with self.lock:
             worker = self.running.get(project["id"])
-            if worker is not None and worker.proc.poll() is not None:
+            if worker is not None and worker.ready.is_set() and (worker.error or worker.proc.poll() is not None):
                 del self.running[project["id"]]
                 worker = None
-            if worker is None:
-                self._make_room(project["tenant_id"])
-                worker = self.running[project["id"]] = self._spawn(project)
+            start = worker is None
+            if start:
+                victims = self._make_room(project["tenant_id"])
+                worker = self.running[project["id"]] = Worker(project)
             worker.active += 1
             worker.used = time.monotonic()
-            return worker
+        for victim in victims:
+            self._kill(victim)
+        if start:
+            try:
+                worker.proc, worker.port, worker.secret = self._spawn(project)
+            except HttpError as exc:
+                worker.error = exc
+            except Exception:  # noqa: BLE001 - waiters must never see a half-made worker.
+                traceback.print_exc()
+                worker.error = HttpError(502, "The project's editor did not start. The server log says why.")
+            finally:
+                worker.ready.set()
+            with self.lock:
+                closed = worker.error is None and self.running.get(project["id"]) is not worker
+                if closed:
+                    worker.error = HttpError(503, "The project was closed while it started. Try again.")
+                elif worker.error is not None and self.running.get(project["id"]) is worker:
+                    del self.running[project["id"]]
+            if closed:
+                self._kill(worker)
+        elif not worker.ready.wait(40):
+            self.release(worker)
+            raise HttpError(503, "The project's editor is still starting. Try again in a moment.")
+        if worker.error is not None:
+            self.release(worker)
+            raise worker.error
+        return worker
 
     def release(self, worker: Worker) -> None:
         with self.lock:
             worker.active -= 1
             worker.used = time.monotonic()
 
-    def _make_room(self, tenant: str) -> None:
+    def _make_room(self, tenant: str) -> list[Worker]:
+        """Take workers out of `running` until one more fits; returns them for the caller to stop (lock held)."""
         settings = self.app.settings()
-        for scope, limit in ((tenant, settings["max_workers_per_tenant"]), (None, settings["max_workers"])):
-            while True:
-                pool = [w for w in self.running.values() if scope is None or w.project["tenant_id"] == scope]
-                if len(pool) < limit:
-                    break
-                idle = sorted((w for w in pool if w.active == 0), key=lambda w: w.used)
-                if not idle:
-                    raise HttpError(503, "The server is busy (too many open projects). Try again in a minute.")
-                self._stop(idle[0])
+        victims: list[Worker] = []
 
-    def _spawn(self, project: dict) -> Worker:
+        def pool(scope: str | None) -> list[Worker]:
+            return [w for w in self.running.values() if scope is None or w.project["tenant_id"] == scope]
+
+        def evict(worker: Worker) -> None:
+            victims.append(self.running.pop(worker.project["id"]))
+
+        while len(pool(tenant)) >= settings["max_workers_per_tenant"]:
+            idle = sorted((w for w in pool(tenant) if w.active == 0), key=lambda w: w.used)
+            if not idle:
+                raise HttpError(503, "Your workspace has too many projects open right now. Try again in a minute.")
+            evict(idle[0])
+        while len(pool(None)) >= settings["max_workers"]:
+            idle = sorted((w for w in pool(None) if w.active == 0), key=lambda w: w.used)
+            if idle:
+                evict(idle[0])
+                continue
+            # Everything is busy. Fair share: the workspace holding the most workers gives up its least recently
+            # active one, but a workspace that already has one never takes another's last one.
+            started = [w for w in pool(None) if w.ready.is_set()]
+            counts = collections.Counter(w.project["tenant_id"] for w in started)
+            if not counts:
+                raise HttpError(503, "The server is busy (too many open projects). Try again in a minute.")
+            top = max(counts, key=lambda t: (counts[t], t != tenant))
+            if counts[top] <= 1 and counts.get(tenant, 0) >= 1:
+                raise HttpError(503, "The server is busy (too many open projects). Try again in a minute.")
+            evict(min((w for w in started if w.project["tenant_id"] == top), key=lambda w: w.used))
+            audit_log(self.app, "worker_evicted", None, None, top, "server full; fair share")
+        return victims
+
+    def _spawn(self, project: dict) -> tuple[subprocess.Popen, int, str]:
         root = self.app.project_root(project)
         home = root / ".home"
         home.mkdir(parents=True, exist_ok=True)
@@ -595,11 +665,11 @@ class Workers:
             build.kill_tree(proc)
             raise HttpError(502, "The project's editor did not start. The server log says why.")
         audit_log(self.app, "worker_started", None, None, project["tenant_id"], project["id"])
-        return Worker(project, proc, found["port"], secret)
+        return proc, found["port"], secret
 
-    def _stop(self, worker: Worker) -> None:
-        self.running.pop(worker.project["id"], None)
-        if worker.proc.poll() is None:
+    @staticmethod
+    def _kill(worker: Worker) -> None:
+        if worker.proc is not None and worker.proc.poll() is None:
             if os.name != "nt":
                 try:
                     os.killpg(worker.proc.pid, 15)
@@ -608,24 +678,23 @@ class Workers:
                     pass
             build.kill_tree(worker.proc)
 
-    def stop(self, project_id: str) -> None:
+    def _stop_where(self, test) -> None:
         with self.lock:
-            worker = self.running.get(project_id)
-            if worker:
-                self._stop(worker)
+            gone = [self.running.pop(pid) for pid, w in list(self.running.items()) if test(w)]
+        for worker in gone:
+            self._kill(worker)
+
+    def stop(self, project_id: str) -> None:
+        self._stop_where(lambda w: w.project["id"] == project_id)
 
     def stop_all(self) -> None:
-        with self.lock:
-            for worker in list(self.running.values()):
-                self._stop(worker)
+        self._stop_where(lambda w: True)
 
     def reap(self) -> None:
         idle = self.app.settings()["worker_idle_minutes"] * 60
         now = time.monotonic()
-        with self.lock:
-            for worker in list(self.running.values()):
-                if worker.proc.poll() is not None or (worker.active == 0 and now - worker.used > idle):
-                    self._stop(worker)
+        self._stop_where(lambda w: w.ready.is_set() and (
+            w.error is not None or w.proc.poll() is not None or (w.active == 0 and now - w.used > idle)))
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +712,10 @@ class App:
         self.cookie = "__Host-lp_session" if self.https else "lp_session"
         self.login_ip, self.login_account = Throttle(20), Throttle(5)
         self.codes = Throttle(5)  # TOTP / recovery codes per account
-        self.signups = Throttle(10, 3600)  # signups and invite lookups per IP
+        self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
+        self.invite_tries = Throttle(10, 3600)  # wrong invite links per address
+        self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
+        self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
         self.discovery: dict[str, tuple[float, dict]] = {}
 
@@ -726,6 +798,9 @@ def create_tenant(app: App, name: str, admin: int | None = None) -> str:
 
 
 def personal_tenant(app: App, user_id: int, name: str) -> str:
+    """A new account's own workspace: one per person, and only for someone in no workspace yet."""
+    if app.db.one("SELECT 1 FROM members WHERE user_id = ?", user_id):
+        raise HttpError(409, "You already have a workspace.")
     limit = app.settings()["max_tenants"]
     if limit and app.db.one("SELECT COUNT(*) AS n FROM tenants")["n"] >= limit:
         raise HttpError(403, "This server has reached its limit of workspaces. Ask the administrator for an invite.")
@@ -983,6 +1058,7 @@ class Handler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             self.query = parse_qs(url.query)
             self.ip = self.client_ip()
+            self.ip_group = ip_key(self.ip)
             self.session = self.load_session()
             if url.path.startswith("/p/"):
                 self.project_proxy(url.path, url.query)
@@ -1074,6 +1150,22 @@ class Handler(BaseHTTPRequestHandler):
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
                 raise HttpError(507, f"This project is over its {limit // 1048576} MB quota. Delete files first.")
+        stream = upgrade or rest in ("/api/poll", "/events")
+        if stream:
+            with APP.streams_lock:
+                if APP.streams[self.session["id"]] >= APP.config["max_streams_per_user"]:
+                    raise HttpError(429, "Too many open editor tabs. Close some and reload.")
+                APP.streams[self.session["id"]] += 1
+        try:
+            self.relay(project, pid, rest, query, role, upgrade, size)
+        finally:
+            if stream:
+                with APP.streams_lock:
+                    APP.streams[self.session["id"]] -= 1
+                    if APP.streams[self.session["id"]] <= 0:
+                        del APP.streams[self.session["id"]]
+
+    def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
         worker = APP.workers.acquire(project)
         upstream = None
         try:
@@ -1108,7 +1200,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.append("Strict-Transport-Security: max-age=63072000")
             self.wfile.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1") + body)
             if switching:
-                self.pump(upstream, pid, role)
+                self.pump(upstream, pid, role, worker)
                 return
             while True:
                 chunk = upstream.recv(65536)
@@ -1124,7 +1216,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.command != "GET" and rest in QUOTA_PATHS:
                 APP.sizes.pop(project["id"], None)
 
-    def pump(self, upstream: socket.socket, pid: str, role: str) -> None:
+    def pump(self, upstream: socket.socket, pid: str, role: str, worker: Worker) -> None:
         """
         Relay a WebSocket both ways until either side closes. Blocking sendall is the backpressure: while one side
         does not read, we stop reading from the other. Every RECHECK seconds the session and role are checked again,
@@ -1153,7 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not data:
                     return
                 (upstream if sock is client else client).sendall(data)
-                traffic = now
+                traffic = worker.used = now  # Fair-share eviction picks the least recently active worker.
 
 
 def session_for(id_hash: str) -> dict | None:
@@ -1277,7 +1369,7 @@ def api_logout(h: Handler) -> None:
 @route("POST", r"/api/signup", "anon")
 def api_signup(h: Handler) -> None:
     data = h.json_body()
-    if APP.signups.wait(h.ip):
+    if APP.signups.full(h.ip_group):
         raise HttpError(429, "Too many sign-ups from your network. Try again later.")
     email, name = norm_email(data.get("email")), clean_name(data.get("name"))
     password = check_password_rules(data.get("password"))
@@ -1290,7 +1382,7 @@ def api_signup(h: Handler) -> None:
             raise HttpError(403, f"This invite is for {found['email']}.")
     else:
         signup_allowed(APP, email, verified=False)
-    APP.signups.fail(h.ip)
+    APP.signups.fail(h.ip_group)
     # An invite sent to this exact address counts as proof of it (for linking sign-in providers later).
     uid = create_user(APP, email, name, password, verified=bool(invite and found["email"]))
     user = APP.db.one("SELECT * FROM users WHERE id = ?", uid)
@@ -1321,12 +1413,12 @@ def api_reset(h: Handler) -> None:
 
 @route("GET", r"/api/invites/([A-Za-z0-9_-]{10,100})", "anon")
 def api_invite_info(h: Handler, token: str) -> None:
-    if APP.signups.wait("invite:" + h.ip):
+    if APP.invite_tries.wait(h.ip_group):
         raise HttpError(429, "Too many tries. Try again later.")
     row = APP.db.one("SELECT i.*, t.name AS tenant FROM invites i JOIN tenants t ON t.id = i.tenant_id "
                      "WHERE token_hash = ?", token_hash(token))
     if not row or row["used"] or row["expires"] < time.time():
-        APP.signups.fail("invite:" + h.ip)
+        APP.invite_tries.fail(h.ip_group)
         raise HttpError(410, "This invite link is not valid any more. Ask for a new one.")
     h.ok({"tenant": row["tenant"], "role": row["role"], "email": row["email"]})
 
@@ -1950,6 +2042,9 @@ def oauth_signup(h: Handler, name: str, flow: dict, ident: dict, email: str) -> 
             raise HttpError(410, "This invite link is not valid any more. Ask for a new one.")
     else:
         signup_allowed(APP, email, verified=True)
+    if APP.signups.full(h.ip_group):
+        raise HttpError(429, "Too many sign-ups from your network. Try again later.")
+    APP.signups.fail(h.ip_group)
     try:
         display = clean_name(ident.get("name") or email.split("@")[0])
     except HttpError:
