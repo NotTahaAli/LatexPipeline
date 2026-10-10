@@ -1343,15 +1343,14 @@ class Handler(BaseHTTPRequestHandler):
                               cfg["daily_total"] - n["total"]))
 
         def record(usage: dict) -> None:
-            """Tokens billed; a request Anthropic billed nothing for (refused before an answer, unreachable, bad
-            request, limits) is given back, so it does not use up the daily count."""
-            if usage.get("input") or usage.get("output"):
-                APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
-                           "WHERE day = ? AND user_id = ? AND tenant_id = ?",
-                           usage["input"], usage["output"], day, uid, tid)
-            else:
-                APP.db.run("UPDATE ai_usage SET requests = requests - 1 "
-                           "WHERE day = ? AND user_id = ? AND tenant_id = ? AND requests > 0", day, uid, tid)
+            """Settle the reservation made with the count: the billed tokens replace ai.MAX_TOKENS of output. A
+            request Anthropic billed nothing for (refused before an answer, unreachable, bad request, limits) is
+            given back whole, so it does not use up the daily count."""
+            billed = bool(usage.get("input") or usage.get("output"))
+            APP.db.run("UPDATE ai_usage SET requests = MAX(0, requests - ?), input_tokens = input_tokens + ?, "
+                       "output_tokens = MAX(0, output_tokens + ?) WHERE day = ? AND user_id = ? AND tenant_id = ?",
+                       0 if billed else 1, usage.get("input", 0), usage.get("output", 0) - ai.MAX_TOKENS,
+                       day, uid, tid)
 
         reason = ("View-only members cannot use the assistant." if role != "edit"
                   else "The AI assistant is off on this server." if not on
@@ -1377,8 +1376,10 @@ class Handler(BaseHTTPRequestHandler):
         with APP.db.tx():  # count first: a slow request uses up its share while it runs (record() may give it back)
             if not left():
                 raise HttpError(429, "The daily AI limit is reached; try again tomorrow.")
-            APP.db.run("INSERT INTO ai_usage(day, user_id, tenant_id, requests) VALUES (?, ?, ?, 1) "
-                       "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1", day, uid, tid)
+            # Reserve a whole reply's output while it runs, so parallel requests cannot overrun the token budget.
+            APP.db.run("INSERT INTO ai_usage(day, user_id, tenant_id, requests, output_tokens) VALUES (?, ?, ?, 1, ?) "
+                       "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1, "
+                       "output_tokens = output_tokens + excluded.output_tokens", day, uid, tid, ai.MAX_TOKENS)
         if "stream" in self.query:
             self.assistant_stream(data, key, cfg["model"], record)
             return
