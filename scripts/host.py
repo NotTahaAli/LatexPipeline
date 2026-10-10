@@ -39,6 +39,8 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import zipfile
 import zlib
 from http.cookies import SimpleCookie
@@ -1244,7 +1246,8 @@ def api_signup(h: Handler) -> None:
     else:
         signup_allowed(APP, email, verified=False)
     APP.signups.fail(h.ip)
-    uid = create_user(APP, email, name, password)
+    # An invite sent to this exact address counts as proof of it (for linking sign-in providers later).
+    uid = create_user(APP, email, name, password, verified=bool(invite and found["email"]))
     user = APP.db.one("SELECT * FROM users WHERE id = ?", uid)
     audit_log(APP, "signup", uid, h.ip, detail=email)
     if invite:
@@ -1645,6 +1648,269 @@ def api_admin_totp_off(h: Handler, uid: str) -> None:
         APP.db.run("UPDATE users SET totp_secret = NULL, totp_pending = NULL WHERE id = ?", int(uid))
         APP.db.run("DELETE FROM recovery_codes WHERE user_id = ?", int(uid))
     audit_log(APP, "totp_removed_by_admin", h.user["id"], h.ip, detail=f"user {uid}")
+    h.ok()
+
+
+# ---------------------------------------------------------------------------
+# Sign-in with OIDC providers (Google, any issuer) and GitHub: authorization code + PKCE + state (+ nonce)
+# ---------------------------------------------------------------------------
+#
+# The ID token comes straight from the token endpoint over TLS (certificate and host name checked), which OIDC
+# Core 3.1.3.7 (6) accepts instead of checking its signature; iss, aud (azp), exp, iat and nonce are checked here.
+
+GITHUB = {"authorize": "https://github.com/login/oauth/authorize", "token": "https://github.com/login/oauth/access_token",
+          "user": "https://api.github.com/user", "emails": "https://api.github.com/user/emails"}
+FLOW_COOKIE = "lp_oauth"
+FLOW_SECONDS = 600
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # A provider endpoint that redirects is an error, never a hop to somewhere else.
+
+
+def http_json(method: str, url: str, form: dict | None = None, headers: dict | None = None):
+    """One HTTPS request to a sign-in provider, JSON back. The only outbound network call host.py makes."""
+    if not url.startswith("https://"):
+        raise HttpError(502, "Sign-in provider endpoints must use https.")
+    request = urllib.request.Request(url, data=urlencode(form).encode() if form is not None else None, method=method,
+                                     headers={"Accept": "application/json", "User-Agent": "latex-host",
+                                              **(headers or {})})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(request, timeout=10) as res:
+            raw = res.read(1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        raise HttpError(502, f"The sign-in provider refused the request (HTTP {exc.code}).")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise HttpError(502, f"Could not reach the sign-in provider: {exc}")
+    if len(raw) > 1024 * 1024:
+        raise HttpError(502, "The sign-in provider sent too much data.")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise HttpError(502, "The sign-in provider did not answer with JSON.")
+
+
+def provider_secret(name: str, provider: dict) -> str:
+    secret = provider.get("client_secret") or os.environ.get(str(provider.get("client_secret_env") or ""), "")
+    if not secret:
+        raise HttpError(500, f"Sign-in with {name} has no client secret (client_secret_env in config.toml).")
+    return secret
+
+
+def discover(name: str, provider: dict) -> dict:
+    """The issuer's /.well-known/openid-configuration, cached for an hour; its issuer must be the configured one."""
+    when, meta = APP.discovery.get(name, (0.0, {}))
+    if time.monotonic() - when < 3600:
+        return meta
+    issuer = provider["issuer"]
+    meta = http_json("GET", issuer.rstrip("/") + "/.well-known/openid-configuration")
+    if not isinstance(meta, dict) or meta.get("issuer") != issuer:
+        raise HttpError(502, f"{name}: the discovery document names another issuer.")
+    for key in ("authorization_endpoint", "token_endpoint"):
+        if not str(meta.get(key, "")).startswith("https://"):
+            raise HttpError(502, f"{name}: the discovery document has no https {key}.")
+    APP.discovery[name] = (time.monotonic(), meta)
+    return meta
+
+
+def jwt_claims(token) -> dict:
+    try:
+        claims = json.loads(unb64(str(token).split(".")[1]))
+    except (IndexError, ValueError):
+        raise HttpError(502, "The sign-in provider sent a malformed ID token.")
+    if not isinstance(claims, dict):
+        raise HttpError(502, "The sign-in provider sent a malformed ID token.")
+    return claims
+
+
+def check_claims(claims: dict, issuer: str, client_id: str, nonce: str, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    audience = claims.get("aud")
+    audiences = [audience] if isinstance(audience, str) else audience if isinstance(audience, list) else []
+    problems = [
+        (claims.get("iss") != issuer, "issuer"),
+        (client_id not in audiences or (len(audiences) > 1 and claims.get("azp") != client_id), "audience"),
+        (not isinstance(claims.get("exp"), (int, float)) or claims["exp"] < now - 60, "expiry"),
+        (isinstance(claims.get("iat"), (int, float)) and claims["iat"] > now + 300, "issue time"),
+        (not hmac.compare_digest(str(claims.get("nonce", "")).encode(), nonce.encode()), "nonce"),
+        (not isinstance(claims.get("sub"), str) or not 0 < len(claims["sub"]) <= 255, "subject"),
+    ]
+    bad = [what for failed, what in problems if failed]
+    if bad:
+        raise HttpError(400, f"The sign-in could not be verified ({', '.join(bad)}). Try again.")
+
+
+def oidc_identity(name: str, provider: dict, flow: dict, code: str) -> dict:
+    meta = discover(name, provider)
+    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri(name),
+            "code_verifier": flow["verifier"]}
+    secret = provider_secret(name, provider)
+    methods = meta.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
+    headers = {}
+    if "client_secret_basic" in methods:
+        pair = f"{quote(provider['client_id'], safe='')}:{quote(secret, safe='')}"
+        headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
+    else:
+        form.update(client_id=provider["client_id"], client_secret=secret)
+    tokens = http_json("POST", meta["token_endpoint"], form, headers)
+    if not isinstance(tokens, dict) or not tokens.get("id_token"):
+        raise HttpError(502, f"{name} sent no ID token.")
+    claims = jwt_claims(tokens["id_token"])
+    check_claims(claims, meta["issuer"], provider["client_id"], flow["nonce"])
+    if "email" not in claims or "email_verified" not in claims:
+        if not str(meta.get("userinfo_endpoint", "")).startswith("https://") or not tokens.get("access_token"):
+            raise HttpError(502, f"{name} did not say which email address you use.")
+        info = http_json("GET", meta["userinfo_endpoint"], None,
+                         {"Authorization": f"Bearer {tokens['access_token']}"})
+        if not isinstance(info, dict) or info.get("sub") != claims["sub"]:
+            raise HttpError(502, f"{name}: the user info belongs to someone else.")
+        claims = {**info, **{k: v for k, v in claims.items() if k in ("sub",)}}
+    return {"subject": claims["sub"], "email": claims.get("email"),
+            "verified": claims.get("email_verified") in (True, "true"), "name": claims.get("name")}
+
+
+def github_identity(name: str, provider: dict, flow: dict, code: str) -> dict:
+    tokens = http_json("POST", GITHUB["token"], {
+        "client_id": provider["client_id"], "client_secret": provider_secret(name, provider), "code": code,
+        "redirect_uri": redirect_uri(name), "code_verifier": flow["verifier"]})
+    if not isinstance(tokens, dict) or not tokens.get("access_token"):
+        raise HttpError(400, f"GitHub refused the sign-in: {str((tokens or {}).get('error_description', ''))[:200]}")
+    auth = {"Authorization": f"Bearer {tokens['access_token']}", "Accept": "application/vnd.github+json"}
+    user = http_json("GET", GITHUB["user"], None, auth)
+    emails = http_json("GET", GITHUB["emails"], None, auth)
+    primary = next((e for e in emails if isinstance(e, dict) and e.get("primary") and e.get("verified") is True),
+                   None) if isinstance(emails, list) else None
+    if not isinstance(user, dict) or not isinstance(user.get("id"), int) or not primary:
+        raise HttpError(403, "Your GitHub account needs a verified primary email address.")
+    return {"subject": str(user["id"]), "email": primary.get("email"), "verified": True,
+            "name": user.get("name") or user.get("login")}
+
+
+def redirect_uri(name: str) -> str:
+    return f"{APP.config['public_url']}/auth/{name}/callback"
+
+
+@route("GET", r"/auth/([a-z0-9-]{1,30})/start", "anon")
+def auth_start(h: Handler, name: str) -> None:
+    provider = APP.config["providers"].get(name)
+    if not provider:
+        raise HttpError(404, "Unknown sign-in provider.")
+    intent = (h.query.get("intent") or ["login"])[0]
+    invite = (h.query.get("invite") or [""])[0]
+    if intent not in ("login", "link") or (invite and not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", invite)):
+        raise HttpError(400, "Bad sign-in request.")
+    if intent == "link" and not (h.session and h.session["stage"] == "full"):
+        raise HttpError(401, "Sign in first.")
+    state, nonce, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(16), secrets.token_urlsafe(48)
+    APP.db.run("INSERT INTO oauth_flows VALUES (?, ?, ?, ?, ?, ?, ?, ?)", token_hash(state), name, verifier, nonce,
+               intent, h.session["id"] if intent == "link" else None, invite or None, time.time())
+    params = {"response_type": "code", "client_id": provider["client_id"], "redirect_uri": redirect_uri(name),
+              "state": state, "code_challenge": b64(hashlib.sha256(verifier.encode()).digest()),
+              "code_challenge_method": "S256"}
+    if provider["type"] == "github":
+        endpoint, params["scope"] = GITHUB["authorize"], "read:user user:email"
+    else:
+        endpoint = discover(name, provider)["authorization_endpoint"]
+        params.update(scope="openid email profile", nonce=nonce)
+    joiner = "&" if "?" in endpoint else "?"
+    h.redirect(endpoint + joiner + urlencode(params), [h.set_cookie(FLOW_COOKIE, state, FLOW_SECONDS, "/auth/")])
+
+
+@route("GET", r"/auth/([a-z0-9-]{1,30})/callback", "anon")
+def auth_callback(h: Handler, name: str) -> None:
+    clear = h.set_cookie(FLOW_COOKIE, "", 0, "/auth/")
+    try:
+        target = finish_sign_in(h, name)
+    except HttpError as exc:
+        audit_log(APP, "oauth_failed", h.session["id"] if h.session else None, h.ip, detail=f"{name}: {exc.message}")
+        h.redirect("/#error=" + quote(exc.message), [clear])
+        return
+    h.redirect(target, [clear, *([h.pending_cookie] if h.pending_cookie else [])])
+
+
+def finish_sign_in(h: Handler, name: str) -> str:
+    provider = APP.config["providers"].get(name)
+    if not provider:
+        raise HttpError(404, "Unknown sign-in provider.")
+    if h.query.get("error"):
+        raise HttpError(400, f"{name} said: {h.query['error'][0][:100]}")
+    state, code = (h.query.get("state") or [""])[0], (h.query.get("code") or [""])[0]
+    expected = h.cookie_value(FLOW_COOKIE) or ""
+    if not state or not code or not hmac.compare_digest(state.encode(), expected.encode()):
+        raise HttpError(400, "This sign-in was started in another browser or has expired. Try again.")
+    with APP.db.tx():  # One use only.
+        flow = APP.db.one("SELECT * FROM oauth_flows WHERE state_hash = ? AND provider = ?", token_hash(state), name)
+        APP.db.run("DELETE FROM oauth_flows WHERE state_hash = ?", token_hash(state))
+    if not flow or flow["created"] < time.time() - FLOW_SECONDS:
+        raise HttpError(400, "This sign-in has expired. Try again.")
+    ident = (github_identity if provider["type"] == "github" else oidc_identity)(name, provider, flow, code)
+    if not ident.get("verified"):
+        raise HttpError(403, f"Your email address at {name} is not verified. Verify it there first.")
+    email = norm_email(ident.get("email"))
+    linked = APP.db.one("SELECT user_id FROM identities WHERE provider = ? AND subject = ?", name, ident["subject"])
+    if flow["intent"] == "link":
+        if not h.session or h.session["stage"] != "full" or h.session["id"] != flow["user_id"]:
+            raise HttpError(403, "Sign in again, then connect the account.")
+        if linked and linked["user_id"] != h.session["id"]:
+            raise HttpError(409, f"This {name} account is already connected to another user.")
+        if not linked:
+            add_identity(name, ident["subject"], h.session["id"], email, h.ip)
+        return "/#account"
+    if linked:
+        user = APP.db.one("SELECT * FROM users WHERE id = ?", linked["user_id"])
+    else:
+        user = APP.db.one("SELECT * FROM users WHERE email = ?", email)
+        if user:
+            if not (APP.settings()["auto_link"] and user["email_verified"]):
+                raise HttpError(409, f"An account for {email} already exists. Sign in with its password, then "
+                                     f"connect {name} on your account page.")
+            add_identity(name, ident["subject"], user["id"], email, h.ip)
+        else:
+            user = oauth_signup(h, name, flow, ident, email)
+    if user["disabled"]:
+        raise HttpError(403, "This account is disabled.")
+    h.start_session(user, "mfa" if user["totp_secret"] else "full")
+    return "/"
+
+
+def add_identity(name: str, subject: str, user_id: int, email: str, ip: str) -> None:
+    APP.db.run("INSERT INTO identities VALUES (?, ?, ?, ?, ?)", name, subject, user_id, email, time.time())
+    audit_log(APP, "identity_linked", user_id, ip, detail=name)
+
+
+def oauth_signup(h: Handler, name: str, flow: dict, ident: dict, email: str) -> dict:
+    """A new account from a provider: through the invite the flow carried, else as the sign-up mode allows."""
+    invite = flow["invite"]
+    if invite:
+        found = APP.db.one("SELECT * FROM invites WHERE token_hash = ?", token_hash(invite))
+        if not found or found["used"] or found["expires"] < time.time():
+            raise HttpError(410, "This invite link is not valid any more. Ask for a new one.")
+    else:
+        signup_allowed(APP, email, verified=True)
+    try:
+        display = clean_name(ident.get("name") or email.split("@")[0])
+    except HttpError:
+        display = email.split("@")[0][:80]
+    uid = create_user(APP, email, display, None, verified=True)
+    add_identity(name, ident["subject"], uid, email, h.ip)
+    audit_log(APP, "signup", uid, h.ip, detail=f"{email} via {name}")
+    user = APP.db.one("SELECT * FROM users WHERE id = ?", uid)
+    if invite:
+        use_invite(APP, invite, user, h.ip)
+    else:
+        personal_tenant(APP, uid, display)
+    return user
+
+
+@route("DELETE", r"/api/account/identities/([a-z0-9-]{1,30})")
+def api_unlink(h: Handler, name: str) -> None:
+    others = APP.db.one("SELECT COUNT(*) AS n FROM identities WHERE user_id = ? AND provider != ?", h.user["id"],
+                        name)["n"]
+    if not h.user["pw_hash"] and not others:
+        raise HttpError(409, "Set a password first: otherwise you could not sign in any more.")
+    APP.db.run("DELETE FROM identities WHERE user_id = ? AND provider = ?", h.user["id"], name)
+    audit_log(APP, "identity_unlinked", h.user["id"], h.ip, detail=name)
     h.ok()
 
 

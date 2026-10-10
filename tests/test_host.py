@@ -151,8 +151,18 @@ class ZipSafety(unittest.TestCase):
 
 
 class Client:
+    """A browser, roughly: a cookie jar (paths ignored), the CSRF token from the last JSON that had one."""
+
     def __init__(self, case: HostCase) -> None:
-        self.case, self.cookie, self.csrf = case, None, None
+        self.case, self.jar, self.csrf = case, {}, None
+
+    @property
+    def cookie(self) -> str | None:
+        return "; ".join(f"{k}={v}" for k, v in self.jar.items()) or None
+
+    @cookie.setter
+    def cookie(self, value: str | None) -> None:
+        self.jar = dict(pair.split("=", 1) for pair in (value or "").split("; ") if "=" in pair)
 
     def call(self, method, path, body=None, raw=None, headers=None, origin=True, ctype="application/json"):
         conn = http.client.HTTPConnection("127.0.0.1", self.case.port, timeout=15)
@@ -172,10 +182,12 @@ class Client:
         res = conn.getresponse()
         data = res.read()
         conn.close()
-        cookie = res.getheader("Set-Cookie")
-        if cookie:
-            pair = cookie.split(";")[0]
-            self.cookie = None if "Max-Age=0" in cookie else pair
+        for cookie in res.headers.get_all("Set-Cookie") or []:
+            name, value = cookie.split(";")[0].split("=", 1)
+            if "Max-Age=0" in cookie:
+                self.jar.pop(name, None)
+            else:
+                self.jar[name] = value
         try:
             data = json.loads(data)
         except ValueError:
@@ -720,6 +732,222 @@ class Proxy(HostCase):
         self.assertNotIn(self.pid, self.app.workers.running)
         self.assertIsNotNone(worker.proc.wait(10))
         self.assertTrue((self.app.project_root({"tenant_id": self.tenant, "id": self.pid}) / ".home").is_dir())
+
+
+REAL_HTTP_JSON = host.http_json
+
+
+def fake_jwt(claims: dict) -> str:
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")  # noqa: E731
+    return f"{enc({'alg': 'RS256'})}.{enc(claims)}.c2ln"
+
+
+class Provider:
+    """Stands in for http_json: an OIDC issuer at https://id.example and GitHub's API."""
+
+    def __init__(self, case):
+        self.case, self.calls = case, []
+        self.claims: dict = {}
+        self.meta = {"issuer": "https://id.example", "authorization_endpoint": "https://id.example/auth",
+                     "token_endpoint": "https://id.example/token", "userinfo_endpoint": "https://id.example/userinfo"}
+        self.github_emails = [{"email": "gh@x.org", "primary": True, "verified": True}]
+
+    def __call__(self, method, url, form=None, headers=None):
+        self.calls.append((method, url, form, headers))
+        if url.endswith("/.well-known/openid-configuration"):
+            return self.meta
+        if url == "https://id.example/token":
+            return {"id_token": fake_jwt(self.claims), "access_token": "at"}
+        if url == "https://id.example/userinfo":
+            return {"sub": self.claims["sub"], "email": "late@x.org", "email_verified": True}
+        if url == host.GITHUB["token"]:
+            return {"access_token": "gh-token"}
+        if url == host.GITHUB["user"]:
+            return {"id": 42, "login": "octo", "name": "Octo Cat"}
+        if url == host.GITHUB["emails"]:
+            return self.github_emails
+        raise AssertionError(url)
+
+
+class SignInProviders(HostCase):
+    def extra_config(self):
+        return {"providers": {
+            "idp": {"type": "oidc", "issuer": "https://id.example", "client_id": "cid", "client_secret": "shh"},
+            "github": {"type": "github", "client_id": "gid", "client_secret": "gsh"}}}
+
+    def setUp(self):
+        super().setUp()
+        self.provider = Provider(self)
+        self.overrides: dict = {}
+        mock.patch.object(host, "http_json", self.provider).start()
+        self.app.save_settings({"signup_mode": "open"})
+
+    def start(self, client, name="idp", query=""):
+        status, _, res = client.call("GET", f"/auth/{name}/start{query}")
+        self.assertEqual(status, 302)
+        location = res.getheader("Location")
+        params = {k: v[0] for k, v in host.parse_qs(host.urlsplit(location).query).items()}
+        return location, params
+
+    def finish(self, client, params, name="idp", code="the-code", state=None):
+        nonce = params.get("nonce")
+        self.provider.claims = {"iss": "https://id.example", "aud": "cid", "exp": time.time() + 300,
+                                "iat": time.time(), "nonce": nonce, "sub": "user-1", "email": "Ann@X.org",
+                                "email_verified": True, "name": "Ann", **self.overrides}
+        self.overrides = {}
+        status, _, res = client.call("GET", f"/auth/{name}/callback?code={code}&state={state or params['state']}")
+        self.assertEqual(status, 302)
+        client.call("GET", "/api/me")  # picks up the new CSRF token
+        return res.getheader("Location")
+
+    def test_oidc_sign_up_with_pkce_state_and_nonce(self):
+        client = Client(self)
+        location, params = self.start(client)
+        self.assertTrue(location.startswith("https://id.example/auth?"))
+        self.assertEqual((params["client_id"], params["code_challenge_method"], params["scope"]),
+                         ("cid", "S256", "openid email profile"))
+        self.assertEqual(params["redirect_uri"], f"{self.origin}/auth/idp/callback")
+        self.assertTrue(params["nonce"] and params["state"])
+        self.assertEqual(self.finish(client, params), "/")
+        me = client.call("GET", "/api/me")[1]["user"]
+        self.assertEqual((me["email"], me["name"], me["password"]), ("ann@x.org", "Ann", False))
+        self.assertEqual([t["role"] for t in me["tenants"]], ["admin"])  # open sign-up: own workspace
+        _, url, form, headers = next(c for c in self.provider.calls if c[1] == "https://id.example/token")
+        verifier = form["code_verifier"]
+        self.assertEqual(host.b64(host.hashlib.sha256(verifier.encode()).digest()), params["code_challenge"])
+        self.assertEqual(headers["Authorization"], "Basic " + base64.b64encode(b"cid:shh").decode())
+        # The same provider account signs in to the same user next time.
+        again = Client(self)
+        _, params = self.start(again)
+        self.finish(again, params)
+        self.assertEqual(again.call("GET", "/api/me")[1]["user"]["id"], me["id"])
+
+    def test_state_must_match_the_browser_and_flows_are_single_use(self):
+        client = Client(self)
+        _, params = self.start(client)
+        other = Client(self)  # e.g. an attacker's callback URL opened in the victim's browser
+        self.assertTrue(self.finish(other, params).startswith("/#error="))
+        self.assertIsNone(other.call("GET", "/api/me")[1]["user"])
+        self.assertEqual(self.finish(client, params), "/")
+        replay = Client(self)
+        replay.jar["lp_oauth"] = params["state"]
+        self.assertTrue(self.finish(replay, params).startswith("/#error="))  # the flow was used
+        wrong = Client(self)
+        _, fresh = self.start(wrong)
+        self.assertTrue(self.finish(wrong, fresh, state="x" * 43).startswith("/#error="))
+        self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM users")["n"], 1)
+
+    def test_bad_claims_are_refused(self):
+        bad = {"iss": {"iss": "https://evil.example"}, "aud": {"aud": "someone-else"},
+               "azp": {"aud": ["cid", "other"], "azp": "other"}, "exp": {"exp": time.time() - 3600},
+               "nonce": {"nonce": "replayed"}, "unverified": {"email_verified": False},
+               "string false": {"email_verified": "false"}}
+        for name, claims in bad.items():
+            with self.subTest(name=name):
+                client = Client(self)
+                _, params = self.start(client)
+                self.overrides = claims
+                self.assertTrue(self.finish(client, params).startswith("/#error="), name)
+                self.assertIsNone(client.call("GET", "/api/me")[1]["user"])
+        self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM users")["n"], 0)
+
+    def test_userinfo_fills_a_missing_email_and_discovery_issuer_is_checked(self):
+        client = Client(self)
+        _, params = self.start(client)
+        claims = {"iss": "https://id.example", "aud": "cid", "exp": time.time() + 300, "nonce": params["nonce"],
+                  "sub": "user-9"}
+        with mock.patch.object(self.provider, "claims", claims):
+            status, _, res = client.call("GET", f"/auth/idp/callback?code=c&state={params['state']}")
+        self.assertEqual(res.getheader("Location"), "/")
+        self.assertEqual(self.app.db.one("SELECT email FROM users")["email"], "late@x.org")
+        self.app.discovery.clear()
+        self.provider.meta = {**self.provider.meta, "issuer": "https://evil.example"}
+        status, data, _ = Client(self).call("GET", "/auth/idp/start")
+        self.assertEqual(status, 502)
+
+    def test_existing_password_account_is_not_taken_over(self):
+        uid = self.user("ann@x.org")
+        client = Client(self)
+        _, params = self.start(client)
+        self.assertIn("already%20exists", self.finish(client, params))
+        self.app.save_settings({"auto_link": True})  # still refused: that account's email was never verified
+        client = Client(self)
+        _, params = self.start(client)
+        self.assertIn("already%20exists", self.finish(client, params))
+        # Linking from the account page (signed in with the password) works, then the provider signs in.
+        ann = self.client("ann@x.org")
+        _, params = self.start(ann, query="?intent=link")
+        self.assertEqual(self.finish(ann, params), "/#account")
+        self.assertEqual([i["provider"] for i in ann.call("GET", "/api/account")[1]["identities"]], ["idp"])
+        fresh = Client(self)
+        _, params = self.start(fresh)
+        self.finish(fresh, params)
+        self.assertEqual(fresh.call("GET", "/api/me")[1]["user"]["id"], uid)
+        self.assertEqual(Client(self).call("GET", "/auth/idp/start?intent=link")[0], 401)
+
+    def test_auto_link_for_verified_accounts_and_two_step_still_applies(self):
+        uid = self.user("ann@x.org", verified=True)
+        secret = host.new_totp_secret()
+        self.app.db.run("UPDATE users SET totp_secret = ? WHERE id = ?", secret, uid)
+        self.app.save_settings({"auto_link": True})
+        client = Client(self)
+        _, params = self.start(client)
+        self.assertEqual(self.finish(client, params), "/")
+        self.assertEqual(client.call("GET", "/api/me")[1]["stage"], "mfa")
+        code = host.totp_code(secret, int(time.time() // 30))
+        self.assertEqual(client.call("POST", "/api/login/code", {"code": code})[0], 200)
+
+    def test_invite_only_needs_an_invite(self):
+        self.app.save_settings({"signup_mode": "invite_only"})
+        client = Client(self)
+        _, params = self.start(client)
+        self.assertIn("invitation", self.finish(client, params))
+        tenant = host.create_tenant(self.app, "Club")
+        token = "t" * 32
+        self.app.db.run("INSERT INTO invites(token_hash, tenant_id, role, created, expires) VALUES (?, ?, ?, ?, ?)",
+                        host.token_hash(token), tenant, "viewer", time.time(), time.time() + 60)
+        client = Client(self)
+        _, params = self.start(client, query=f"?invite={token}")
+        self.assertEqual(self.finish(client, params), "/")
+        tenants = client.call("GET", "/api/me")[1]["user"]["tenants"]
+        self.assertEqual([(t["name"], t["role"]) for t in tenants], [("Club", "viewer")])
+
+    def test_open_domains_uses_the_verified_provider_email(self):
+        self.app.save_settings({"signup_mode": "open_domains", "signup_domains": ["corp.org"]})
+        client = Client(self)
+        _, params = self.start(client)
+        self.assertIn("domain", self.finish(client, params))
+        client = Client(self)
+        _, params = self.start(client)
+        self.overrides = {"email": "ann@corp.org"}
+        self.assertEqual(self.finish(client, params), "/")
+
+    def test_github(self):
+        client = Client(self)
+        location, params = self.start(client, "github")
+        self.assertTrue(location.startswith(host.GITHUB["authorize"]))
+        self.assertNotIn("nonce", params)
+        self.assertEqual(self.finish(client, params, "github"), "/")
+        me = client.call("GET", "/api/me")[1]["user"]
+        self.assertEqual((me["email"], me["name"]), ("gh@x.org", "Octo Cat"))
+        form = next(c[2] for c in self.provider.calls if c[1] == host.GITHUB["token"])
+        self.assertEqual((form["client_secret"], bool(form["code_verifier"])), ("gsh", True))
+        self.provider.github_emails = [{"email": "x@y.org", "primary": True, "verified": False}]
+        client = Client(self)
+        _, params = self.start(client, "github")
+        self.assertIn("verified", self.finish(client, params, "github"))
+
+    def test_unlink_keeps_a_way_in(self):
+        client = Client(self)
+        _, params = self.start(client)
+        self.finish(client, params)
+        self.assertEqual(client.call("DELETE", "/api/account/identities/idp")[0], 409)  # no password yet
+        self.assertEqual(client.call("POST", "/api/account/password", {"password": "now-a-password"})[0], 200)
+        self.assertEqual(client.call("DELETE", "/api/account/identities/idp")[0], 200)
+
+    def test_http_json_refuses_plain_http(self):
+        with self.assertRaises(host.HttpError):
+            REAL_HTTP_JSON("GET", "http://id.example/x")
 
 
 class Cli(unittest.TestCase):
