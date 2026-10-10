@@ -53,6 +53,9 @@ import hints
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 UI_DIR = Path(__file__).resolve().parent / "serve_ui"
 VENDOR_DIR = UI_DIR / "vendor"  # made by scripts/vendor_ui.py; when present the editor needs no CDN
+FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+FONT_FILES = ("fonts.css", "newsreader.woff2", "newsreader-italic.woff2", "source-sans-3.woff2",
+              "ibm-plex-mono-400.woff2", "ibm-plex-mono-500.woff2")  # the only files /fonts/ serves
 STARTED = time.time()
 
 STOP = threading.Event()
@@ -2336,17 +2339,26 @@ def localize(page: bytes) -> bytes:
 UNAUTHORIZED_PAGE = b"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Unauthorized - LaTeX Studio</title>
+<link rel="stylesheet" href="/fonts/fonts.css">
 <style>
-:root{--bg:#f4f5f7;--panel:#fff;--fg:#1f2328;--mute:#59636e;--line:#dfe3e8;--bad:#cf222e;color-scheme:light dark}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a20;--fg:#e6e9ee;--mute:#a1abb8;--line:#2b3039;--bad:#ff7b72}}
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);
-font:14px/1.45 system-ui,-apple-system,
-"Segoe UI",Roboto,sans-serif}
-main{max-width:420px;margin:16px;padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
-h1{margin:0 0 8px;font-size:18px}p{margin:0;color:var(--mute)}b{color:var(--bad)}
-</style></head><body><main><h1>Unauthorized</h1>
-<p><b>401.</b> Open the full share link you were sent, including the part after <code>?token=</code>.
-This address on its own does not grant access.</p>
+:root{--paper:#F6F3EB;--surface:#FFFDF8;--sunk:#EFEADF;--ink:#1C222C;--ink-2:#3A4250;--muted:#5A6170;--rule:#DCD4C4;
+--ox:#7A2430;--shadow:0 1px 0 rgba(28,34,44,.04),0 12px 32px -12px rgba(28,34,44,.18);color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--paper:#12161D;--surface:#1A1F28;--sunk:#151A22;--ink:#ECE6D9;--ink-2:#CFC8BA;
+--muted:#A3A8B2;--rule:#2B3240;--ox:#EBA2AC;--shadow:0 1px 0 rgba(0,0,0,.3),0 16px 40px -12px rgba(0,0,0,.6)}}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px 16px;
+box-sizing:border-box;background:var(--paper);color:var(--ink);font:14px/1.45 "Source Sans 3",system-ui,sans-serif}
+main{max-width:480px;width:100%;box-sizing:border-box;padding:36px 36px 30px;background:var(--surface);
+border:1px solid var(--rule);border-radius:10px;box-shadow:var(--shadow)}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--ox)}
+h1{font:600 30px/1.2 "Newsreader",Georgia,serif;letter-spacing:-.01em;margin:8px 0 12px}
+p{margin:0 0 18px;color:var(--ink-2);font-size:15px}
+code{font:13px "IBM Plex Mono",ui-monospace,monospace;background:var(--sunk);padding:1px 5px;border-radius:3px}
+hr{border:0;border-top:1px solid var(--rule);margin:0}p.note{margin:14px 0 0;color:var(--muted);font-size:13px}
+</style></head><body><main><div class="eyebrow">Error 401</div><h1>This document needs its full link</h1>
+<p>Open the share link you were sent, including the part after <code>?token=</code>.
+This address on its own does not grant access.</p><hr>
+<p class="note">If the link stopped working, the host may have stopped sharing or made new links.
+Ask them for a new one.</p>
 </main></body></html>
 """
 
@@ -2550,6 +2562,14 @@ class Handler(BaseHTTPRequestHandler):
                 if role_for_token(query["token"][0]):  # First visit through a link: keep the token in a cookie only.
                     self.reply(302, b"", "text/plain", {"Location": "/", **self.cookie(query["token"][0])})
                     return
+            if self.command == "GET" and url.path.startswith("/fonts/"):  # public files; the 401 page uses them too
+                name = url.path[7:]
+                if name in FONT_FILES:
+                    body = (FONTS_DIR / name).read_bytes()
+                    self.reply(200, body, STATIC_TYPES[Path(name).suffix])
+                else:
+                    self.reply(404, b"Not found", "text/plain")
+                return
             self.role = self.authenticate()
             if self.role is None:
                 if "text/html" in self.headers.get("Accept", "") and not url.path.startswith("/api/"):
