@@ -70,7 +70,7 @@ export function aiPanel(root, ctx) {
       save({ enabled: on.checked });
     };
     share.onchange = () => {
-      if (share.checked && !confirm("People with an edit link could then send text to Anthropic with your API key (up to 100 requests while this server runs). Allow it?")) { share.checked = false; return; }
+      if (share.checked && !confirm("People with an edit link could then send text to Anthropic with your API key (up to 20 an hour per visitor and 100 in all while this server runs). Allow it?")) { share.checked = false; return; }
       save({ share: share.checked });
     };
     model.onchange = () => save({ model: model.value });
@@ -91,23 +91,76 @@ export function aiPanel(root, ctx) {
   }
 
   // ---- requests ----------------------------------------------------------------------------------------------------
+  /** The checked reply. The answer text arrives through onText while the model writes; a stream that fails before
+   *  its first byte (an old server, a proxy that refuses it) falls back to the plain request. */
+  async function request(body, onText, signal) {
+    const plain = () => ctx.api.ai(ctx.doc(), body);
+    let res;
+    try { res = await ctx.api.aiStream(ctx.doc(), body, signal); } catch (e) { if (signal.aborted) throw e; return plain(); }
+    if (!res.ok) {
+      let data = null;
+      try { data = await res.json(); } catch { /* non-JSON error body */ }
+      throw Object.assign(new Error(data?.error || res.statusText), { status: res.status });
+    }
+    if (!(res.headers.get("Content-Type") || "").includes("ndjson")) return res.json();   // a server without streaming
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "", started = false;
+    for (;;) {
+      let chunk;
+      try { chunk = await reader.read(); } catch (e) { if (signal.aborted || started) throw e; return plain(); }
+      if (chunk.done) break;
+      started = true;
+      buf += dec.decode(chunk.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === "delta") onText(ev.text);
+        else if (ev.type === "done") return ev.reply;
+        else if (ev.type === "error") throw Object.assign(new Error(ev.error), { status: ev.status });
+      }
+    }
+    throw new Error("The answer stopped before it was complete; try again.");
+  }
+
   async function run(label, body, show) {
     if (busy) return;
     busy = true; render();
+    const abort = new AbortController();
+    const stop = el("button", { type: "button", className: "btn ghost", textContent: "Stop", onclick: () => abort.abort() });
+    const note = el("p", { className: "mute", textContent: "Thinking..." });
+    const live = el("p", { className: "ai-a", hidden: true });
     const item = el("li", { className: "ai-item" }, el("div", { className: "ai-q" }, el("b", { textContent: TASKS[body.task] }), el("span", { className: "mute", textContent: label ? " " + label : "" })),
-      el("p", { className: "mute", textContent: "Thinking..." }));
+      note, live, el("div", { className: "ai-actions" }, stop));
     log.prepend(item);
+    log.setAttribute("aria-busy", "true");   // screen readers announce the answer once, when it is complete
+    let text = "", frame = 0;
+    const onText = (t) => {
+      text += t;
+      frame ||= requestAnimationFrame(() => { frame = 0; live.hidden = false; note.hidden = true; live.textContent = text; });
+    };
     try {
-      const r = await ctx.api.ai(ctx.doc(), body);
-      item.lastChild.remove();
+      const r = await request(body, onText, abort.signal);
+      cancelAnimationFrame(frame);
+      note.remove(); live.remove(); stop.parentNode.remove();
       if (r.answer) item.append(el("p", { className: "ai-a", textContent: r.answer }));
       show?.(item, r);
       for (const n of r.notes || []) item.append(el("p", { className: "refs-warn", textContent: n }));
       if (info.left != null) { info.left = Math.max(0, info.left - 1); }
       return r;
     } catch (e) {
-      item.lastChild.replaceWith(el("p", { className: "refs-err", role: "alert", textContent: e.message }));
-    } finally { busy = false; render(); }
+      cancelAnimationFrame(frame);
+      stop.parentNode.remove(); note.remove();
+      if (abort.signal.aborted) {
+        if (!text) live.remove(); else { live.hidden = false; live.textContent = text; }
+        item.append(el("p", { className: "mute", textContent: text ? "Stopped. This answer is incomplete; nothing was changed." : "Stopped." }));
+      } else {
+        live.remove();   // a refusal or a cut-off: the partial answer does not count
+        item.append(el("p", { className: "refs-err", role: "alert", textContent: e.message }));
+      }
+    } finally { busy = false; log.removeAttribute("aria-busy"); render(); }
   }
 
   function diff(oldText, newText) {

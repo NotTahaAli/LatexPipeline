@@ -1326,6 +1326,85 @@ class Assistant(HostCase):
         ai.post_json.side_effect = ai.AiError("Anthropic answered HTTP 500.", 502)
         self.assertEqual(self.ask(editor)[0], 502)
 
+    def requests_today(self):
+        row = self.app.db.one("SELECT requests, input_tokens, output_tokens FROM ai_usage")
+        return (row["requests"], row["input_tokens"], row["output_tokens"]) if row else None
+
+    def test_unbilled_failures_are_given_back(self):
+        """Not reachable, refused with an HTTP error, a bad request: Anthropic billed nothing, so neither do we."""
+        editor = self.client("ed@x.org")
+        ai.post_json.side_effect = ai.AiError("Anthropic is not reachable: timed out", 502)
+        self.assertEqual([self.ask(editor)[0] for _ in range(4)], [502] * 4)  # daily_per_user is 3
+        self.assertEqual(self.ask(editor, {"task": "nope"})[0], 400)
+        self.assertEqual(self.requests_today(), (0, 0, 0))
+        ai.post_json.side_effect = None
+        ai.post_json.return_value = ai_reply()
+        self.assertEqual([self.ask(editor)[0] for _ in range(4)], [200, 200, 200, 429])
+        self.assertEqual(self.requests_today(), (3, 300, 60))
+
+    def stream(self, client, data=None):
+        return client.call("POST", f"/p/{self.pid}/api/ai?stream=1", data or {
+            "task": "explain", "error": {"message": "Runaway argument?"},
+            "files": [{"path": "main.tex", "text": "a \\textbf{x\n", "line": 1}]})
+
+    def test_streams_are_relayed_by_the_gateway_and_their_usage_recorded(self):
+        from test_ai import sse_reply
+        heard = []
+        mock.patch.object(ai, "post_stream", side_effect=lambda url, body, headers: heard.append(headers) or (
+            c for c in sse_reply("Close the brace.", edits=[{"file": "main.tex", "old": "\\textbf{x", "new": "y"}]))
+                          ).start()
+        editor = self.client("ed@x.org")
+        self.assertEqual(self.stream(self.client("vi@x.org"))[0], 403)
+        self.assertEqual(self.stream(self.client("out@x.org"))[0], 404)
+        status, raw, res = self.stream(editor)
+        self.assertEqual((status, res.getheader("Content-Type")), (200, "application/x-ndjson"))
+        lines = [json.loads(line) for line in raw.decode().splitlines()]
+        self.assertEqual("".join(e["text"] for e in lines if e["type"] == "delta"), "Close the brace.")
+        self.assertEqual([e["file"] for e in lines[-1]["reply"]["edits"]], ["main.tex"])
+        self.assertEqual(heard[0]["x-api-key"], self.KEY)
+        self.assertNotIn(self.KEY, raw.decode())
+        self.assertEqual(self.requests_today(), (1, 12, 30))
+        # A refusal mid-stream is billed: counted, in-band error.
+        ai.post_stream.side_effect = lambda url, body, headers: (c for c in sse_reply("No.", stop="refusal"))
+        status, raw, _ = self.stream(editor)
+        self.assertEqual((status, json.loads(raw.decode().splitlines()[-1])["status"]), (200, 422))
+        self.assertEqual(self.requests_today(), (2, 24, 60))
+        # Refused before the stream opened (HTTP 529 from Anthropic): a plain error, and given back.
+        ai.post_stream.side_effect = ai.AiError("Anthropic answered HTTP 529.", 502)
+        self.assertEqual(self.stream(editor)[0], 502)
+        self.assertEqual(self.requests_today(), (2, 24, 60))
+
+    def test_a_browser_that_stops_closes_the_upstream_stream_and_its_usage_counts(self):
+        from test_ai import sse_reply
+        closed = threading.Event()
+
+        def slow(url, body, headers):
+            try:
+                for chunk in sse_reply("x" * 2000, size=40):
+                    time.sleep(0.01)
+                    yield chunk
+            finally:
+                closed.set()
+        mock.patch.object(ai, "post_stream", side_effect=slow).start()
+        editor = self.client("ed@x.org")
+        body = json.dumps({"task": "rewrite", "selection": {"text": "x"}}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        cookie = "; ".join(f"{k}={v}" for k, v in editor.jar.items())
+        sock.sendall(f"POST /p/{self.pid}/api/ai?stream=1 HTTP/1.1\r\nHost: {self.netloc}\r\nOrigin: {self.origin}\r\n"
+                     f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\nCookie: {cookie}\r\n\r\n"
+                     .encode() + body)
+        got = b""
+        while b'"start"' not in got:
+            got += sock.recv(4096) or self.fail(got)
+        self.assertIn(b" 200 ", got.split(b"\r\n")[0])
+        sock.close()
+        self.assertTrue(closed.wait(5))
+        for _ in range(50):
+            if self.requests_today() == (1, 12, 1):
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.requests_today(), (1, 12, 1))  # what message_start reported
+
     def test_workers_never_get_the_key_in_their_environment(self):
         seen = {}
 

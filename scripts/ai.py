@@ -12,13 +12,18 @@ Everything the user sends is data for the model, never instructions; the reply i
 (output_config.format) that is checked again here. Proposed edits must name a file the request carried and
 quote text that occurs once in the part of it the model saw; they come back as UTF-16 offsets for the editor,
 which shows a diff and applies them only on a click. Nothing here writes a file.
+
+ask_stream is the same request with "stream": true: it yields the "answer" field as it arrives (decoded from the
+model's partial JSON by AnswerStream), and the checked reply only at the end, so nothing can be applied before it.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -35,6 +40,8 @@ NOTICE = "The AI assistant sends the text you ask about to Anthropic (api.anthro
 TASKS = ("explain", "rewrite", "shorten", "grammar", "translate", "write", "ask")
 SELECTION_TASKS = ("rewrite", "shorten", "grammar", "translate")
 MAX_TOKENS = 16_000  # per reply, thinking included
+STREAM_TIMEOUT = 120.0  # seconds without a byte from Anthropic (it sends pings while the model thinks)
+MAX_STREAM_TEXT = 512 * 1024  # characters of streamed text; MAX_TOKENS of JSON is far less
 MAX_BODY = 1_000_000  # bytes of one request from the editor
 MAX_FILE_CHARS = 120_000
 MAX_FILES = 3
@@ -167,25 +174,87 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # The key header must never follow a redirect to another host.
 
 
-def post_json(url: str, body: dict, headers: dict, timeout: float = 300.0) -> dict:
-    """POST JSON to the Anthropic API and return its JSON reply. The only network call; tests replace it."""
-    request = urllib.request.Request(url, json.dumps(body).encode("utf-8"), {
-        "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "latex-pipeline-ai", **headers})
+def _opener():
+    return urllib.request.build_opener(_NoRedirect)
+
+
+def _request(url: str, body: dict, headers: dict, accept: str) -> urllib.request.Request:
+    return urllib.request.Request(url, json.dumps(body).encode("utf-8"), {
+        "Content-Type": "application/json", "Accept": accept, "User-Agent": "latex-pipeline-ai", **headers})
+
+
+def _http_error(error: urllib.error.HTTPError) -> AiError:
+    """Anthropic's status as a message for the editor. These requests were not billed (no usage)."""
     try:
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout) as reply:
+        detail = str(json.loads(error.read(65536))["error"]["message"])[:200]
+    except (OSError, ValueError, KeyError, TypeError):
+        detail = ""
+    if error.code in (401, 403):
+        return AiError(f"Anthropic refused the API key (HTTP {error.code}). Check the key.", 502)
+    if error.code == 429:
+        return AiError("Anthropic says too many requests (HTTP 429); try again in a minute.", 429)
+    return AiError(f"Anthropic answered HTTP {error.code}. {detail}".strip(), 502)
+
+
+def post_json(url: str, body: dict, headers: dict, timeout: float = 300.0) -> dict:
+    """POST JSON to the Anthropic API and return its JSON reply. A network call; tests replace it."""
+    try:
+        with _opener().open(_request(url, body, headers, "application/json"), timeout=timeout) as reply:
             return json.loads(reply.read(8 * 1024 * 1024).decode("utf-8"))
     except urllib.error.HTTPError as error:
-        try:
-            detail = str(json.loads(error.read(65536))["error"]["message"])[:200]
-        except (OSError, ValueError, KeyError, TypeError):
-            detail = ""
-        if error.code in (401, 403):
-            raise AiError(f"Anthropic refused the API key (HTTP {error.code}). Check the key.", 502)
-        if error.code == 429:
-            raise AiError("Anthropic says too many requests (HTTP 429); try again in a minute.", 429)
-        raise AiError(f"Anthropic answered HTTP {error.code}. {detail}".strip(), 502)
+        raise _http_error(error)
     except (OSError, ValueError) as error:
         raise AiError(f"Anthropic is not reachable: {error}", 502)
+
+
+def post_stream(url: str, body: dict, headers: dict, timeout: float = STREAM_TIMEOUT):
+    """POST a streaming request and yield the reply's bytes as they arrive. The other network call; tests replace it.
+    Closing the generator closes the connection, which stops the model (the caller does that when its client left)."""
+    try:
+        reply = _opener().open(_request(url, body, headers, "text/event-stream"), timeout=timeout)
+    except urllib.error.HTTPError as error:
+        raise _http_error(error)
+    except (OSError, ValueError) as error:
+        raise AiError(f"Anthropic is not reachable: {error}", 502)
+    with reply:
+        while True:
+            try:
+                chunk = reply.read1(65536)
+            except socket.timeout:
+                raise AiError("Anthropic stopped sending; try again.", 504)
+            except (OSError, ValueError) as error:
+                raise AiError(f"The connection to Anthropic broke: {error}", 502)
+            if not chunk:
+                return
+            yield chunk
+
+
+def sse(chunks):
+    """(event name, data dict) from server-sent-event bytes, whatever the chunk boundaries (lines are decoded whole,
+    so a UTF-8 character split between chunks is intact)."""
+    buf, event, data = b"", "", []
+    for chunk in chunks:
+        buf += chunk
+        if len(buf) > 4 * 1024 * 1024:
+            raise AiError("Anthropic sent an unexpected reply.", 502)
+        *lines, buf = buf.split(b"\n")
+        for raw in lines:
+            line = raw.rstrip(b"\r").decode("utf-8", "replace")
+            if not line:
+                if data:
+                    try:
+                        item = json.loads("\n".join(data))
+                    except ValueError:
+                        raise AiError("Anthropic sent an unexpected reply.", 502)
+                    yield event, item if isinstance(item, dict) else {}
+                event, data = "", []
+            elif not line.startswith(":"):
+                field, _, value = line.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if field == "event":
+                    event = value
+                elif field == "data":
+                    data.append(value)
 
 
 # ---------------------------------------------------------------------------
@@ -370,18 +439,167 @@ def parse_reply(reply: dict, task: str, files: list[dict]) -> dict:
             "model": str(reply.get("model") or "")[:80], "usage": usage_of(reply)}
 
 
-def ask(data: dict, *, key: str, model: str) -> dict:
-    """Validate the editor's request, ask the model once, and return the checked reply. An AiError raised after the
-    call carries the billed tokens in .usage: a refusal, a cut-off or a malformed answer still costs."""
-    task, prompt, files = build_prompt(data)
+def _acquire() -> None:
     try:
         LIMITER.acquire(1, max_wait=0)
     except grammar.GrammarError:
         raise AiError("Too many AI requests on this server; wait a minute.", 429)
+
+
+def _headers(key: str, extra: dict) -> dict:
+    return {"x-api-key": key, "anthropic-version": API_VERSION, **extra}
+
+
+def ask(data: dict, *, key: str, model: str) -> dict:
+    """Validate the editor's request, ask the model once, and return the checked reply. An AiError raised after the
+    call carries the billed tokens in .usage: a refusal, a cut-off or a malformed answer still costs."""
+    task, prompt, files = build_prompt(data)
+    _acquire()
     body, headers = request_body(prompt, model, task)
-    reply = post_json(API_URL, body, {"x-api-key": key, "anthropic-version": API_VERSION, **headers})
+    reply = post_json(API_URL, body, _headers(key, headers))
     try:
         return parse_reply(reply, task, files)
     except AiError as exc:
         exc.usage = usage_of(reply)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Streaming: the same request, the answer shown as it is written
+# ---------------------------------------------------------------------------
+
+class AnswerStream:
+    """The top-level "answer" string of a JSON object that arrives in pieces; feed() returns the newly decoded part.
+    An escape split between pieces waits until it is whole, and so does a surrogate pair."""
+
+    ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.in_string = self.is_key = self.expect_key = False
+        self.key = self.last_key = self.escape = self.held = ""
+
+    def feed(self, text: str) -> str:
+        out = [self.held]
+        for ch in text:
+            if not self.in_string:
+                if ch == '"':
+                    self.in_string, self.is_key, self.key = True, self.depth == 1 and self.expect_key, ""
+                elif ch in "{[":
+                    self.depth += 1
+                    self.expect_key = ch == "{" and self.depth == 1
+                elif ch in "}]":
+                    self.depth -= 1
+                elif ch in ",:" and self.depth == 1:
+                    self.expect_key = ch == ","
+                continue
+            if self.escape or ch == "\\":
+                self.escape += ch
+                if len(self.escape) < 2 or (self.escape[1] == "u" and len(self.escape) < 6):
+                    continue
+                seq, self.escape = self.escape, ""
+                try:
+                    ch = chr(int(seq[2:], 16)) if seq[1] == "u" else self.ESCAPES.get(seq[1], seq[1])
+                except ValueError:
+                    ch = "�"
+            elif ch == '"':
+                self.in_string = False
+                if self.is_key:
+                    self.last_key = self.key
+                elif self.depth == 1:
+                    self.last_key = ""  # one value per key
+                continue
+            if self.is_key:
+                self.key += ch
+            elif self.depth == 1 and self.last_key == "answer":
+                out.append(ch)
+        piece = "".join(out)
+        self.held = piece[-1] if piece and "\ud800" <= piece[-1] < "\udc00" else ""  # half of a pair: next time
+        piece = piece[:len(piece) - len(self.held)]
+        return piece.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
+def ask_stream(data: dict, *, key: str, model: str, spent: dict | None = None):
+    """ask() as a stream of events for the editor: {"type": "start"} once Anthropic answers, {"type": "delta",
+    "text"} pieces of the answer, {"type": "ping"} while the model thinks, and last {"type": "done", "reply"} with
+    the reply parse_reply checked; nothing else carries model output. Raises AiError like ask(). spent (a dict) holds
+    the billed tokens seen so far, also for a caller that stops early. Closing the generator closes the request."""
+    spent = {} if spent is None else spent
+    spent.update(input=0, output=0)
+    task, prompt, files = build_prompt(data)
+    _acquire()
+    body, headers = request_body(prompt, model, task)
+    chunks = post_stream(API_URL, {**body, "stream": True}, _headers(key, headers))
+    reply: dict = {"content": [], "usage": {}}
+    answer, size = AnswerStream(), 0
+    try:
+        for event, item in sse(chunks):
+            kind = item.get("type") or event
+            if kind == "message_start":
+                message = item.get("message") if isinstance(item.get("message"), dict) else {}
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                reply = {**message, "content": [], "usage": dict(usage)}
+                spent.update(usage_of(reply))
+                yield {"type": "start", "model": str(reply.get("model") or "")[:80]}
+            elif kind == "content_block_start":
+                block = item.get("content_block")
+                reply["content"].append(dict(block) if isinstance(block, dict) else {})
+            elif kind == "content_block_delta":
+                delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+                if delta.get("type") != "text_delta" or not reply["content"]:
+                    continue  # thinking and signature deltas: nothing to show
+                index = item.get("index")
+                blocks = reply["content"]
+                block = blocks[index if isinstance(index, int) and 0 <= index < len(blocks) else -1]
+                text = str(delta.get("text", ""))
+                size += len(text)
+                if size > MAX_STREAM_TEXT:
+                    raise AiError("The model's answer is too long.", 502)
+                block["text"] = str(block.get("text", "")) + text
+                piece = answer.feed(text)
+                if piece:
+                    yield {"type": "delta", "text": piece}
+            elif kind == "message_delta":
+                delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+                reply.update({k: v for k, v in delta.items() if k in ("stop_reason", "stop_details")})
+                if isinstance(item.get("usage"), dict):
+                    reply["usage"] = {**reply["usage"], **item["usage"]}  # cumulative output; iterations
+                spent.update(usage_of(reply))
+            elif kind == "ping":
+                yield {"type": "ping"}
+            elif kind == "error":
+                error = item.get("error") if isinstance(item.get("error"), dict) else {}
+                detail = str(error.get("message") or error.get("type") or "")[:200]
+                raise AiError(f"Anthropic stopped with an error. {detail}".strip(), 502)
+            elif kind == "message_stop":
+                break
+        else:
+            raise AiError("The answer from Anthropic ended early; try again.", 502)
+        result = parse_reply(reply, task, files)
+    except AiError as exc:
+        exc.usage = dict(spent)
+        raise
+    finally:
+        chunks.close()
+    yield {"type": "done", "reply": result}
+
+
+def relay(events, begin, write) -> None:
+    """Send ask_stream's events as NDJSON lines. The first event is awaited before begin() sends the headers, so an
+    error until then (a bad request, a limit, Anthropic refusing the key) is a plain HTTP error: the AiError
+    propagates. Later errors go in-band as {"type": "error", "error", "status"}. When the client is gone (write
+    raises OSError), the generator is closed at once, which closes the connection to Anthropic."""
+    first = next(events)
+    begin()
+    try:
+        for event in itertools.chain([first], events):
+            write((json.dumps(event) + "\n").encode())
+    except AiError as exc:
+        try:
+            write((json.dumps({"type": "error", "error": str(exc), "status": exc.status}) + "\n").encode())
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        events.close()

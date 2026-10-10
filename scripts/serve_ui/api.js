@@ -36,7 +36,9 @@ export const api = {
   zoteroSettings: (body) => call("api/zotero/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   zoteroPreview: (doc, body) => call(`api/zotero/preview?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   zoteroApply: (doc, body) => call(`api/zotero/apply?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
-  ai: (doc, body) => call(`api/ai?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  ai: (doc, body) => call(`api/ai?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  // The raw Response: NDJSON lines {type: start|delta|ping|done|error} while the model writes (ai.js reads them).
+  aiStream: (doc, body, signal) => fetch(`api/ai?${qs({ doc, stream: 1, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal }),
   aiInfo: () => call("api/ai"),
   aiSettings: (s) => call("api/ai/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(s) }),
   history: (doc, path, before) => call(`api/history?${qs({ doc, ...(path ? { path } : {}), ...(before ? { before } : {}) })}`),
