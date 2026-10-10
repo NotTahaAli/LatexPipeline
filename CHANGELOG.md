@@ -35,6 +35,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Changed
 
+- Hosted pages restyled ("classic journal": paper and ink, Newsreader / Source Sans 3 / IBM Plex Mono served by `host.py` from `scripts/fonts/` under CSP `font-src 'self'`): sign-in beside a title page, project cards with a "Start a project" card and new-project / zip-upload dialogs, members beside the invite form, account sections, and a site admin section menu (sign-up, workspaces, users, quotas and limits, sign-in providers, audit log). Light and dark, phone layouts.
 - Editor: the More menu is grouped (Panels, Build, Document, Session, Help); the chapter preview opens at its first page and the full PDF returns to where you were reading; the build pill's tooltip says "Building... N s (last build took M s)" during a build; browsers that open a share link without a token get a small themed 401 page (API clients still get plain text); on phones the error and warning badges collapse into one count chip and the top bar stays on one row.
 - `serve.py`: `GET /forward` no longer moves every open PDF viewer (it only answers with the position); `POST /forward` (owner only) does. A GET with side effects could be triggered by any web page.
 - Editor UX pass: usable on phones (editor and PDF stack, top bar fits, More menu spans the screen), themed find/replace panel (dark mode), "Build failed" note no longer covers the zoom buttons, scrollable drawer tabs, DOCX export feedback, Home/End in the More menu, and contrast fixes (axe: 0 violations).
