@@ -2036,6 +2036,7 @@ POLL_HOLD = 25.0
 
 
 CDNS = "https://esm.sh https://cdnjs.cloudflare.com https://cdn.jsdelivr.net"
+DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
     "/synctex/edit",
@@ -2071,7 +2072,7 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
     if method == "GET":
         if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll"):
             return
-        if path.startswith(("/pdf/", "/log/")):
+        if path.startswith(("/pdf/", "/log/", "/docx/")):
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
             scoped(doc)
@@ -2101,6 +2102,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("grammar", 30, 60.0):
             raise ApiError("Too many grammar checks; wait a moment.", 429)
+    # POST /api/docx has no branch on purpose: owner only. Pandoc reads any file a \input names, so an edit link
+    # could otherwise put /etc/passwd into a download.
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2269,6 +2272,11 @@ class Handler(BaseHTTPRequestHandler):
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
+        elif url.path == "/api/docx" and name in DOCS:
+            ok, message = build.export_docx(DOCS[name])
+            if not ok:
+                raise ApiError(message, 500)
+            self.json({"ok": True})
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
@@ -2324,6 +2332,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(health(self.role))
         elif path == "/api/config":
             self.json({"pdfjs": PDFJS, "editor": SETTINGS["editor"], "role": self.role, "collab": True,
+                       "pandoc": shutil.which("pandoc") is not None,
                        "grammar": grammar_info(self.role)})
         elif path == "/api/share":
             self.json(share_info())
@@ -2333,7 +2342,7 @@ class Handler(BaseHTTPRequestHandler):
             self.poll(query)
         elif path == "/events":
             self.events()
-        elif path.startswith(("/pdf/", "/log/")):
+        elif path.startswith(("/pdf/", "/log/", "/docx/")):
             self.file(path, "focus" in query)
         elif path == "/api/files":
             root = self.doc_root(query)
@@ -2398,7 +2407,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Unknown document", "text/plain")
             return
         main_tex = DOCS[name]
-        if focus:
+        if kind == "docx":
+            target = build.docx_path_for(main_tex)
+        elif focus:
             target = build.focus_paths(main_tex)[0 if kind == "pdf" else 1]
         else:
             target = build.output_path_for(main_tex) if kind == "pdf" else build.log_path_for(main_tex)
@@ -2407,7 +2418,10 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.reply(404, b"Not built yet", "text/plain")
             return
-        self.reply(200, body, "application/pdf" if kind == "pdf" else "text/plain; charset=utf-8")
+        types = {"pdf": "application/pdf", "docx": DOCX_TYPE}
+        save = f'attachment; filename="{posixpath.basename(name)}.docx"'
+        self.reply(200, body, types.get(kind, "text/plain; charset=utf-8"),
+                   {"Content-Disposition": save} if kind == "docx" else None)
 
     # --- transports -------------------------------------------------------
 

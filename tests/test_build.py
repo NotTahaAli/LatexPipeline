@@ -419,6 +419,39 @@ class NewTemplateTests(unittest.TestCase):
             self.assertNotIn("Citation `knuth84' undefined", text)
 
 
+class DocxExportTests(unittest.TestCase):
+    def test_pandoc_command_and_prune(self):
+        with fake_repo() as root:
+            main = write_doc(root, "a", "x")
+            (main.parent / "r.bib").write_text("", encoding="utf-8")
+            ran = []
+            done = mock.Mock(returncode=0, stderr="")
+            fake_run = lambda cmd, **kw: ran.append((cmd, kw)) or done  # noqa: E731
+            with mock.patch.object(build.shutil, "which", return_value="/bin/pandoc"), \
+                    mock.patch.object(build.subprocess, "run", side_effect=fake_run):
+                ok, _ = build.export_docx(main)
+            cmd, kw = ran[0]
+            self.assertTrue(ok)
+            self.assertEqual(kw["cwd"], main.parent)
+            self.assertEqual(cmd[1:3], ["main.tex", "-o"])
+            self.assertIn("--citeproc", cmd)
+            self.assertIn("--bibliography=r.bib", cmd)
+            self.assertEqual(cmd[3], str(root / "out" / "a.docx"))
+
+            (root / "out").mkdir(exist_ok=True)
+            (root / "out" / "a.docx").write_bytes(b"x")
+            (root / "out" / "gone.docx").write_bytes(b"x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build.prune([main])
+            self.assertEqual(sorted(p.name for p in (root / "out").iterdir()), ["a.docx"])
+
+    def test_missing_pandoc_is_a_clear_message(self):
+        with fake_repo() as root, mock.patch.object(build.shutil, "which", return_value=None):
+            ok, message = build.export_docx(write_doc(root, "a", "x"))
+        self.assertFalse(ok)
+        self.assertIn("pandoc was not found", message)
+
+
 if __name__ == "__main__":
     unittest.main()
 

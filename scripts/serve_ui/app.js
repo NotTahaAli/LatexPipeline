@@ -612,6 +612,10 @@ async function loadPdf() {
 // ---- chapter preview: build only the chapter being edited; the chip says so and leads back to the full PDF ----------
 let focusView = null;   // {path} while the person asked for a chapter preview of that file
 const isChapter = (tab) => tab?.kind === "text" && tab.path.endsWith(".tex") && tab.path !== "main.tex";
+async function exportDocx() {
+  try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); }
+  catch (e) { toast(el("span", { textContent: e.message })); }
+}
 async function previewChapter(quiet) {
   if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
   const path = active.path;
@@ -1037,6 +1041,7 @@ const COMMANDS = [
   { id: "focus", edit: true, title: "Preview this chapter", run: () => previewChapter() },
   { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
+  { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
@@ -1056,7 +1061,7 @@ let paletteItems = [], paletteSel = 0;
 function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && !(role === "owner" && config.pandoc))).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
   $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
     const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
@@ -1116,7 +1121,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
+  const entries = ["files", "outline", "-", "problems", "warnings", "lint", "grammar", "log", "-", ...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), "-", ...(role === "owner" ? ["share"] : []), "theme", "settings", "-", "cheat", "tips", "palette"];
   m.replaceChildren(...entries.map((id) => {
     if (id === "-") return el("hr");
     const c = COMMANDS.find((x) => x.id === id);

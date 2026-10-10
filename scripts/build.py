@@ -488,6 +488,11 @@ def log_path_for(main_tex: Path) -> Path:
     return output_path_for(main_tex).with_suffix(".log")
 
 
+def docx_path_for(main_tex: Path) -> Path:
+    """files/reports/final/main.tex -> out/reports/final.docx (optional pandoc export, never published)."""
+    return output_path_for(main_tex).with_suffix(".docx")
+
+
 # ---------------------------------------------------------------------------
 # Per-document settings
 # ---------------------------------------------------------------------------
@@ -1315,8 +1320,9 @@ def prune(documents: list[Path]) -> None:
     expected = {output_path_for(document) for document in documents}
     expected |= {log_path_for(document) for document in documents}
     expected |= {path for document in documents for path in focus_paths(document)}
+    expected |= {docx_path_for(document) for document in documents}
 
-    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]:
+    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx")]:
         if path not in expected:
             info(f"Removing stale: {path.relative_to(ROOT_DIR)}")
             path.unlink()
@@ -1342,6 +1348,48 @@ def clean() -> None:
             raise SystemExit(1)
 
     info("Clean complete.")
+
+
+# ---------------------------------------------------------------------------
+# DOCX export (optional: needs pandoc)
+# ---------------------------------------------------------------------------
+
+def export_docx(main_tex: Path) -> tuple[bool, str]:
+    """
+    pandoc main.tex -> out/<name>.docx, run in the document's directory, with every .bib there as bibliography.
+    Returns (ok, message). Pandoc reads \\input files itself, so callers must not use this on untrusted LaTeX.
+    """
+    pandoc = shutil.which("pandoc")
+    if not pandoc:
+        return False, "pandoc was not found on your PATH (https://pandoc.org/installing.html)."
+
+    target = docx_path_for(main_tex)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    folder = main_tex.parent
+    command = [pandoc, main_tex.name, "-o", str(target), f"--resource-path={folder}"]
+    bibs = sorted(path.name for path in folder.glob("*.bib"))
+    if bibs:
+        command += ["--citeproc", *(f"--bibliography={name}" for name in bibs)]
+
+    try:
+        result = subprocess.run(command, cwd=folder, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"pandoc failed: {exc}"
+
+    if result.returncode != 0:
+        return False, (result.stderr.strip() or f"pandoc exited with {result.returncode}").splitlines()[0]
+
+    return True, display(target)
+
+
+def export_docx_all(documents: list[Path]) -> int:
+    """The --docx step: export each document, print one line each; 1 if any failed."""
+    failed = 0
+    for document in documents:
+        ok, message = export_docx(document)
+        (info if ok else error)(f"DOCX {doc_name(document)}: {message}")
+        failed += not ok
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1560,12 @@ def parse_args() -> argparse.Namespace:
         choices=["article", "report", "beamer", "letter"],
         default="article",
         help="Template for --new (default article; report adds chapters/, refs.bib, figures/, build.toml).",
+    )
+
+    parser.add_argument(
+        "--docx",
+        action="store_true",
+        help="After building, also export each selected document to out/<name>.docx with pandoc (must be installed).",
     )
 
     parser.add_argument(
@@ -1716,6 +1770,10 @@ def main() -> int:
 
         return 0
 
+    if args.docx and not shutil.which("pandoc"):
+        error("--docx needs pandoc, which was not found on your PATH (https://pandoc.org/installing.html).")
+        return 2
+
     latexmk = check_latex()
 
     if args.focus and not args.watch:
@@ -1727,12 +1785,14 @@ def main() -> int:
     if args.watch:
         return watch(latexmk, args.docs, args.open, args.focus)
 
+    exported = documents
+
     if not args.force:
         documents = [document for document in documents if is_stale(document)]
 
         if not documents:
             info("Everything is up to date.")
-            return 0
+            return export_docx_all(exported) if args.docx else 0
 
     separator()
     info(f"Found {len(documents)} document(s).")
@@ -1757,7 +1817,11 @@ def main() -> int:
     write_report(results)
     print_summary(results, args.profile)
 
-    return 1 if any(not entry["ok"] for entry in results) else 0
+    failed = any(not entry["ok"] for entry in results)
+    if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
+        failed = bool(export_docx_all(exported)) or failed
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

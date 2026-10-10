@@ -37,6 +37,8 @@ export const api = {
   imageUrl: (doc, name, from) => `api/image?${qs({ doc, name, from })}`,
   upload: (doc, file, name) => call(`api/upload?${qs({ doc, name })}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }),
   fs: (doc, op, path, to) => call(`api/fs?${qs(to == null ? { doc, op, path } : { doc, op, path, to })}`, { method: "POST" }),
+  docx: (doc) => call(`api/docx?${qs({ doc })}`, { method: "POST" }),
+  docxUrl: (doc) => `docx/${doc.split("/").map(enc).join("/")}`,
   focus: (doc, path) => call(`api/focus?${qs({ doc, path })}`, { method: "POST" }),
   pdfUrl: (doc, v, focus) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}${focus ? "&focus=1" : ""}`,
   logUrl: (doc) => `log/${doc.split("/").map(enc).join("/")}`,
