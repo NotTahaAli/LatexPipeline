@@ -260,6 +260,8 @@ class Figures:
         # no file of the document changed after that (build.py sets it before each run).
         self.recorded: float | None = None
         self.skips: dict[str, str] = {}
+        # .tex files whose figure text changed (set by touched()); None: something else changed too.
+        self.dirty: set[str] | None = set()
 
     def file(self, name: str, suffix: str) -> Path:
         # Not with_suffix(): a document called "v1.2" would lose its tail.
@@ -281,6 +283,8 @@ class Figures:
             before = {}
         now: dict[str, str] = {}
         found = False
+        dirty: set[str] = set()
+        other = False
         for path in self.main_tex.parent.rglob("*"):
             if path.name.startswith(".") or not path.is_file():
                 continue
@@ -291,7 +295,14 @@ class Figures:
                 changed = now[key] != before.get(key, NO_FIGURES)
             else:
                 changed = path.suffix in FIGURE_DEPS
-            found = found or (changed and path.stat().st_mtime > since)
+            if changed and path.stat().st_mtime > since:
+                found = True
+                # Only a figure-text edit in a .tex file can be listed on its own (discover_partial).
+                if path.suffix == ".tex":
+                    dirty.add(key)
+                else:
+                    other = True
+        self.dirty = None if other else dirty
         snapshot.write_text(json.dumps(now), encoding="utf-8")
         return found
 
@@ -327,6 +338,104 @@ class Figures:
             f"{self.main_pretex}\\input{{{self.main_tex.name}}}",
         ]
 
+    def quiet_entries(self, entries: list[dict]) -> list[bool]:
+        """Per focusmap entry: neither its file nor any file it reads defines anything."""
+        doc = self.main_tex.parent
+        own = []  # Per entry: its file defines nothing.
+        for entry in entries:
+            path = doc / entry["raw"]
+            path = path if path.suffix == ".tex" and path.is_file() else path.with_name(path.name + ".tex")
+            try:
+                own.append(not DEFINES.search(PICTURE.sub("", COMMENT.sub("", path.read_text(encoding="utf-8")))))
+            except (OSError, UnicodeDecodeError):
+                own.append(False)
+        quiet = []
+        for i, entry in enumerate(entries):
+            j = i + 1
+            while j < len(entries) and entries[j]["depth"] > entry["depth"]:
+                j += 1
+            quiet.append(all(own[i:j]))
+        return quiet
+
+    def discover_partial(self) -> bool:
+        """
+        List only the figures of the files whose figure text changed (touched() found them),
+        reading nothing else: the files that define nothing are skipped, as in a figure job.
+        That is one or two seconds where the full listing run typesets the whole document
+        (11 s of a 25 s build of a 300 page report). Writes the new <figure>.md5 files into
+        build_dir/tikz and returns True. Returns False, having changed nothing, whenever it is
+        not sure the figure numbers are still the ones of the last full listing (a figure was
+        added or removed, the \\input tree is unknown): the caller then lists everything.
+        This is only a speed-up: the text pass compares every figure with its .md5 and sets
+        a figure whose source differs inline, and the sync/latexmk loop corrects it afterwards.
+        """
+        mapfile = self.build_dir / f"{self.stem}.focusmap"
+        old = self.names()
+        if not self.dirty or not old or not mapfile.exists():
+            return False
+        doc = self.main_tex.parent
+        entries = read_focusmap(mapfile)
+        quiet = self.quiet_entries(entries)
+        files = [normalize(entry["raw"]) for entry in entries]
+        wanted = {normalize(path) for path in self.dirty}
+        if not (wanted - {normalize(self.main_tex.name)}) <= set(files):
+            return False  # A changed file the last run did not read: its place is unknown.
+        skip, covered = [], set()
+        for i, entry in enumerate(entries):
+            j = i + 1
+            while j < len(entries) and entries[j]["depth"] > entry["depth"]:
+                j += 1
+            if (
+                entry["kind"] == "n" and quiet[i] and files.count(files[i]) == 1
+                and 0 <= entry.get("figs", -1) <= entry.get("end", -1)
+                and not wanted & set(files[i:j])
+            ):
+                skip.append(entry)
+                covered.update(range(entry["figs"], entry["end"]))
+        # Skipping an entry that sits inside a skipped one is harmless; the figures it
+        # holds are in `covered` twice at most.
+        numbers = {name: re.fullmatch(rf"tikz/{re.escape(self.stem)}-figure(\d+)", name) for name in old}
+        if not all(numbers.values()):
+            return False  # Figures with their own names (\tikzsetnextfilename) have no place in the map.
+        expected = {name for name, found in numbers.items() if int(found.group(1)) not in covered}
+        if not skip or not expected:
+            return False
+        lines = [
+            rf"\expandafter\def\csname pgfx@s@{entry['raw']}\endcsname{{"
+            + "".join(rf"\pgff@c{{{c}}}{{{v}}}" for c, v in entry["exit"]) + rf"\pgff@n{{{entry['end']}}}}}"
+            for entry in skip
+        ]
+        work = self.build_dir / "figwork" / "list"
+        shutil.rmtree(work, ignore_errors=True)
+        (work / "tikz").mkdir(parents=True)
+        try:
+            for aux in self.build_dir.glob("*.aux"):  # Lets \ref and \cite inside a figure resolve.
+                shutil.copy(aux, work / aux.name)
+            shutil.copy(self.build_dir / "_inject.tex", work / "_inject.tex")  # See write_inject.
+            inject = write_inject(work, doc, "_skip.tex", FIGSKIP % "\n".join(lines))
+            command = self.discover_command()
+            command[command.index(f"-output-directory={self.build_dir}")] = f"-output-directory={work}"
+            command[-1] = self.pretex + inject + f"\\input{{{self.main_tex.name}}}"
+            try:
+                subprocess.run(
+                    **sandbox.spawn(command, doc, self.build_dir, self.env, work=work),
+                    stdin=subprocess.DEVNULL, timeout=1800, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            finally:
+                sandbox.scrub(work)
+            listed = work / f"{self.stem}.figlist"
+            names = {line.strip() for line in listed.read_text(encoding="utf-8").splitlines() if line.strip()} \
+                if listed.exists() else set()
+            if names != expected or not all((work / f"{name}.md5").exists() for name in names):
+                return False
+            for name in names:
+                shutil.copy(work / f"{name}.md5", self.file(name, ".md5"))
+            return True
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     def plan_skips(self) -> None:
         """
         Work out, per figure, which files its job may skip (self.skips: name -> TeX).
@@ -343,20 +452,7 @@ class Figures:
             return
         entries = read_focusmap(mapfile)
         raws = [entry["raw"] for entry in entries]
-        own = []  # Per entry: its file defines nothing.
-        for entry in entries:
-            path = doc / entry["raw"]
-            path = path if path.suffix == ".tex" and path.is_file() else path.with_name(path.name + ".tex")
-            try:
-                own.append(not DEFINES.search(PICTURE.sub("", COMMENT.sub("", path.read_text(encoding="utf-8")))))
-            except (OSError, UnicodeDecodeError):
-                own.append(False)
-        quiet = []  # Per entry: neither its file nor any file it reads defines anything.
-        for i, entry in enumerate(entries):
-            j = i + 1
-            while j < len(entries) and entries[j]["depth"] > entry["depth"]:
-                j += 1
-            quiet.append(all(own[i:j]))
+        quiet = self.quiet_entries(entries)
         for name in self.names():
             match = re.fullmatch(rf"tikz/{re.escape(self.stem)}-figure(\d+)", name)
             if not match:

@@ -895,10 +895,15 @@ def build_document(
                 if not figures.names() or touched:
                     say("Listing figures ...")
                     figures.recorded = time.time()
-                    run(figures.discover_command(), "figures")
-                    if errors:  # Timed out: no figures, no plain rebuild.
-                        return -1, ""
-                    console.clear()  # The listing run is not a result; latexmk's output is.
+                    began = time.monotonic()
+                    # A figure edit: list just the changed files (falls back to the whole document).
+                    if touched and figures.discover_partial():
+                        phases["figures"] += time.monotonic() - began
+                    else:
+                        run(figures.discover_command(), "figures")
+                        if errors:  # Timed out: no figures, no plain rebuild.
+                            return -1, ""
+                        console.clear()  # The listing run is not a result; latexmk's output is.
 
                 for attempt in range(3):
                     began = time.monotonic()

@@ -179,6 +179,33 @@ class ExternalizedBuildTests(unittest.TestCase):
         self.assertNotIn("pgfx@s@b\\endcsname", skips)
         self.assertIn("2-bee", words)
 
+    def test_partial_listing_gives_the_md5_of_the_full_listing(self):
+        self.write("a.tex", "\\section{One} Text.\n")
+        self.write("b.tex", pic("one"))
+        self.write("c.tex", pic("two"))
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{a}\\input{b}\\input{c}\n\\end{document}\n")
+        self.render()
+        figures = self.figures
+        figures.touched(0.0)  # Snapshot of the figure text.
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "check": True}
+
+        self.write("b.tex", pic("ONE"))
+        self.assertTrue(figures.touched(0.0))
+        self.assertEqual(figures.dirty, {"b.tex"})
+        figures.recorded = time.time()
+        self.assertTrue(figures.discover_partial())
+        partial = {path.name: path.read_text() for path in (self.build / "tikz").glob("*.md5")}
+        subprocess.run(figures.discover_command(), cwd=self.doc, **quiet)
+        full = {path.name: path.read_text() for path in (self.build / "tikz").glob("*.md5")}
+        self.assertEqual(partial, full)
+        self.assertFalse((self.build / "figwork" / "list").exists())
+
+        # A figure more in the file shifts the numbers of the files after it: list everything.
+        self.write("b.tex", pic("ONE") + pic("EXTRA"))
+        self.assertTrue(figures.touched(0.0))
+        figures.recorded = time.time()
+        self.assertFalse(figures.discover_partial())
+
     def test_pictures_that_need_the_page_disable_externalization(self):
         self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}[remember picture,overlay]"
                    "\\node{x};\\end{tikzpicture}\n\\end{document}\n")
