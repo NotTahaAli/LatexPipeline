@@ -2753,6 +2753,13 @@ def room_open(doc: str, path: str) -> bool:
         return bool(room and room["members"])
 
 
+def room_editable(doc: str, path: str) -> bool:
+    """A room someone can write through: viewers alone never apply a restore, so for them the server writes it."""
+    with COLLAB_LOCK:
+        room = ROOMS.get(room_id(doc, path))
+        return bool(room and any(m["role"] in ("owner", "edit") for m in room["members"].values()))
+
+
 def write_restored(name: str, rel: str, text: str, author: str, note: str) -> bool:
     """Write restored text to a file no co-editing room has open; False when it already matched."""
     root = DOCS[name].parent
@@ -2809,12 +2816,12 @@ def history_restore(name: str, role: str, vid, path: str | None, author: str) ->
             continue
         try:
             resolve_in_doc(root, rel)
-            if not room_open(name, rel):
+            if not room_editable(name, rel):
                 later.append(rel)
                 continue
             current = read_text_file(root, rel)
             remember_disk(name, rel)
-            store.pend(rel, text, secrets.token_hex(8))
+            store.pend(rel, text, secrets.token_hex(8), current["text"])
             if current["text"] != text:  # the room may hold edits the disk does not have yet: apply it anyway
                 remember(name, rel, text, [author], "restore", note)
             out["pending"].append(rel)
@@ -2855,7 +2862,9 @@ def history_claim(name: str, role: str, cid: str | None, data: dict) -> dict:
     """
     POST /api/history/pending: op "claim" hands one editor in the file's room the pending restore (one claimer at a
     time, so two editors never apply it concurrently); it applies the text as one edit and then sends "restore-done"
-    on the bus, after its Yjs update, so the next claimer's copy already holds it. op "release": it could not.
+    on the bus, after its Yjs update, so the next claimer's copy already holds it. op "release": it could not
+    apply it now; op "drop": the restored part of the file changed since the restore was asked for, so it is not
+    applied at all (it stays in the history and can be restored again).
     """
     path, op = data.get("path"), data.get("op")
     if not isinstance(path, str) or (role != "owner" and is_rc(path)):
@@ -2867,6 +2876,11 @@ def history_claim(name: str, role: str, cid: str | None, data: dict) -> dict:
         if store.release(path, cid):
             BUS.publish("history", {"doc": name})
         return {"released": True}
+    if op == "drop":
+        token = data.get("token")
+        dropped = isinstance(token, str) and store.finish(path, token, cid)
+        BUS.publish("history", {"doc": name})
+        return {"dropped": dropped}
     if op != "claim":
         raise ApiError("Unknown operation.", 400)
     with COLLAB_LOCK:
@@ -2899,25 +2913,36 @@ def on_restore_done(message: dict, client: str, role: str) -> dict | None:
 HANDLERS["restore-done"] = on_restore_done
 
 
-def finish_pending(name: str) -> bool:
+def finish_pending(name: str, now: float | None = None) -> bool:
     """
-    Complete the pending restores of a document whose rooms closed (the browser that claimed one is gone and nobody
-    else was there): the server writes them now, as it does for files without a room. A claim whose client went
-    away is released, so another editor in the room takes it. True while something is still pending.
+    Pending restores of a document. In a room with an editor: a claim whose client went away, or older than
+    CLAIM_TTL (its "restore-done" may have been lost), is released, so an editor claims it again and finds it
+    applied, or applies it. Once no editor has the file open, the server writes it, but only while the file is
+    still exactly what the restore replaced and that text is in the history; if it changed (the room saved it,
+    applied or edited) the pending entry is dropped instead of overwriting newer text. True while any is pending.
     """
+    now = time.time() if now is None else now
     store = history_store(name)
     left = False
     for row in store.pending():
         rel = row["path"]
-        if room_open(name, rel):
+        if room_editable(name, rel):
             left = True
-            if row["claim"] and not claim_alive(row["claim"]) and store.release(rel, row["claim"]):
+            stale = row["claim"] and (not claim_alive(row["claim"]) or now - row["claimed"] >= history.CLAIM_TTL)
+            if stale and store.release(rel, row["claim"]):
                 BUS.publish("history", {"doc": name})
             continue
         try:
-            if write_restored(name, rel, store.blob(row["hash"]), "Restore", "Restored (finished by the server)"):
-                broadcast("fs", {"doc": name, "changed": [rel], "removed": []})
-        except (KeyError, ApiError, OSError) as exc:
+            text = store.blob(row["hash"])
+            disk = read_text_file(DOCS[name].parent, rel)["text"]
+            if row["base"] and history.digest(disk) == row["base"] and disk != text:
+                if not store.has(rel, row["base"]):
+                    store.record(rel, disk, (), "outside")  # raises Full: then nothing is overwritten
+                if write_restored(name, rel, text, "Restore", "Restored (finished by the server)"):
+                    broadcast("fs", {"doc": name, "changed": [rel], "removed": []})
+            elif history.digest(disk) != row["base"]:
+                build.error(f"history of {name}: {rel} changed after a restore was asked for; not restored")
+        except (KeyError, ApiError, OSError, history.Full) as exc:
             build.error(f"history of {name}: could not finish restoring {rel}: {exc}")
         store.finish(rel, row["token"])
     return left
@@ -3165,7 +3190,10 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
             scoped(doc)
-            if path.startswith("/api/history") and not rate_ok("history-read", *HISTORY_READ_LIMIT):
+            if path == "/api/history/pending":  # every editor asks on each history message: its own, cheap bucket
+                if not rate_ok("history-pending", 600, 60.0):
+                    raise ApiError("Too many history requests; wait a moment.", 429)
+            elif path.startswith("/api/history") and not rate_ok("history-read", *HISTORY_READ_LIMIT):
                 raise ApiError("Too many history requests; wait a moment.", 429)  # diffs cost CPU
         elif path == "/forward" and "quiet" in query:
             return  # Checked again once the target document is known.

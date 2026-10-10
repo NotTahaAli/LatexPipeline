@@ -941,7 +941,7 @@ const historyUi = historyPanel($("dpanel-history"), {
   toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
   inRoom: (path) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit); },
-  roomApply: (path, text) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit) && mergeInto(room.ytext, room.text(), text); },
+  roomApply: (path, text, base) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit) && (room.text() === text || mergeInto(room.ytext, base ?? room.text(), text)); },
   send: (message) => channel.send(message),
 });
 $("diffClose").onclick = () => $("diffDlg").close();

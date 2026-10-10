@@ -2,7 +2,9 @@
 // ("name this version"), restore and clean-up (the owner, or a workspace admin when hosted). Restoring writes files
 // on the server, except files open in a co-editing room: those stay pending on the server until one editor in the
 // room claims one (claim-once), applies it as one edit and says "restore-done" on the bus after its Yjs update
-// (resume). The server finishes what nobody in an emptied room applied. Deleting versions has no undo.
+// (resume). It applies only the change from the text the restore replaced (base) where that part is unchanged; if
+// someone edited it since, the restore is dropped rather than reverting their edit. The server finishes what
+// nobody in an emptied room applied, while the file is still unchanged. Deleting versions has no undo.
 import { hunk } from "./collab.js";
 
 export function ago(t) {
@@ -112,8 +114,9 @@ export function historyPanel(root, ctx) {
   }
 
   // ---- pending restores of files open in a co-editing room -----------------------------------------------------------
-  let resuming = false, again = false;
-  async function resume() {
+  let resuming = false, again = false, resumeTimer;
+  function resume() { clearTimeout(resumeTimer); resumeTimer = setTimeout(resumeNow, 150); }   // one ask per burst of messages
+  async function resumeNow() {
     const doc = ctx.doc();
     if (!ctx.canEdit || !doc) return;
     if (resuming) { again = true; return; }
@@ -124,12 +127,20 @@ export function historyPanel(root, ctx) {
         if (p.claimed || !ctx.inRoom(p.path)) continue;
         let got;
         try { got = await ctx.api.historyClaim(doc, p.path, "claim"); } catch { continue; }   // another editor has it
-        if (ctx.doc() === doc && ctx.roomApply(p.path, got.text)) ctx.send({ type: "restore-done", topic: "y", data: { doc, path: p.path, token: got.token } });
-        else await ctx.api.historyClaim(doc, p.path, "release").catch(() => {});
+        if (ctx.doc() !== doc || !ctx.inRoom(p.path)) { await ctx.api.historyClaim(doc, p.path, "release").catch(() => {}); continue; }
+        // roomApply: true when the room already holds the text (a lost restore-done) or the change base -> text
+        // went in as one edit where that part is as it was; false when it was edited since.
+        if (got.base != null && ctx.roomApply(p.path, got.text, got.base)) {
+          const done = { type: "restore-done", topic: "y", data: { doc, path: p.path, token: got.token } };
+          if (!(await ctx.send(done))) setTimeout(() => ctx.send(done), 2000);   // a lapsed claim is re-checked anyway
+        } else {
+          await ctx.api.historyClaim(doc, p.path, "drop", got.token).catch(() => {});
+          ctx.toast(`${p.path} was not restored: it changed since the restore was asked for. Restore it again from History if you still want it.`);
+        }
       }
     } catch { /* the next history message tries again; the server finishes it when the room empties */ }
     resuming = false;
-    if (again) { again = false; resume(); }
+    if (again) { again = false; resumeNow(); }
   }
 
   // ---- diff dialog ------------------------------------------------------------------------------------------------

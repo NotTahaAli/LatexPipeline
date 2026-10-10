@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE INDEX IF NOT EXISTS versions_path ON versions(path, id);
 CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS pending (path TEXT PRIMARY KEY, hash TEXT NOT NULL, token TEXT NOT NULL,
-    time REAL NOT NULL, claim TEXT, claimed REAL);
+    time REAL NOT NULL, claim TEXT, claimed REAL, base TEXT);
 """
 
 
@@ -88,6 +88,8 @@ class Store:
         con.executescript(SCHEMA)
         if "role" not in {r[1] for r in con.execute("PRAGMA table_info(versions)")}:  # stores made before it
             con.execute("ALTER TABLE versions ADD COLUMN role TEXT")
+        if "base" not in {r[1] for r in con.execute("PRAGMA table_info(pending)")}:
+            con.execute("ALTER TABLE pending ADD COLUMN base TEXT")
         return con
 
     def _blob_path(self, h: str) -> Path:
@@ -271,7 +273,7 @@ class Store:
         """Forget blobs no row, label manifest or pending restore refers to; their files go once the transaction
         commits."""
         used = {r[0] for r in con.execute("SELECT hash FROM versions WHERE hash IS NOT NULL UNION "
-                                          "SELECT hash FROM pending")}
+                                          "SELECT hash FROM pending UNION SELECT base FROM pending")}
         for (manifest,) in con.execute("SELECT manifest FROM versions WHERE manifest IS NOT NULL"):
             used.update(json.loads(manifest).values())
         for (h,) in con.execute("SELECT hash FROM blobs").fetchall():
@@ -318,17 +320,18 @@ class Store:
 
     # --- pending restores (files open in a co-editing room) ----------------------------------------------------
 
-    def pend(self, path: str, text: str, token: str, now: float | None = None) -> None:
+    def pend(self, path: str, text: str, token: str, base: str, now: float | None = None) -> None:
         """
-        Remember that `path` must still become `text`. A newer restore of the same file replaces the text but keeps a
-        claim on it: the claimer may be applying the older one right now, and the next claim must see that first.
+        Remember that `path` must still go from `base` (its text on disk when the restore was asked for) to `text`.
+        A newer restore of the same file replaces both but keeps a claim on it: the claimer may be applying the older
+        one right now, and the next claim must see that first.
         """
         def work(con, put, charge):
-            h = put(text)
+            h, b = put(text), put(base)
             charge(ROW_BYTES + len(path))
-            con.execute("INSERT INTO pending (path, hash, token, time) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO "
-                        "UPDATE SET hash = excluded.hash, token = excluded.token, time = excluded.time",
-                        (path, h, token, time.time() if now is None else now))
+            con.execute("INSERT INTO pending (path, hash, token, time, base) VALUES (?, ?, ?, ?, ?) ON CONFLICT(path) "
+                        "DO UPDATE SET hash = excluded.hash, token = excluded.token, time = excluded.time, "
+                        "base = excluded.base", (path, h, token, time.time() if now is None else now, b))
             self._collect(con)  # the text a replaced pending restore held
 
         self._write(work)
@@ -343,7 +346,8 @@ class Store:
         """
         Claim the pending restore of `path` for client cid: one claimer at a time, so two editors never apply it
         concurrently. A claim lapses after CLAIM_TTL or once alive(claimer) is False. None: nothing pending, or
-        another live client holds it. Returns {token, text}.
+        another live client holds it. Returns {token, text, base} (base: the text the restore replaces, None when
+        unknown).
         """
         now = time.time() if now is None else now
         with LOCK, closing(self._db()) as con:
@@ -353,7 +357,14 @@ class Store:
                                  and alive(r["claim"])):
                     return None
                 con.execute("UPDATE pending SET claim = ?, claimed = ? WHERE path = ?", (cid, now, path))
-            return {"token": r["token"], "text": self.blob(r["hash"])}
+            return {"token": r["token"], "text": self.blob(r["hash"]),
+                    "base": self.blob(r["base"]) if r["base"] else None}
+
+    def has(self, path: str, h: str) -> bool:
+        """Whether some version of `path` holds the text with hash h (so overwriting that text loses nothing)."""
+        with LOCK, closing(self._db()) as con:
+            return con.execute("SELECT 1 FROM versions WHERE path = ? AND hash = ? LIMIT 1", (path, h)).fetchone() \
+                is not None
 
     def release(self, path: str, cid: str) -> bool:
         """The claimer could not apply it (or went away): another editor may take it."""

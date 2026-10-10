@@ -2776,11 +2776,11 @@ class HistoryStore(unittest.TestCase):
 
     def test_pending_restores_are_claimed_once(self):
         s = self.store
-        s.pend("a.tex", "restored", "t1", now=0.0)
+        s.pend("a.tex", "restored", "t1", "before", now=0.0)
         self.assertEqual([p["path"] for p in s.pending()], ["a.tex"])
         alive = {"c1", "c2"}
         got = s.claim("a.tex", "c1", alive.__contains__, now=1.0)
-        self.assertEqual(got, {"token": "t1", "text": "restored"})
+        self.assertEqual(got, {"token": "t1", "text": "restored", "base": "before"})
         self.assertIsNone(s.claim("a.tex", "c2", alive.__contains__, now=2.0))
         self.assertIsNotNone(s.claim("a.tex", "c2", alive.__contains__, now=1.0 + self.history.CLAIM_TTL))
         alive.discard("c2")  # the claimer went away: someone else may take it at once
@@ -2930,6 +2930,71 @@ class HistoryApi(SharedState, ServerCase):
         self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
         self.assertEqual(self.pending(), [])
         self.assertEqual(serve.PENDING_DOCS, set())
+
+    def pend_main(self):
+        """main.tex changed, open in an owner's room (c1), and restored to its first text: pending."""
+        mock.patch.object(serve, "PENDING_DOCS", set()).start()
+        self.put("new\n")
+        first = self.versions("&path=main.tex")[-1]["id"]
+        self.join("c1")
+        self.assertEqual(self.call("POST", "/api/history/restore?doc=demo", {"id": first})[1]["pending"], ["main.tex"])
+
+    def test_a_restore_is_never_written_over_newer_text(self):
+        self.pend_main()
+        self.put("edited in the room after the restore was asked for\n")  # the room saved: base no longer matches
+        serve.client_gone("c1")
+        serve.finish_all_pending()
+        self.assertEqual((self.root / "main.tex").read_text(), "edited in the room after the restore was asked for\n")
+        self.assertEqual(self.pending(), [])  # dropped, not left to overwrite hours later
+
+    def test_a_lost_restore_done_does_not_hold_the_claim(self):
+        import history
+        self.pend_main()
+        self.assertEqual(self.claim("c1")[0], 200)
+        serve.finish_pending("demo")
+        self.assertEqual(self.call("GET", "/api/history/pending?doc=demo")[1]["pending"][0]["claimed"], True)
+        # c1 is still connected (same cid after a reconnect) but its restore-done never arrived: the claim lapses.
+        serve.finish_pending("demo", now=time.time() + history.CLAIM_TTL + 1)
+        self.assertEqual(self.call("GET", "/api/history/pending?doc=demo")[1]["pending"][0]["claimed"], False)
+        got = self.claim("c1")[1]
+        self.assertEqual((got["text"], got["base"]), ("\\section{A}\nhello\n", "new\n"))
+        self.assertEqual(self.claim("c1", op="drop")[1], {"dropped": False})  # needs its token
+        self.assertEqual(self.call("POST", "/api/history/pending?doc=demo&cid=c1",
+                                   {"op": "drop", "path": "main.tex", "token": got["token"]})[1], {"dropped": True})
+        self.assertEqual(self.pending(), [])
+
+    def test_the_server_never_overwrites_text_it_could_not_keep(self):
+        import history
+        self.pend_main()
+        serve.client_gone("c1")
+        with mock.patch.object(history.Store, "has", return_value=False), \
+                mock.patch.object(history.Store, "record", side_effect=history.Full("full")):
+            serve.finish_all_pending()
+        self.assertEqual((self.root / "main.tex").read_text(), "new\n")
+        self.assertEqual(self.pending(), [])
+
+    def test_viewers_alone_do_not_hold_a_restore(self):
+        mock.patch.object(serve, "PENDING_DOCS", set()).start()
+        self.put("new\n")
+        first = self.versions("&path=main.tex")[-1]["id"]
+        self.join("v1", "view")
+        out = self.call("POST", "/api/history/restore?doc=demo", {"id": first})[1]
+        self.assertEqual((out["written"], out["pending"]), (["main.tex"], []))
+        self.put("newer\n")
+        self.join("c1")
+        self.call("POST", "/api/history/restore?doc=demo", {"id": first})
+        serve.leave_room("c1", "demo\nmain.tex")  # only the viewer is left: the server finishes it
+        serve.finish_all_pending()
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+        self.assertEqual(self.pending(), [])
+
+    def test_pending_checks_have_their_own_rate_bucket(self):
+        self.tokens = self.share_on()
+        with mock.patch.object(serve, "HISTORY_READ_LIMIT", (2, 60.0)):
+            codes = [self.call("GET", "/api/history/pending?doc=demo", role="edit")[0] for _ in range(5)]
+            self.assertEqual(codes, [200] * 5)
+            self.assertEqual([self.call("GET", "/api/history?doc=demo", role="edit")[0] for _ in range(3)],
+                             [200, 200, 429])
 
     def test_concurrent_restores_of_one_file_end_with_the_last(self):
         mock.patch.object(serve, "PENDING_DOCS", set()).start()
