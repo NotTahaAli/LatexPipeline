@@ -611,7 +611,7 @@ class ShareHttp(SharedState, ServerCase):
 
     def test_view_role_is_read_only_and_confined_to_the_shared_document(self):
         ok = ["/", "/api/config", "/api/health", "/api/files?doc=demo", "/api/file?doc=demo&path=main.tex",
-              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png"]
+              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png", "/api/warnings?doc=demo"]
         for path in ok:
             with self.subTest(path=path):
                 self.assertEqual(self.get("GET", path, "view")[0], 200)
@@ -620,6 +620,7 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("GET", "/api/health", "view")[1]["docs"], ["demo"])  # no 'second'
         denied = [
             ("GET", "/api/files?doc=second"), ("GET", "/api/file?doc=second&path=main.tex"), ("GET", "/pdf/second"),
+            ("GET", "/api/warnings?doc=second"),
             ("GET", "/events"), ("GET", "/api/share"), ("GET", "/forward?doc=demo&file=main.tex&line=1"),
             ("POST", "/rebuild?doc=demo"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
             ("POST", "/api/share/regenerate"), ("PUT", "/api/file?doc=demo&path=main.tex"),
@@ -1254,6 +1255,97 @@ class ProseRoundTrip(unittest.TestCase):
             ["node", "--input-type=module", "-e", script], capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class LogWarnings(ServerCase):
+    LOG = (
+        "Build of files/demo/main.tex: SUCCESS\n\n===== latexmk output =====\n"
+        "LaTeX Warning: Reference `dup' on page 1 undefined on input line 99.\n\n"
+        "===== LaTeX log (main.log) =====\nThis is XeTeX, Version 3.14 (TeX Live)\n"
+        "(./main.tex (/usr/share/texlive/article.cls (/usr/share/texlive/size10.clo))\n"
+        "(./Chapters/one.tex\nLaTeX Warning: Reference `fig:missing' on page 2 undefined on input line 7.\n\n"
+        "Overfull \\hbox (31.2pt too wide) in paragraph at lines 12--13\n[]\\OT1/cmr/m/n/10 text\n\n"
+        "Underfull \\hbox (badness 10000) in paragraph at lines 20--21\n\n"
+        "Package natbib Warning: Citation `knuth' on page 3 undefined on input line 30.\n\n"
+        "LaTeX Warning: Reference `fig:missing' on page 2 undefined on input line 7.\n\n)\n"
+        "Package hyperref Warning: Token not allowed in a PDF string (Unicode):\n"
+        "(hyperref)                removing `math shift' on input line 5.\n\n"
+        "LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.\n\n"
+        "Package siunitx Warning: odd thing.\n\n"
+        "(/usr/share/texlive/x.sty\nLaTeX Warning: In a system file on input line 4.\n\n))\n"
+        "Output written on main.pdf (3 pages, 1234 bytes).\n"
+        "\n===== BibTeX log (main.blg) =====\nThis is BibTeX\nWarning--I didn't find a database entry for \"nobody\"\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.write("Chapters/one.tex", "chapter\n")
+        self.log = self.root / "main.log"
+        self.log.write_text(self.LOG, encoding="utf-8")
+        for name in ("log_path_for",):
+            mock.patch.object(build, name, return_value=self.log).start()
+
+    def test_parses_warnings_with_files_lines_kinds_and_hints(self):
+        found = serve.parse_warnings(self.LOG, self.root)
+        by = {(w["kind"], w["line"]): w for w in found}
+        self.assertEqual(by[("undefined", 7)]["file"], "Chapters/one.tex")
+        self.assertIn("fig:missing", by[("undefined", 7)]["message"])
+        self.assertIn("\\label", by[("undefined", 7)]["hint"])
+        self.assertEqual((by[("overfull", 12)]["file"], by[("overfull", 12)]["level"]), ("Chapters/one.tex", "warning"))
+        self.assertIn("margin", by[("overfull", 12)]["hint"])
+        self.assertEqual(by[("underfull", 20)]["level"], "info")
+        self.assertEqual(by[("undefined", 30)]["source"], "natbib")
+        self.assertEqual(by[("package", 5)]["file"], "main.tex")  # after one.tex closed
+        self.assertIn("removing `math shift'", by[("package", 5)]["message"])  # continuation joined, prefix dropped
+        self.assertNotIn("(hyperref)", by[("package", 5)]["message"])
+
+    def test_dedupes_and_ignores_the_latexmk_console_copy_and_system_files(self):
+        found = serve.parse_warnings(self.LOG, self.root)
+        self.assertEqual(sum("fig:missing" in w["message"] for w in found), 1)
+        self.assertFalse(any("dup" in w["message"] for w in found))  # only the LaTeX log section counts
+        system = next(w for w in found if "system file" in w["message"])
+        self.assertEqual((system["file"], system["line"]), (None, None))  # not a file of this document: no link
+        rerun = next(w for w in found if w["kind"] == "rerun")
+        self.assertEqual((rerun["file"], rerun["line"], rerun["level"]), (None, None, "info"))
+
+    def test_bibtex_warnings_are_listed_and_files_cannot_escape_the_document(self):
+        found = serve.parse_warnings(self.LOG, self.root)
+        bib = [w for w in found if w["kind"] == "bibtex"]
+        self.assertEqual(len(bib), 1)
+        self.assertIn("nobody", bib[0]["message"])
+        self.assertIsNone(serve.doc_relative(self.root, "../secret.tex"))
+        self.assertIsNone(serve.doc_relative(self.root, str(self.base / "secret.tex")))
+        self.assertEqual(serve.doc_relative(self.root, "./Chapters/one.tex"), "Chapters/one.tex")
+        self.assertEqual(serve.doc_relative(self.root, str(self.root / "Chapters" / "one.tex")), "Chapters/one.tex")
+
+    def test_endpoint_and_missing_log(self):
+        status, data = self.request("GET", "/api/warnings?doc=demo")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(w["kind"] == "overfull" for w in data["warnings"]))
+        self.log.unlink()
+        self.assertEqual(self.request("GET", "/api/warnings?doc=demo")[1], {"warnings": []})
+        self.assertEqual(self.request("GET", "/api/warnings?doc=nope")[0], 404)
+
+    def test_saved_result_restores_pages_warnings_and_time_after_a_restart(self):
+        pdf = self.root / "main.pdf"
+        pdf.write_bytes(b"%PDF")
+        report = self.root / "report"
+        report.mkdir()
+        (report / "build-report.json").write_text(json.dumps({"documents": [
+            {"name": "demo", "ok": True, "seconds": 4.5, "engine": "xelatex"}]}), encoding="utf-8")
+        with mock.patch.object(build, "output_path_for", return_value=pdf), mock.patch.object(build, "OUT_DIR", report):
+            state = serve.fresh_state("demo", self.root / "main.tex")
+            self.assertEqual((state["status"], state["pages"], state["warnings"]), ("idle", 3, 7))
+            self.assertEqual((state["seconds"], state["engine"]), (4.5, "xelatex"))
+            self.assertIsNotNone(state["finished"])
+            (report / "build-report.json").write_text("not json", encoding="utf-8")
+            self.assertEqual(serve.fresh_state("demo", self.root / "main.tex")["engine"], "xelatex")  # from the log
+            self.assertIsNone(serve.fresh_state("demo", self.root / "main.tex")["seconds"])
+            self.log.write_text(self.LOG.replace(": SUCCESS", ": FAILED", 1), encoding="utf-8")
+            self.assertIsNone(serve.fresh_state("demo", self.root / "main.tex")["pages"])  # a failed build says nothing
+            self.log.write_text(self.LOG, encoding="utf-8")
+            pdf.unlink()
+            self.assertIsNone(serve.fresh_state("demo", self.root / "main.tex")["pages"])  # no PDF, no result
 
 
 class UiWiring(unittest.TestCase):

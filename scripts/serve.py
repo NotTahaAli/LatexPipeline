@@ -263,11 +263,52 @@ def snapshot() -> dict:
         return {"docs": list(STATE.values())}
 
 
+def latex_section(text: str) -> str:
+    """The LaTeX log inside out/<name>.log (the part before any BibTeX log); the whole text if it has no sections."""
+    start = text.find("===== LaTeX log")
+    if start < 0:
+        return text
+    end = text.find("\n===== BibTeX log", start)
+    return text[start:end if end > 0 else len(text)]
+
+
+ENGINES = {"pdfTeX": "pdflatex", "XeTeX": "xelatex", "LuaTeX": "lualatex", "LuaHBTeX": "lualatex"}
+
+
+def saved_result(name: str, main_tex: Path) -> dict:
+    """
+    What out/ remembers of the last successful build (pages, warnings, engine, time), so "Up to date" after a
+    restart still says how big the PDF is. Nothing when there is no PDF, or the log says the build failed.
+    """
+    try:
+        text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
+        finished = build.log_path_for(main_tex).stat().st_mtime
+    except (OSError, ValueError):  # ValueError: a document outside the repository has no out/ path.
+        return {}
+    if not build.output_path_for(main_tex).is_file() or not text.startswith("Build of ") \
+            or not text.split("\n", 1)[0].endswith(": SUCCESS"):
+        return {}
+    latex = latex_section(text)
+    pages = build.LATEX_PAGES.findall(latex)
+    engine = re.search(r"^This is (\w+)", latex, re.M)
+    result = {
+        "pages": int(pages[-1]) if pages else None, "warnings": len(build.LATEX_WARNING.findall(latex)),
+        "engine": ENGINES.get(engine.group(1)) if engine else None, "finished": finished,
+    }
+    try:  # The build summary has the build time; the log does not.
+        for entry in json.loads((build.OUT_DIR / "build-report.json").read_text("utf-8"))["documents"]:
+            if entry.get("name") == name and entry.get("ok"):
+                result.update(seconds=entry.get("seconds"), engine=entry.get("engine") or result["engine"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return result
+
+
 def fresh_state(name: str, main_tex: Path) -> dict:
     return {
         "name": name, "status": "idle", "ok": None, "seconds": None, "pages": None, "warnings": 0,
         "engine": None, "error": None, "errors": [], "finished": None, "started": None,
-        "version": pdf_version(main_tex),
+        "version": pdf_version(main_tex), "focus": None, **saved_result(name, main_tex),
     }
 
 
@@ -286,6 +327,100 @@ def log_excerpt(log_text: str, found: dict, lines: int = 8) -> str:
         if found["message"] in row:
             return "\n".join(rows[index:index + lines])
     return ""
+
+
+# One LaTeX warning or box report (it ends at the first blank line), or the start/end of a file in the log.
+_WARNING_TOKEN = re.compile(
+    r"(?P<warn>(?:(?:LaTeX(?: Font)?|Package [\w.-]+|Class [\w.-]+|Module [\w.-]+) Warning:"
+    r"|(?:Overfull|Underfull) \\[hv]box)[^\n]*(?:\n(?!\n)[^\n]*)*)"
+    r"|\((?P<open>[^\s()]*)|\)"
+)
+MAX_WARNINGS = 400
+
+
+def doc_relative(root: Path, name: str | None) -> str | None:
+    """A file name from the log as a path inside the document, or None (a system package, a missing file)."""
+    if not name:
+        return None
+    candidate = Path(name)
+    try:
+        rel = candidate.resolve().relative_to(root.resolve()).as_posix() if candidate.is_absolute() else \
+            posixpath.normpath(name)
+        return rel if resolve_in_doc(root, rel).is_file() else None
+    except (ValueError, OSError, ApiError):
+        return None
+
+
+def parse_warnings(log_text: str, root: Path | None = None) -> list[dict]:
+    """
+    LaTeX warnings and box reports from an out/<name>.log, in log order, plus BibTeX's "Warning--" lines:
+    {kind, level, message, file, line, source, hint, excerpt}. file is a path inside `root` when TeX named one
+    (the innermost .tex being read), else None. kind is undefined | overfull | underfull | rerun | package |
+    latex | bibtex.
+    """
+    found: list[dict] = []
+    seen: set[tuple] = set()
+    stack: list[str | None] = []
+    for match in _WARNING_TOKEN.finditer(latex_section(log_text)):
+        if match.group("open") is not None:
+            name = match.group("open")
+            stack.append(name if name.endswith(".tex") else None)
+            continue
+        if match.group("warn") is None:
+            if stack:
+                stack.pop()
+            continue
+        rows = match.group("warn").split("\n")
+        first = rows[0]
+        box = first.startswith(("Overfull", "Underfull"))
+        if box:
+            message, source = first, "TeX"
+            kind = first.split()[0].lower()
+        else:
+            head, _, rest = first.partition(" Warning:")
+            source = head.replace("Package ", "").replace("Class ", "").replace("Module ", "")
+            joined = " ".join([rest.strip(), *(re.sub(r"^\([\w.-]+\)\s*", "", row).strip() for row in rows[1:])])
+            message = re.sub(r"\s+", " ", joined).strip()
+            if re.search(r"(?:Reference|Citation) .*? undefined|There were undefined", message):
+                kind = "undefined"
+            elif re.search(r"Rerun to get|Label\(s\) may have changed", message):
+                kind = "rerun"
+            else:
+                kind = "package" if head.startswith(("Package", "Class", "Module")) else "latex"
+        at = re.search(r"\blines? (\d+)" if box else r"on input line (\d+)", first if box else message)
+        file = stack[-1] if stack else None  # A warning raised while a package file is open names that file's lines.
+        file = doc_relative(root, file[2:] if file and file.startswith("./") else file) if root else None
+        line = int(at.group(1)) if at and file else None
+        file = file if line else None  # No line: nothing to jump to.
+        key = (kind, message, file, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        excerpt = "\n".join(rows[:5])
+        found.append({
+            "kind": kind, "level": "info" if kind in ("underfull", "rerun") else "warning", "message": message,
+            "file": file, "line": line, "source": source, "hint": hints.explain(message, excerpt), "excerpt": excerpt,
+        })
+        if len(found) >= MAX_WARNINGS:
+            return found
+    bib = log_text.find("\n===== BibTeX log")
+    for row in log_text[bib:].splitlines() if bib >= 0 else []:
+        if row.startswith("Warning--") and len(found) < MAX_WARNINGS:
+            message = row[len("Warning--"):].strip()
+            found.append({
+                "kind": "bibtex", "level": "warning", "message": message, "file": None, "line": None,
+                "source": "BibTeX", "hint": hints.explain(message), "excerpt": row,
+            })
+    return found
+
+
+def doc_warnings(name: str) -> list[dict]:
+    main_tex = DOCS[name]
+    try:
+        text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return []
+    return parse_warnings(text, main_tex.parent)
 
 
 def run_build(main_tex: Path, latexmk: str, force: bool) -> None:
@@ -1563,7 +1698,8 @@ POLL_HOLD = 25.0
 
 CDNS = "https://esm.sh https://cdnjs.cloudflare.com https://cdn.jsdelivr.net"
 READ_API = {
-    "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/synctex/edit",
+    "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
+    "/synctex/edit",
 }
 
 
@@ -1844,6 +1980,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/lint":
             self.doc_root(query)
             self.json({"findings": lint(query["doc"][0])})
+        elif path == "/api/warnings":
+            self.doc_root(query)
+            self.json({"warnings": doc_warnings(query["doc"][0])})
         elif path == "/synctex/edit":
             name = query.get("doc", [""])[0]
             if name not in DOCS:
