@@ -6,6 +6,7 @@
 <title>LaTeX Studio</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230969da'/%3E%3Cpath d='M7 7h10M12 7v10' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="ui/style.css">
+<!-- Single source of the pinned third-party URLs. scripts/vendor_ui.py downloads them; serve.py swaps in the local copies. -->
 <script type="importmap">
 {
  "imports": {
@@ -18,7 +19,16 @@
   "@lezer/common": "https://esm.sh/@lezer/common@1.2.3?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@lezer/highlight": "https://esm.sh/@lezer/highlight@1.2.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "yjs": "https://esm.sh/yjs@13.6.27?deps=lib0@0.2.99",
-  "@lezer/lr": "https://esm.sh/@lezer/lr@1.4.2?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr"
+  "@lezer/lr": "https://esm.sh/@lezer/lr@1.4.2?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "stex": "https://esm.sh/@codemirror/legacy-modes@6.5.1/mode/stex?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "vim": "https://esm.sh/@replit/codemirror-vim@6.3.0?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "emacs": "https://cdn.jsdelivr.net/npm/@replit/codemirror-emacs@6.1.0/dist/index.js",
+  "y-codemirror.next": "https://esm.sh/y-codemirror.next@0.3.5?external=yjs,@codemirror/state,@codemirror/view&deps=lib0@0.2.99",
+  "y-protocols/awareness": "https://esm.sh/y-protocols@1.0.6/awareness?external=yjs&deps=lib0@0.2.99",
+  "katex": "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.mjs",
+  "katex.css": "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
+  "pdfjs": "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs",
+  "pdfjs-worker": "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs"
  }
 }
 </script>

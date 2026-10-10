@@ -736,6 +736,7 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("PUT", "/api/file?doc=demo&path=main.tex", "edit", {"text": "x"}, origin)[0], 403)
 
     def test_security_headers(self):
+        mock.patch.object(serve, "VENDOR_DIR", self.root / "none").start()
         res = self.raw_get("/", {"Cookie": f"{serve.cookie_name()}={self.tokens['view']}"})
         self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
         self.assertEqual(res.getheader("Referrer-Policy"), "no-referrer")
@@ -1950,6 +1951,65 @@ class GrammarApi(SharedState, ServerCase):
         msgs = [{"rev": 1, "topic": "x", "type": "grammar", "data": {"doc": "demo"}}]
         self.share_on()
         self.assertEqual(serve.visible(msgs, "edit"), [])
+
+
+class VendoredUi(ServerCase):
+    """Offline mode: serve.py serves only files listed in vendor/manifest.json and drops the CDNs from the CSP."""
+
+    def get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path, headers={"Host": f"127.0.0.1:{self.port}"})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        return res.status, res.getheader("Content-Security-Policy"), body
+
+    def vendor(self, **files):
+        vendor = self.root / "vendor"
+        vendor.mkdir()
+        (self.root / "secret.js").write_text("secret")
+        for name, text in files.items():
+            (vendor / name).write_text(text)
+        url = re.search(r'"(https://[^"]+)"', (UI_DIR / "index.html").read_text("utf-8")).group(1)
+        manifest = {"files": {url: {"file": "a.js"}, "https://x/b.css": {"file": "b.css"}}}
+        (vendor / "manifest.json").write_text(json.dumps(manifest))
+        mock.patch.object(serve, "VENDOR_DIR", vendor).start()
+        return url
+
+    def test_without_vendor_dir_the_cdns_are_used(self):
+        with mock.patch.object(serve, "VENDOR_DIR", self.root / "none"):
+            status, policy, body = self.get("/")
+        self.assertIn("https://esm.sh", policy)
+        self.assertIn(b"https://esm.sh/", body)
+        self.assertEqual(self.get("/ui/vendor/a.js")[0], 404)
+
+    def test_vendored_page_uses_local_files_and_self_only_csp(self):
+        url = self.vendor(**{"a.js": "export {}", "b.css": "x{}", "unlisted.js": "no"})
+        status, policy, body = self.get("/")
+        self.assertEqual(re.findall(r"https?://[^\s;]+", policy), [])
+        self.assertNotIn(url.encode(), body)
+        self.assertIn(b'"/ui/vendor/a.js"', body)
+        self.assertEqual(self.get("/ui/vendor/a.js")[::2], (200, b"export {}"))
+        self.assertEqual(self.get("/ui/vendor/b.css")[0], 200)
+
+    def test_only_manifest_files_are_served(self):
+        self.vendor(**{"a.js": "export {}", "unlisted.js": "no"})
+        for path in ("/ui/vendor/unlisted.js", "/ui/vendor/manifest.json", "/ui/vendor/../secret.js",
+                     "/ui/vendor/%2e%2e/secret.js", "/ui/vendor/..%2fsecret.js"):
+            self.assertEqual(self.get(path)[0], 404, path)
+
+    def test_vendor_ui_rewrites_imports_to_local_names(self):
+        import vendor_ui
+        body, needed = vendor_ui.rewrite("https://esm.sh/a@1/x.mjs",
+            b'import"/node/p.mjs";export*from"../b.mjs";import("@codemirror/state")')
+        self.assertEqual(needed, ["https://esm.sh/node/p.mjs", "https://esm.sh/b.mjs"])
+        self.assertIn(f'"/ui/vendor/{vendor_ui.local_name(needed[1])}"'.encode(), body)
+        self.assertIn(b'import("@codemirror/state")', body)
+        css, needed = vendor_ui.rewrite("https://cdn/d/k.css",
+            b'@font-face{src:url(fonts/a.woff2) format("woff2"),url(fonts/a.woff) format("woff"),'
+            b'url(fonts/a.ttf) format("truetype")}')
+        self.assertEqual(needed, ["https://cdn/d/fonts/a.woff2"])
+        self.assertNotIn(b"ttf", css)
 
 
 class UiWiring(unittest.TestCase):
