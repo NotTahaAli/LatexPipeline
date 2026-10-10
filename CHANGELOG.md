@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Added
 
+- `serve.py --gateway`: a worker mode for the hosted gateway (`scripts/host.py`). It serves one document folder on loopback, accepts only requests carrying the per-worker `X-Host-Secret` (role and user from `X-Host-Role` / `X-Host-User`; no cookies, tokens or share links), treats everyone as a shared editor or viewer (sharing build restrictions always on, owner features off), keeps its `out/` and cache beside the document folder, and the editor works under a path prefix.
 - Optional DOCX export with pandoc: `build.py --docx` writes `out/<name>.docx`; "Export DOCX" in the editor's More menu (owner only, hidden without pandoc). Never published to the release.
 - `build.py --new NAME --template {article,report,beamer,letter}`; `report` creates chapters, `refs.bib`, `figures/` and a commented `build.toml`.
 - **Offline editor**: `python scripts/vendor_ui.py` copies the pinned PDF.js, CodeMirror, KaTeX and Yjs files into `scripts/serve_ui/vendor/` (git-ignored); `serve.py` then serves them itself and the CSP drops the CDNs.

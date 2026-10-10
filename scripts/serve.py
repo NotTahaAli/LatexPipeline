@@ -129,9 +129,9 @@ BUS = Bus()
 HANDLERS: dict = {}  # client message type -> fn(message, client_id, role) -> reply dict | None
 
 
-def handle_client_message(message: dict, client: str, role: str = "owner") -> dict | None:
+def handle_client_message(message: dict, client: str, role: str = "owner", user: str | None = None) -> dict | None:
     kind = message.get("type")
-    if not bind_client(client, role):
+    if not bind_client(client, role, user):
         return {"type": "error", "topic": "sys", "data": {"error": "Client id belongs to another session."}}
     if kind == "ping":
         return {"type": "pong", "topic": "sys", "data": {"t": message.get("data"), "rev": BUS.rev}}
@@ -1523,6 +1523,11 @@ SHARE: dict = {
 }
 SHARE_LOCK = threading.Lock()
 ROLES = ("owner", "edit", "view")
+# --gateway (scripts/host.py): one worker per project, reached only through the gateway, which authenticates the
+# user and says who they are in X-Host-* headers signed with a per-worker secret. Every request is a shared
+# non-owner (edit or view): cookies, share tokens and owner features do not exist here.
+GATEWAY: dict = {"secret": b""}
+GATEWAY_ROLES = ("edit", "view")
 SHELL_TOKENS = ("shell-escape", "enable-write18", "shell-restricted")
 COMMAND_KEYS = {
     "pdflatex", "xelatex", "lualatex", "latex", "bibtex", "biber", "makeindex", "makeglossaries", "dvips", "dvipdf",
@@ -1578,6 +1583,29 @@ def role_for_token(token: str | None) -> str | None:
         if hmac.compare_digest(probe, good.encode()) and token:
             found = role
     return found
+
+
+def gateway_enable(secret: str, doc: str, timeout: int | None = None) -> None:
+    """Serve one document to the gateway only: sharing restrictions on for good, no tokens, no Host check."""
+    global SHARE_TIMEOUT
+    GATEWAY["secret"] = secret.encode()
+    SETTINGS["check_host"] = False  # Loopback only, and every request must carry the secret instead.
+    SHARE.update(on=True, doc=doc, provider="gateway", status="ready", tokens={}, public=None, hosts=set())
+    share_env(True)
+    if timeout:
+        SHARE_TIMEOUT = timeout
+
+
+def gateway_identity(headers) -> tuple[str | None, str | None]:
+    """(role, "id;name") from the gateway's headers, or (None, None) unless X-Host-Secret matches."""
+    probe = (headers.get("X-Host-Secret") or "").encode("utf-8", "replace")
+    if not GATEWAY["secret"] or not hmac.compare_digest(probe, GATEWAY["secret"]):
+        return None, None
+    role = headers.get("X-Host-Role")
+    user = unquote(headers.get("X-Host-User") or "")
+    if role not in GATEWAY_ROLES or not re.fullmatch(r"[A-Za-z0-9_-]{1,64};[^\x00-\x1f]{0,80}", user):
+        return None, None
+    return role, user
 
 
 def cookie_name() -> str:
@@ -1914,14 +1942,17 @@ def room_id(doc: str, path: str) -> str:
     return f"{doc}\n{path}"
 
 
-def bind_client(client: str, role: str) -> bool:
-    """Remember who a client id belongs to. False if the id was already taken by another role."""
+def bind_client(client: str, role: str, user: str | None = None) -> bool:
+    """
+    Remember who a client id belongs to. False if the id was already taken by another role, or (behind the
+    gateway) by another user: presence shows client ids, so a client id alone must not be enough to act as someone.
+    """
     with COLLAB_LOCK:
         record = CLIENTS.setdefault(client, {
-            "role": role, "rooms": set(), "name": None, "color": None, "path": None, "doc": None,
+            "role": role, "rooms": set(), "name": None, "color": None, "path": None, "doc": None, "user": user,
         })
         record["seen"] = time.monotonic()
-        return record["role"] == role
+        return record["role"] == role and record.get("user") == user
 
 
 def room_leader(room: dict) -> str | None:
@@ -2004,7 +2035,8 @@ def on_hello(message: dict, client: str, role: str) -> dict:
     data = message.get("data") or {}
     with COLLAB_LOCK:
         record = CLIENTS[client]
-        record["name"] = str(data.get("name") or "Guest")[:40]
+        # Behind the gateway the name is the account's, not whatever the browser claims.
+        record["name"] = (record.get("user") or "").partition(";")[2][:40] or str(data.get("name") or "Guest")[:40]
         color = str(data.get("color") or "")
         record["color"] = color if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "#0969da"
         path = data.get("path")
@@ -2223,7 +2255,8 @@ def localize(page: bytes) -> bytes:
     local = vendor_files()
     if not local:
         return page
-    return re.sub(rb'"(https://[^"]+)"', lambda m: b'"/ui/vendor/%s"' % local[m.group(1).decode()].encode()
+    prefix = b"./ui/vendor/" if GATEWAY["secret"] else b"/ui/vendor/"  # Behind the gateway the page is at /p/<id>/.
+    return re.sub(rb'"(https://[^"]+)"', lambda m: b'"%s%s"' % (prefix, local[m.group(1).decode()].encode())
                   if m.group(1).decode() in local else m.group(0), page)
 
 
@@ -2328,6 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 75  # Socket timeout: a stalled client cannot hold a thread forever. The UI pings every 20 s.
     role = "owner"
     token = None
+    user = None  # "id;display name" behind the gateway
 
     def log_message(self, *args) -> None:  # Quiet: build output is the interesting part.
         pass
@@ -2360,6 +2394,9 @@ class Handler(BaseHTTPRequestHandler):
         return (host if host.endswith("]") else host.rsplit(":", 1)[0]).lower()
 
     def authenticate(self) -> str | None:
+        if GATEWAY["secret"]:
+            role, self.user = gateway_identity(self.headers)
+            return role
         if not SHARE["on"]:
             return "owner"
         jar = SimpleCookie()
@@ -2418,7 +2455,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             url = urlsplit(self.path)
             query = parse_qs(url.query)
-            if self.command == "GET" and url.path == "/" and SHARE["on"] and "token" in query:
+            if self.command == "GET" and url.path == "/" and SHARE["on"] and "token" in query and not GATEWAY["secret"]:
                 if role_for_token(query["token"][0]):  # First visit through a link: keep the token in a cookie only.
                     self.reply(302, b"", "text/plain", {"Location": "/", **self.cookie(query["token"][0])})
                     return
@@ -2491,7 +2528,8 @@ class Handler(BaseHTTPRequestHandler):
             client = str(query.get("cid", ["?"])[0])[:64]
             replies = []
             for message in data.get("messages", []):
-                reply = handle_client_message(message, client, self.role) if isinstance(message, dict) else None
+                reply = handle_client_message(message, client, self.role, self.user) if isinstance(message, dict) \
+                    else None
                 if reply:
                     replies.append(reply)
             self.json({"replies": replies, "rev": BUS.rev})
@@ -2539,7 +2577,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(health(self.role))
         elif path == "/api/config":
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
-                       "pandoc": shutil.which("pandoc") is not None,
+                       "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
         elif path == "/api/share":
             self.json(share_info())
@@ -2647,10 +2685,10 @@ class Handler(BaseHTTPRequestHandler):
             since = int(query["since"][0]) if "since" in query else None
         except ValueError:
             since = None
-        if not bind_client(str(query.get("cid", ["?"])[0])[:64], self.role):
+        if not bind_client(str(query.get("cid", ["?"])[0])[:64], self.role, self.user):
             raise ApiError("Client id belongs to another session.", 403)
         events = BUS.wait(since, POLL_HOLD) if since is not None else BUS.since(None)
-        bind_client(str(query.get("cid", ["?"])[0])[:64], self.role)
+        bind_client(str(query.get("cid", ["?"])[0])[:64], self.role, self.user)
         # rev is where the client resumes: filtered-out messages still advance it, so it cannot spin on them.
         self.json({"rev": events[-1]["rev"] if events else since, "events": visible(events, self.role)})
 
@@ -2662,7 +2700,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.same_origin():  # Has already answered 403.
             return
         client = str(query.get("cid", ["?"])[0])[:64]
-        if not bind_client(client, self.role):
+        if not bind_client(client, self.role, self.user):
             raise ApiError("Client id belongs to another session.", 403)
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
@@ -2675,7 +2713,7 @@ class Handler(BaseHTTPRequestHandler):
             since = int(query["since"][0]) if "since" in query else None
         except ValueError:
             since = None
-        role, token = self.role, self.token
+        role, token, user = self.role, self.token, self.user
         send_lock = threading.Lock()
         alive = threading.Event()
 
@@ -2684,8 +2722,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(ws_encode(opcode, payload))
                 self.wfile.flush()
 
-        def revoked() -> bool:
-            return role_for_token(token) != role  # Tokens regenerated or sharing stopped.
+        def revoked() -> bool:  # Tokens regenerated or sharing stopped. The gateway closes its own sockets.
+            return False if GATEWAY["secret"] else role_for_token(token) != role
 
         def pump() -> None:  # Bus -> socket.
             cursor = since
@@ -2694,7 +2732,7 @@ class Handler(BaseHTTPRequestHandler):
                     messages = BUS.since(cursor) if cursor is None else BUS.wait(cursor, 5.0)
                     if alive.is_set():
                         break
-                    bind_client(client, role)  # Keeps the client "seen" while the socket idles.
+                    bind_client(client, role, user)  # Keeps the client "seen" while the socket idles.
                     for message in visible(messages, role):
                         send(0x1, json.dumps(message).encode())
                     if messages:
@@ -2725,7 +2763,7 @@ class Handler(BaseHTTPRequestHandler):
                         message = json.loads(payload)
                     except ValueError:
                         continue
-                    reply = handle_client_message(message, client, role) if isinstance(message, dict) else None
+                    reply = handle_client_message(message, client, role, user) if isinstance(message, dict) else None
                     if reply:
                         send(0x1, json.dumps(reply).encode())
         except (OSError, ValueError, struct.error):
@@ -2893,10 +2931,31 @@ def main() -> int:
         "--share-selftest", action="store_true",
         help="Start a tunnel (--share PROVIDER, default auto); check health, WebSocket and a 30 s long-poll.",
     )
+    parser.add_argument(
+        "--gateway", action="store_true",
+        help="Worker for scripts/host.py: serve the one document in --source to the gateway only (secret in "
+        "LP_HOST_SECRET; loopback; every request a shared editor or viewer).",
+    )
+    parser.add_argument("--build-timeout", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())  # Stop like Ctrl+C would: tunnels must not be orphaned.
     if args.share_selftest:
         return selftest(args.share or "auto", args.port if args.port != 8000 else 0)
+
+    if args.gateway:
+        secret = os.environ.pop("LP_HOST_SECRET", "")  # Popped: LaTeX and its children inherit os.environ.
+        project = Path(args.source or "").resolve()
+        if len(secret) < 32 or args.host not in ("127.0.0.1", "::1") or args.share or args.docs \
+                or not (project / "main.tex").is_file():
+            build.error("--gateway needs LP_HOST_SECRET (32+ chars), --source <dir with main.tex>, a loopback --host, "
+                        "and no --share or DOC arguments.")
+            return 2
+        # The project's parent holds the document folder plus its out/ and cache (dot names: a document folder
+        # never starts with a dot), so nothing is written next to the scripts and error messages show no host paths.
+        build.ROOT_DIR = build.SOURCE_DIR = build.FILES_DIR = project.parent
+        build.OUT_DIR, build.CACHE_DIR = project.parent / ".out", project.parent / ".cache"
+        args.docs, args.source = [project.name], None
+        gateway_enable(secret, project.name, args.build_timeout)
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else build.ROOT_DIR / args.source
@@ -2914,8 +2973,8 @@ def main() -> int:
     latexmk = build.check_latex()
     SETTINGS["editor"] = args.editor
     SETTINGS["latexmk"] = latexmk
-    SETTINGS["check_host"] = args.host in LOOPBACK_HOSTS | {"::1"}
-    if not SETTINGS["check_host"]:
+    SETTINGS["check_host"] = args.host in LOOPBACK_HOSTS | {"::1"} and not args.gateway
+    if not SETTINGS["check_host"] and not args.gateway:
         build.error(f"Listening on {args.host}: anyone who can reach this port can read and EDIT your documents.")
 
     try:
@@ -2931,6 +2990,8 @@ def main() -> int:
     first = build.select_documents(documents, args.docs)
     if first:
         address += "#" + build.doc_name(first[0]).replace(" ", "%20")
+    if args.gateway:
+        print(f"LP_GATEWAY_PORT={port}", flush=True)  # host.py reads this line.
     build.info(f"Serving {address}  (Ctrl+C to stop)")
 
     threading.Thread(target=watcher, args=(latexmk, args.docs), daemon=True).start()

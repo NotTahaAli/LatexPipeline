@@ -1299,8 +1299,14 @@ if (role !== "owner") {
   const chip = $("roleChip");
   chip.hidden = false; chip.className = "role " + role;
   chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: readOnly ? "View only" : "Can edit" }));
-  chip.title = readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
+  chip.title = config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
+    : readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
   chip.tabIndex = 0;
+}
+if (config.hosted) {   // Behind scripts/host.py the editor lives at /p/<id>/: the logo goes back to the project list.
+  const logo = document.querySelector(".brand"), home = el("a", { className: "brand", href: "../../", title: "All projects" });
+  home.setAttribute("aria-label", "All projects");
+  home.append(...logo.childNodes); logo.replaceWith(home);
 }
 if (readOnly) {
   for (const [id, why] of [["rebuildBtn", "Only people with the edit link can rebuild"], ["proseBtn", "Paragraph editing needs the edit link"]]) {

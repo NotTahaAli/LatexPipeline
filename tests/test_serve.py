@@ -455,6 +455,89 @@ class SharedState(unittest.TestCase):
         return serve.SHARE["tokens"]
 
 
+class GatewayMode(SharedState, ServerCase):
+    """serve.py --gateway: only scripts/host.py may talk to it, and everyone is a shared editor or viewer."""
+
+    SECRET = "s" * 40
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable(self.SECRET, "demo")
+        self.write("build.toml", "shell_escape = true\n")
+
+    def as_(self, role, method, path, body=None, user="7;Ada", secret=None, headers=None):
+        hdrs = {"X-Host-Secret": self.SECRET if secret is None else secret, "X-Host-Role": role,
+                "X-Host-User": quote(user, safe=";"), **(headers or {})}
+        return self.request(method, path, body, hdrs)
+
+    def test_missing_or_forged_secret_is_401(self):
+        self.assertEqual(self.request("GET", "/api/health")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health", secret="s" * 39 + "t")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health", secret="")[0], 401)
+        self.assertEqual(self.as_("owner", "GET", "/api/health")[0], 401)  # never the owner
+        self.assertEqual(self.as_("edit", "GET", "/api/health", user="no-separator")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health")[0], 200)
+
+    def test_share_tokens_and_cookies_do_not_authenticate(self):
+        self.assertEqual(self.request("GET", "/?token=anything")[0], 401)
+        self.assertEqual(self.request("GET", "/", headers={"Cookie": f"{serve.cookie_name()}=x"})[0], 401)
+        self.assertEqual(self.as_("view", "GET", "/?token=anything")[0], 200)  # no redirect, no cookie
+
+    def test_role_header_is_honoured(self):
+        self.assertEqual(self.as_("view", "GET", "/api/config")[1]["role"], "view")
+        self.assertTrue(self.as_("view", "GET", "/api/config")[1]["hosted"])
+        self.assertEqual(self.as_("view", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 403)
+        self.assertEqual(self.as_("view", "POST", "/rebuild?doc=demo")[0], 403)
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 200)
+        self.assertEqual((self.root / "main.tex").read_text(), "x")
+
+    def test_owner_only_features_are_unavailable(self):
+        for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
+                             ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
+                             ("GET", "/events")]:
+            with self.subTest(path=path):
+                self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
+        self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
+
+    def test_build_config_files_cannot_be_written(self):
+        for name in ("build.toml", ".latexmkrc", "sub/latexmkrc"):
+            with self.subTest(name=name):
+                status, _ = self.as_("edit", "PUT", f"/api/file?doc=demo&path={quote(name)}", {"text": "x"})
+                self.assertEqual(status, 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=rename&path=main.tex&to=.latexmkrc")[0], 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=newfile&path=build.toml")[0], 403)
+        serve.bind_client("c1", "edit", "7;Ada")
+        reply = serve.handle_client_message(
+            {"type": "y-join", "data": {"doc": "demo", "path": "build.toml"}}, "c1", "edit", "7;Ada")
+        self.assertEqual(reply["data"]["status"], 403)
+
+    def test_builds_always_use_the_sharing_restrictions(self):
+        for key, value in serve.SHARE_ENV.items():
+            self.assertEqual(os.environ.get(key), value)
+        settings = build.read_settings(self.root / "main.tex")
+        self.assertFalse(settings["shell_escape"])  # build.toml asked for it
+        self.assertEqual(settings["latexmk_args"][0], "-norc")
+        self.assertLessEqual(settings["timeout"], serve.SHARE_TIMEOUT)
+        self.write("build.toml", "latexmk_args = ['-e', '$x=1']\n")
+        with self.assertRaises(build.ConfigError):
+            build.read_settings(self.root / "main.tex")
+
+    def test_names_and_client_ids_belong_to_the_gateway_user(self):
+        hello = {"type": "hello", "data": {"name": "Mallory", "doc": "demo"}}
+        serve.handle_client_message(hello, "c1", "edit", "7;Ada")
+        self.assertEqual([u["name"] for u in serve.presence("edit")["users"]], ["Ada"])
+        reply = serve.handle_client_message({"type": "bye"}, "c1", "edit", "8;Bob")  # Bob saw c1 in presence
+        self.assertEqual(reply["type"], "error")
+        self.assertIn("c1", serve.CLIENTS)
+
+    def test_host_header_is_not_checked_but_origin_is(self):
+        self.assertEqual(self.as_("edit", "GET", "/api/health", headers={"Host": "latex.example.org"})[0], 200)
+        bad = {"Host": "latex.example.org", "Origin": "https://evil.example"}
+        self.assertEqual(self.as_("edit", "POST", "/rebuild?doc=demo", headers=bad)[0], 403)
+
+
 class TunnelParsing(unittest.TestCase):
     def test_urls_from_each_tools_output(self):
         samples = {
