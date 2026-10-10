@@ -347,19 +347,15 @@ def tex_tree_dirs() -> tuple[Path, ...] | None:
     once per run). None if kpsewhich cannot be run, in which case files outside
     a document's directory are not tracked at all.
     """
-    dirs = []
-    for variable in TEX_TREE_VARIABLES:
-        try:
-            result = subprocess.run(
-                ["kpsewhich", f"-var-value={variable}"],
-                capture_output=True, text=True, check=True,
-            )
-        except (OSError, subprocess.CalledProcessError):
-            return None
-        value = result.stdout.strip()
-        if value:
-            dirs.append(Path(value).resolve())
-    return tuple(dirs)
+    try:
+        # One call for all variables ("|" cannot occur in a path on Windows).
+        result = subprocess.run(
+            ["kpsewhich", "-expand-var=" + "|".join(f"${variable}" for variable in TEX_TREE_VARIABLES)],
+            capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return tuple(Path(value).resolve() for value in result.stdout.strip().split("|") if value)
 
 
 def mirror_dirs(source: Path, target: Path) -> None:
@@ -407,19 +403,22 @@ def recorded_inputs(main_tex: Path) -> list[Path]:
 
     # A TEXMF* value that contains the repository (say "/") would hide every input.
     skip = [path for path in (*tree, CACHE_DIR, OUT_DIR) if path not in ROOT_DIR.parents and path != ROOT_DIR]
-    directory = main_tex.parent
-    found: list[Path] = []
+    # Plain strings: a .fls of a big document lists thousands of paths, and pathlib costs 0.7 s on them.
+    prefixes = tuple(os.path.normcase(os.path.join(str(path), "")) for path in (*skip, main_tex.parent.resolve()))
+    base = str(main_tex.parent)
+    found: dict[str, None] = {}
 
     for line in recorder.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith("INPUT "):
             continue
-        path = (directory / line[len("INPUT "):].strip()).resolve()
-        if path.is_relative_to(directory) or any(path.is_relative_to(base) for base in skip):
+        name = os.path.normpath(os.path.join(base, line[len("INPUT "):].strip()))
+        if name in found or os.path.normcase(name).startswith(prefixes):
             continue
-        if path not in found:
-            found.append(path)
+        name = os.path.realpath(name)
+        if not os.path.normcase(name).startswith(prefixes):
+            found[name] = None
 
-    return found
+    return [Path(name) for name in found]
 
 
 def newest_input(main_tex: Path) -> float:
