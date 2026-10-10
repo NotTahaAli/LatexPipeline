@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 ### Fixed
 
+- Live preview: labels a chapter defines and citations of keys the full build never cited resolve in the same preview (up to 3 passes, BibTeX sandboxed; 1.5 s and 2.2 s on `bench/sample-report` instead of `??` / `(?)` at 0.7 s); `main.tex` body edits preview the part between two chapters (0.2 to 0.4 s), edits of the preamble, a `.cls`/`.sty` or the `\input` list pause the preview with "rebuilding preamble" until the full build instead of showing stale pages; pages are placed from the `.focusmap`'s shipped-page counts (`\pgff@s`), so the splice works without hyperref, and chapters after an uncleared page are numbered like the full PDF (also in `--focus`); double-click on preview pages (SyncTeX of the preview, `/synctex/edit?preview=`); `\include`d chapters and package-read files are typeset from the unsaved text; full builds run at nice 10 (and their Linux autogroup) and figure jobs wait while a preview typesets (worst previews 0.4 to 0.7 s shorter under a forced rebuild, medians unchanged).
+- Partial figure listing reads a file whose pictures a macro draws instead of skipping it (a changed macro could leave figure numbers wrong).
 - A figure edit no longer trusts a stale `.focusmap` (wrong `\thesection` baked into a cached figure); a deleted input or a folder change makes the PDF stale; files reached through a symlinked folder inside a document directory are tracked; `--focus` and figure jobs work in tagged documents.
 
 ### Added
