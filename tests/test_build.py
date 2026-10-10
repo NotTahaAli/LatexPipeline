@@ -173,7 +173,7 @@ class ReadSettingsTests(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
                          {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
-                          "pdfa": None, "lang": "en-US", "timeout": 600})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -193,7 +193,7 @@ class ReadSettingsTests(unittest.TestCase):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
                          {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
-                          "pdfa": None, "lang": "en-US", "timeout": 600})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
@@ -220,15 +220,43 @@ class ReadSettingsTests(unittest.TestCase):
         for value in ("2b", "a-2b", "A-2B"):
             settings = self.settings(self.PLAIN, f'pdfa = "{value}"\nlang = "de-DE"\n')
             self.assertEqual(settings["pdfa"], "a-2b")
-            meta = build.pdfa_metadata(settings)
+            meta = build.document_metadata(settings)
             self.assertTrue(meta.startswith(r"\DocumentMetadata{pdfstandard=a-2b,lang=de-DE}"))
             self.assertNotIn("\n", meta)  # a single latexmk -usepretex argument
             self.assertNotIn("objcompresslevel", meta)
-        self.assertIn(r"\pdfobjcompresslevel=0", build.pdfa_metadata(self.settings(self.PLAIN, 'pdfa = "1b"\n')))
-        self.assertEqual(build.pdfa_metadata(self.settings(self.PLAIN)), "")
+        self.assertIn(r"\pdfobjcompresslevel=0", build.document_metadata(self.settings(self.PLAIN, 'pdfa = "1b"\n')))
+        self.assertEqual(build.document_metadata(self.settings(self.PLAIN)), "")
         self.assertConfigError(self.PLAIN, 'pdfa = "9z"\n')
         self.assertConfigError(self.PLAIN, 'pdfa = true\n')
         self.assertConfigError(self.PLAIN, 'lang = "en}US"\n')
+
+    def test_tagged_metadata(self):
+        meta = build.document_metadata(self.settings(self.PLAIN, "tagged = true\n"))
+        self.assertNotIn("\n", meta)  # a single latexmk -usepretex argument
+        self.assertIn(r"\DocumentMetadata{pdfstandard=ua-1,lang=en-US,tagging=on}", meta)
+        self.assertIn(r"\DocumentMetadata{pdfstandard=ua-1,lang=en-US,testphase={phase-III,firstaid}}", meta)
+        self.assertIn(r"\IfFormatAtLeastTF{2025-06-01}", meta)
+        self.assertIn("WARNING: tagged = true needs LaTeX 2023-06-01", meta)  # old kernels: untagged, with a note
+        self.assertIn("pdfdisplaydoctitle", meta)
+        combined = build.document_metadata(self.settings(self.PLAIN, 'tagged = true\npdfa = "2a"\nlang = "de-DE"\n'))
+        self.assertIn(r"\DocumentMetadata{pdfstandard=a-2a,lang=de-DE,tagging=on}", combined)
+        self.assertIn("glyphtounicode", combined)
+        self.assertNotIn("\n", combined)
+        self.assertEqual(build.document_metadata(self.settings(self.PLAIN, "tagged = false\n")), "")
+        self.assertConfigError(self.PLAIN, 'tagged = "yes"\n')
+
+    def test_tagged_check_and_ua_flavour(self):
+        with fake_repo() as root:
+            pdf = root / "a.pdf"
+            pdf.write_bytes(b"%PDF-1.7\n/MarkInfo<</Marked true>>/StructTreeRoot 5 0 R\n")
+            self.assertIn("present", build.tagged_check(pdf))
+            pdf.write_bytes(b"%PDF-1.7\n")
+            self.assertIn("no structure tree", build.tagged_check(pdf))
+        done = subprocess.CompletedProcess([], 0, stdout='<validationReport isCompliant="true">', stderr="")
+        with mock.patch.object(build.subprocess, "run", return_value=done) as call:
+            note = build.verapdf_note("verapdf", Path("a.pdf"), "a-2a", tagged=True)
+        self.assertEqual([c[0][0][4] for c in call.call_args_list], ["2a", "ua1"])
+        self.assertEqual(note, "PDF/A a-2a: veraPDF passed. PDF/UA-1: veraPDF passed.")
 
     def test_pdfa_check_reads_xmp_and_output_intent(self):
         with fake_repo() as root:
