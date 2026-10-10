@@ -494,7 +494,8 @@ def log_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang", "timeout"}
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang", "timeout",
+               "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
 # Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
 DEFAULT_TIMEOUT = 600
 TIMEOUT_RANGE = (10, 7200)

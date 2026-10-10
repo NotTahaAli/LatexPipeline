@@ -6,7 +6,8 @@ Subcommands:
 
 - summary     Markdown table of this run's documents, for $GITHUB_STEP_SUMMARY.
 - lint        Structural checks (labels, references, figures, bib), overfull boxes from
-              the cached log, chktex and word counts into out/lint-report.json.
+              the cached log, chktex and word counts into out/lint-report.json. --grammar adds
+              LanguageTool findings (grammar.py).
               Findings are GitHub annotations in Actions; --strict fails on them.
 - diff        latexdiff of every document changed since --base, PDFs into --out
               (keep --out outside out/, so the PDFs are not published to the release).
@@ -30,6 +31,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
+import grammar
 from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, read_settings, size_text
 from hints import overfull_boxes
 
@@ -505,6 +507,41 @@ def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[F
     return findings
 
 
+def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
+    """LanguageTool findings for every .tex file the document pulls in. Quiet and empty when grammar is off."""
+    settings = read_settings(doc_dir / "main.tex")
+    try:
+        grammar.validate_settings(settings)
+        mode, url = grammar.resolve(settings.get("grammar"), settings.get("grammar_url"))
+        in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+        if mode == "public" and in_ci and os.environ.get("GRAMMAR_PUBLIC_OK") != "1":
+            print(f"{name}: grammar = \"public\" sends the text to languagetool.org; "
+                  "set GRAMMAR_PUBLIC_OK=1 to allow it in CI.")
+            return []
+        if mode == "off":
+            print(f"{name}: grammar is off (no LanguageTool server answered; see README).")
+            return []
+        if mode == "public":
+            print(f"{name}: {grammar.PUBLIC_NOTICE}")
+        sources = reachable_sources(doc_dir)
+        found = []
+        for rel in sources:
+            if not rel.endswith(".tex"):
+                continue
+            text = (doc_dir / rel).read_text(encoding="utf-8", errors="replace")
+            found += [
+                Finding("grammar", rel, item.line, f"{item.message} [{item.rule}]"
+                        + (f" Try: {', '.join(item.replacements)}" if item.replacements else ""),
+                        f"{item.rule}:{item.text[:40]}", level="info")
+                for item in grammar.check_source(text, rel, url=url, public=mode == "public",
+                                                 lang=settings["lang"], disabled=settings.get("disabled_rules", []))
+            ]
+        return found
+    except grammar.GrammarError as error:
+        print(f"{name}: grammar check skipped: {error}")
+        return []
+
+
 def read_baseline(doc_dir: Path) -> set[str]:
     path = doc_dir / BASELINE_NAME
     if not path.is_file():
@@ -564,6 +601,8 @@ def cmd_lint(args: argparse.Namespace) -> int:
     for name in lint_targets(args.documents):
         doc_dir = SOURCE_DIR / name
         findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt)
+        if getattr(args, "grammar", False):
+            findings += grammar_findings(name, doc_dir)
         suppressed = 0
         if args.update_baseline:
             write_baseline(doc_dir, findings)
@@ -709,6 +748,9 @@ def main() -> int:
                       help="write files/<doc>/.lint-baseline from the current findings")
     lint.add_argument("--overfull-pt", type=float, default=DEFAULT_OVERFULL_PT,
                       help="report overfull boxes wider than this many points (default 10)")
+
+    lint.add_argument("--grammar", action="store_true",
+                      help="also check the prose with LanguageTool (see README; off by default)")
 
     diff = commands.add_parser("diff", help="latexdiff of changed documents")
     diff.add_argument("--base", required=True, help="git ref to compare against")
