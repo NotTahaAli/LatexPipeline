@@ -66,6 +66,23 @@ class TikzDetectionTests(unittest.TestCase):
             self.assertTrue(accel.uses_tikz(root))
 
 
+class TouchedTests(unittest.TestCase):
+    def test_only_figure_text_counts_as_a_figure_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc, cache = Path(tmp) / "doc", Path(tmp) / "cache"
+            doc.mkdir()
+            cache.mkdir()
+            (doc / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\\input{a}\\end{document}\n")
+            chapter = doc / "a.tex"
+            chapter.write_text("Text.\n\\begin{tikzpicture}\\node{A};\\end{tikzpicture}\n")
+            figures = accel.Figures(doc / "main.tex", cache, "pdflatex", False, 1)
+            self.assertTrue(figures.touched(0.0))  # No snapshot yet: any file with a figure.
+            chapter.write_text("More text.\n\\begin{tikzpicture}\\node{A};\\end{tikzpicture}\n")
+            self.assertFalse(figures.touched(0.0))
+            chapter.write_text("More text.\n\\begin{tikzpicture}\\node{B};\\end{tikzpicture}\n")
+            self.assertTrue(figures.touched(0.0))
+
+
 HEAD = "\\documentclass{article}\n\\usepackage{tikz}\n\\pagestyle{empty}\n"
 
 

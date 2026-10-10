@@ -22,6 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 ### Changed
 
 - **Faster builds** on `bench/sample-report` (303 pages, 25 TikZ figures, 4 CPUs): cold build 93 s to 65 s, one-line text edit 47 s to 20 s, `--focus` preview 1.7 s.
+- A text edit in a file that also holds a TikZ figure no longer re-lists the figures: one LaTeX pass instead of two (23 s to 13 s on `bench/sample-report`).
 - **Faster CI**: TeX Live comes from a cache (restore about 12 s) filled by a parallel `texlive-cache` job; on a miss the build uses trimmed apt (about 70 s). The build job takes about 19 s warm and about 70 s cold.
 - `sample-report` moved from `files/` to `bench/` and is built with `--source bench`. CI never builds it, and the next publish deletes it from the `pdfs` release.
 - `\today` follows the date of the last commit that touched the document, so PDFs are reproducible (`SOURCE_DATE_EPOCH`); unchanged release files are not uploaded again.

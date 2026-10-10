@@ -210,7 +210,7 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 
 Nothing here needs a change to the document.
 
-**TikZ/pgfplots figures are compiled once and cached.** If a document uses `tikz` or `pgfplots` (in `main.tex`, a class, a package or a chapter), `build.py` switches on TikZ's `external` library through `latexmk -usepretex`. A first run lists the figures, they are compiled in parallel (about one process per CPU, shared between the documents built at once; no `make` and no shell escape needed), and the text passes then include the finished PDFs. Figures are cached in `.latex-cache/_figcache/` by the hash of their source, so an edit re-typesets only the text, and renumbering or moving a figure costs nothing. The cache is also invalidated when the preamble, a file the preamble `\input`s, a local `.cls`/`.sty`/`.csv`/`.dat`/`.tikz` file, the TeX engine or the TikZ/pgfplots packages change, and figures nobody uses any more are deleted. Works with `pdflatex`, `xelatex` and `lualatex`. Documents without TikZ are built as before, and so are documents with `remember picture`, `overlay` or `tikzmark` pictures, which cannot be cut out as figures. If the figures cannot be made, the document is built again without externalization and its log says so (a LaTeX error in the text does not trigger that second build).
+**TikZ/pgfplots figures are compiled once and cached.** If a document uses `tikz` or `pgfplots` (in `main.tex`, a class, a package or a chapter), `build.py` switches on TikZ's `external` library through `latexmk -usepretex`. A first run lists the figures, they are compiled in parallel (about one process per CPU, shared between the documents built at once; no `make` and no shell escape needed), and the text passes then include the finished PDFs. Figures are cached in `.latex-cache/_figcache/` by the hash of their source, so an edit re-typesets only the text, and renumbering or moving a figure costs nothing. Figures are listed again only when the figure text of a file changed (its `tikzpicture` environments and lines that mention tikz, pgf or axis), so a text edit next to a figure costs one LaTeX pass. The cache is also invalidated when the preamble, a file the preamble `\input`s, a local `.cls`/`.sty`/`.csv`/`.dat`/`.tikz` file, the TeX engine or the TikZ/pgfplots packages change, and figures nobody uses any more are deleted. Works with `pdflatex`, `xelatex` and `lualatex`. Documents without TikZ are built as before, and so are documents with `remember picture`, `overlay` or `tikzmark` pictures, which cannot be cut out as figures. If the figures cannot be made, the document is built again without externalization and its log says so (a LaTeX error in the text does not trigger that second build).
 
 Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to recompile every figure):
 
@@ -229,6 +229,7 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 | --- | --- | --- |
 | cold build (`--force`) | 93 s | 65 s |
 | one-line text edit | 47 s | 20 s |
+| one-line text edit in a file that holds a figure | n/a | 13 s (was 23 s) |
 | edit one figure | 24 s | 23 s |
 | `--focus Chapters/chapter5` | n/a | 1.7 s |
 

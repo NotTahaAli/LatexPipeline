@@ -844,7 +844,9 @@ def build_document(
                 say()
 
                 last = mode_file.stat().st_mtime if mode_file.exists() and not force else 0.0
-                if not figures.names() or figures.touched(last):
+                # touched() runs every time: it also records the figure text for the next build.
+                touched = figures.touched(last)
+                if not figures.names() or touched:
                     say("Listing figures ...")
                     run(figures.discover_command(), "figures")
                     if errors:  # Timed out: no figures, no plain rebuild.
