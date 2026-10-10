@@ -32,6 +32,35 @@ class FocusTests(unittest.TestCase):
         self.assertEqual([e["path"] for e in entries][3], "Chapters/ch5/b")
         self.assertEqual(entries[1]["counters"], [("chapter", "4"), ("page", "80")])
 
+    def test_read_attaches_shipped_page_counts_to_start_and_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "main.focusmap"
+            path.write_text(
+                "\\pgff@e{n}{1}{a}{}\n\\pgff@f{-1}\n\\pgff@s{3}{1}\n\\pgff@e{n}{2}{b}{}\n\\pgff@f{-1}\n\\pgff@s{4}{0}\n"
+                "\\pgff@x{2}{-1}{}\n\\pgff@s{6}{3}\n\\pgff@x{1}{-1}{}\n\\pgff@s{9}{2}\n\\pgff@e{n}{1}{c}{}\n"
+                "\\pgff@s{-1}{0}\n",
+                encoding="utf-8",
+            )
+            entries = accel.read_focusmap(path)
+        self.assertEqual([(e.get("shipped"), e.get("shipped_end")) for e in entries], [(3, 9), (4, 6), (None, None)])
+        self.assertEqual([(e.get("pending"), e.get("pending_end")) for e in entries], [(1, 2), (0, 3), (None, None)])
+
+    def test_a_chapter_after_a_filled_page_starts_on_the_next_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp)
+            (doc / "ch.tex").write_text("% a comment\n\\label{x}\\chapter{Two}\n", encoding="utf-8")
+            (doc / "sec.tex").write_text("\\section{Two}\n", encoding="utf-8")
+            (doc / "wrap.tex").write_text("\\appendix\n\\input{ch}\n", encoding="utf-8")
+            entry = {"kind": "n", "raw": "ch", "pending": 1}
+            self.assertEqual(accel.next_page(entry, doc), 1)
+            self.assertEqual(accel.next_page({**entry, "pending": 3}, doc), 2)  # and a page of waiting floats
+            self.assertEqual(accel.next_page({**entry, "pending": 0}, doc), 0)  # an empty page: no break
+            self.assertEqual(accel.next_page({**entry, "raw": "sec"}, doc), 0)  # a section continues the page
+            self.assertEqual(accel.next_page({**entry, "raw": "wrap"}, doc), 1)
+            self.assertEqual(accel.next_page(entry, doc, "unsaved text"), 0)
+            entries = [{"kind": "n", "raw": "ch", "path": "ch", "depth": 1, "counters": [("page", "7")]}]
+            self.assertIn(r"\pgff@c{page}{9}", accel.focus_tex(entries, {0}, 0, 2))
+
     def test_directory_focus_keeps_matches_and_their_ancestors(self):
         entries = self.entries()
         keep, first = accel.focus_selection(entries, "Chapters/ch5")
@@ -204,6 +233,23 @@ class ExternalizedBuildTests(unittest.TestCase):
         self.write("b.tex", pic("ONE") + pic("EXTRA"))
         self.assertTrue(figures.touched(0.0))
         figures.recorded = time.time()
+        self.assertFalse(figures.discover_partial())
+
+    def test_partial_listing_reads_files_whose_figures_a_macro_draws(self):
+        # a.tex draws with a macro (no picture in its text); the macro now draws two pictures.
+        head = HEAD + "\\newcommand\\myfig{\\begin{tikzpicture}\\node{m};\\end{tikzpicture}}\n"
+        self.write("a.tex", "\\section{One}\\myfig\n")
+        self.write("b.tex", pic("bee"))
+        self.write("main.tex", head + "\\begin{document}\n\\input{a}\\input{b}\n\\end{document}\n")
+        self.render()
+        figures = self.figures
+        figures.touched(0.0)
+        self.write("main.tex", head.replace("\\end{tikzpicture}}", "\\end{tikzpicture}\\tikz\\node{n};}")
+                   + "\\begin{document}\n\\input{a}\\input{b}\n\\end{document}\n")
+        self.write("b.tex", pic("BEE"))
+        self.assertTrue(figures.touched(0.0))
+        figures.recorded = time.time() + 10  # a.tex counts as unedited since the map.
+        # Skipping a.tex would list b.tex as figure 1 (it is figure 2 now) and pass the names check.
         self.assertFalse(figures.discover_partial())
 
     def test_partial_listing_does_not_trust_a_stale_map(self):

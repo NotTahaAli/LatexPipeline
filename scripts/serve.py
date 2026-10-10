@@ -580,11 +580,15 @@ def refresh_preview(main_tex: Path) -> None:
 
 
 def live_preview(name: str, client: str, data: dict) -> tuple[dict, bytes | None]:
-    """POST /api/preview: typeset the chapter holding data["path"] with data["text"] in place of that file."""
+    """
+    POST /api/preview: typeset the chapter holding data["path"] with data["text"] in place of that file (main.tex:
+    the part around the edit). An edit of the preamble, a class or a package answers status "preamble": the
+    full build after the save (the watcher's) brings previews back.
+    """
     main_tex = DOCS[name]
     rel, text = data.get("path"), data.get("text")
-    if not isinstance(rel, str) or not rel.endswith(".tex") or rel == "main.tex" or is_rc(rel):
-        raise ApiError("Live preview works on the chapters of a document (not main.tex).", 400)
+    if not isinstance(rel, str) or not rel.endswith((".tex", ".cls", ".sty")) or is_rc(rel):
+        raise ApiError("Live preview works on the .tex, .cls and .sty files of a document.", 400)
     if not resolve_in_doc(main_tex.parent, rel).is_file():
         raise ApiError("No such file.", 404)
     if text is not None and not isinstance(text, str):
@@ -1657,12 +1661,13 @@ class SynctexError(Exception):
     pass
 
 
-def synctex(main_tex: Path, kind: str, spec: str) -> dict[str, str]:
-    """Run the synctex CLI against the cached PDF (its .synctex.gz sits beside it)."""
+def synctex(main_tex: Path, kind: str, spec: str, pdf: Path | None = None) -> dict[str, str]:
+    """Run the synctex CLI against the cached PDF (its .synctex.gz sits beside it), or another PDF."""
     # ponytail: the cache PDF can be newer than the out/ PDF after a failed build; line-level error is small.
-    pdf = build.cache_dir_for(main_tex) / f"{main_tex.stem}.pdf"
-    if not synctex_file(main_tex).exists():
-        raise SynctexError("No SyncTeX data yet: use Rebuild from scratch.")
+    if pdf is None:
+        pdf = build.cache_dir_for(main_tex) / f"{main_tex.stem}.pdf"
+        if not synctex_file(main_tex).exists():
+            raise SynctexError("No SyncTeX data yet: use Rebuild from scratch.")
     argv = ["edit", "-o", f"{spec}:{pdf}"] if kind == "edit" else ["view", "-i", spec, "-o", str(pdf)]
     try:
         result = subprocess.run(
@@ -1691,9 +1696,16 @@ def number(query: dict, key: str, default: str | None = None) -> float:
 
 
 def inverse(main_tex: Path, query: dict) -> dict:
+    """PDF position -> source line. With preview=<cid>: a page of that browser tab's newest live preview."""
     page, x, y = number(query, "page"), number(query, "x"), number(query, "y")
-    fields = synctex(main_tex, "edit", f"{int(page)}:{x:.2f}:{y:.2f}")
+    cid = query.get("preview", [""])[0][:64]
+    found = preview.sync_files(main_tex, cid) if cid else None
+    if cid and found is None:
+        raise SynctexError("This live preview has no SyncTeX data any more; type again or wait for the full PDF.")
+    fields = synctex(main_tex, "edit", f"{int(page)}:{x:.2f}:{y:.2f}", found[0] if found else None)
     source = Path(fields["Input"])
+    if found and source.name in found[1]:  # The editor's unsaved text, standing for the file being typed.
+        source = main_tex.parent / found[1][source.name]
     if not source.is_absolute():
         source = main_tex.parent / source
     source = Path(posixpath.normpath(source.as_posix()))

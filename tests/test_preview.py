@@ -50,6 +50,10 @@ def doc(root: Path, build_toml: str | None = None) -> Path:
     return main
 
 
+def tearDownModule():
+    preview.sandbox.LOW_UNTIL = 0.0  # Previews here put later builds below normal priority for a minute.
+
+
 class KeyTests(unittest.TestCase):
     """What restarts the waiting process: anything that shaped its preamble, and nothing else."""
 
@@ -101,7 +105,7 @@ class RefusalTests(unittest.TestCase):
             main = doc(root)
             calls = []
 
-            def spawn(cmd, cwd, build_dir, env=None, cpu=0, work=None):
+            def spawn(cmd, cwd, build_dir, env=None, cpu=0, work=None, urgent=False):
                 calls.append((cwd, build_dir, work))
                 return {"args": [sys.executable, "-c", "pass"], "cwd": cwd, "env": None}
 
@@ -130,7 +134,7 @@ class WarmTests(unittest.TestCase):
     def wait_ready(self):
         self.warm.warm_up()
         deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and not (self.warm.ready.dir / f"{self.main.stem}.log").exists():
+        while time.monotonic() < deadline and not (self.warm.ready[0].dir / f"{self.main.stem}.log").exists():
             time.sleep(0.05)
         time.sleep(0.5)  # Loading the (small) preamble.
 
@@ -144,12 +148,12 @@ class WarmTests(unittest.TestCase):
         self.assertIn("Typed", words)
         self.assertNotIn("Two", words)  # Only the chapter around the cursor.
         self.assertNotIn("??", words)  # \ref{two} comes from the full build's .aux.
-        self.assertIsNotNone(self.warm.ready)  # The next process is already loading its preamble.
+        self.assertTrue(self.warm.ready)  # The next process is already loading its preamble.
         self.assertFalse(list(preview.root_for(self.main).glob("p*/*.pdf")))  # Used directories are removed.
 
     def test_a_preamble_change_replaces_the_waiting_process(self):
         self.wait_ready()
-        old = self.warm.ready
+        old = self.warm.ready[0]
         sty = self.main.parent / "mystyle.sty"
         sty.write_text("\\newcommand\\mine{Changed}\n")
         os.utime(sty, ns=(2, 2))
@@ -157,7 +161,7 @@ class WarmTests(unittest.TestCase):
         self.assertTrue(result["ok"], result["errors"])
         self.assertFalse(result["warm"])  # Started cold, from the new preamble.
         self.assertIn("Changed", text(result["pdf"]))
-        self.assertIsNot(self.warm.ready, old)
+        self.assertNotIn(old, self.warm.ready)
         self.assertIsNotNone(old.popen.poll())  # The stale one was stopped.
 
     def test_a_newer_preview_of_the_same_client_cancels_the_older_one(self):
@@ -211,3 +215,143 @@ class OtherEngineTests(unittest.TestCase):
                 self.assertTrue(result["ok"], result["errors"])
                 self.assertIn("Typed", text(result["pdf"]))
                 self.assertNotIn("??", text(result["pdf"]))
+
+
+FULL = r"""\documentclass{article}
+\ifdefined\pdfobjcompresslevel\pdfcompresslevel=0 \pdfobjcompresslevel=0 \fi
+\usepackage{mystyle}
+\begin{document}
+Front.
+\input{ch/one}
+Between the chapters.
+\input{ch/two}
+\include{ch/three}
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}
+"""
+BIB = """@misc{known, title={Known Work}, author={A. Author}, year=2000}
+@misc{fresh, title={Fresh Work}, author={B. Author}, year=2001}
+"""
+
+
+@unittest.skipUnless(LATEX and shutil.which("bibtex") and shutil.which("pdftotext"), "needs latexmk, bibtex, pdftotext")
+class LiveFeatureTests(unittest.TestCase):
+    """One full build (no hyperref), then: new labels and citations, main.tex's body, \\include, package-read files,
+    pages placed without page labels, SyncTeX, preamble edits, build priority."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stack = contextlib.ExitStack()
+        root = cls.stack.enter_context(fake_repo())
+        cls.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        cls.main = write_doc(root, "doc", FULL)
+        doc = cls.main.parent
+        (doc / "ch").mkdir()
+        (doc / "ch" / "one.tex").write_text(
+            "\\clearpage\\section{One}\\label{one}Chapter one, see \\ref{two} and \\cite{known}.\n"
+            "\\InputIfFileExists{ch/table.tex}{}{}\n")
+        (doc / "ch" / "table.tex").write_text("Table text.\n")
+        (doc / "ch" / "two.tex").write_text("\\clearpage\\section{Two}\\label{two}Chapter two.\n")
+        (doc / "ch" / "three.tex").write_text("\\section{Three}Chapter three.\n")
+        (doc / "refs.bib").write_text(BIB)
+        (doc / "mystyle.sty").write_text("\\newcommand\\mine{M}\n")
+        entry, _ = build.build_safely(cls.main, shutil.which("latexmk"), False, False, record=True)
+        assert entry["ok"], entry
+        preview.snapshot(cls.main)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stack.close()
+
+    def setUp(self):
+        self.warm = preview.Warm(self.main)
+        self.addCleanup(self.warm.shutdown)
+        self.warm.warm_up()
+
+    def compile(self, rel, typed, client="c"):
+        result = self.warm.compile(client, rel, typed)
+        self.assertTrue(result["ok"], result["errors"])
+        return result, text(result["pdf"])
+
+    def test_labels_and_citations_new_in_the_chapter_resolve_in_the_same_preview(self):
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}Plain edit, see \\ref{two}.\n")
+        self.assertEqual(result["passes"], 1)  # Nothing new: one pass, as before.
+        typed = ("\\clearpage\\section{One}\\label{one}\\subsection{Sub}\\label{brandnew}See \\ref{brandnew} "
+                 "and \\cite{fresh}.\n")
+        result, words = self.compile("ch/one.tex", typed)
+        self.assertNotIn("??", words)  # The label the chapter itself defines.
+        self.assertNotIn("[?]", words)  # A key the full build never cited, from refs.bib through BibTeX.
+        self.assertIn("1.1", words)
+        self.assertEqual(result["passes"], 3)  # labels and bibliography, then the citation's number
+        self.assertEqual(self.warm.pool, 2)  # From now on a second waiting process is kept for such passes.
+
+    def test_main_tex_body_is_previewed_between_its_chapters(self):
+        result, words = self.compile("main.tex", FULL.replace("Between the chapters.", "Edited between."))
+        self.assertIn("Edited between", words)
+        self.assertNotIn("Chapter two", words)
+        self.assertNotIn("Chapter one", words)
+        self.assertEqual((result["pages"]["first"], result["pages"]["last"]), (1, 1))  # page 2 holds that text
+        self.assertEqual(self.warm.compile("c", "main.tex", FULL)["status"], "same")
+        moved = self.warm.compile("c", "main.tex", FULL.replace("\\input{ch/two}\n", ""))
+        self.assertEqual((moved["status"], moved["saved"]), ("rebuild", False))  # the input tree is the build's
+        edited = self.warm.compile("c", "main.tex", FULL.replace("\\begin{document}", "\\usepackage{xcolor}\n"
+                                                                                       "\\begin{document}"))
+        self.assertEqual((edited["status"], edited["saved"]), ("preamble", False))
+
+    def test_include_and_package_read_files_use_the_typed_text(self):
+        result, words = self.compile("ch/three.tex", "\\section{Three}Typed into an include.\n")
+        self.assertIn("Typed into an include", words)
+        with self.assertRaises(preview.PreviewError):  # Read by a package: which chapter is unknown yet.
+            self.warm.compile("fresh-tab", "ch/table.tex", "Typed table.\n")
+        self.compile("ch/one.tex", None)
+        result, words = self.compile("ch/table.tex", "Typed table.\n")
+        self.assertIn("Typed table", words)
+        self.assertEqual(result["target"], "ch/one")
+
+    def test_pages_are_placed_in_the_full_pdf_without_page_labels(self):
+        result, words = self.compile("ch/two.tex", "\\clearpage\\section{Two}Chapter two typed.\n")
+        self.assertEqual((result["pages"]["first"], result["pages"]["last"]), (2, 2))  # the full PDF's third page
+        self.assertIn("\n3\n", words)  # numbered like the full build: the page before held chapter one's text
+
+    @unittest.skipUnless(shutil.which("synctex"), "needs synctex")
+    def test_synctex_on_a_preview_page_names_the_typed_file(self):
+        self.compile("ch/two.tex", "\\clearpage\\section{Two}\n\nFirst typed line.\n\nSecond typed line.\n", "tab1")
+        pdf, names = preview.sync_files(self.main, "tab1")
+        out = subprocess.run(["synctex", "edit", "-o", f"1:150:130:{pdf}"], capture_output=True, text=True).stdout
+        fields = dict(line.split(":", 1) for line in out.splitlines() if line.startswith(("Input:", "Line:")))
+        self.assertEqual(names[Path(fields["Input"]).name], "ch/two.tex")
+        self.assertGreaterEqual(int(fields["Line"]), 1)
+        self.assertIsNone(preview.sync_files(self.main, "other-tab"))
+
+    def test_a_saved_package_edit_restarts_the_waiting_process_and_previews_wait_for_the_build(self):
+        sty = self.main.parent / "mystyle.sty"
+        old = self.warm.ready[0]
+        sty.write_text("\\newcommand\\mine{N}\n")
+        self.addCleanup(sty.write_text, "\\newcommand\\mine{M}\n")
+        os.utime(sty, ns=(5, 5))
+        self.assertEqual(self.warm.compile("c", "mystyle.sty", "unsaved"), preview.status("preamble", saved=False))
+        result = self.warm.compile("c", "mystyle.sty", None)
+        self.assertEqual((result["status"], result["saved"]), ("preamble", True))
+        self.assertNotIn(old, self.warm.ready)  # Restarted from the new preamble.
+        self.assertIsNotNone(old.popen.poll())
+
+    def test_previews_put_full_builds_below_normal_priority(self):
+        with mock.patch.object(preview.sandbox, "LOW_UNTIL", 0.0):
+            self.compile("ch/two.tex", None)
+            self.assertGreater(preview.sandbox.LOW_UNTIL, time.monotonic())
+
+
+class LabelTests(unittest.TestCase):
+    def test_only_what_a_reference_prints_counts_as_a_change(self):
+        line = "\\newlabel{x}{{1.2}{5}{Title}{section.1.2}{}}"
+        self.assertEqual(preview.shown(line), preview.shown(line.replace("section.1.2", "section.7")))
+        self.assertNotEqual(preview.shown(line), preview.shown(line.replace("{5}", "{6}")))
+        self.assertEqual(preview.labels(["\\newlabel{a}{{1}{2}}\n\\bibcite{k}{3}\n", "\\newlabel{a}{{9}{9}}"]),
+                         {"a": "\\newlabel{a}{{9}{9}}", "k": "\\bibcite{k}{3}"})
+
+    def test_referenced_ignores_the_label_itself(self):
+        self.assertFalse(preview.referenced("x", "\\label{x} text"))
+        self.assertTrue(preview.referenced("x", "\\label{x} see \\ref{x}"))
+        self.assertTrue(preview.referenced("x@cref", "\\cref{a, x}"))
+        self.assertTrue(preview.referenced("key", "\\citep[p.~3]{other,key}"))

@@ -17,6 +17,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 try:
@@ -46,6 +48,30 @@ KEEP_ENV = {
 MEMORY = 2 << 30  # RLIMIT_AS
 FILE_SIZE = 512 << 20  # RLIMIT_FSIZE
 OPEN_FILES = 1024  # RLIMIT_NOFILE
+
+
+# Until this time.monotonic() value, runs that are not urgent start below normal priority: the editor's
+# live preview (scripts/preview.py) sets it while it is in use, so a full build does not slow it down.
+LOW_UNTIL = 0.0
+NICE = 10  # POSIX niceness of such runs (Linux derives their I/O priority from it); Windows: below normal
+# Live previews typesetting right now. Figure jobs wait (a few seconds at most) before they start while
+# one runs: nice alone does not help under bubblewrap, whose new session is a scheduler group of its own.
+_BUSY = 0
+_BUSY_LOCK = threading.Condition()
+
+
+def preview_running(delta: int) -> None:
+    """A live preview starts (+1) or ends (-1) typesetting."""
+    global _BUSY
+    with _BUSY_LOCK:
+        _BUSY = max(0, _BUSY + delta)
+        _BUSY_LOCK.notify_all()
+
+
+def wait_turn(limit: float = 5.0) -> None:
+    """Before a background LaTeX run (a figure job): let a live preview that is typesetting finish first."""
+    with _BUSY_LOCK:
+        _BUSY_LOCK.wait_for(lambda: _BUSY == 0, limit)
 
 
 class SandboxError(OSError):
@@ -158,23 +184,51 @@ def environment(env: dict[str, str] | None, var: Path) -> dict[str, str]:
     }
 
 
-def _limits(values: list[tuple[int, int]]) -> None:  # In the child between fork and exec: no imports.
+def _lower(nice: int, group: bool) -> None:  # In the child between fork and exec: no imports.
+    os.nice(nice)
+    if group:  # A new session is a scheduler group of its own on Linux (autogroup): lower the group, too.
+        try:
+            with open("/proc/self/autogroup", "w") as autogroup:
+                autogroup.write(str(nice))
+        except OSError:
+            pass
+
+
+def _limits(values: list[tuple[int, int]], nice: int, group: bool) -> None:  # In the child: no imports.
+    if nice:
+        _lower(nice, group)
     for kind, value in values:
         resource.setrlimit(kind, (value, value))
 
 
+def process_options(new_group: bool, low: bool) -> dict:
+    """Popen options for a new process group and below-normal priority (POSIX: the nice goes in preexec_fn)."""
+    if os.name == "nt":
+        flags = (subprocess.CREATE_NEW_PROCESS_GROUP if new_group else 0) | (
+            subprocess.BELOW_NORMAL_PRIORITY_CLASS if low else 0)
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True} if new_group else {}
+
+
 def spawn(
     cmd: list[str], cwd: Path, build_dir: Path, env: dict[str, str] | None = None, cpu: int = 1800,
-    work: Path | None = None,
+    work: Path | None = None, new_group: bool = False, urgent: bool = False,
 ) -> dict:
     """
     Keyword arguments for subprocess.Popen / subprocess.run that run a TeX command: the one place
     every LaTeX process of build.py and accel.py starts. Unsandboxed unless LATEX_SANDBOX=bwrap.
     The sandbox may write build_dir, or (a figure job) only read it and write work and the caches.
     cpu: the CPU-seconds limit, the run's timeout. Call scrub(build_dir) once the run has ended.
+    new_group: in its own process group (killed as a tree). Runs that are not urgent (the live preview's
+    are) start below normal priority while LOW_UNTIL lies ahead.
     """
+    low = not urgent and time.monotonic() < LOW_UNTIL
+    options = process_options(new_group, low)
+    nice = NICE if low and os.name != "nt" else 0
     if not enabled():
-        return {"args": cmd, "cwd": cwd, "env": env}
+        if nice:
+            options["preexec_fn"] = functools.partial(_lower, nice, new_group)
+        return {"args": cmd, "cwd": cwd, "env": env, **options}
     check()
     var = build_dir / "texmf-var"
     (var / "par").mkdir(parents=True, exist_ok=True)
@@ -185,7 +239,8 @@ def spawn(
         values.append((kind, value if hard == resource.RLIM_INFINITY else min(value, hard)))
     return {
         "args": wrap(cmd, cwd, [build_dir], []) if work is None else wrap(cmd, cwd, [work, var], [build_dir]),
-        "cwd": cwd, "env": environment(env, var), "preexec_fn": functools.partial(_limits, values),
+        "cwd": cwd, "env": environment(env, var), "preexec_fn": functools.partial(_limits, values, nice, new_group),
+        **options,
     }
 
 
