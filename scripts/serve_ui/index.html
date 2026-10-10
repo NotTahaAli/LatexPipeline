@@ -50,6 +50,10 @@
     <symbol id="i-bold" viewBox="0 0 24 24"><path d="M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z"/></symbol>
     <symbol id="i-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/></symbol>
     <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12h.01"/></symbol>
+    <symbol id="i-newfile" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/></symbol>
+    <symbol id="i-newfolder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10v5M9.5 12.5h5"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></symbol>
     <symbol id="i-focus" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
   </defs>
@@ -92,7 +96,16 @@
       </div>
       <button class="icon x" id="sideClose" aria-label="Close sidebar" title="Close sidebar"><svg class="ic"><use href="#i-x"/></svg></button>
     </div>
-    <div id="panel-files" role="tabpanel" aria-labelledby="tab-files"><div id="tree" role="tree" aria-label="Files"></div></div>
+    <div id="panel-files" role="tabpanel" aria-labelledby="tab-files">
+      <div class="tree-tools" role="toolbar" aria-label="File actions">
+        <button id="fNewFile" class="icon" title="New file" aria-label="New file"><svg class="ic"><use href="#i-newfile"/></svg></button>
+        <button id="fNewDir" class="icon" title="New folder" aria-label="New folder"><svg class="ic"><use href="#i-newfolder"/></svg></button>
+        <span class="spacer"></span>
+        <button id="fRename" class="icon" title="Rename or move (F2)" aria-label="Rename or move"><svg class="ic"><use href="#i-edit"/></svg></button>
+        <button id="fDelete" class="icon" title="Delete (Delete key)" aria-label="Delete"><svg class="ic"><use href="#i-trash"/></svg></button>
+      </div>
+      <div id="tree" role="tree" aria-label="Files"></div>
+    </div>
     <div id="panel-outline" role="tabpanel" aria-labelledby="tab-outline" hidden>
       <div id="outlineHead" class="outline-head"></div>
       <div id="outlineList" role="group" aria-label="Document outline"></div>
@@ -171,6 +184,19 @@
   <form method="dialog">
     <div class="dlg-head"><h2 id="shareTitle">Share</h2><button class="icon" value="close" aria-label="Close share dialog"><svg class="ic"><use href="#i-x"/></svg></button></div>
     <div id="shareBody" class="share-body"></div>
+  </form>
+</dialog>
+
+<dialog id="fsDlg" aria-labelledby="fsTitle">
+  <form id="fsForm" method="dialog">
+    <div class="dlg-head"><h2 id="fsTitle"></h2><button type="button" class="icon" id="fsClose" aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></div>
+    <div class="share-body">
+      <p id="fsMsg"></p>
+      <label for="fsName" id="fsLabel"></label>
+      <input id="fsName" type="text" autocomplete="off" spellcheck="false" maxlength="240">
+      <p id="fsErr" class="err" role="alert" hidden></p>
+      <div class="actions"><button type="button" class="btn" id="fsCancel">Cancel</button><button type="submit" class="btn primary" id="fsOk"></button></div>
+    </div>
   </form>
 </dialog>
 

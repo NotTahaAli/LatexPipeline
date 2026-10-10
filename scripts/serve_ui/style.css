@@ -116,6 +116,8 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 .count{background:var(--line2);border-radius:99px;padding:0 6px;font-size:11px;min-width:18px;text-align:center}
 .count:empty{display:none}
 
+.tree-tools{display:flex;align-items:center;gap:2px;padding:0 0 6px;margin-bottom:4px;border-bottom:1px solid var(--line2)}
+.tree-tools .icon{width:28px;height:28px}
 #tree .row{display:flex;align-items:center;gap:6px;width:100%;height:26px;padding:0 6px;border-radius:5px;text-align:left;color:var(--fg);white-space:nowrap}
 #tree .row:hover{background:var(--line2)}
 #tree .row[aria-selected=true]{background:var(--acc-bg);color:var(--acc-fg)}
@@ -239,6 +241,7 @@ button.link:hover{filter:brightness(1.15)}
 dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--fg);box-shadow:var(--shadow);padding:0;max-width:min(560px,94vw);width:560px}
 dialog::backdrop{background:rgba(0,0,0,.4)}
 #palette{margin-top:12vh;padding:8px}
+#fsDlg{width:440px}
 #paletteInput{width:100%;height:38px;font-size:15px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;margin-bottom:6px}
 #paletteInput:focus-visible{outline:none}
 #paletteList{list-style:none;margin:0;padding:0;max-height:50vh;overflow:auto}

@@ -23,7 +23,7 @@ const saveSettings = () => store.set("settings", settings);
 // ---- state ------------------------------------------------------------------------------
 let docs = {}, cur = decodeURIComponent(location.hash.slice(1));
 const tabs = new Map();      // path -> tab (per-file editor state)
-let active = null, files = [], refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
+let active = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
 const firstVisit = store.get("ui") === null;
 const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
@@ -219,16 +219,17 @@ function gotoLine(line) {
   view.dispatch({ selection: { anchor: ln.from }, effects: EditorView.scrollIntoView(ln.from, { y: "center" }) });
 }
 
-function closeTab(tab) {
-  if (!tab.collab && tab.dirty && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
+async function closeTab(tab, force, quiet) {   // force: no unsaved-changes question; quiet: do not open another file afterwards
+  if (!force && !tab.collab && tab.dirty && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
   tabs.delete(tab.path);
-  tab.collab?.leave();
+  const left = tab.collab?.leave();
   if (active === tab) {
     active = null;
     const next = [...tabs.values()].pop();
-    if (next) activate(next); else openFile("main.tex");
+    if (next) activate(next); else if (!quiet) openFile("main.tex");
   }
   persistTabs(); renderTabs();
+  await left;
 }
 
 function persistTabs() { store.set("tabs:" + cur, { open: [...tabs.keys()], active: active?.path }); }
@@ -351,7 +352,7 @@ async function onFsEvent(msg) {
 const openDirs = new Set(store.json("dirs", [""]));
 async function loadFiles() {
   if (!cur) return;
-  try { files = (await api.files(cur)).files; } catch { return; }
+  try { const r = await api.files(cur); files = r.files; emptyDirs = r.dirs || []; } catch { return; }
   if (ui.side) renderTree();
 }
 
@@ -363,6 +364,7 @@ function renderTree() {
     parts.slice(0, -1).forEach((d) => node = (node[d + "/"] ||= {}));
     node[parts.at(-1)] = f;
   }
+  for (const d of emptyDirs) d.split("/").reduce((node, part) => (node[part + "/"] ||= {}), root);
   const rows = [];
   const walk = (node, prefix, depth) => {
     const entries = Object.entries(node).sort(([a, x], [b, y]) => (a.endsWith("/") ? 0 : 1) - (b.endsWith("/") ? 0 : 1) || a.localeCompare(b));
@@ -370,23 +372,126 @@ function renderTree() {
       const pad = `${6 + depth * 14}px`;
       if (name.endsWith("/")) {
         const path = prefix + name, open = openDirs.has(path);
-        const row = el("button", { className: "row", role: "treeitem", onclick: () => { open ? openDirs.delete(path) : openDirs.add(path); store.set("dirs", [...openDirs]); renderTree(); } }, icon("chev"), icon("folder"), el("span", { className: "name", textContent: name.slice(0, -1) }));
+        const row = el("button", { className: "row", role: "treeitem", onclick: () => { treeSel = path.slice(0, -1); open ? openDirs.delete(path) : openDirs.add(path); store.set("dirs", [...openDirs]); renderTree(); } }, icon("chev"), icon("folder"), el("span", { className: "name", textContent: name.slice(0, -1) }));
         row.querySelector(".ic").classList.add("chev");
-        row.style.paddingLeft = pad; row.setAttribute("aria-expanded", String(open));
+        row.dataset.path = path.slice(0, -1); row.dataset.dir = "1";
+        row.style.paddingLeft = pad; row.setAttribute("aria-expanded", String(open)); row.setAttribute("aria-selected", String(treeSel === path.slice(0, -1)));
         rows.push(row);
         if (open) walk(v, path, depth + 1);
       } else {
         const text = v.kind === "text", img = v.kind === "image";
-        const row = el("button", { className: "row" + (text || img ? "" : " dim"), role: "treeitem", title: v.path + (text || img ? "" : " (not editable)"), disabled: !(text || img), onclick: () => { if (narrow()) setSide(false); openFile(v.path); } }, el("span", { style: "width:16px" }), icon(img ? "image" : "file"), el("span", { className: "name", textContent: name }));
-        row.style.paddingLeft = pad;
-        row.setAttribute("aria-selected", String(active?.path === v.path));
+        const row = el("button", { className: "row" + (text || img ? "" : " dim"), role: "treeitem", title: v.path + (text || img ? "" : " (not editable)"), disabled: !(text || img), onclick: () => { treeSel = v.path; if (narrow()) setSide(false); openFile(v.path); } }, el("span", { style: "width:16px" }), icon(img ? "image" : "file"), el("span", { className: "name", textContent: name }));
+        row.style.paddingLeft = pad; row.dataset.path = v.path;
+        row.setAttribute("aria-selected", String(treeSel ? treeSel === v.path : active?.path === v.path));
         rows.push(row);
       }
     }
   };
   walk(root, "", 0);
   out.replaceChildren(...rows);
+  showTreeTools();
 }
+
+// ---- file tree actions: new file/folder, rename, delete (owner and edit link; the server checks every path again) ----
+const treeTarget = () => treeSel || active?.path || null;
+const baseDir = () => { const t = treeTarget(); if (!t) return ""; return files.some((f) => f.path === t) ? t.split("/").slice(0, -1).join("/") : t; };
+function showTreeTools() {
+  const t = treeTarget(), protectedPath = t === "main.tex";
+  const why = readOnly ? "File changes need the edit link" : null;
+  for (const [id, label, off] of [["fNewFile", "New file", why], ["fNewDir", "New folder", why],
+    ["fRename", "Rename or move (F2)", why || (!t ? "Select a file or folder first" : protectedPath ? "main.tex cannot be renamed" : null)],
+    ["fDelete", "Delete (Delete key)", why || (!t ? "Select a file or folder first" : protectedPath ? "main.tex cannot be deleted" : null)]]) {
+    $(id).disabled = !!off; $(id).title = off ? `${label}: ${off}` : label;
+  }
+}
+const joinPath = (dir, name) => (dir ? dir + "/" : "") + name;
+
+/** One dialog for naming and confirming. run(value) throws to show its message inside the dialog and keep it open. */
+function fsDialog({ title, message = "", label = "", value = "", ok, danger = false, run, after }) {
+  const dlg = $("fsDlg"), input = $("fsName");
+  $("fsTitle").textContent = title; $("fsMsg").textContent = message; $("fsMsg").hidden = !message;
+  $("fsLabel").textContent = label; $("fsLabel").hidden = input.hidden = !label;
+  input.value = value;
+  $("fsErr").hidden = true;
+  $("fsOk").textContent = ok; $("fsOk").classList.toggle("danger", danger); $("fsOk").classList.toggle("primary", !danger);
+  dlg.onclose = () => { dlg.onclose = null; };
+  $("fsForm").onsubmit = async (e) => {
+    e.preventDefault();
+    $("fsOk").disabled = true;
+    try { await run(input.value.trim()); dlg.close(); after?.(); }
+    catch (err) { $("fsErr").textContent = err.message; $("fsErr").hidden = false; input.hidden ? $("fsCancel").focus() : input.focus(); }
+    finally { $("fsOk").disabled = false; }
+  };
+  dlg.showModal();
+  if (label) {   // Select the file name, not the folder, so typing renames in place.
+    input.focus();
+    const at = value.lastIndexOf("/") + 1, dot = value.lastIndexOf(".");
+    input.setSelectionRange(at, dot > at ? dot : value.length);
+  } else $("fsCancel").focus();   // A destructive confirmation starts on Cancel.
+}
+$("fsCancel").onclick = $("fsClose").onclick = () => $("fsDlg").close();
+$("fsDlg").addEventListener("click", (e) => { if (e.target === $("fsDlg")) $("fsDlg").close(); });
+
+const affected = (path) => [...tabs.values()].filter((t) => t.path === path || t.path.startsWith(path + "/"));
+function newFile() {
+  if (readOnly) return;
+  const dir = baseDir();
+  fsDialog({ title: "New file", label: "Path (folders are created as needed)", value: joinPath(dir, "untitled.tex"), ok: "Create", run: async (path) => {
+    await api.fs(cur, "newfile", path);
+    path.split("/").slice(0, -1).forEach((_, i, parts) => openDirs.add(parts.slice(0, i + 1).join("/") + "/"));
+    store.set("dirs", [...openDirs]); treeSel = path;
+    await loadFiles(); await openFile(path);
+  }, after: () => view.focus() });
+}
+function newFolder() {
+  if (readOnly) return;
+  fsDialog({ title: "New folder", label: "Path", value: joinPath(baseDir(), "new-folder"), ok: "Create", run: async (path) => {
+    await api.fs(cur, "mkdir", path);
+    path.split("/").forEach((_, i, parts) => openDirs.add(parts.slice(0, i + 1).join("/") + "/"));
+    store.set("dirs", [...openDirs]); treeSel = path; await loadFiles();
+  } });
+}
+/** Close the tabs under path (their files are about to move or vanish), run fn, and on failure reopen them. */
+async function withTabsClosed(path, fn) {
+  const open = affected(path), was = open.map((t) => t.path), activePath = active?.path;
+  for (const t of open) { await saveTab(t); await closeTab(t, true, true); }   // Rooms are left first, so no one is told off for our own change.
+  try { await fn(); return { was, activePath }; }
+  catch (e) { for (const p of was) await openFile(p, 0, { noFocus: true }); throw e; }
+}
+function renameTarget(path = treeTarget()) {
+  if (readOnly || !path || path === "main.tex") return;
+  fsDialog({ title: "Rename or move", message: path, label: "New path (change the folder to move it)", value: path, ok: "Rename", run: async (to) => {
+    if (!to || to === path) return;
+    const { was, activePath } = await withTabsClosed(path, () => api.fs(cur, "rename", path, to));
+    treeSel = to;
+    await loadFiles();
+    const moved = (p) => to + p.slice(path.length);
+    for (const p of was) await openFile(moved(p), 0, { noFocus: true });   // The same tabs, at the new path.
+    if (activePath && was.includes(activePath)) await activate(tabs.get(moved(activePath)), 0, { noFocus: true });
+    else if (!active) await openFile("main.tex");
+    renderTree(); loadOutline();
+  } });
+}
+function deleteTarget(path = treeTarget()) {
+  if (readOnly || !path || path === "main.tex") return;
+  const inside = files.filter((f) => f.path.startsWith(path + "/")).length, isDir = inside > 0 || emptyDirs.includes(path);
+  fsDialog({ title: isDir ? "Delete folder" : "Delete file", message: isDir ? `Delete ${path} and the ${inside} ${inside === 1 ? "file" : "files"} in it? This cannot be undone.` : `Delete ${path}? This cannot be undone.`,
+    ok: "Delete", danger: true, run: async () => {
+      await withTabsClosed(path, () => api.fs(cur, "delete", path));
+      if (treeSel === path || treeSel?.startsWith(path + "/")) treeSel = null;
+      await loadFiles(); loadOutline();
+      if (!active) await openFile("main.tex");
+      renderTree();
+      toast(el("span", { textContent: `Deleted ${path}.` }));
+    } });
+}
+$("fNewFile").onclick = newFile; $("fNewDir").onclick = newFolder;
+$("fRename").onclick = () => renameTarget(); $("fDelete").onclick = () => deleteTarget();
+$("tree").addEventListener("keydown", (e) => {
+  const row = e.target.closest?.(".row"); if (!row?.dataset.path) return;
+  if (e.key === "F2") { e.preventDefault(); renameTarget(row.dataset.path); }
+  else if (e.key === "Delete") { e.preventDefault(); deleteTarget(row.dataset.path); }
+});
 
 // ---- sidebar: outline -------------------------------------------------------------------------
 const outlineVisible = () => ui.side && ui.sideTab === "outline";
@@ -819,6 +924,10 @@ const COMMANDS = [
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
+  { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
+  { id: "newdir", edit: true, title: "New folder...", run: () => newFolder() },
+  { id: "rename", edit: true, title: "Rename or move file...", keys: "F2", run: () => { setSide(true, "files"); renameTarget(); } },
+  { id: "delete", edit: true, title: "Delete file or folder...", run: () => { setSide(true, "files"); deleteTarget(); } },
   { id: "focus", edit: true, title: "Preview this chapter", run: () => previewChapter() },
   { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
@@ -1075,7 +1184,7 @@ async function pick(name) {
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
   $("doc").value = name;
   focusView = null; renderFocus();
-  tabs.clear(); active = null; files = []; outlineData = null; refs = { labels: {}, bib: {} };
+  tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {} };
   pdfView.version = null;
   warnKey = warnLoaded = null; warnings = []; renderWarnings();
   renderStatus(); loadPdf(); loadWarnings(); await loadFiles(); await restoreTabs();
