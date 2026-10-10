@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -183,8 +184,8 @@ class DocCase(unittest.TestCase):
         out = mcp_tools.handle(rpc("tools/call", {"name": name, "arguments": args}), backend or self.local)[0]
         return out["result"]
 
-    def ok(self, name, **args):
-        out = self.call(name, **args)
+    def ok(self, name, backend=None, **args):
+        out = self.call(name, backend, **args)
         self.assertFalse(out["isError"], out["content"][0].get("text"))
         return out
 
@@ -273,8 +274,25 @@ class Tools(DocCase):
         kinds = [v["kind"] for v in serve.history_store("thesis").versions("chapters/three.tex")]
         self.assertIn("delete", kinds)
 
-    def test_build_config_files_are_the_local_owners_only(self):
-        self.ok("edit_file", project="thesis", path="build.toml", old_text="pdflatex", new_text="xelatex")
+    def test_build_config_files_need_an_explicit_flag(self):
+        # Prompt injection (text a guest wrote) must not make the model turn on shell escape or add a latexmkrc.
+        owner = mcp_tools.Doc(serve, "thesis", "owner", None, "Tester (MCP)")
+        for doc in (owner, self.doc("edit", "7;Ed")):
+            for tool, args in (("edit_file", {"path": "build.toml", "old_text": "pdflatex", "new_text": "x"}),
+                               ("write_file", {"path": "latexmkrc", "content": "$x"}),
+                               ("write_file", {"path": "sub/build.toml", "content": "x"}),
+                               ("rename_file", {"path": "chapters/one.tex", "to": "latexmkrc"}),
+                               ("delete_file", {"path": "build.toml"}),
+                               ("add_comment", {"path": "build.toml", "quote": "pdflatex", "comment": "hm"})):
+                with self.subTest(role=doc.role, tool=tool), self.assertRaises(mcp_tools.ToolError) as ctx:
+                    doc.run(tool, args)
+                self.assertIn("configures the build", str(ctx.exception))
+        self.assertTrue((self.root / "chapters/one.tex").is_file())
+        self.assertFalse((self.root / "latexmkrc").exists())
+        allowed = mcp_server.Local(serve, read_only=False, build_config=True)
+        self.ok("edit_file", backend=allowed, project="thesis", path="build.toml", old_text="pdflatex",
+                new_text="xelatex")
+        self.assertTrue(mcp_tools.Doc(serve, "thesis", "edit", "7;Ed", "x", build_config=True).build_config is False)
         editor = self.doc("edit", "7;Ed")
         for tool, args in (("edit_file", {"path": "build.toml", "old_text": "x", "new_text": "y"}),
                            ("write_file", {"path": "latexmkrc", "content": "$x"}),
@@ -297,6 +315,43 @@ class Tools(DocCase):
             self.assertIn("view-only", str(ctx.exception))
         self.assertIn("Hello", (self.root / "main.tex").read_text())
         self.assertFalse(viewer.run("read_file", {"path": "main.tex"})["isError"])
+
+    def test_regular_expressions_only_for_the_local_owner(self):
+        self.assertEqual(len(self.ok("grep", project="thesis", query=r"Al\w+a", regex=True)["structuredContent"]
+                             ["matches"]), 1)
+        with self.assertRaises(mcp_tools.ToolError) as ctx:  # (a+)+$ would hold a hosted worker for minutes
+            self.doc("view", "8;Vi").run("grep", {"query": "(a+)+$", "regex": True})
+        self.assertIn("literal", str(ctx.exception))
+        self.assertEqual(self.doc("view", "8;Vi").run("grep", {"query": "(a+)+$"})["structuredContent"]["matches"],
+                         [])
+
+    def test_rooms_of_a_running_local_editor_are_respected(self):
+        marker = serve.history_folder("thesis") / serve.ROOMS_MARK
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"pid": os.getpid() + 1, "paths": ["chapters/one.tex"]}), "utf-8")
+        self.assertIn("open in the editor", self.error("edit_file", project="thesis", path="chapters/one.tex",
+                                                       old_text="gamma", new_text="delta"))
+        self.assertIn("open in the editor", self.error("delete_file", project="thesis", path="chapters"))
+        stale = time.time() - serve.ROOMS_FRESH - 5
+        os.utime(marker, (stale, stale))  # that editor stopped
+        self.ok("edit_file", project="thesis", path="chapters/one.tex", old_text="gamma", new_text="delta")
+
+    def test_serve_marks_its_rooms(self):
+        serve.ROOMS[serve.room_id("thesis", "main.tex")] = {"doc": "thesis", "path": "main.tex",
+                                                             "members": {"c1": {"role": "owner"}}}
+        mock.patch.dict(serve._MARKED, {}, clear=True).start()
+        serve.mark_rooms()
+        marker = serve.history_folder("thesis") / serve.ROOMS_MARK
+        self.assertEqual(json.loads(marker.read_text())["paths"], ["main.tex"])
+        self.assertEqual(serve.rooms_elsewhere("thesis"), [])  # its own marker
+        serve.ROOMS.clear()
+        serve.mark_rooms()
+        self.assertFalse(marker.exists())
+
+    def test_client_names_lose_invisible_characters(self):
+        self.assertEqual(mcp_tools.client_label({"name": "Cla\u202eude\u200b \u2028Desk<b>top\ue000"}),
+                         "Cla ude Desk b top")
+        self.assertEqual(mcp_tools.client_label({"name": "\u200b"}), "AI client")
 
     def test_files_open_in_a_room_are_not_written(self):
         serve.ROOMS[serve.room_id("thesis", "chapters/one.tex")] = {

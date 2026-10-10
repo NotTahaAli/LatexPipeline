@@ -2,12 +2,13 @@
 """
 Local MCP server for this repository's LaTeX documents, over stdio (JSON-RPC 2.0, one message per line).
 
-    python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox]
+    python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox] [--allow-build-config]
 
 Any MCP client that starts local servers (Claude Desktop, Claude Code, Codex CLI, Cursor, VS Code, Windsurf,
 Gemini CLI) can use it with your own subscription; see README, "Use with AI clients (MCP)". The tools are those of
 mcp_tools.py, run as the owner: like serve.py without sharing, builds use your normal local settings (build.toml,
-latexmkrc), so only point it at documents you trust, or pass --sandbox. Changes go through the editor's save path
+latexmkrc), so only point it at documents you trust, or pass --sandbox; the tools change those two files only
+with --allow-build-config. Changes go through the editor's save path
 and into the version history as "<client> (MCP)"; a serve.py editor that has the file open sees the change on disk.
 
 Stdlib only, Python 3.9+, Windows, macOS and Linux.
@@ -25,9 +26,9 @@ from pathlib import Path
 class Local:
     """The backend of mcp_tools.handle for this repository: every served document, as the owner."""
 
-    def __init__(self, serve, read_only: bool) -> None:
+    def __init__(self, serve, read_only: bool, build_config: bool = False) -> None:
         import mcp_tools
-        self.serve, self.tools_mod, self.read_only = serve, mcp_tools, read_only
+        self.serve, self.tools_mod, self.read_only, self.build_config = serve, mcp_tools, read_only, build_config
         self.client = "AI client"
 
     @property
@@ -77,7 +78,7 @@ class Local:
         doc = args.pop("project")
         if doc not in s.DOCS:
             raise t.ToolError(f"No project {doc!r}. list_projects shows the names.")
-        return t.Doc(s, doc, "owner", None, self.author).run(name, args)
+        return t.Doc(s, doc, "owner", None, self.author, self.build_config).run(name, args)
 
 
 def serve_stdio(backend, lines, out) -> None:
@@ -108,6 +109,9 @@ def main() -> int:
     parser.add_argument("--source", metavar="DIR", help="Directory holding the documents (default: files/).")
     parser.add_argument("--read-only", action="store_true", help="Offer only the tools that read.")
     parser.add_argument("--sandbox", action="store_true", help="Run LaTeX under bubblewrap (LATEX_SANDBOX=bwrap).")
+    parser.add_argument("--allow-build-config", action="store_true",
+                        help="Let the AI client change build.toml and latexmkrc (they can run programs; off by "
+                        "default because the model reads text other people wrote).")
     args = parser.parse_args()
 
     import build
@@ -137,7 +141,7 @@ def main() -> int:
     serve.SETTINGS["latexmk"] = build.find_latexmk() or "latexmk"
     print(f"MCP server ready: {len(serve.DOCS)} document(s){', read-only' if args.read_only else ''}.", file=sys.stderr)
     try:
-        serve_stdio(Local(serve, args.read_only), sys.stdin.buffer, protocol)
+        serve_stdio(Local(serve, args.read_only, args.allow_build_config), sys.stdin.buffer, protocol)
     except KeyboardInterrupt:
         pass
     return 0

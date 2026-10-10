@@ -1297,6 +1297,8 @@ class Handler(BaseHTTPRequestHandler):
         if (self.command != "GET" or upgrade) and not self.origin_ok():
             raise HttpError(403, "Cross-site request refused.")
         size = self.body_size(MAX_PROXY_BODY)
+        if rest == "/api/mcp":  # only through /mcp (OAuth grant, audit, limits), never with a browser session
+            raise HttpError(404, "Not found.")
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
@@ -1724,6 +1726,7 @@ def api_reset(h: Handler) -> None:
         APP.db.run("DELETE FROM resets WHERE user_id = ?", row["user_id"])
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), row["user_id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ?", row["user_id"])
+        APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", row["user_id"])  # connected AI clients too
     audit_log(APP, "password_reset", row["user_id"], h.ip)
     h.ok()
 
@@ -1822,6 +1825,7 @@ def api_password(h: Handler) -> None:
     with APP.db.tx():
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), h.user["id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ? AND id_hash != ?", h.user["id"], h.session["id_hash"])
+        APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", h.user["id"])  # connected AI clients too
     audit_log(APP, "password_changed", h.user["id"], h.ip)
     h.ok()
 
@@ -2148,6 +2152,7 @@ def api_admin_user(h: Handler, uid: str) -> None:
                 APP.db.run(f"UPDATE users SET {key} = ? WHERE id = ?", int(data[key]), int(uid))
         if data.get("disabled"):
             APP.db.run("DELETE FROM sessions WHERE user_id = ?", int(uid))
+            APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", int(uid))
     audit_log(APP, "user_changed", h.user["id"], h.ip, detail=f"user {uid}: {json.dumps(data)[:200]}")
     h.ok()
 

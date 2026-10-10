@@ -1798,8 +1798,13 @@ class Mcp(HostCase):
     def test_registration_validates_redirect_uris(self):
         for good in (CALLBACK, "https://chatgpt.com/connector_platform_oauth_redirect", "http://127.0.0.1:33418/",
                      "http://localhost/callback", "http://[::1]:7777/oauth/callback",
-                     "cursor://anysphere.cursor-mcp/oauth/callback", "vscode://github.copilot-chat/oauth"):
+                     "cursor://anysphere.cursor-mcp/oauth/callback", "vscode://github.copilot-chat/oauth",
+                     "com.example.notes:/oauth2redirect"):
             self.register([good])
+        for bad in ("ms-msdt:/id", "search-ms:query=x", "myapp://cb", "zoommtg://x"):  # not reverse-DNS, not listed
+            self.assertEqual(self.anon("POST", "/oauth/register", {"redirect_uris": [bad]})[0], 400, bad)
+        self.assertEqual(host_mcp.redirect_label("https://xn--pple-43d.com/cb"), "xn--pple-43d.com")
+        self.assertEqual(host_mcp.redirect_label("https://\u0430pple.com/cb"), "xn--pple-43d.com")  # Cyrillic a
         for bad in ([], ["http://evil.example/cb"], ["javascript:alert(1)"], ["https://x.org/cb#frag"],
                     ["data:text/html,x"], ["file:///etc/passwd"], ["https://user@x.org/cb"], ["/relative"],
                     ["https://x.org/a b"], "https://x.org", ["https://x.org/" + "a" * 2100], [CALLBACK] * 11):
@@ -1826,10 +1831,9 @@ class Mcp(HostCase):
                              ({"code_challenge": None}, "invalid_request"),
                              ({"response_type": "token"}, "unsupported_response_type"),
                              ({"resource": "https://other.example/mcp"}, "invalid_target")):
-            location = self.authorize(cid, **extra)
-            self.assertTrue(location.startswith(CALLBACK + "?"), location)
-            query = parse_qs(urlsplit(location).query)
-            self.assertEqual((query["error"], query["state"], query["iss"]), ([error], ["st-1"], [self.origin]))
+            location = self.authorize(cid, **extra)  # before the person acts: our own page, never a redirect
+            self.assertTrue(location.startswith("/#oauth-error="), location)
+            self.assertIn(error, location)
 
     def test_consent_needs_a_session_and_csrf_and_may_be_declined(self):
         rid = self.authorize(self.register()).split("#oauth=", 1)[1]
@@ -1988,6 +1992,53 @@ class Mcp(HostCase):
                                                                    "client_id": cid})[0], 200)
         self.assertEqual(self.mcp(tokens["access_token"], {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 401)
         self.assertEqual(self.anon("POST", "/oauth/revoke", form={"token": "unknown", "client_id": cid})[0], 200)
+
+    def test_password_change_reset_and_disabling_end_connections(self):
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        _, tokens = self.connect()
+        browser = self.client("ed@x.org")
+        self.assertEqual(browser.call("POST", "/api/account/password", {"current": "password-123",
+                                                                          "password": "password-456"})[0], 200)
+        self.assertEqual(self.mcp(tokens["access_token"], ping)[0], 401)
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.app.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", host.hash_password("password-123"), uid)
+        cid, tokens = self.connect()
+        token = host.reset_link(uid).split("#reset=")[1]
+        self.assertEqual(Client(self).call("POST", "/api/reset", {"token": token, "password": "password-789"})[0], 200)
+        self.assertEqual(self.anon("POST", "/oauth/token", form={
+            "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "client_id": cid})[0], 400)
+        self.app.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", host.hash_password("password-123"), uid)
+        _, tokens = self.connect()
+        self.user("root@x.org", site_admin=True)
+        self.assertEqual(self.client("root@x.org").call("POST", f"/api/admin/users/{uid}", {"disabled": True})[0], 200)
+        self.app.db.run("UPDATE users SET disabled = 0 WHERE id = ?", uid)  # re-enabling must not bring it back
+        self.assertEqual(self.mcp(tokens["access_token"], ping)[0], 401)
+        self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM oauth_grants")["n"], 0)
+
+    def test_worker_mcp_endpoint_is_not_reachable_through_the_editor_proxy(self):
+        self.worker()
+        editor = self.client("ed@x.org")
+        status, _, _ = editor.call("POST", f"/p/{self.pid}/api/mcp?doc=Doc", {"tool": "edit_file", "arguments": {
+            "path": "main.tex", "old_text": "document", "new_text": "x"}})
+        self.assertEqual(status, 404)
+
+    def test_search_is_limited_per_person(self):
+        self.worker()
+        tokens = [self.connect()[1]["access_token"] for _ in range(2)]  # two connections, one person
+        outcomes = [self.tool(tokens[i % 2], "search", query="document")["isError"] for i in range(12)]
+        self.assertEqual(outcomes.count(True), 2)  # 10 a minute in all
+
+    def test_a_pending_authorization_keeps_its_registration(self):
+        cid = self.register()
+        rid = self.authorize(cid).split("#oauth=", 1)[1]
+        self.app.db.run("UPDATE oauth_clients SET created = 0")
+        host_mcp.cleanup(stale_clients=0)
+        self.assertIsNotNone(self.app.db.one("SELECT id FROM oauth_clients WHERE id = ?", cid))
+        self.assertEqual(self.client("ed@x.org").call("GET", f"/api/oauth/requests/{rid}")[0], 200)
+        unused = self.register()
+        self.app.db.run("UPDATE oauth_clients SET created = 0 WHERE id = ?", unused)
+        host_mcp.cleanup()
+        self.assertIsNone(self.app.db.one("SELECT id FROM oauth_clients WHERE id = ?", unused))
 
     def test_endpoint_rules_origin_protocol_and_rate(self):
         _, tokens = self.connect()

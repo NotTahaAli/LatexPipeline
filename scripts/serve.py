@@ -2526,9 +2526,55 @@ def reap(now: float | None = None) -> None:
     finish_all_pending()
 
 
+ROOMS_MARK = "rooms.json"  # in history_folder(doc): the files this local server has open in rooms (mcp_server.py)
+ROOMS_FRESH = 30.0  # a marker older than this is from a server that stopped
+_MARKED: dict = {}
+
+
+def mark_rooms() -> None:
+    """Tell other local processes (scripts/mcp_server.py) which files have open co-editing rooms, so they do not
+    write them behind the editors' backs. Rewritten when the set changes and every ROOMS_FRESH / 3 seconds."""
+    if GATEWAY["secret"]:
+        return  # hosted: MCP calls run in this process and see ROOMS directly
+    with COLLAB_LOCK:
+        open_paths: dict = {}
+        for room in ROOMS.values():
+            if room["members"]:
+                open_paths.setdefault(room["doc"], set()).add(room["path"])
+    now = time.monotonic()
+    for name in list(DOCS):
+        paths = sorted(open_paths.get(name, ()))
+        last = _MARKED.get(name)
+        if last and last[0] == paths and (not paths or now - last[1] < ROOMS_FRESH / 3):
+            continue
+        try:
+            target = history_folder(name) / ROOMS_MARK
+            if paths:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(target, json.dumps({"pid": os.getpid(), "paths": paths}).encode())
+            else:
+                target.unlink(missing_ok=True)
+            _MARKED[name] = (paths, now)
+        except OSError:
+            pass
+
+
+def rooms_elsewhere(name: str) -> list[str]:
+    """Files another local serve.py has open in rooms for this document (its fresh marker), else []."""
+    try:
+        target = history_folder(name) / ROOMS_MARK
+        if time.time() - target.stat().st_mtime > ROOMS_FRESH:
+            return []
+        data = json.loads(target.read_text("utf-8"))
+        return [] if data.get("pid") == os.getpid() else [p for p in data.get("paths", []) if isinstance(p, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def housekeeping() -> None:
     while not STOP.wait(3.0):
         reap()
+        mark_rooms()
 
 
 HANDLERS.update({

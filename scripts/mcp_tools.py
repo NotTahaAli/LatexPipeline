@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import unicodedata
 from pathlib import Path
 
 import sandbox
@@ -111,7 +112,7 @@ TOOLS = [
     _tool("grep", "Find text", "read",
           "Find lines containing some text in a project's text files; returns path, line number and the line.",
           {"query": _s("string", "Text to find (case-insensitive unless regex is true).", maxLength=500),
-           "regex": _s("boolean", "Treat query as a Python regular expression (default false)."),
+           "regex": _s("boolean", "Treat query as a Python regular expression (default false; local server only)."),
            "path": _s("string", "Only files at or below this path.", maxLength=240)}, ["query"]),
     _tool("outline", "Outline and word counts", "read",
           "The document's structure: parts, chapters and sections with the file and line of each heading, words "
@@ -455,8 +456,10 @@ class Doc:
     gateway. author: the name history and review show for changes ("Alice via Claude", or "Claude (MCP)" locally).
     """
 
-    def __init__(self, serve, name: str, role: str, user: str | None, author: str) -> None:
+    def __init__(self, serve, name: str, role: str, user: str | None, author: str,
+                 build_config: bool = False) -> None:
         self.s, self.name, self.role, self.user, self.author = serve, name, role, user, author
+        self.build_config = build_config and role == "owner"  # mcp_server.py --allow-build-config
         self.main = serve.DOCS[name]
         self.root = self.main.parent
 
@@ -482,14 +485,18 @@ class Doc:
                 raise ToolError("Too many changes in a short time; wait a minute and try again.")
 
     def need_text_path(self, path: str) -> None:
-        if self.role != "owner" and self.s.is_rc(path):
-            raise ToolError(f"{path} configures the build ({', '.join(sorted(self.s.RC_NAMES))}); only the "
-                            "project's owner on their own computer can change it.")
+        """Build configuration (build.toml, latexmkrc) can run programs, and the model reads text others wrote: no
+        MCP caller changes it, comments on it or creates it, unless the local owner started the server with
+        --allow-build-config."""
+        if not self.build_config and self.s.is_rc(path):
+            raise ToolError(f"{path} configures the build ({', '.join(sorted(self.s.RC_NAMES))}) and can run "
+                            "programs, so AI clients cannot change it. Edit it yourself.")
 
     def need_no_room(self, path: str) -> None:
-        with self.s.COLLAB_LOCK:
-            busy = [r["path"] for r in self.s.ROOMS.values() if r["doc"] == self.name and r["members"] and (
-                r["path"] == path or r["path"].startswith(path.rstrip("/") + "/"))]
+        with self.s.COLLAB_LOCK:  # rooms in this process (hosted worker), or in a local serve.py (its marker)
+            open_paths = [r["path"] for r in self.s.ROOMS.values() if r["doc"] == self.name and r["members"]]
+        open_paths += self.s.rooms_elsewhere(self.name)
+        busy = [p for p in open_paths if p == path or p.startswith(path.rstrip("/") + "/")]
         if busy:
             raise ToolError(f"{busy[0]} is open in the editor right now, so a direct change would collide with "
                             "someone's typing. Use add_suggestion (they can accept it with one click), or try again "
@@ -531,6 +538,8 @@ class Doc:
         return result(None, head + "\n" + "\n".join(taken))
 
     def t_grep(self, query: str, regex: bool = False, path: str | None = None) -> dict:
+        if regex and self.role != "owner":  # a pattern like (a+)+$ takes minutes and holds the worker for everyone
+            raise ToolError("Regular expressions work only with the local server; search for literal text here.")
         try:
             pattern = re.compile(query if regex else re.escape(query), 0 if regex else re.IGNORECASE)
         except re.error as exc:
@@ -786,7 +795,10 @@ def worker_call(serve, name: str, role: str, user: str | None, data: dict) -> di
 
 def client_label(info, fallback: str = "AI client") -> str:
     """A display name from a client's self-reported name: printable, short. Never trusted for anything else."""
-    name = re.sub(r"[\x00-\x1f\x7f<>]+", " ", str((info or {}).get("name") or "") if isinstance(info, dict) else "")
+    raw = str(info.get("name") or "")[:200] if isinstance(info, dict) else ""
+    # No control, format (bidi overrides, zero-width), private-use, unassigned or line/paragraph separator characters.
+    name = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp") or c in "<>" else c
+                   for c in raw)
     name = re.sub(r"\s+", " ", name).strip()[:40]
     return name or fallback
 

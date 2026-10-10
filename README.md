@@ -311,10 +311,10 @@ The protocol is MCP revision 2026-07-28 (each request carries its version, `serv
 ### Local server
 
 ```bash
-python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox]
+python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox] [--allow-build-config]
 ```
 
-It runs as you, like `serve.py` without sharing: builds use the documents' `build.toml` and `latexmkrc`, and the tools may change those files too. Point it only at documents you trust, or add `--sandbox` (Linux, bubblewrap, as in [Sandboxed builds](#sandboxed-builds)). `--read-only` offers only the tools that read. `DOC` and `--source` select documents like `serve.py`. stdout carries only the protocol; progress and errors go to stderr. If `serve.py` is running, its editor picks up the change on disk; a file open there that you also change through MCP shows the usual "changed on disk" conflict instead of being overwritten.
+It runs as you, like `serve.py` without sharing: builds use the documents' `build.toml` and `latexmkrc`. The tools never change, create or rename onto those two files unless you pass `--allow-build-config`: they can turn on shell escape or run programs, and the model reads text that others may have written (a chapter from a co-author or a share link can carry instructions). Point it only at documents you trust, or add `--sandbox` (Linux, bubblewrap, as in [Sandboxed builds](#sandboxed-builds)). `grep` takes regular expressions here (the hosted server searches literal text only). `--read-only` offers only the tools that read. `DOC` and `--source` select documents like `serve.py`. stdout carries only the protocol; progress and errors go to stderr. If `serve.py` is running, its editor picks up the change on disk, and files it has open in a co-editing room are not written (it lists them in `.latex-history/<document>/rooms.json`, refreshed every 10 s while a room is open; the model can use `add_suggestion` instead).
 
 Use absolute paths (on Windows `python` and `C:\\path\\to\\LatexPipeline\\scripts\\mcp_server.py` in JSON). In each snippet `/path/to/LatexPipeline` is your clone.
 
@@ -351,7 +351,7 @@ The hosted endpoint works with any client that speaks Streamable HTTP and OAuth 
 | Windsurf | `{"mcpServers": {"latex": {"serverUrl": "https://latex.example.org/mcp"}}}` in `~/.codeium/windsurf/mcp_config.json`. |
 | Gemini CLI | `{"mcpServers": {"latex": {"httpUrl": "https://latex.example.org/mcp"}}}` in `settings.json`, then `/mcp auth latex` (loopback redirect). |
 
-Redirect URIs the server accepts at registration: any `https` URL, `http` to `127.0.0.1`, `[::1]` or `localhost` on any port (RFC 8252; the port is ignored when matching), and private-use app schemes such as `cursor://` or `vscode://` (not `javascript:`, `data:`, `file:` and the like). Nothing above is specific to one vendor.
+Redirect URIs the server accepts at registration: any `https` URL, `http` to `127.0.0.1`, `[::1]` or `localhost` on any port (RFC 8252; the port is ignored when matching), and private-use app schemes: reverse-DNS names (`com.example.app:/callback`, RFC 8252 7.1) plus `cursor`, `vscode`, `vscode-insiders` and `windsurf` (not `javascript:`, `data:`, `ms-msdt:` and the like). Host names are shown in punycode on the consent page. Nothing above is specific to one vendor.
 
 What was tested: the MCP Inspector CLI (`npx @modelcontextprotocol/inspector --cli`) against the local server (`tools/list`, `tools/call`) and against the hosted endpoint with a bearer token (`tools/list`, `list_projects`, `build`, `read_file`); `tests/mcp_e2e.py` plays a client through the whole hosted flow in Chromium (discovery, registration, sign-in with two-step code, consent, PKCE, refresh, MCP calls, disconnect); `tests/test_mcp.py` and `tests/test_host.py` cover the protocol, tools and OAuth rules. The per-app setups in the two lists above follow each vendor's current documentation and were not run against the real apps here (they need accounts and desktop apps); `claude mcp add` was checked to write the configuration shown.
 
@@ -516,12 +516,12 @@ The account page lists the connected apps (where they return, permissions, proje
 
 Security details:
 
-* OAuth 2.1 authorization code with PKCE (S256 only), public clients only (`token_endpoint_auth_method` `none`; a Basic header's client id is accepted, its secret ignored). Codes last 2 minutes and work once; a second use revokes the connection. Every redirect carries `state` and `iss` (RFC 9207).
+* OAuth 2.1 authorization code with PKCE (S256 only), public clients only (`token_endpoint_auth_method` `none`; a Basic header's client id is accepted, its secret ignored). Codes last 2 minutes and work once; a second use revokes the connection. Every redirect carries `state` and `iss` (RFC 9207). A bad authorization request is shown on this server's own page, never redirected to the app, until the person has decided (RFC 9700 4.11.2: no open redirect).
 * Access tokens last an hour and are bound to `<public_url>/mcp` (RFC 8707 `resource`; another resource is `invalid_target`, a token for another one is refused). Refresh tokens last 30 days and rotate on every use; presenting an old one revokes the connection. Tokens are random and only their SHA-256 is stored.
 * `/mcp` takes only `Authorization: Bearer` (cookies are ignored), answers `401` with `WWW-Authenticate: Bearer resource_metadata=...` and `403 insufficient_scope` for a tool outside the grant, refuses a request whose `Origin` is another site, and is stateless: no `Mcp-Session-Id`, no SSE stream (`GET` is `405`). Workers never see tokens.
 * Registration is open by design (that is how the apps connect) but rate limited per address and capped in number; unused registrations are deleted after a day. Client ID Metadata Documents (the newer alternative to registration) are not supported, because the gateway would have to fetch URLs that anyone names; every app listed falls back to registration.
-* Tokens survive a password change: disconnect apps on the account page. Disabling an account or removing a member ends them.
-* The model and the app are untrusted: they get nothing a person with the same role could not do in the editor, never change `build.toml` or `latexmkrc` (only the local owner can, with the local server), never accept suggestions, and their tool results are capped.
+* Changing or resetting the password and disabling the account disconnect every app (re-enabling does not bring them back); leaving a workspace ends access to it. `search` reads files in the gateway, so it is limited to 10 a minute per person and 16 MB over at most 20 projects; regular expressions in `grep` are local-only. The worker's `/api/mcp` is not reachable through the editor proxy, only through `/mcp`.
+* The model and the app are untrusted: they get nothing a person with the same role could not do in the editor, never change `build.toml` or `latexmkrc` (only the local owner can, with `mcp_server.py --allow-build-config`), never accept suggestions, and their tool results are capped.
 
 ### TLS with Caddy, and systemd
 

@@ -56,8 +56,11 @@ REFRESH_SECONDS = 30 * 86400
 CODE_SECONDS = 120
 REQUEST_SECONDS = 600
 MAX_GRANTS_PER_USER = 50
+SEARCHES_PER_MINUTE, SEARCH_BYTES, SEARCH_PROJECTS = 10, 16 * 1024 * 1024, 20
 MAX_BODY = 8 * 1024 * 1024
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+# Private-use schemes (RFC 8252 7.1): reverse-DNS names (com.example.app), plus the short ones these editors use.
+APP_SCHEMES = {"cursor", "vscode", "vscode-insiders", "windsurf"}
 BAD_SCHEMES = {"javascript", "data", "file", "vbscript", "blob", "about", "ftp", "ws", "wss", "view-source",
                "filesystem", "intent", "chrome", "jar", "mailto", "tel", "sms"}
 SCOPE_TEXT = {"read": "Read files, outline, build results and PDF pages",
@@ -124,13 +127,18 @@ def redirect_kind(uri) -> str:
     if scheme == "https":
         if not parts.hostname or "@" in parts.netloc:
             raise ValueError("An https redirect URI needs a host (and no user name).")
+        try:
+            parts.hostname.encode("idna")
+        except UnicodeError:
+            raise ValueError("The redirect URI's host name is not valid.")
         return "web"
     if scheme == "http":
         if (parts.hostname or "").lower() not in LOOPBACK or "@" in parts.netloc:
             raise ValueError("http redirect URIs must point to this computer (127.0.0.1, [::1] or localhost); "
                              "use https otherwise.")
         return "loopback"
-    if re.fullmatch(r"[a-z][a-z0-9+.-]{1,62}", scheme) and scheme not in BAD_SCHEMES and ":" in uri:
+    if re.fullmatch(r"[a-z][a-z0-9+.-]{1,62}", scheme) and scheme not in BAD_SCHEMES and ":" in uri and (
+            scheme in APP_SCHEMES or re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", scheme)):
         return "app"
     raise ValueError(f"Redirect URIs with {scheme or 'no'} scheme are not allowed.")
 
@@ -153,7 +161,7 @@ def redirect_matches(registered: str, sent: str) -> bool:
 def redirect_label(uri: str) -> str:
     kind, parts = redirect_kind(uri), urlsplit(uri)
     if kind == "web":
-        return parts.hostname
+        return parts.hostname.encode("idna").decode("ascii")  # punycode: no look-alike letters
     if kind == "loopback":
         return "an app on your computer (http://" + (parts.hostname or "") + ")"
     return f"the app that handles {parts.scheme}:// links on your computer"
@@ -271,7 +279,7 @@ def register(h) -> None:
         name = mcp_tools.client_label({"name": data.get("client_name")}, "Unnamed AI client")
         throttle("register", settings["registrations_per_ip_hour"], 3600).fail(h.ip_group)
         if db.one("SELECT COUNT(*) AS n FROM oauth_clients")["n"] >= settings["max_clients"]:
-            cleanup(stale_clients=60.0)
+            cleanup(stale_clients=3600.0)
             if db.one("SELECT COUNT(*) AS n FROM oauth_clients")["n"] >= settings["max_clients"]:
                 raise OAuthError(503, "temporarily_unavailable", "Too many registered clients; try again later.")
         cid = "mcp_" + secrets.token_hex(16)
@@ -306,7 +314,9 @@ def authorize(h) -> None:
     state = q.get("state")
 
     def fail(code: str, text: str) -> None:
-        h.redirect(with_params(sent, {"error": code, "error_description": text, "state": state, "iss": issuer()}))
+        # Shown here, never redirected: before the person acts, a redirect would make this an open redirector
+        # for any registered URI (RFC 9700 4.11.2).
+        h.redirect("/#oauth-error=" + quote(f"The app sent a request this server cannot accept ({code}): {text}"))
 
     if q.get("response_type") != "code":
         return fail("unsupported_response_type", "Only response_type=code.")
@@ -594,9 +604,13 @@ class Hosted:
                 {"project": pid, "name": p["name"], "workspace": spaces.get(p["tenant_id"]), "access": self.access(r),
                  "pdf": (H.APP.project_root(p) / ".out" / f"{p['slug']}.pdf").is_file()}
                 for pid, (p, r) in reachable.items()]})
-        if name == "search":
-            budget, found = [mcp_tools.SEARCH_BYTES], []
-            for pid, (p, _) in list(reachable.items())[:50]:
+        if name == "search":  # reads files in the gateway: per person (not per grant), and a small budget
+            limit = throttle("search", SEARCHES_PER_MINUTE, 60)
+            if limit.full(f"u{self.user['id']}"):
+                raise mcp_tools.ToolError("Too many searches; wait a minute.")
+            limit.fail(f"u{self.user['id']}")
+            budget, found = [SEARCH_BYTES], []
+            for pid, (p, _) in list(reachable.items())[:SEARCH_PROJECTS]:
                 found += [(score, pid, p["name"], rel) for score, rel in
                           mcp_tools.search_tree(H.APP.project_source(p), args["query"], budget)]
             found.sort(key=lambda f: (-f[0], f[2], f[3]))
@@ -693,7 +707,8 @@ def cleanup(stale_clients: float = 86400.0) -> None:
            "t.grant_id = oauth_grants.id) AND NOT EXISTS (SELECT 1 FROM oauth_codes c WHERE "
            "c.grant_id = oauth_grants.id AND c.used = 0)", now - 3600)
     db.run("DELETE FROM oauth_clients WHERE created < ? AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE "
-           "g.client_id = oauth_clients.id)", now - stale_clients)
+           "g.client_id = oauth_clients.id) AND NOT EXISTS (SELECT 1 FROM oauth_requests r WHERE "
+           "r.client_id = oauth_clients.id)", now - stale_clients)
 
 
 def install(module) -> None:
