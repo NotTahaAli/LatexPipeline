@@ -794,7 +794,7 @@ def quota_after_build(started: float) -> str | None:
             for name in names:
                 path = os.path.join(current, name)
                 try:
-                    if os.lstat(path).st_mtime >= started:
+                    if os.lstat(path).st_mtime >= started - 2:  # coarse file clocks (Windows ~16 ms, FAT 2 s)
                         os.unlink(path)
                 except OSError:
                     pass
