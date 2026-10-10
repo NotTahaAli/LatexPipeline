@@ -1576,7 +1576,8 @@ def zotero_apply(data: dict) -> dict:
 # AI assistant (ai.py): the owner's Anthropic key, off until the owner turns it on
 # ---------------------------------------------------------------------------
 
-AI_GUEST_CAP = 100  # requests from shared links per server run
+AI_GUEST_CAP = 100  # requests from shared links per server run, every guest together
+AI_GUEST_HOURLY = 20  # requests per guest (share link + its client id) per hour
 AI: dict = {"guest_used": 0}
 
 
@@ -1606,17 +1607,30 @@ def ai_info(role: str = "owner") -> dict:
     return info
 
 
-def ai_run(role: str, data: dict) -> dict:
+def ai_begin(role: str, guest: str = "") -> tuple[str, str]:
+    """(key, model) for one request, after the role, consent and guest checks. guest identifies a link visitor."""
     info = ai_info(role)
     if not info["enabled"]:
         raise ApiError(info["reason"], 403)
     if role != "owner":
         if AI["guest_used"] >= AI_GUEST_CAP:
             raise ApiError("Shared links have used up their AI requests for this session.", 429)
+        if not rate_ok("ai-guest:" + guest, AI_GUEST_HOURLY, 3600.0):
+            raise ApiError(f"You have used your {AI_GUEST_HOURLY} AI requests for this hour.", 429)
         AI["guest_used"] += 1
     saved = ai.load_settings()
+    return ai.env_key() or saved["key"], saved["model"]
+
+
+def ai_guest(token: str | None, client: str | None) -> str:
+    """Who a link visitor is for the AI cap: their share token and, when it is bound to them, their client id."""
+    return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()[:16] + "/" + (client or "-")
+
+
+def ai_run(role: str, data: dict, guest: str = "") -> dict:
+    key, model = ai_begin(role, guest)
     try:
-        return ai.ask(data, key=ai.env_key() or saved["key"], model=saved["model"])
+        return ai.ask(data, key=key, model=model)
     except ai.AiError as exc:
         raise ApiError(str(exc), exc.status)
 
@@ -3185,7 +3199,11 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/zotero/settings" and self.role == "owner":
             self.json(zotero_call(zotero.save_settings, self.body()))
         elif url.path == "/api/ai" and name in DOCS:
-            self.json(ai_run(self.role, self.body()))
+            guest = ai_guest(self.token, trusted_client(query.get("cid", [""])[0][:64], self.role, self.user))
+            if "stream" in query:
+                self.ai_stream(self.body(), guest)
+            else:
+                self.json(ai_run(self.role, self.body(), guest))
         elif url.path == "/api/ai/settings" and self.role == "owner":
             self.json(ai_settings(self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
@@ -3482,6 +3500,27 @@ class Handler(BaseHTTPRequestHandler):
                 send(0x8, b"")
             except OSError:
                 pass
+
+    def ai_stream(self, data: dict, guest: str) -> None:
+        """POST /api/ai?stream: the answer as NDJSON lines while the model writes it (ai.relay). No Content-Length:
+        the body ends when the connection closes, which passes through the gateway's relay and share tunnels."""
+        key, model = ai_begin(self.role, guest)
+
+        def begin() -> None:
+            self.send_response(200)
+            for name, value in (("Content-Type", "application/x-ndjson"), ("Cache-Control", "no-store"),
+                                ("X-Content-Type-Options", "nosniff"), ("X-Accel-Buffering", "no")):
+                self.send_header(name, value)
+            self.end_headers()
+
+        def write(line: bytes) -> None:
+            self.wfile.write(line)
+            self.wfile.flush()
+
+        try:
+            ai.relay(ai.ask_stream(data, key=key, model=model), begin, write)
+        except ai.AiError as exc:
+            raise ApiError(str(exc), exc.status)
 
     def events(self) -> None:
         """Legacy SSE view of the bus; the UI does not use it."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import stat
@@ -199,6 +200,152 @@ class Calls(unittest.TestCase):
         self.assertIsNone(ai._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil.example/"))
 
 
+def sse_reply(answer="Café \"quoted\" \U0001F600 done.", text="", edits=(), stop="end_turn", size=7,
+              error_after=None, end=True):
+    """A streamed Messages API reply as raw bytes in chunks of `size` (cutting through UTF-8 characters), the
+    shape Anthropic sends: message_start, a thinking block, pings, the JSON text in deltas, message_delta, stop."""
+    payload = json.dumps({"answer": answer, "text": text, "edits": list(edits)}, ensure_ascii=False)
+    events = [("message_start", {"type": "message_start", "message": {
+                  "model": "claude-opus-5-5", "content": [], "usage": {"input_tokens": 12, "output_tokens": 1}}}),
+              ("content_block_start", {"type": "content_block_start", "index": 0,
+                                       "content_block": {"type": "thinking", "thinking": ""}}),
+              ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                       "delta": {"type": "signature_delta", "signature": "abc"}}),
+              ("ping", {"type": "ping"}),
+              ("content_block_start", {"type": "content_block_start", "index": 1,
+                                       "content_block": {"type": "text", "text": ""}})]
+    for i in range(0, len(payload), 5):
+        if error_after is not None and i >= error_after:
+            events.append(("error", {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}))
+            break
+        events.append(("content_block_delta", {"type": "content_block_delta", "index": 1,
+                                               "delta": {"type": "text_delta", "text": payload[i:i + 5]}}))
+    else:
+        events += [("content_block_stop", {"type": "content_block_stop", "index": 1}),
+                   ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop},
+                                      "usage": {"output_tokens": 30}})]
+        if end:
+            events.append(("message_stop", {"type": "message_stop"}))
+    raw = ": comment\r\n\r\n" + "".join(f"event: {e}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n" for e, d in events)
+    raw = raw.encode("utf-8")
+    return [raw[i:i + size] for i in range(0, len(raw), size)]
+
+
+class Streaming(unittest.TestCase):
+    def setUp(self):
+        mock.patch.object(ai, "LIMITER", grammar.Limiter(requests=1000, size=10 ** 9)).start()
+        self.addCleanup(mock.patch.stopall)
+        self.calls, self.closed = [], []
+
+    def fake(self, chunks):
+        def post_stream(url, body, headers):
+            self.calls.append((url, body, headers))
+            try:
+                yield from chunks
+            finally:
+                self.closed.append(True)
+        mock.patch.object(ai, "post_stream", side_effect=post_stream).start()
+
+    def events(self, data=None, **kw):
+        spent = {}
+        out = []
+        try:
+            for event in ai.ask_stream(data or explain(), key="sk-secret-key", model="claude-opus-5-5", spent=spent):
+                out.append(event)
+        except ai.AiError as exc:
+            out.append(exc)
+        return out, spent
+
+    def test_the_answer_streams_in_pieces_and_the_checked_reply_comes_last(self):
+        answer = "Café \"quoted\" \\ \U0001F600 é\nnext line."
+        for size in (1, 2, 3, 7, 64, 4096):
+            with self.subTest(size=size):
+                self.fake(sse_reply(answer, edits=[{"file": "main.tex", "old": "\\textbf{world", "new": "x"}],
+                                    size=size))
+                out, spent = self.events()
+                kinds = [e["type"] for e in out]
+                self.assertEqual((kinds[0], kinds[-1]), ("start", "done"))
+                self.assertIn("ping", kinds)
+                self.assertEqual("".join(e["text"] for e in out if e["type"] == "delta"), answer)
+                self.assertGreater(kinds.count("delta"), 3 if size < 64 else 0)
+                reply = out[-1]["reply"]
+                self.assertEqual((reply["answer"], reply["usage"]), (answer, {"input": 12, "output": 30}))
+                self.assertEqual([e["file"] for e in reply["edits"]], ["main.tex"])
+                self.assertEqual(spent, {"input": 12, "output": 30})
+        url, body, headers = self.calls[0]
+        self.assertTrue(body["stream"])
+        self.assertEqual((headers["x-api-key"], headers["anthropic-version"]), ("sk-secret-key", ai.API_VERSION))
+        self.assertNotIn("sk-secret-key", json.dumps([e for e in out if isinstance(e, dict)]))
+
+    def test_only_the_answer_streams_never_unchecked_text_or_edits(self):
+        self.fake(sse_reply("ok", text="\\write18{rm -rf}", edits=[{"file": "build.toml", "old": "a", "new": "b"}]))
+        out, _ = self.events({"task": "rewrite", "selection": {"text": "x"}})
+        streamed = json.dumps([e for e in out if e["type"] != "done"])
+        self.assertNotIn("write18", streamed)
+        self.assertNotIn("build.toml", streamed)
+        self.assertEqual((out[-1]["reply"]["text"], out[-1]["reply"]["edits"]), ("", []))
+
+    def test_an_error_event_mid_stream_fails_with_the_usage_so_far(self):
+        self.fake(sse_reply("A long answer " * 5, error_after=30))
+        out, spent = self.events()
+        self.assertTrue(any(isinstance(e, dict) and e["type"] == "delta" for e in out))
+        self.assertIsInstance(out[-1], ai.AiError)
+        self.assertIn("Overloaded", str(out[-1]))
+        self.assertEqual((out[-1].status, out[-1].usage), (502, {"input": 12, "output": 1}))
+        self.assertEqual(self.closed, [True])
+
+    def test_refusals_cut_offs_and_streams_that_end_early_are_errors(self):
+        for kw, status in (({"stop": "refusal"}, 422), ({"stop": "max_tokens"}, 502), ({"end": False}, 502)):
+            with self.subTest(**kw):
+                self.fake(sse_reply("partial", **kw))
+                out, spent = self.events()
+                self.assertIsInstance(out[-1], ai.AiError)
+                self.assertEqual(out[-1].status, status)
+                self.assertEqual(out[-1].usage, {"input": 12, "output": 30})
+                self.assertFalse(any(isinstance(e, dict) and e["type"] == "done" for e in out))
+
+    def test_relay_errors_before_the_first_event_are_plain_and_a_gone_client_closes_upstream(self):
+        mock.patch.object(ai, "post_stream", side_effect=ai.AiError("Anthropic refused the API key (HTTP 401).", 502)
+                          ).start()
+        begun = []
+        with self.assertRaises(ai.AiError):
+            ai.relay(ai.ask_stream(explain(), key="k", model="claude-opus-5-5"), lambda: begun.append(1), print)
+        self.assertEqual(begun, [])
+        self.fake(sse_reply("x" * 200, size=3))
+        lines = []
+
+        def write(line):
+            if len(lines) == 2:
+                raise BrokenPipeError
+            lines.append(json.loads(line))
+        spent = {}
+        ai.relay(ai.ask_stream(explain(), key="k", model="claude-opus-5-5", spent=spent),
+                 lambda: begun.append(1), write)
+        self.assertEqual((begun, self.closed, spent), ([1], [True], {"input": 12, "output": 1}))
+        self.assertEqual(lines[0]["type"], "start")
+        # A later error goes in-band, after the headers.
+        self.fake(sse_reply("abc", stop="refusal"))
+        lines.clear()
+        ai.relay(ai.ask_stream(explain(), key="k", model="claude-opus-5-5"), lambda: None,
+                 lambda line: lines.append(json.loads(line)))
+        self.assertEqual((lines[-1]["type"], lines[-1]["status"]), ("error", 422))
+
+    def test_sse_parsing(self):
+        got = list(ai.sse([b"event: a\r\nda", b"ta: {\"x\":", b" 1}\r\n\r\n: keep\n\ndata: [1]\n\n"]))
+        self.assertEqual(got, [("a", {"x": 1}), ("", {})])
+        with self.assertRaises(ai.AiError):
+            list(ai.sse([b"data: {nope\n\n"]))
+
+    def test_answer_stream_handles_split_escapes_and_ignores_other_fields(self):
+        doc = json.dumps({"text": "answer", "answer": "aé\"\\/\U0001F600\t", "edits": [{"answer": "no"}]})
+        for size in (1, 2, 5):
+            stream = ai.AnswerStream()
+            out = "".join(stream.feed(doc[i:i + size]) for i in range(0, len(doc), size))
+            self.assertEqual(out, "aé\"\\/\U0001F600\t")
+        stream = ai.AnswerStream()  # an escaped surrogate pair split between two pieces
+        self.assertEqual(stream.feed('{"answer": "\\ud83d') + stream.feed('\\ude00!"}'), "\U0001F600!")
+
+
 class KeysAndSettings(unittest.TestCase):
     def test_the_environment_key_is_taken_out_of_the_environment(self):
         with mock.patch.dict(os.environ, {"LP_TEST_AI_KEY": "sk-from-env"}), mock.patch.dict(ai._ENV_KEYS, clear=True):
@@ -349,6 +496,50 @@ class ServeApi(ts.SharedState, ts.ServerCase):
         serve.AI["guest_used"] = serve.AI_GUEST_CAP
         self.assertEqual(self.run_ai("edit")[0], 429)
         self.assertEqual(self.run_ai("owner")[0], 200)
+
+    def test_each_guest_has_an_hourly_cap(self):
+        """The cap is per visitor (share token + bound client id), so one guest cannot use up everyone's share."""
+        self.tokens = self.share_on()
+        self.turn_on(share=True)
+        mock.patch.object(serve, "AI_GUEST_HOURLY", 2).start()
+        for cid in ("guest-a", "guest-b"):
+            serve.bind_client(cid, "edit")
+        a = [self.request("POST", "/api/ai?doc=demo&cid=guest-a", {"task": "rewrite", "selection": {"text": "x"}},
+                          self.hdr("edit"))[0] for _ in range(3)]
+        b = self.request("POST", "/api/ai?doc=demo&cid=guest-b", {"task": "rewrite", "selection": {"text": "x"}},
+                         self.hdr("edit"))[0]
+        self.assertEqual((a, b), ([200, 200, 429], 200))
+        serve.bind_client("owner-tab", "owner")  # a client id bound to another role is not this guest's
+        self.assertEqual(self.request("POST", "/api/ai?doc=demo&cid=owner-tab", {"task": "rewrite", "selection": {
+            "text": "x"}}, self.hdr("edit"))[0], 200)
+        self.assertEqual([self.run_ai("edit")[0] for _ in range(2)], [200, 429])  # same bucket as the unbound id
+        self.assertEqual(self.run_ai("owner")[0], 200)
+        self.assertEqual(serve.AI["guest_used"], 5)
+
+    def test_streaming_has_the_same_checks_and_never_carries_the_key(self):
+        self.tokens = self.share_on()
+        self.turn_on()
+        heard = []
+        mock.patch.object(ai, "post_stream", side_effect=lambda url, body, headers: heard.append(headers)
+                          or (c for c in sse_reply("Streamed answer."))).start()
+        data = {"task": "rewrite", "selection": {"text": "x"}}
+        self.assertEqual(self.request("POST", "/api/ai?doc=demo&stream=1", data, self.hdr("edit"))[0], 403)
+        self.assertEqual(self.request("POST", "/api/ai?doc=demo&stream=1", data, self.hdr("view"))[0], 403)
+        self.assertEqual(heard, [])
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/ai?doc=demo&stream=1", json.dumps(data),
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": "application/json", **self.hdr("owner")})
+        res = conn.getresponse()
+        raw = res.read().decode()
+        conn.close()
+        self.assertEqual((res.status, res.getheader("Content-Type")), (200, "application/x-ndjson"))
+        lines = [json.loads(line) for line in raw.splitlines()]
+        self.assertEqual("".join(e["text"] for e in lines if e["type"] == "delta"), "Streamed answer.")
+        self.assertEqual(lines[-1]["reply"]["answer"], "Streamed answer.")
+        self.assertEqual(heard[0]["x-api-key"], self.KEY)
+        self.assertNotIn(self.KEY, raw)
+        status, out = self.request("POST", "/api/ai?doc=demo&stream=1", {"task": "nope"}, self.hdr("owner"))
+        self.assertEqual((status, out["error"]), (400, "Unknown task."))  # errors before the stream: plain JSON
 
     def test_no_bus_message_carries_ai_results(self):
         self.share_on()

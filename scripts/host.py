@@ -1291,9 +1291,15 @@ class Handler(BaseHTTPRequestHandler):
                               cfg["daily_total"] - n["total"]))
 
         def record(usage: dict) -> None:
-            APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
-                       "WHERE day = ? AND user_id = ? AND tenant_id = ?",
-                       usage["input"], usage["output"], day, uid, tid)
+            """Tokens billed; a request Anthropic billed nothing for (refused before an answer, unreachable, bad
+            request, limits) is given back, so it does not use up the daily count."""
+            if usage.get("input") or usage.get("output"):
+                APP.db.run("UPDATE ai_usage SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? "
+                           "WHERE day = ? AND user_id = ? AND tenant_id = ?",
+                           usage["input"], usage["output"], day, uid, tid)
+            else:
+                APP.db.run("UPDATE ai_usage SET requests = requests - 1 "
+                           "WHERE day = ? AND user_id = ? AND tenant_id = ? AND requests > 0", day, uid, tid)
 
         reason = ("View-only members cannot use the assistant." if role != "edit"
                   else "The AI assistant is off on this server." if not on
@@ -1316,11 +1322,14 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(400, "Bad JSON.")
         if not isinstance(data, dict):
             raise HttpError(400, "Expected a JSON object.")
-        with APP.db.tx():  # count first: a failed or slow request still uses up its share
+        with APP.db.tx():  # count first: a slow request uses up its share while it runs (record() may give it back)
             if not left():
                 raise HttpError(429, "The daily AI limit is reached; try again tomorrow.")
             APP.db.run("INSERT INTO ai_usage(day, user_id, tenant_id, requests) VALUES (?, ?, ?, 1) "
                        "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1", day, uid, tid)
+        if "stream" in self.query:
+            self.assistant_stream(data, key, cfg["model"], record)
+            return
         try:
             result = ai.ask(data, key=key, model=cfg["model"])
         except ai.AiError as exc:
@@ -1328,6 +1337,29 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(exc.status, str(exc))
         record(result["usage"])
         self.send_json(result)
+
+    def assistant_stream(self, data: dict, key: str, model: str, record) -> None:
+        """?stream: the gateway reads Anthropic's stream itself and relays the answer as NDJSON (ai.relay); usage is
+        recorded however it ends, also when the browser stops it or goes away."""
+        spent = {"input": 0, "output": 0}
+
+        def begin() -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            for name, value in self.headers_out([("X-Accel-Buffering", "no")]):
+                self.send_header(name, value)
+            self.end_headers()
+
+        def write(line: bytes) -> None:
+            self.wfile.write(line)
+            self.wfile.flush()
+
+        try:
+            ai.relay(ai.ask_stream(data, key=key, model=model, spent=spent), begin, write)
+        except ai.AiError as exc:
+            raise HttpError(exc.status, str(exc))
+        finally:
+            record(spent)
 
     def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
         worker = APP.workers.acquire(project)
