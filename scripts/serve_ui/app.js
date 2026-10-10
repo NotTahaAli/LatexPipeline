@@ -7,6 +7,7 @@ import * as prose from "./prose.js";
 import { grammarSupport } from "./grammar.js";
 import { addBibLookup } from "./bib.js";
 import { refsPanel } from "./refs.js";
+import { aiPanel } from "./ai.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -817,6 +818,7 @@ function renderProblems() {
     if (e.hint) more.push(el("div", { className: "hint", textContent: e.hint }));
     if (e.excerpt) more.push(el("pre", { textContent: e.excerpt, tabIndex: 0 }));
     if (!more.length) more.push(el("span", { className: "mute", textContent: "No further details." }), logLink.cloneNode(true));
+    more.push(...aiUi.explainButton(e));
     list.push(disclosure([el("span", { className: "sev" }), el("span", { className: "msg", textContent: e.message }), whereLink(e.file, e.line)], more, i === 0));   // The first error opens by itself; the rest stay one line each.
   });
   if (!list.length && d.status === "failed") {
@@ -876,6 +878,15 @@ const refsUi = refsPanel($("panel-refs"), {
   async newFile(path) { await api.fs(cur, "newfile", path); await loadFiles(); },
   changed: () => loadRefs(),
 });
+
+// Assistant panel (ai.js): the server asks the model; answers go into the open editor document only on Apply.
+const aiUi = aiPanel($("panel-ai"), {
+  api, el, icon, role, readOnly, doc: () => cur, toast: (m) => toast(el("span", { textContent: m })),
+  show: () => setSide(true, "ai"), text: (path) => bibCtx.text(path), errors: () => (docs[cur]?.errors || []).filter((e) => e.file),
+  logUrl: () => api.logUrl(cur), current: () => active?.kind === "text" ? { path: active.path, view } : null,
+  async view(path) { if (narrow()) setSide(false); if (active?.path !== path) await openFile(path, 0, { noFocus: true }); return view; },
+});
+aiUi.load().then(() => renderProblems());
 
 async function loadLint() {
   $("lintList").replaceChildren(el("li", { className: "none", textContent: "Checking..." }));
@@ -1006,17 +1017,18 @@ $("drawerClose").onclick = () => setDrawer(false);
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
   $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
-  for (const n of ["files", "outline", "refs"]) {
+  for (const n of ["files", "outline", "refs", "ai"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
-  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); }
+  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); }
 }
 $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
 $("tab-files").onclick = () => setSide(true, "files");
 $("tab-outline").onclick = () => setSide(true, "outline");
 $("tab-refs").onclick = () => setSide(true, "refs");
+$("tab-ai").onclick = () => setSide(true, "ai");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------
 async function setVisual(on) {
@@ -1105,6 +1117,8 @@ const COMMANDS = [
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
+  { id: "assistant", title: "Toggle AI assistant", run: () => (ui.side && ui.sideTab === "ai") ? setSide(false) : setSide(true, "ai") },
+  ...aiUi.commands,
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
@@ -1200,7 +1214,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]],
+  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]],
     ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },

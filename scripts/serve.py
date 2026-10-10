@@ -45,6 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+import ai
 import bibfix
 import build
 import grammar
@@ -1496,6 +1497,64 @@ def bib_import(data: dict) -> dict:
     return {"entries": found, "error": error}
 
 
+# ---------------------------------------------------------------------------
+# AI assistant (ai.py): the owner's Anthropic key, off until the owner turns it on
+# ---------------------------------------------------------------------------
+
+AI_GUEST_CAP = 100  # requests from shared links per server run
+AI: dict = {"guest_used": 0}
+
+
+def ai_info(role: str = "owner") -> dict:
+    """What the editor may show. The key never leaves this process; only the owner learns where it comes from."""
+    saved = ai.load_settings()
+    on = bool(saved["enabled"] and (ai.env_key() or saved["key"]) and not GATEWAY["secret"])
+    allowed = on and (role == "owner" or (role == "edit" and saved["share"]))
+    info = {"enabled": allowed, "model": saved["model"], "notice": ai.NOTICE,
+            "reason": None if allowed else "View-only links cannot use the assistant." if role == "view"
+            else "The owner has not allowed the assistant for shared links." if on
+            else "The AI assistant is off. The owner can turn it on in the Assistant panel."}
+    if role == "owner":
+        info.update(on=saved["enabled"], share=saved["share"], models=list(ai.MODELS),
+                    key="environment" if ai.env_key() else "settings" if saved["key"] else None)
+    return info
+
+
+def ai_run(role: str, data: dict) -> dict:
+    info = ai_info(role)
+    if not info["enabled"]:
+        raise ApiError(info["reason"], 403)
+    if role != "owner":
+        if AI["guest_used"] >= AI_GUEST_CAP:
+            raise ApiError("Shared links have used up their AI requests for this session.", 429)
+        AI["guest_used"] += 1
+    saved = ai.load_settings()
+    try:
+        return ai.ask(data, key=ai.env_key() or saved["key"], model=saved["model"], owner=role == "owner")
+    except ai.AiError as exc:
+        raise ApiError(str(exc), exc.status)
+
+
+def ai_settings(data: dict) -> dict:
+    """Owner only: on/off, model, shared links, and the key (kept in ai.SETTINGS_FILE, never sent back)."""
+    saved = ai.load_settings()
+    try:
+        if "enabled" in data:
+            saved["enabled"] = data["enabled"] is True
+        if "share" in data:
+            saved["share"] = data["share"] is True
+        if "model" in data:
+            saved["model"] = ai.check_model(data["model"])
+        if data.get("key"):
+            saved["key"] = ai.check_key(data["key"])
+        if data.get("forget_key"):
+            saved["key"] = None
+    except ai.AiError as exc:
+        raise ApiError(str(exc), exc.status)
+    ai.save_settings(saved)
+    return ai_info()
+
+
 def grammar_info(role: str = "owner") -> dict:
     info = {"mode": GRAMMAR["mode"], "share_public": GRAMMAR["share_public"]}
     return {**info, "url": GRAMMAR["url"]} if role == "owner" else info
@@ -2392,7 +2451,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
             raise ApiError("This link is view-only.", 403)
 
     if method == "GET":
-        if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll"):
+        if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll") \
+                or path == "/api/ai":  # ai_info answers per role and never holds the key
             return
         if path.startswith("/docx/"):
             raise ApiError("Only the owner can download the DOCX export.", 403)
@@ -2426,6 +2486,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("grammar", 30, 60.0):
             raise ApiError("Too many grammar checks; wait a moment.", 429)
+    elif method == "POST" and path == "/api/ai":
+        need_edit()  # Sends text to Anthropic with the owner's key; ai_run also needs the owner's consent.
+        scoped(doc)
+        if not rate_ok("ai", 10, 60.0):
+            raise ApiError("Too many AI requests; wait a moment.", 429)
     # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
     # link could otherwise put /etc/passwd into a download.
     elif method == "POST" and path == "/api/bib":
@@ -2628,6 +2693,10 @@ class Handler(BaseHTTPRequestHandler):
             self.json(bib_edit(self.body()))
         elif url.path == "/api/bib/import" and name in DOCS:
             self.json(bib_import(self.body()))
+        elif url.path == "/api/ai" and name in DOCS:
+            self.json(ai_run(self.role, self.body()))
+        elif url.path == "/api/ai/settings" and self.role == "owner":
+            self.json(ai_settings(self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:
@@ -2700,6 +2769,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
+        elif path == "/api/ai":
+            self.json(ai_info(self.role))
         elif path == "/api/share":
             self.json(share_info())
         elif path == "/ws":

@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
+import ai
 import host
 import serve
 
@@ -1206,6 +1207,124 @@ class SignInProviders(HostCase):
     def test_http_json_refuses_plain_http(self):
         with self.assertRaises(host.HttpError):
             REAL_HTTP_JSON("GET", "http://id.example/x")
+
+
+def ai_reply(edits=()):
+    payload = json.dumps({"answer": "Close the brace.", "text": "", "edits": list(edits)})
+    return {"stop_reason": "end_turn", "model": "claude-opus-5-5", "usage": {"input_tokens": 100, "output_tokens": 20},
+            "content": [{"type": "text", "text": payload}]}
+
+
+class Assistant(HostCase):
+    """/p/<id>/api/ai: the gateway makes the call with the operator's key; workers never see the key or the request."""
+
+    KEY = "sk-ant-operator-" + "o" * 30
+    AI = {"enabled": True, "api_key": KEY, "daily_per_user": 3, "daily_per_workspace": 100}
+
+    def extra_config(self):
+        return {"ai": dict(self.AI)}
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for AI")).start()
+        mock.patch.object(ai, "LIMITER", ai.grammar.Limiter(requests=1000, size=10 ** 9)).start()
+        self.calls = []
+        mock.patch.object(ai, "post_json", side_effect=lambda url, body, headers: self.calls.append((body, headers))
+                          or ai_reply([{"file": "build.toml", "old": "a", "new": "b"},
+                                       {"file": "main.tex", "old": "\\textbf{x", "new": "\\textbf{x}"}])).start()
+
+    def ask(self, client, data=None, **kw):
+        data = data or {"task": "explain", "error": {"message": "Runaway argument?"},
+                        "files": [{"path": "main.tex", "text": "a \\textbf{x\n", "line": 1},
+                                  {"path": "build.toml", "text": "a = 1\n"}]}
+        return client.call("POST", f"/p/{self.pid}/api/ai", data, **kw)
+
+    def test_editors_get_checked_answers_and_the_key_stays_on_the_gateway(self):
+        editor = self.client("ed@x.org")
+        status, out, _ = self.ask(editor)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["answer"], "Close the brace.")
+        self.assertEqual([e["file"] for e in out["edits"]], ["main.tex"])  # build.toml is owner-only: dropped
+        self.assertEqual(self.calls[0][1]["x-api-key"], self.KEY)
+        self.assertNotIn(self.KEY, json.dumps(out))
+        status, info, _ = editor.call("GET", f"/p/{self.pid}/api/ai")
+        self.assertEqual((info["enabled"], info["left"]), (True, 2))
+        self.assertNotIn(self.KEY, json.dumps(info))
+
+    def test_roles_origin_and_membership(self):
+        viewer = self.client("vi@x.org")
+        self.assertFalse(viewer.call("GET", f"/p/{self.pid}/api/ai")[1]["enabled"])
+        self.assertEqual(self.ask(viewer)[0], 403)
+        self.assertEqual(self.ask(self.client("out@x.org"))[0], 404)  # not their project: 404, not 403
+        self.assertEqual(self.ask(Client(self))[0], 401)
+        self.assertEqual(self.ask(self.client("ed@x.org"), origin=False)[0], 403)
+        self.assertEqual(self.ask(self.client("ed@x.org"), origin="https://evil.example")[0], 403)
+        self.assertEqual(self.calls, [])
+
+    def test_off_without_the_operator(self):
+        self.app.config["ai"] = {**self.AI, "enabled": False}
+        editor = self.client("ed@x.org")
+        self.assertFalse(editor.call("GET", f"/p/{self.pid}/api/ai")[1]["enabled"])
+        self.assertEqual(self.ask(editor)[0], 403)
+        self.app.config["ai"] = {**self.AI, "api_key": "", "api_key_env": "LP_NO_SUCH_KEY"}
+        self.assertEqual(self.ask(editor)[0], 403)
+        self.assertEqual(self.calls, [])
+
+    def test_daily_limits_and_usage_for_the_site_admin(self):
+        editor = self.client("ed@x.org")
+        self.assertEqual([self.ask(editor)[0] for _ in range(4)], [200, 200, 200, 429])
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.ask(editor, {"task": "nope"})[0], 429)  # used up before it is even read
+        self.user("root@x.org", site_admin=True)
+        status, data, _ = self.client("root@x.org").call("GET", "/api/admin")
+        self.assertEqual(status, 200)
+        row = data["ai"]["usage"][0]
+        self.assertEqual((row["email"], row["workspace"], row["requests"], row["input_tokens"], row["output_tokens"]),
+                         ("ed@x.org", "Team", 3, 300, 60))
+        self.assertTrue(data["ai"]["enabled"])
+        self.assertNotIn(self.KEY, json.dumps(data))
+        self.assertEqual(editor.call("GET", "/api/admin")[0], 404)
+
+    def test_bad_requests_and_upstream_errors(self):
+        editor = self.client("ed@x.org")
+        self.assertEqual(self.ask(editor, {"task": "nope"})[0], 400)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/ai", raw=b"[1]")[0], 400)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/ai", raw=b"x" * (ai.MAX_BODY + 1))[0], 413)
+        ai.post_json.side_effect = ai.AiError("Anthropic answered HTTP 500.", 502)
+        self.assertEqual(self.ask(editor)[0], 502)
+
+    def test_workers_never_get_the_key_in_their_environment(self):
+        seen = {}
+
+        def popen(argv, env, **kw):
+            seen.update(env)
+            return mock.Mock(stdout=io.StringIO("LP_GATEWAY_PORT=5\n"), pid=0, poll=lambda: None)
+
+        project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env-should-stay"}), \
+                mock.patch.object(host.subprocess, "Popen", popen):
+            self.app.workers._spawn(project)
+        self.assertTrue(seen)
+        self.assertNotIn("ANTHROPIC_API_KEY", seen)
+        self.assertNotIn("sk-env-should-stay", json.dumps(seen))
+        self.assertNotIn(self.KEY, json.dumps(seen))
+
+    def test_config_section_is_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            for text in ('[ai]\nenabled = "yes"', '[ai]\nmodel = "gpt-4"', '[ai]\ndaily_per_user = -1',
+                         '[ai]\nshell = "x"', 'ai = 3'):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+            (data / "config.toml").write_text('[ai]\nenabled = true\nmodel = "claude-haiku-5-5"')
+            self.assertEqual(host.load_config(data)["ai"]["daily_per_user"], 50)
 
 
 class Cli(unittest.TestCase):

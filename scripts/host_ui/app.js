@@ -368,7 +368,7 @@ async function accountPage() {
 
 // ---- site admin ------------------------------------------------------------------------------------------------
 const adminSections = [["signup", "Sign-up"], ["workspaces", "Workspaces"], ["users", "Users"], ["quotas", "Quotas and limits"],
-  ["providers", "Sign-in providers"], ["audit", "Audit log"]];
+  ["providers", "Sign-in providers"], ["ai", "AI assistant"], ["audit", "Audit log"]];
 
 // One page with every section; the menu on the left (#admin/<section>) scrolls to one.
 function adminSection(name) {
@@ -438,6 +438,14 @@ async function adminPage() {
     el("tbody", {}, d.audit.map((r) => el("tr", {}, el("td", { className: "mute", textContent: new Date(r.at * 1000).toLocaleString() }), el("td", { className: "mono", textContent: r.email || r.ip || "" }),
       el("td", {}, r.action.includes("fail") ? el("span", { className: "tag warn", textContent: r.action.replace(/_/g, " ") }) : r.action.replace(/_/g, " ")),
       el("td", { className: "mono", textContent: r.detail || "" }))))));
+  const a = d.ai;
+  const aiUsage = el("div", { className: "table-wrap", tabIndex: 0, role: "region", ariaLabel: "AI requests in the last 30 days" }, el("table", {}, el("caption", { className: "sr", textContent: "AI requests in the last 30 days" }),
+    el("thead", {}, el("tr", {}, ["Who", "Workspace", "Requests", "Tokens in / out", "Last"].map((h) => el("th", { scope: "col", textContent: h })))),
+    el("tbody", {}, a.usage.map((r) => el("tr", {}, el("td", { className: "mono", textContent: r.email || "(deleted)" }), el("td", { textContent: r.workspace || "(deleted)" }),
+      el("td", { textContent: r.requests }), el("td", { className: "mono", textContent: `${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}` }),
+      el("td", { className: "mute", textContent: r.last_day }))))));
+  const aiLead = a.enabled ? `On, model ${a.model}. At most ${a.daily_per_user} requests per person and ${a.daily_per_workspace} per workspace a day. Set in config.toml.`
+    : a.configured ? "Enabled in config.toml, but the API key is missing (api_key_env)." : "Off. The operator turns it on in config.toml ([ai]).";
   const sect = (id, title, lead, ...body) => el("section", { className: "adm", id: "s-" + id, ariaLabel: title },
     el("h2", { textContent: title, tabIndex: -1 }), lead ? el("p", { className: "lead", textContent: lead }) : null, ...body);
   const side = el("nav", { className: "side", ariaLabel: "Site admin sections" }, el("p", { className: "eyebrow", textContent: "Sections" }),
@@ -449,6 +457,7 @@ async function adminPage() {
     sect("users", "Users", null, resetOut, users),
     sect("quotas", "Quotas and limits", "Limits for every workspace and for the server.", quotas),
     sect("providers", "Sign-in providers", "Configured by the operator in config.toml.", providers),
+    sect("ai", "AI assistant", aiLead, a.usage.length ? aiUsage : el("p", { className: "card", textContent: "No AI requests in the last 30 days." })),
     sect("audit", "Audit log", `The last ${d.audit.length} events.`, audit));
   main.dataset.page = "admin";
   const section = location.hash.slice(7);
