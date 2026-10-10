@@ -59,7 +59,7 @@ export function refsPanel(root, ctx) {
   const addBtn = el("button", { type: "button", className: "icon", title: "New reference", hidden: ctx.readOnly }, icon("plus"));
   addBtn.setAttribute("aria-label", "New reference");
   const zotActs = ctx.readOnly ? [] : [action("Sync from Zotero...", () => zot.sync()), action("Zotero settings...", () => zot.settings())];
-  zotActs.forEach((b) => { b.hidden = true; });   // Shown once the server says this viewer may (owner of a local editor).
+  zotActs.forEach((b) => { b.hidden = true; });   // Shown once the server says this viewer may sync (and configure).
   const more = details("More reference actions", [
     ...(ctx.readOnly ? [] : [action("Import BibTeX, RIS or DOI...", () => openImport()), ...zotActs, action("New .bib file...", () => newBib())]),
     action("Refresh", () => load()),
@@ -81,7 +81,7 @@ export function refsPanel(root, ctx) {
   root.querySelector(".refs-bar").setAttribute("aria-label", "References");
 
   const zot = zoteroUi({ ...ctx, box: formBox, data: () => S.data, scope: () => S.scope, uid, authorLabel, yearOf, reload: () => load() });
-  if (zotActs.length) zot.probe().then((info) => { zotActs.forEach((b) => { b.hidden = !info; }); });
+  if (zotActs.length) zot.probe().then((info) => { zotActs[0].hidden = !info?.can_sync; zotActs[1].hidden = !(info?.can_configure || (info?.hosted && info.can_sync)); });
   search.oninput = () => { S.q = search.value; render(); };
   scope.onchange = () => { S.scope = scope.value; render(); };
   sort.onchange = () => { S.sort = sort.value; render(); };

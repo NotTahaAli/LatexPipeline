@@ -10,6 +10,7 @@ dir. It is sent only in the `Zotero-API-Key` header (never in a URL) and `info()
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -18,12 +19,13 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 import bibfix
 import grammar
 
 API = "https://api.zotero.org"
-LOCAL = "http://127.0.0.1:23119/better-bibtex/export/library?/1/library."  # Better BibTeX, Zotero desktop
+LOCAL = "http://127.0.0.1:23119/better-bibtex/export/"  # Better BibTeX pull export, Zotero desktop
 USER_AGENT = "LatexPipeline (https://github.com/NotTahaAli/LatexPipeline)"
 LIMITER = grammar.Limiter(requests=120, size=1, window=60.0)  # one hit per page; a full sync is up to 200 pages
 WAIT = 60.0  # seconds get() may wait for the limiter before refusing
@@ -35,10 +37,13 @@ MAX_OPS = 500
 MAX_OPS_CHARS = 1_000_000
 MAX_FIELDS = 60
 MAX_VALUE = 20_000
+MAX_TEXT = 1_000_000  # characters of the target .bib (serve.BIB_MAX_CHARS)
+MAX_OTHERS = 4 * MAX_TEXT  # characters of the project's other .bib files together
+MAX_REQUEST = 6 * 1024 * 1024  # bytes of a preview request's JSON (the gateway reads it itself)
 FUZZY_BUDGET = 200_000  # title comparisons per compare()
 FORMATS = ("bibtex", "biblatex")
 IGNORE = {"file"}  # Attachment paths on the Zotero machine
-CACHE: dict = {}  # (mode, base, format) -> {"version", "text"}; small, in memory, never holds the key
+CACHE: dict = {}  # (mode, base, format, key hash) -> {"version", "text"}; small, in memory, never holds the key
 CACHE_LOCK = threading.Lock()
 
 
@@ -81,31 +86,57 @@ def info() -> dict:
     out = {"mode": mode, "library_type": "groups" if cfg.get("library_type") == "groups" else "users",
            "library_id": str(cfg.get("library_id") or ""), "collection": str(cfg.get("collection") or ""),
            "format": cfg.get("format") if cfg.get("format") in FORMATS else "bibtex",
-           "has_key": env or bool(cfg.get("key")), "key_from_env": env}
-    out["configured"] = mode == "local" or bool(out["library_id"] and out["has_key"])
+           "has_key": env or bool(cfg.get("key")), "key_from_env": env,
+           "share_editors": cfg.get("share_editors") is True}
+    out["configured"] = configured(out)
     return out
 
 
-def save_settings(data: dict) -> dict:
-    """Validate and write the settings file (mode 0600). `key` "" keeps the stored key; `clear_key` removes it."""
-    cfg = _read()
+def configured(cfg: dict) -> bool:
+    if cfg.get("mode") == "local":  # My Library needs no ID; a group library needs its group ID
+        return cfg.get("library_type") != "groups" or bool(cfg.get("library_id"))
+    return bool(cfg.get("library_id") and cfg.get("has_key", cfg.get("key")))
+
+
+def check_settings(data: dict, local: bool = True) -> dict:
+    """The validated settings in `data` (no key): mode, library_type, library_id, collection, format.
+
+    Web collections are keys (8 letters or digits); Better BibTeX (local) also takes a path such as Thesis/Chapter 2."""
     mode, kind = data.get("mode", "web"), data.get("library_type", "users")
-    lib, coll = str(data.get("library_id") or "").strip(), str(data.get("collection") or "").strip()
+    lib, coll = str(data.get("library_id") or "").strip(), str(data.get("collection") or "").strip().strip("/")
     fmt = data.get("format", "bibtex")
-    if mode not in ("web", "local") or kind not in ("users", "groups") or fmt not in FORMATS:
+    if mode not in (("web", "local") if local else ("web",)) or kind not in ("users", "groups") or fmt not in FORMATS:
         raise ZoteroError("Unknown mode, library type or format.", 400)
     if lib and not re.fullmatch(r"\d{1,12}", lib):
         raise ZoteroError("The library ID is the number in your Zotero profile or group URL.", 400)
-    if coll and not re.fullmatch(r"[A-Za-z0-9]{8}", coll):
+    if coll and mode == "web" and not re.fullmatch(r"[A-Za-z0-9]{8}", coll):
         raise ZoteroError("A collection key is 8 letters or digits (the end of the collection's web address).", 400)
-    key = data.get("key")
-    if key not in (None, "") and not (isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9]{10,64}", key.strip())):
+    if coll and mode == "local" and (len(coll) > 300 or re.search(r"[\x00-\x1f\x7f]|(^|/)\.\.?(/|$)|//", coll)):
+        raise ZoteroError("A collection is its key or its path, such as Thesis/Chapter 2.", 400)
+    return {"mode": mode, "library_type": kind, "library_id": lib, "collection": coll, "format": fmt}
+
+
+def check_key(key) -> str:
+    """A new key, or "" for none. Raises on anything that does not look like a Zotero API key."""
+    if key in (None, ""):
+        return ""
+    if not (isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9]{10,64}", key.strip())):
         raise ZoteroError("That does not look like a Zotero API key (letters and digits).", 400)
-    cfg.update(mode=mode, library_type=kind, library_id=lib, collection=coll, format=fmt)
+    return key.strip()
+
+
+def save_settings(data: dict) -> dict:
+    """Validate and write the settings file (mode 0600). `key` "" keeps the stored key; `clear_key` removes it.
+    `share_editors` (owner's choice, default off) lets shared-link editors sync with this key, server-side."""
+    cfg = _read()
+    fields, key = check_settings(data), check_key(data.get("key"))
+    cfg.update(fields)
+    if "share_editors" in data:
+        cfg["share_editors"] = data["share_editors"] is True
     if data.get("clear_key"):
         cfg.pop("key", None)
     if key:
-        cfg["key"] = key.strip()
+        cfg["key"] = key
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -172,15 +203,16 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
     if cfg["mode"] == "local":
         if not local_ok:
             raise ZoteroError("Better BibTeX sync is off while sharing: use the web API.", 409)
-        status, _, body = get(LOCAL + cfg["format"], {}, local=True, limit=MAX_TOTAL)
+        status, _, body = get(local_url(cfg), {}, local=True, limit=MAX_TOTAL)
         if len(body) > MAX_TOTAL:
             raise ZoteroError("The export is too large.", 413)
         return body.decode("utf-8", "replace"), "", False
-    if not cfg["library_id"] or not cfg["key"]:
+    if not cfg["library_id"] or not cfg.get("key"):
         raise ZoteroError("Set the library ID and API key first (Zotero settings).", 400)
     scope = f"collections/{cfg['collection']}/" if cfg["collection"] else ""
     base = f"{API}/{cfg['library_type']}/{cfg['library_id']}/{scope}items/top"
-    cache_key = ("web", base, cfg["format"])
+    # Per key: a 304 for one person's key must not hand the cached text to someone else's.
+    cache_key = ("web", base, cfg["format"], hashlib.sha256(cfg["key"].encode()).hexdigest())
     with CACHE_LOCK:
         cached = CACHE.get(cache_key)
     headers = {"Zotero-API-Version": "3", "Zotero-API-Key": cfg["key"]}
@@ -217,6 +249,15 @@ def fetch(cfg: dict, local_ok: bool) -> tuple:
         while len(CACHE) > 4:
             CACHE.pop(next(iter(CACHE)))
     return text, version or "", False
+
+
+def local_url(cfg: dict) -> str:
+    """Better BibTeX pull export (content/pull-export.ts): /export/library?/<lib>/library.<fmt> and
+    /export/collection?/<lib>/<key or path>.<fmt>, where <lib> is 1 (My Library) or a group's ID."""
+    lib = cfg["library_id"] if cfg["library_type"] == "groups" else "1"
+    if cfg.get("collection"):
+        return f"{LOCAL}collection?/{lib}/{quote(cfg['collection'], safe='/')}.{cfg['format']}"
+    return f"{LOCAL}library?/{lib}/library.{cfg['format']}"
 
 
 # ---------------------------------------------------------------------------
@@ -307,16 +348,22 @@ def _free_key(key: str, taken: set) -> str:
     return key
 
 
-def compare(remote_text: str, local_text: str, taken=()) -> dict:
-    """Which remote entries are new, changed for a local entry, identical; which local ones Zotero lacks.
+def compare(remote_text: str, local_text: str, taken=(), others=None) -> dict:
+    """Which remote entries are new, changed for a local entry, identical; which local ones Zotero lacks; which are
+    already in another .bib file of the project (`elsewhere`: not offered again, so no duplicates).
 
-    `taken`: keys of the project's other .bib files (a new entry must not reuse them)."""
+    `taken`: keys of the project's other .bib files (a new entry must not reuse them).
+    `others`: {path: text} of the project's other .bib files, matched like the target file (key, DOI, title)."""
     local = _entries(local_text)
     by_key = {e["key"]: e for e in local}
-    taken = set(taken)
+    away = [{**e, "file": path} for path, text in sorted((others or {}).items()) for e in _entries(text)]
+    away_by_key: dict[str, dict] = {}
+    for e in away:
+        away_by_key.setdefault(e["key"], e)
+    taken = set(taken) | set(away_by_key)
     raw = _entries(remote_text)
     taken_all = set(by_key) | taken | {e["key"] for e in raw}
-    out = {"new": [], "changed": [], "same": 0, "local_only": [], "skipped": 0}
+    out = {"new": [], "changed": [], "same": 0, "local_only": [], "skipped": 0, "elsewhere": []}
     seen = set()
     remote = []
     for entry in raw:
@@ -346,7 +393,18 @@ def compare(remote_text: str, local_text: str, taken=()) -> dict:
     rest = [item for item in remote if item["key"] not in twins]
     for key, other in _twins(rest, local, claimed).items():
         twins[key] = (other, "doi/title")
+    found: dict[str, dict] = {}  # remote key -> entry of another file
     for item in remote:
+        twin = away_by_key.get(item["key"])
+        if item["key"] not in twins and twin and not _conflict(item["fields"], twin["fields"]):
+            found[item["key"]] = twin
+    rest = [item for item in remote if item["key"] not in twins and item["key"] not in found]
+    found.update(_twins(rest, away, {twin["key"] for twin in found.values()}))
+    for item in remote:
+        if item["key"] in found:
+            twin = found[item["key"]]
+            out["elsewhere"].append({"key": twin["key"], "file": twin["file"], "zotero_key": item["zotero_key"]})
+            continue
         if item["key"] not in twins:
             key = item["key"]
             clash = key in collided or key in taken
@@ -367,10 +425,24 @@ def compare(remote_text: str, local_text: str, taken=()) -> dict:
     return out
 
 
-def preview(text: str, taken, local_ok: bool) -> dict:
-    cfg = {**info(), "key": _key(_read())}
+def check_request(data: dict) -> tuple:
+    """(text, taken, others) of a preview request: the target .bib text, keys and texts of the other .bib files."""
+    text, taken, others = data.get("text"), data.get("taken") or [], data.get("others") or {}
+    if not (isinstance(text, str) and isinstance(taken, list) and all(isinstance(k, str) for k in taken)
+            and isinstance(others, dict) and all(isinstance(v, str) for v in others.values())):
+        raise ZoteroError("Send the .bib text.", 400)
+    if len(text) > MAX_TEXT:
+        raise ZoteroError("This .bib file is too large to sync (1 MB limit).", 413)
+    if len(others) > 50 or len(taken) > 100_000 or sum(map(len, others.values())) > MAX_OTHERS:
+        raise ZoteroError("The other .bib files are too large to compare (4 MB limit).", 413)
+    return text, taken, others
+
+
+def preview(text: str, taken, local_ok: bool, others=None, cfg=None) -> dict:
+    """Fetch with `cfg` (default: this computer's settings and key) and compare with `text` and `others`."""
+    cfg = cfg or {**info(), "key": _key(_read())}
     remote, version, cached = fetch(cfg, local_ok)
-    return {**compare(remote, text, taken), "source": cfg["mode"], "version": version, "cached": cached}
+    return {**compare(remote, text, taken, others), "source": cfg["mode"], "version": version, "cached": cached}
 
 
 def apply(text: str, ops) -> dict:

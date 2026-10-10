@@ -308,7 +308,7 @@ async function tenantPage(tid) {
 
 // ---- account ---------------------------------------------------------------------------------------------------
 async function accountPage() {
-  const a = await api("/api/account");
+  const [a, z] = await Promise.all([api("/api/account"), api("/api/account/zotero")]);
   const profile = form([field("Name", input("name", "text", { required: true, maxLength: 80, value: a.name, autocomplete: "name" }))],
     "Save", async (v) => { await api("/api/account", "POST", v); await loadMe(); return "Saved."; }, "inline");
   const password = form([
@@ -359,11 +359,29 @@ async function accountPage() {
         button("Disconnect", async () => { try { await api(`/api/account/identities/${p.id}`, "DELETE"); accountPage(); } catch (err) { alert(err.message); } }, "btn ghost", { ariaLabel: `Disconnect ${p.label}` })]
         : el("a", { className: "btn", href: `/auth/${p.id}/start?intent=link`, textContent: "Connect", ariaLabel: `Connect ${p.label}` }))))) : null;
 
+  // Zotero: your own library and read-only key. The key stays on this server (never shown again, never given to a
+  // project's editor process); "Sync from Zotero" in a project's References panel uses it.
+  const opt = (value, text, on) => el("option", { value, textContent: text, selected: value === on });
+  const zotero = form([
+    field("Library type", el("select", { name: "library_type" }, opt("users", "Personal library", z.library_type), opt("groups", "Group library", z.library_type))),
+    field("Library ID", input("library_id", "text", { value: z.library_id, inputMode: "numeric", pattern: "\\d{1,12}", required: true, autocomplete: "off" }), "Your numeric user ID (zotero.org/settings/keys) or the number in a group's address."),
+    field("Collection key (optional)", input("collection", "text", { value: z.collection, pattern: "[A-Za-z0-9]{8}", maxLength: 8, autocomplete: "off" }), "8 characters at the end of a collection's web address; empty syncs the whole library."),
+    field("Format", el("select", { name: "format" }, opt("bibtex", "BibTeX", z.format), opt("biblatex", "BibLaTeX", z.format))),
+    field("API key", input("key", "password", { autocomplete: "off", placeholder: z.has_key ? "Stored; leave empty to keep it" : "Paste a read-only API key" }), "Create one with read access only at zotero.org/settings/keys/new."),
+    z.has_key ? el("label", { className: "check" }, input("clear_key", "checkbox"), "Remove the stored key") : null,
+  ].filter(Boolean), "Save Zotero settings", async (v, f) => {
+    const r = await api("/api/account/zotero", "POST", { ...v, clear_key: v.clear_key === "on" });
+    f.querySelector("[name=key]").value = "";
+    f.querySelector("[name=key]").placeholder = r.has_key ? "Stored; leave empty to keep it" : "Paste a read-only API key";
+    return r.has_key ? "Saved. Sync from Zotero is in each project's References panel." : "Saved (no key stored).";
+  });
+
   page({ title: "Account", eyebrow: a.email, layout: "narrowpage" },
     sect("Profile", "Your name as other members see it.", profile),
     sect("Two-step sign-in", "A code from an authenticator app at every sign-in.", twoStep),
     providers,
-    sect("Password", "Changing it signs out your other sessions.", password));
+    sect("Password", "Changing it signs out your other sessions.", password),
+    sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero));
 }
 
 // ---- site admin ------------------------------------------------------------------------------------------------

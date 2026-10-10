@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import zotero
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UI_DIR = SCRIPT_DIR / "host_ui"
@@ -244,6 +245,11 @@ MIGRATIONS = [
         day TEXT NOT NULL, user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
         input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(day, user_id, tenant_id));
+    """,
+    """
+    CREATE TABLE zotero_settings(
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, library_type TEXT NOT NULL,
+        library_id TEXT NOT NULL, collection TEXT NOT NULL, format TEXT NOT NULL, api_key TEXT);
     """,
 ]
 
@@ -781,6 +787,7 @@ class App:
         self.codes = Throttle(5)  # TOTP / recovery codes per account
         self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
         self.invite_tries = Throttle(10, 3600)  # wrong invite links per address
+        self.zotero_syncs = Throttle(10, 600)  # Zotero previews per account (hard cap)
         self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
         self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
@@ -1250,6 +1257,9 @@ class Handler(BaseHTTPRequestHandler):
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
+        if rest in ("/api/zotero", "/api/zotero/preview"):
+            self.zotero_sync(rest, role, size)
+            return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
@@ -1328,6 +1338,40 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(exc.status, str(exc))
         record(result["usage"])
         self.send_json(result)
+
+    def zotero_sync(self, rest: str, role: str, size: int) -> None:
+        """/p/<id>/api/zotero[/preview] stops here: each person's own Zotero key (Account page) lives in host.db and
+        never reaches a worker. GET says whether the editor may offer a sync; POST fetches with that person's key
+        and compares with the .bib text the editor sent. Applying stays in the worker (a network-free splice)."""
+        cfg = zotero_settings(self.session["id"])
+        allowed = role == "edit" and zotero.configured(cfg)
+        reason = ("View-only members cannot sync from Zotero." if role != "edit" else None if allowed
+                  else "Add your Zotero library and API key on the Account page first.")
+        if self.command == "GET" and rest == "/api/zotero":
+            self.send_json({**zotero_public(cfg), "hosted": True, "can_sync": allowed, "reason": reason})
+            return
+        if self.command != "POST" or rest != "/api/zotero/preview":
+            raise HttpError(405, "Method not allowed.")
+        if reason:
+            raise HttpError(403 if role != "edit" else 400, reason)
+        if APP.zotero_syncs.full(f"zotero:{self.session['id']}"):
+            raise HttpError(429, "Too many Zotero syncs; wait a few minutes.")
+        if size > zotero.MAX_REQUEST:
+            raise HttpError(413, "The .bib files are too large to compare.")
+        if "json" not in self.headers.get("Content-Type", ""):
+            raise HttpError(415, "Expected application/json.")
+        try:
+            data = json.loads(self.read_exact(size) or b"{}")
+        except ValueError:
+            raise HttpError(400, "Bad JSON.")
+        if not isinstance(data, dict):
+            raise HttpError(400, "Expected a JSON object.")
+        APP.zotero_syncs.fail(f"zotero:{self.session['id']}")  # counted before the fetch: a slow one still counts
+        try:
+            text, taken, others = zotero.check_request(data)
+            self.send_json(zotero.preview(text, taken, False, others, cfg))
+        except zotero.ZoteroError as exc:
+            raise HttpError(exc.status, str(exc))
 
     def relay(self, project: dict, pid: str, rest: str, query: str, role: str, upgrade: bool, size: int) -> None:
         worker = APP.workers.acquire(project)
@@ -1629,6 +1673,45 @@ def api_account_update(h: Handler) -> None:
     name = clean_name(h.json_body().get("name"))
     APP.db.run("UPDATE users SET name = ? WHERE id = ?", name, h.user["id"])
     h.ok()
+
+
+def zotero_settings(user_id: int) -> dict:
+    """The person's Zotero settings as zotero.fetch takes them, key included: for the gateway's own fetch only."""
+    row = APP.db.one("SELECT * FROM zotero_settings WHERE user_id = ?", user_id) or {}
+    return {"mode": "web", "library_type": row.get("library_type") or "users",
+            "library_id": row.get("library_id") or "",
+            "collection": row.get("collection") or "", "format": row.get("format") or "bibtex",
+            "key": row.get("api_key") or ""}
+
+
+def zotero_public(cfg: dict) -> dict:
+    """What a reply may hold: never the key, only whether there is one."""
+    shown = {k: cfg[k] for k in ("mode", "library_type", "library_id", "collection", "format")}
+    return {**shown, "has_key": bool(cfg["key"]), "configured": zotero.configured(cfg), "local_ok": False}
+
+
+@route("GET", r"/api/account/zotero")
+def api_zotero(h: Handler) -> None:
+    h.ok(zotero_public(zotero_settings(h.user["id"])))
+
+
+@route("POST", r"/api/account/zotero")
+def api_zotero_update(h: Handler) -> None:
+    data = h.json_body()
+    try:
+        fields, key = zotero.check_settings({**data, "mode": "web"}, local=False), zotero.check_key(data.get("key"))
+    except zotero.ZoteroError as exc:
+        raise HttpError(exc.status, str(exc))
+    old = zotero_settings(h.user["id"])["key"]
+    key = None if data.get("clear_key") else key or old or None
+    APP.db.run("INSERT INTO zotero_settings(user_id, library_type, library_id, collection, format, api_key) "
+               "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET library_type = excluded.library_type, "
+               "library_id = excluded.library_id, collection = excluded.collection, format = excluded.format, "
+               "api_key = excluded.api_key", h.user["id"], fields["library_type"], fields["library_id"],
+               fields["collection"], fields["format"], key)
+    if key != old:
+        audit_log(APP, "zotero_key_set" if key else "zotero_key_removed", h.user["id"], h.ip)
+    h.ok(zotero_public(zotero_settings(h.user["id"])))
 
 
 def require_password(h: Handler, data: dict) -> None:

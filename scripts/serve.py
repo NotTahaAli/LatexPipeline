@@ -1556,13 +1556,21 @@ def zotero_call(fn, *args) -> dict:
         raise ApiError(str(exc), exc.status)
 
 
+def zotero_info(role: str) -> dict:
+    """The owner sees the settings (never the key); a shared-link editor only whether it may sync."""
+    info = zotero.info()
+    if role == "owner":
+        return {**info, "local_ok": not SHARE["on"], "can_sync": True, "can_configure": True}
+    allowed = role == "edit" and info["share_editors"] and info["configured"]
+    return {"guest": True, "can_sync": allowed, "configured": allowed, "mode": info["mode"], "local_ok": False,
+            "reason": None if allowed else "View-only links cannot sync." if role != "edit"
+            else "The owner has not let shared editors sync from Zotero."}
+
+
 def zotero_preview(data: dict) -> dict:
-    text, taken = data.get("text"), data.get("taken") or []
-    if not (isinstance(text, str) and isinstance(taken, list) and all(isinstance(k, str) for k in taken)):
-        raise ApiError("Send the .bib text.", 400)
-    if len(text) > BIB_MAX_CHARS:
-        raise ApiError("This .bib file is too large to sync (1 MB limit).", 413)
-    return zotero_call(zotero.preview, text, taken, not SHARE["on"])
+    """Owner, or a shared-link editor once the owner allowed it (check_permission); always the owner's key."""
+    text, taken, others = zotero_call(zotero.check_request, data)
+    return zotero_call(zotero.preview, text, taken, not SHARE["on"], others)
 
 
 def zotero_apply(data: dict) -> dict:
@@ -2898,6 +2906,8 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll") \
                 or path == "/api/ai":  # ai_info answers per role and never holds the key
             return
+        if path == "/api/zotero" and not GATEWAY["secret"]:
+            return  # zotero_info answers per role: a guest learns only whether it may sync
         if path.startswith("/docx/"):
             raise ApiError("Only the owner can download the DOCX export.", 403)
         if path.startswith(("/pdf/", "/log/")):
@@ -2951,9 +2961,16 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
             raise ApiError("Too many lookups; wait a moment.", 429)
+    elif method == "POST" and path == "/api/zotero/preview" and not GATEWAY["secret"]:
+        need_edit()  # The owner's key fetches; the owner opted in (share_editors), and the key never leaves here.
+        scoped(doc)
+        if not zotero.info()["share_editors"]:
+            raise ApiError("The owner has not let shared editors sync from Zotero.", 403)
+        if not rate_ok("zotero-guest", 6, 60.0):  # All guests together: a guest cannot drain the owner's quota.
+            raise ApiError("Too many Zotero syncs; wait a moment.", 429)
     elif method == "POST" and path == "/api/zotero/apply":
         need_edit()  # No network: a splice for the chosen entries, like /api/bib/edit.
-        # Settings and fetching stay owner only (the default deny below).
+        # Settings stay owner only (the default deny below); hosted workers fetch nothing (the gateway does).
         scoped(doc)
         if not rate_ok("zotero-apply", 20, 60.0):  # CPU only, but a guest could still keep the server busy
             raise ApiError("Too many requests; wait a moment.", 429)
@@ -3180,7 +3197,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(bib_import(self.body()))
         elif url.path == "/api/zotero/apply" and name in DOCS:
             self.json(zotero_apply(self.body()))
-        elif url.path == "/api/zotero/preview" and self.role == "owner" and name in DOCS:
+        elif url.path == "/api/zotero/preview" and name in DOCS:  # role checked in check_permission
             self.json(zotero_preview(self.body()))
         elif url.path == "/api/zotero/settings" and self.role == "owner":
             self.json(zotero_call(zotero.save_settings, self.body()))
@@ -3269,8 +3286,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
-        elif path == "/api/zotero" and self.role == "owner" and not GATEWAY["secret"]:
-            self.json({**zotero.info(), "local_ok": not SHARE["on"]})
+        elif path == "/api/zotero" and not GATEWAY["secret"]:
+            self.json(zotero_info(self.role))
         elif path == "/api/ai":
             self.json(ai_info(self.role))
         elif path == "/api/share":

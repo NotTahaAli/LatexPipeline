@@ -1,5 +1,6 @@
 // Zotero in the References panel: settings (owner only) and "Sync from Zotero" with a preview you pick from.
-// The server fetches and compares (zotero.py); the key never reaches this page. Applying asks the server for one
+// The server fetches and compares (zotero.py): the owner's key locally (shared-link editors only when the owner allowed
+// it), behind the hosted gateway each person's own key from the Account page. The key never reaches this page. Applying asks the server for one
 // splice and puts it into the open .bib document, like the rest of the panel, so co-editing stays consistent.
 
 /**
@@ -20,38 +21,49 @@ export function zoteroUi(ctx) {
   };
   const heading = (form, text) => { const h = el("h2", { id: ctx.uid("zh"), textContent: text }); form.setAttribute("aria-labelledby", h.id); return h; };
 
-  /** True when this server lets the viewer use Zotero (owner of a local editor); false otherwise, so the menu hides it. */
+  /** What this viewer may do ({can_sync, can_configure, hosted...}), or null: the menu hides what it may not. */
   async function probe() { try { return await ctx.api.zotero(); } catch { return null; } }
 
   async function settings() {
     let info;
     try { info = await ctx.api.zotero(); } catch (e) { ctx.toast(e.message); return; }
+    if (info.hosted) { window.open("/#account", "_blank", "noopener"); ctx.toast("Your Zotero library and key are on your Account page."); return; }
+    if (!info.can_configure) { ctx.toast("Only the owner can change the Zotero settings."); return; }
     const form = el("form", { className: "refs-form" });
     const mode = el("select", {}, new Option("Zotero web API (api.zotero.org)", "web"), ...(info.local_ok ? [new Option("Better BibTeX on this computer", "local")] : []));
     mode.value = info.mode === "local" && info.local_ok ? "local" : "web";
     const type = el("select", {}, new Option("Personal library", "users"), new Option("Group library", "groups"));
     type.value = info.library_type;
     const lib = el("input", { type: "text", value: info.library_id, inputMode: "numeric", autocomplete: "off", spellcheck: false });
-    const coll = el("input", { type: "text", value: info.collection, autocomplete: "off", spellcheck: false, maxLength: 8 });
+    const coll = el("input", { type: "text", value: info.collection, autocomplete: "off", spellcheck: false, maxLength: 300 });
     const fmt = el("select", {}, new Option("BibTeX", "bibtex"), new Option("BibLaTeX", "biblatex"));
     fmt.value = info.format;
     const key = el("input", { type: "password", autocomplete: "off", spellcheck: false, placeholder: info.has_key ? "Stored; leave empty to keep it" : "Paste an API key" });
+    const share = el("input", { type: "checkbox", checked: !!info.share_editors });
     const out = el("p", { className: "refs-err", role: "alert", hidden: true });
-    const webOnly = [field("Library type", type), field("Library ID", lib, "Your numeric user ID (zotero.org/settings/keys) or the number in a group's address."),
-      field("Collection key (optional)", coll, "8 characters at the end of a collection's web address; empty syncs the whole library."),
-      field("API key", key, info.key_from_env ? "ZOTERO_API_KEY is set in the environment and is used instead." : "Create a read-only key at zotero.org/settings/keys/new. It is kept on this computer, outside the project, and never shown to collaborators.")];
-    const web = el("div", { className: "rgrid" }, ...webOnly);
-    const sync = () => { web.hidden = mode.value === "local"; };
-    mode.onchange = sync; sync();
+    const libHint = el("span", { className: "mute rh" }), collHint = el("span", { className: "mute rh" });
+    const libField = field("Library ID", lib), collField = field("Collection (optional)", coll);
+    libField.append(libHint); collField.append(collHint);
+    const keyField = field("API key", key, info.key_from_env ? "ZOTERO_API_KEY is set in the environment and is used instead." : "Create a read-only key at zotero.org/settings/keys/new. It is kept on this computer, outside the project, and never shown to collaborators.");
+    const web = el("div", { className: "rgrid" }, field("Library type", type), libField, collField, keyField);
+    const shareBox = el("label", { className: "check" }, share, " Let editors of shared links sync from my Zotero library (your key stays on this computer; Better BibTeX is never used while sharing)");
+    const sync = () => {
+      const local = mode.value === "local";
+      keyField.hidden = local;
+      libField.hidden = local && type.value !== "groups";
+      libHint.textContent = local ? "The group's number (as in its zotero.org address)." : "Your numeric user ID (zotero.org/settings/keys) or the number in a group's address.";
+      collHint.textContent = local ? "Its key or its path, such as Thesis/Chapter 2; empty exports the whole library." : "8 characters at the end of a collection's web address; empty syncs the whole library.";
+    };
+    mode.onchange = sync; type.onchange = sync; sync();
     const save = el("button", { type: "submit", className: "btn primary", textContent: "Save" });
-    form.append(heading(form, "Zotero"), el("div", { className: "rgrid" }, field("Source", mode), field("Format", fmt, "BibLaTeX keeps fields such as date and journaltitle.")), web, out,
+    form.append(heading(form, "Zotero"), el("div", { className: "rgrid" }, field("Source", mode), field("Format", fmt, "BibLaTeX keeps fields such as date and journaltitle.")), web, shareBox, out,
       el("div", { className: "fixes" }, save,
         ...(info.has_key && !info.key_from_env ? [el("button", { type: "button", className: "btn", textContent: "Remove key", onclick: () => submit({ clear_key: true }) })] : []),
         el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: close })));
     async function submit(extra = {}) {
       out.hidden = true; save.disabled = true;
       try {
-        await ctx.api.zoteroSettings({ mode: mode.value, library_type: type.value, library_id: lib.value, collection: coll.value, format: fmt.value, key: key.value.trim(), ...extra });
+        await ctx.api.zoteroSettings({ mode: mode.value, library_type: type.value, library_id: lib.value, collection: coll.value, format: fmt.value, key: key.value.trim(), share_editors: share.checked, ...extra });
         key.value = ""; ctx.toast("Zotero settings saved."); close();
       } catch (e) { out.textContent = e.message; out.hidden = false; } finally { save.disabled = false; }
     }
@@ -63,7 +75,7 @@ export function zoteroUi(ctx) {
     const d = ctx.data();
     let info;
     try { info = await ctx.api.zotero(); } catch (e) { ctx.toast(e.message); return; }
-    if (!info.configured) { ctx.toast("Set up Zotero first."); await settings(); return; }
+    if (!info.can_sync || !info.configured) { ctx.toast(info.reason || "Set up Zotero first."); if (info.can_configure) await settings(); return; }
     if (!d.files.length) { ctx.toast("Create a .bib file first."); return; }
     const form = el("form", { className: "refs-form" });
     const fileSel = el("select", {}, ...d.files.map((f) => new Option(f.path, f.path)));
@@ -71,16 +83,20 @@ export function zoteroUi(ctx) {
     const out = el("div", { className: "refs-imp-out", role: "status" });
     const go = el("button", { type: "submit", className: "btn primary", textContent: "Fetch from Zotero" });
     form.append(heading(form, "Sync from Zotero"),
-      el("p", { className: "mute rh", textContent: info.mode === "local" ? "Reads the Better BibTeX export from Zotero on this computer." : `Reads ${info.library_type === "groups" ? "group" : "user"} library ${info.library_id}${info.collection ? `, collection ${info.collection}` : ""} from api.zotero.org. Nothing is written until you choose entries.` }),
-      field("Compare with", fileSel), out,
-      el("div", { className: "fixes" }, go, el("button", { type: "button", className: "btn", textContent: "Settings...", onclick: settings }), el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: close })));
+      el("p", { className: "mute rh", textContent: info.guest ? "Reads the owner's Zotero library (the owner's key stays on their computer). Nothing is written until you choose entries."
+        : info.mode === "local" ? `Reads the Better BibTeX export${info.collection ? ` of collection ${info.collection}` : ""} from Zotero on this computer.`
+        : `Reads ${info.library_type === "groups" ? "group" : "user"} library ${info.library_id}${info.collection ? `, collection ${info.collection}` : ""} from api.zotero.org. Nothing is written until you choose entries.` }),
+      field("Add to and update", fileSel, d.files.length > 1 ? "Entries already in the other .bib files are matched too and not added again." : ""), out,
+      el("div", { className: "fixes" }, go, ...(info.can_configure || info.hosted ? [el("button", { type: "button", className: "btn", textContent: "Settings...", onclick: settings })] : []), el("button", { type: "button", className: "btn", textContent: "Cancel", onclick: close })));
     form.onsubmit = async (ev) => {
       ev.preventDefault(); go.disabled = true;
       out.replaceChildren(note("mute", "Asking Zotero..."));
       try {
         const path = fileSel.value, text = await ctx.text(path);
         const taken = d.entries.filter((e) => e.file !== path).map((e) => e.key);
-        const r = await ctx.api.zoteroPreview(ctx.doc(), { text, taken });
+        const others = {};
+        for (const f of d.files) if (f.path !== path) others[f.path] = await ctx.text(f.path);
+        const r = await ctx.api.zoteroPreview(ctx.doc(), { text, taken, others });
         out.replaceChildren(...result(r, path, text));
       } catch (e) { out.replaceChildren(note("refs-err", e.message)); } finally { go.disabled = false; }
     };
@@ -130,9 +146,12 @@ export function zoteroUi(ctx) {
       } catch (e) { res.prepend(note("refs-err", e.message)); count(); }
     };
     const res = el("div", {});
-    const summary = `${r.new.length} new, ${r.changed.length} changed, ${r.same} identical, ${r.local_only.length} only here${r.cached ? " (library unchanged since the last sync)" : ""}.`;
+    const away = r.elsewhere || [];
+    const summary = `${r.new.length} new, ${r.changed.length} changed, ${r.same} identical, ${away.length} in other files, ${r.local_only.length} only here${r.cached ? " (library unchanged since the last sync)" : ""}.`;
     res.append(note("mute", summary), ...(r.skipped ? [note("refs-warn", `${r.skipped} Zotero ${r.skipped === 1 ? "entry was" : "entries were"} skipped (unusable key or fields).`)] : []),
       ...section("New in Zotero", newRows), ...section("Changed in Zotero", changedRows, "Only the fields that differ are replaced; fields Zotero does not export stay as they are."),
+      ...(away.length ? [el("h3", { className: "refs-sec", textContent: `Already in other files (${away.length})` }), note("mute rh", "Not added again. To update one, choose its file above."),
+        el("ul", { className: "refs-keys" }, ...away.map((x) => el("li", {}, el("code", { textContent: x.key }), ` in ${x.file}${x.zotero_key !== x.key ? ` (Zotero ${x.zotero_key})` : ""}`)))] : []),
       ...(r.local_only.length ? [el("h3", { className: "refs-sec", textContent: `Only in ${path} (${r.local_only.length})` }), note("mute rh", "Not in Zotero (or under another key); left untouched."), el("p", { className: "refs-keys" }, ...r.local_only.flatMap((k) => [el("code", { textContent: k }), " "]))] : []),
       ...(picks.length ? [el("div", { className: "fixes" }, apply)] : []));
     return [res];

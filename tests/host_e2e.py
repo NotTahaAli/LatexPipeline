@@ -6,7 +6,9 @@ End-to-end check of the hosted mode in a real browser (not part of `unittest dis
 init -> site admin signs in, turns on two-step sign-in, signs in again with a code -> creates a workspace and
 invites two editors and a viewer -> each signs up in their own browser -> an editor creates a project from the
 report template, edits and builds it, a second editor co-edits it live -> the viewer can read but not write ->
-someone from another workspace gets 404 for every URL of it -> sign-out and session expiry end access. axe-core
+someone from another workspace gets 404 for every URL of it -> an editor saves their own Zotero key on the Account
+page and syncs refs.bib from it (the gateway's zotero.get is replaced by a stub: no network) -> sign-out and session
+expiry end access. axe-core
 (pinned, from cdnjs, only here) must report no violations on every host page, light and dark, desktop and phone.
 Needs LaTeX, and bubblewrap unless --insecure-no-sandbox. The editor itself loads its libraries from CDNs.
 """
@@ -34,6 +36,23 @@ AXE = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.2/axe.min.js"
 PASSWORD = "password-123"
 CHECKS: list[str] = []
 SEEN_LINKS: list[str] = []
+ZOTERO_KEY = "E2eZoteroKey12345"
+# The gateway runs with zotero.get replaced: it answers for user library 42 and this key only, so the test needs no
+# network and proves the key the browser saved is the one the gateway sends.
+ZOTERO_STUB = f"""
+import sys
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+import zotero
+BIB = (b"@article{{Zotero2024Sync,\\n  author = {{Doe, Jane}},\\n"
+       b"  title = {{Synced from Zotero}},\\n  year = {{2024}}\\n}}\\n")
+def get(url, headers, local=False, timeout=20.0, limit=0):
+    if not url.startswith("https://api.zotero.org/users/42/") or headers.get("Zotero-API-Key") != {ZOTERO_KEY!r}:
+        raise zotero.ZoteroError("stub: wrong library or key", 502)
+    return 200, {{"last-modified-version": "1", "total-results": "1"}}, BIB
+zotero.get = get
+import host
+sys.exit(host.main())
+"""
 LOADED = "() => window.__app && window.__app.active && window.__app.view.state.doc.length > 0"
 BUILT = "() => { const d = window.__app.docs[window.__app.cur]; return d && d.status === 'ok' && d.pages > 0; }"
 REBUILT = ("() => { const d = window.__app.docs[window.__app.cur]; "
@@ -80,7 +99,7 @@ def main() -> int:
         subprocess.run([sys.executable, str(ROOT / "scripts/host.py"), "init", "--data", str(data)], env=env,
                        check=True, stdout=subprocess.DEVNULL)
         (data / "config.toml").write_text(f'public_url = "{origin}"\nport = {port}\nsession_idle_hours = 1\n')
-        command = [sys.executable, str(ROOT / "scripts/host.py"), "serve", "--data", str(data)]
+        command = [sys.executable, "-c", ZOTERO_STUB, "serve", "--data", str(data)]
         if args.insecure_no_sandbox:
             command.append("--insecure-no-sandbox")
         server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -256,6 +275,34 @@ def run(browser, origin, data: Path, insecure: bool) -> None:
     assert status == 403, status
     assert "pwned" not in source.read_text()
     ok("viewer opens the project read-only; writes are refused (403)")
+
+    # --- Zotero: each person's own key, kept by the gateway -------------------------------------------------
+    assert ed.request.get(origin + f"/p/{pid}/api/zotero").json()["can_sync"] is False  # no key yet
+    ed.goto("/#account")
+    zform = ed.locator("form").filter(has=ed.get_by_label("Library ID"))
+    zform.get_by_label("Library ID").fill("42")
+    zform.get_by_label("API key").fill(ZOTERO_KEY)
+    zform.get_by_role("button", name="Save Zotero settings").click()
+    expect(ed.get_by_text("Saved. Sync from Zotero")).to_be_visible()
+    assert ZOTERO_KEY not in ed.content()
+    axe(ed, "account page with Zotero settings")
+    ed.goto(project_url)
+    ed.wait_for_function(LOADED, timeout=30000)
+    ed.locator("#tab-refs").click()
+    ed.locator("#panel-refs summary[aria-label='More reference actions']").click()
+    ed.get_by_role("button", name="Sync from Zotero...").click()
+    ed.get_by_role("button", name="Fetch from Zotero").click()
+    expect(ed.get_by_text("New in Zotero (1)")).to_be_visible(timeout=20000)
+    ed.get_by_role("button", name="Apply 1 selected").click()
+    bib = data / "projects" / tenant_a / pid / "Thesis" / "refs.bib"
+    deadline = time.monotonic() + 30
+    while "Zotero2024Sync" not in bib.read_text() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    assert "Zotero2024Sync" in bib.read_text(), "the synced entry was not saved"
+    status = vi.request.post(origin + f"/p/{pid}/api/zotero/preview", data={"text": ""},
+                             headers={"Origin": origin}).status
+    assert status == 403, status
+    ok("an editor saves their own Zotero key on the Account page and syncs refs.bib; a viewer cannot (403)")
 
     # --- tenant isolation -------------------------------------------------------------------------------------
     for path in (project_url, f"/p/{pid}/api/file?doc=Thesis&path=main.tex", f"/api/projects/{pid}/zip",

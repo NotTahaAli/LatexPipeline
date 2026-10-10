@@ -112,6 +112,16 @@ class Fetch(Base):
             third = zotero.preview("", [], True)
         self.assertEqual((third["cached"], third["version"], len(third["new"])), (False, "11", 4))
 
+    def test_cache_is_per_key(self):
+        """Another person's key for the same library never gets this cache's 304 answer."""
+        fake, calls = self.pages(2)
+        cfg = {"mode": "web", "library_type": "groups", "library_id": "7", "collection": "", "format": "bibtex"}
+        with mock.patch.object(zotero, "get", fake):
+            zotero.preview("", [], False, cfg={**cfg, "key": KEY})
+            zotero.preview("", [], False, cfg={**cfg, "key": "Q" * 16})
+        self.assertNotIn("If-Modified-Since-Version", calls[1][1])
+        self.assertEqual(calls[1][1]["Zotero-API-Key"], "Q" * 16)
+
     def test_library_changing_between_pages_is_an_error(self):
         versions = iter(["5", "6"])
 
@@ -167,6 +177,49 @@ class Fetch(Base):
             result = zotero.preview("", [], True)
         self.assertTrue(seen["local"] and seen["url"].startswith("http://127.0.0.1:23119/"))
         self.assertEqual((result["source"], len(result["new"])), ("local", 1))
+
+
+class BetterBibTeX(Base):
+    """Pull export URLs as content/pull-export.ts in retorquere/zotero-better-bibtex registers them."""
+
+    def fetched(self, **settings):
+        zotero.save_settings({"mode": "local", **settings})
+        seen = []
+
+        def fake(url, headers, local=False, timeout=20.0, limit=0):
+            seen.append((url, local, headers))
+            return 200, {}, entry().encode()
+        with mock.patch.object(zotero, "get", fake):
+            zotero.preview("", [], True)
+        self.assertTrue(seen[0][1])
+        self.assertEqual(seen[0][2], {})  # no key goes to 127.0.0.1
+        return seen[0][0]
+
+    def test_library_group_and_collection_urls(self):
+        base = "http://127.0.0.1:23119/better-bibtex/export/"
+        self.assertEqual(self.fetched(), base + "library?/1/library.bibtex")
+        self.assertEqual(self.fetched(library_id="99", format="biblatex"), base + "library?/1/library.biblatex")  # My Library is 1
+        self.assertEqual(self.fetched(library_type="groups", library_id="4711"), base + "library?/4711/library.bibtex")
+        self.assertEqual(self.fetched(collection="ABCD2345"), base + "collection?/1/ABCD2345.bibtex")
+        self.assertEqual(self.fetched(library_type="groups", library_id="4711", collection="/Thesis/Chapter 2 & co/"),
+                         base + "collection?/4711/Thesis/Chapter%202%20%26%20co.bibtex")
+
+    def test_local_settings_are_checked(self):
+        self.assertFalse(zotero.save_settings({"mode": "local", "library_type": "groups"})["configured"])  # group ID missing
+        self.assertTrue(zotero.save_settings({"mode": "local", "collection": "Thesis/Ch 1"})["configured"])
+        for bad in ("a/../b", "..", "a//b", "x\x00", "y" * 301):
+            with self.assertRaises(zotero.ZoteroError):
+                zotero.save_settings({"mode": "local", "collection": bad})
+        with self.assertRaises(zotero.ZoteroError):  # paths are Better BibTeX only; the web API takes keys
+            zotero.save_settings({"library_id": "1", "collection": "Thesis/Ch 1"})
+        with self.assertRaises(zotero.ZoteroError):  # the gateway offers the web API only
+            zotero.check_settings({"mode": "local"}, local=False)
+
+    def test_share_editors_is_off_by_default_and_kept_until_changed(self):
+        self.assertFalse(self.configure()["share_editors"])
+        self.assertTrue(self.configure(share_editors=True)["share_editors"])
+        self.assertTrue(self.configure()["share_editors"])
+        self.assertFalse(self.configure(share_editors="yes")["share_editors"])
 
 
 class Hardening(Base):
@@ -317,6 +370,21 @@ class Compare(unittest.TestCase):
                              entry("k", title="The first paper ever", doi="10.1/a"), taken=["k2"])
         self.assertEqual([(e["key"], e["zotero_key"], e["collision"]) for e in out["new"]], [("ka", "k", True), ("k2a", "k2", True)])
         self.assertEqual((out["changed"], out["local_only"]), ([], ["k"]))
+
+    def test_entries_in_other_files_are_not_offered_again(self):
+        remote = (entry("same_key", title="In the other file", doi="10.1/o") + entry("zot_doi", title="Renamed there", doi="10.1/r")
+                  + entry("zot_title", title="Matched by its long title", doi="") + entry("clash", title="Different work", doi="10.1/c2")
+                  + entry("fresh", title="Brand new one", doi="10.1/n"))
+        others = {"b.bib": entry("same_key", title="In the other file", doi="10.1/o") + entry("there", title="x", doi="10.1/r"),
+                  "c.bib": entry("t", title="Matched by its long title.", doi="") + entry("clash", title="Quite unrelated", doi="10.1/c1")}
+        out = zotero.compare(remote, entry("mine", title="Only here", doi="10.1/m"), others=others)
+        self.assertEqual(sorted((e["key"], e["file"], e["zotero_key"]) for e in out["elsewhere"]),
+                         [("same_key", "b.bib", "same_key"), ("t", "c.bib", "zot_title"), ("there", "b.bib", "zot_doi")])
+        self.assertEqual([(e["key"], e["collision"]) for e in out["new"]], [("clasha", True), ("fresh", False)])
+        self.assertEqual(out["local_only"], ["mine"])
+        local_wins = zotero.compare(entry("same_key", title="In the other file", doi="10.1/o"),
+                                    entry("same_key", title="In the other file", doi="10.1/o"), others=others)
+        self.assertEqual((local_wins["same"], local_wins["elsewhere"]), (1, []))  # the chosen file comes first
 
     def test_unusable_remote_entries_are_counted_not_fatal(self):
         out = zotero.compare("@article{ok, title={fine}}\n@article{bad, title={x}, note={a\\\\}}\n", "")

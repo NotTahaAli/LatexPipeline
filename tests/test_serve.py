@@ -2534,18 +2534,53 @@ class ZoteroApi(SharedState, ServerCase):
         self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY})
         self.tokens = self.share_on()
         for role in ("view", "edit"):
-            attempts = (("GET", "/api/zotero", None),
-                        ("POST", "/api/zotero/settings", {"library_id": "1", "key": "Z" * 12}),
+            status, info = self.call("GET", "/api/zotero", role=role)  # only whether this link may sync
+            self.assertEqual((status, info["can_sync"], info.get("can_configure")), (200, False, None))
+            self.assertNotIn("library_id", info)
+            attempts = (("POST", "/api/zotero/settings", {"library_id": "1", "key": "Z" * 12, "share_editors": True}),
                         ("POST", "/api/zotero/preview", {"text": self.BIB}))
             for method, path, body in attempts:
                 self.assertEqual(self.call(method, path, body, role=role)[0], 403, (role, path))
         self.assertEqual(self.get.call_count, 0)
+        self.assertFalse(self.zotero.info()["share_editors"])
         self.assertEqual(self.zotero.info()["library_id"], "42")
         apply = {"text": self.BIB, "ops": []}
         self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="view")[0], 403)
         self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="edit")[0], 200)
         self.assertEqual(self.call("POST", "/api/zotero/apply", apply, role="edit", doc="demo2")[0], 403)
         self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")[0], 200)
+
+    def test_shared_editors_sync_with_the_owners_key_only_after_the_owner_opts_in(self):
+        self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY, "share_editors": True})
+        self.tokens = self.share_on()
+        status, info = self.call("GET", "/api/zotero", role="edit")
+        self.assertEqual((status, info["can_sync"], info["guest"]), (200, True, True))
+        self.assertNotIn(self.KEY, json.dumps(info))
+        self.assertNotIn("has_key", info)
+        status, prev = self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="edit")
+        self.assertEqual((status, [e["key"] for e in prev["new"]]), (200, ["b"]))
+        self.assertEqual(self.get.call_args[0][1]["Zotero-API-Key"], self.KEY)  # the owner's key, server-side
+        self.assertNotIn(self.KEY, json.dumps(prev))
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="view")[0], 403)
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="edit", doc="demo2")[0], 403)
+        codes = [self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="edit")[0] for _ in range(6)]
+        self.assertEqual(codes, [200] * 5 + [429])  # all guests together
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="owner")[0], 200)
+        serve.RATE.clear()
+        self.call("POST", "/api/zotero/settings", {"library_id": "42", "share_editors": False}, role="owner")
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB}, role="edit")[0], 403)
+        self.assertFalse(self.call("GET", "/api/zotero", role="edit")[1]["can_sync"])
+
+    def test_preview_matches_the_other_bib_files(self):
+        self.call("POST", "/api/zotero/settings", {"library_id": "42", "key": self.KEY})
+        other = "@misc{elsewhere,\n  title = {Other}\n}\n"
+        status, prev = self.call("POST", "/api/zotero/preview", {"text": self.BIB, "others": {"more.bib": other}})
+        self.assertEqual(status, 200)
+        self.assertEqual((prev["new"], prev["elsewhere"]),
+                         ([], [{"key": "elsewhere", "file": "more.bib", "zotero_key": "b"}]))
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB, "others": {"x.bib": 5}})[0], 400)
+        big = {"x.bib": "x" * (4 * serve.BIB_MAX_CHARS + 1)}
+        self.assertEqual(self.call("POST", "/api/zotero/preview", {"text": self.BIB, "others": big})[0], 413)
 
     def test_apply_is_rate_limited_and_bounded_for_shared_editors(self):
         self.tokens = self.share_on()

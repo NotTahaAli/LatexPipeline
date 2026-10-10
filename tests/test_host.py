@@ -1354,6 +1354,130 @@ class Assistant(HostCase):
             self.assertEqual(host.load_config(data)["ai"]["daily_per_user"], 50)
 
 
+class Zotero(HostCase):
+    """Each account brings its own Zotero key: in host.db, used only by the gateway, never sent back or to a worker."""
+
+    KEY = "ZoteroKeyOfEd123456"
+    BIB = "@article{a,\n  title = {Old},\n  doi = {10.1/a}\n}\n"
+    REMOTE = "@article{a,\n  title = {New},\n  doi = {10.1/a}\n}\n@misc{b,\n  title = {Other}\n}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Zotero")).start()
+        host.zotero.CACHE.clear()
+        self.calls = []
+        mock.patch.object(host.zotero, "get", side_effect=lambda url, headers, **kw: self.calls.append((url, headers))
+                          or (200, {"last-modified-version": "3", "total-results": "2"}, self.REMOTE.encode())).start()
+
+    def setup_key(self, client, **extra):
+        return client.call("POST", "/api/account/zotero", {"library_type": "users", "library_id": "42",
+                                                            "format": "bibtex", "key": self.KEY, **extra})
+
+    def preview(self, client, body=None, **kw):
+        return client.call("POST", f"/p/{self.pid}/api/zotero/preview?doc=Doc", body or {"text": self.BIB}, **kw)
+
+    def test_account_settings_keep_the_key_server_side(self):
+        editor = self.client("ed@x.org")
+        status, info, _ = editor.call("GET", "/api/account/zotero")
+        self.assertEqual((status, info["has_key"], info["configured"]), (200, False, False))
+        status, info, _ = self.setup_key(editor)
+        self.assertEqual((status, info["has_key"], info["configured"], info["library_id"]), (200, True, True, "42"))
+        self.assertNotIn(self.KEY, json.dumps(info))
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        row = self.app.db.one("SELECT api_key FROM zotero_settings WHERE user_id = ?", uid)
+        self.assertEqual(row["api_key"], self.KEY)
+        status, info, _ = editor.call("POST", "/api/account/zotero", {"library_id": "43", "key": ""})  # empty keeps it
+        self.assertEqual((status, info["has_key"], info["library_id"]), (200, True, "43"))
+        for bad in ({"library_id": "x"}, {"library_id": "1", "collection": "Thesis/Ch 1"},
+                    {"library_id": "1", "key": "a b"},
+                    {"library_id": "1", "format": "csl"}, {"library_id": "1", "library_type": "orgs"}):
+            self.assertEqual(editor.call("POST", "/api/account/zotero", bad)[0], 400, bad)
+        cleared = editor.call("POST", "/api/account/zotero", {"library_id": "43", "clear_key": True})[1]
+        self.assertFalse(cleared["has_key"])
+        self.assertEqual(Client(self).call("GET", "/api/account/zotero")[0], 401)
+        no_csrf = self.client("ed@x.org")
+        no_csrf.csrf = None
+        self.assertEqual(self.setup_key(no_csrf)[0], 403)
+        evil = editor.call("POST", "/api/account/zotero", {"library_id": "1"}, origin="https://evil.example")
+        self.assertEqual(evil[0], 403)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'zotero%'")]
+        self.assertEqual(actions, ["zotero_key_set", "zotero_key_removed"])
+
+    def test_editors_preview_with_their_own_key_and_no_worker(self):
+        editor = self.client("ed@x.org")
+        status, info, _ = editor.call("GET", f"/p/{self.pid}/api/zotero")
+        self.assertEqual((status, info["can_sync"], info["hosted"]), (200, False, True))
+        self.assertEqual(self.preview(editor)[0], 400)  # no key yet
+        self.setup_key(editor)
+        status, info, _ = editor.call("GET", f"/p/{self.pid}/api/zotero")
+        self.assertEqual((info["can_sync"], info["has_key"]), (True, True))
+        self.assertNotIn(self.KEY, json.dumps(info))
+        others = {"more.bib": "@misc{x,\n  title = {Other}\n}\n"}
+        status, prev, _ = self.preview(editor, {"text": self.BIB, "others": others})
+        self.assertEqual(status, 200, prev)
+        self.assertEqual(([c["key"] for c in prev["changed"]], prev["new"], prev["elsewhere"][0]["key"]),
+                         (["a"], [], "x"))
+        self.assertNotIn(self.KEY, json.dumps(prev))
+        self.assertEqual(self.calls[0][1]["Zotero-API-Key"], self.KEY)
+        self.assertIn("/users/42/items/top", self.calls[0][0])
+        self.assertNotIn(self.KEY, self.calls[0][0])
+
+    def test_viewers_outsiders_and_other_accounts(self):
+        self.setup_key(self.client("ed@x.org"))
+        viewer = self.client("vi@x.org")
+        self.setup_key(viewer, key="ViewerKey123456")
+        self.assertFalse(viewer.call("GET", f"/p/{self.pid}/api/zotero")[1]["can_sync"])
+        self.assertEqual(self.preview(viewer)[0], 403)
+        outsider = self.client("out@x.org")
+        self.setup_key(outsider)
+        self.assertEqual(self.preview(outsider)[0], 404)  # not their project: 404, not 403
+        self.assertEqual(outsider.call("GET", f"/p/{self.pid}/api/zotero")[0], 404)
+        self.assertEqual(self.preview(Client(self))[0], 401)
+        self.assertEqual(self.preview(self.client("ed@x.org"), origin=False)[0], 403)
+        self.assertEqual(self.preview(self.client("ed@x.org"), origin="https://evil.example")[0], 403)
+        self.assertEqual(self.client("ed@x.org").call("POST", f"/p/{self.pid}/api/zotero")[0], 405)
+        self.assertEqual(self.calls, [])
+
+    def test_rate_limit_bad_bodies_and_errors(self):
+        editor = self.client("ed@x.org")
+        self.setup_key(editor)
+        self.assertEqual(self.preview(editor, {"text": 5})[0], 400)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/preview", raw=b"[1]")[0], 400)
+        huge = b"x" * (host.zotero.MAX_REQUEST + 1)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/zotero/preview", raw=huge)[0], 413)
+        host.zotero.get.side_effect = host.zotero.ZoteroError("Zotero refused the API key.", 502)
+        status, body, _ = self.preview(editor)
+        self.assertEqual((status, body["error"]), (502, "Zotero refused the API key."))
+        codes = [self.preview(editor)[0] for _ in range(10)]
+        self.assertEqual(codes.count(429), 2)  # 10 per account in 10 minutes, bad requests included
+        other = self.client("vi@x.org")
+        self.app.db.run("UPDATE members SET role = 'editor' WHERE tenant_id = ?", self.tenant)
+        self.setup_key(other)
+        self.assertEqual(self.preview(other)[0], 502)  # a separate allowance per account
+
+    def test_workers_never_get_a_zotero_key(self):
+        self.setup_key(self.client("ed@x.org"))
+        seen = {}
+
+        def popen(argv, env, **kw):
+            seen.update(env, argv=" ".join(argv))
+            return mock.Mock(stdout=io.StringIO("LP_GATEWAY_PORT=5\n"), pid=0, poll=lambda: None)
+
+        project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
+        with mock.patch.dict(os.environ, {"ZOTERO_API_KEY": "OperatorEnvKey123"}), \
+                mock.patch.object(host.subprocess, "Popen", popen):
+            self.app.workers._spawn(project)
+        self.assertTrue(seen)
+        self.assertNotIn(self.KEY, json.dumps(seen))
+        self.assertNotIn("OperatorEnvKey123", json.dumps(seen))
+
+
 class Cli(unittest.TestCase):
     def test_init_creates_config_db_and_admin(self):
         env = {"LP_ADMIN_EMAIL": "Root@Example.org", "LP_ADMIN_PASSWORD": "password-123"}
