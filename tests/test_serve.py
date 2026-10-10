@@ -1112,6 +1112,13 @@ class ShareHttp(SharedState, ServerCase):
             codes = [self.get("POST", "/api/focus?doc=demo&path=main.tex", "edit")[0] for _ in range(limit + 1)]
         self.assertEqual(codes, [200] * limit + [429])
 
+    def test_a_first_preview_builds_so_it_counts_against_the_rebuild_limit(self):
+        with mock.patch.object(serve.preview, "has_snapshot", return_value=False), \
+                mock.patch.object(serve, "live_preview", side_effect=serve.ApiError("built", 409)):
+            limit = serve.REBUILD_LIMIT[0]
+            codes = [self.get("POST", "/api/preview?doc=demo", "edit", {})[0] for _ in range(limit + 1)]
+        self.assertEqual(codes, [409] * limit + [429])
+
     def test_the_preview_pdf_and_log_are_readable_for_the_shared_document_only(self):
         (self.root / "demo.focus.pdf").write_bytes(b"%PDF")
         with mock.patch.object(build, "focus_paths", return_value=(self.root / "demo.focus.pdf", self.root / "x.log")):
