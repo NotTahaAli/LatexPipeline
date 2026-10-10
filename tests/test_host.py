@@ -884,6 +884,22 @@ class Proxy(HostCase):
         self.assertEqual(json.loads(data["body"]), {"text": "hi"})
         self.assertIn("X-Host-Role: edit", data["headers"])
 
+    def test_workspace_admins_are_marked_for_the_worker(self):
+        upstream = Upstream()
+        upstream.start()
+        self.addCleanup(upstream.sock.close)
+        self.fake_worker(upstream.port)
+        self.user("ad@x.org", "admin", self.tenant)
+        url = f"/p/{self.pid}/api/file?doc=Doc&path=main.tex"
+        forged = {"X-Host-Admin": "1"}  # a client cannot say it: X-Host-* never passes the proxy
+        for email, role, admin in (("ed@x.org", "edit", []), ("vi@x.org", "view", []),
+                                   ("ad@x.org", "edit", ["X-Host-Admin: 1"])):
+            with self.subTest(email=email):
+                status, data, _ = self.client(email).call("GET", url, headers=forged)
+                self.assertEqual(status, 200)
+                self.assertIn(f"X-Host-Role: {role}", data["headers"])
+                self.assertEqual([h for h in data["headers"] if h.startswith("X-Host-Admin")], admin)
+
     def test_writes_need_same_origin_and_respect_the_quota(self):
         self.fake_worker(1)
         editor = self.client("ed@x.org")

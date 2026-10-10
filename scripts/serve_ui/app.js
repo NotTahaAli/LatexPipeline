@@ -1,5 +1,5 @@
 import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
-import { Collab, PALETTE, hunk } from "./collab.js";
+import { Collab, PALETTE, mergeInto } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
 import { visualField, visualTheme, visualEnv, refresh } from "./visual.js";
@@ -931,18 +931,14 @@ const aiUi = aiPanel($("panel-ai"), {
 });
 aiUi.load().then(() => renderProblems());
 // Version history (history.js): the drawer's History tab and the diff dialog. Restored text for a file open in a
-// co-editing room goes in here, through the editor, like every other edit.
+// co-editing room goes in here, as one edit of the room's shared text, like every other edit.
 const historyUi = historyPanel($("dpanel-history"), {
-  api, el, doc: () => cur, activePath: () => (active?.kind === "text" ? active.path : null), canEdit: !readOnly, dialog: $("diffDlg"),
+  api, el, doc: () => cur, activePath: () => (active?.kind === "text" ? active.path : null), canEdit: !readOnly, canClean: !!config.cleanup, dialog: $("diffDlg"),
   toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
-  async apply(path, text) {
-    await openFile(path, 0, { noFocus: true });
-    if (active?.path !== path) return false;
-    const h = hunk(view.state.doc.toString(), text);
-    view.dispatch({ changes: { from: h.from, to: h.to, insert: h.insert }, annotations: REV.bypass.of(true), userEvent: "input.restore" });
-    return true;
-  },
+  inRoom: (path) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit); },
+  roomApply: (path, text) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit) && mergeInto(room.ytext, room.text(), text); },
+  send: (message) => channel.send(message),
 });
 $("diffClose").onclick = () => $("diffDlg").close();
 REV.mount($("dpanel-review"));
@@ -1480,7 +1476,11 @@ channel.on("state", (data) => {
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
 channel.on("review", (d) => { if (d.doc === cur) REV.changed(); });
-channel.on("history", (d) => { if (d.doc === cur && ui.drawer && ui.drawerTab === "history") { clearTimeout(historyTimer); historyTimer = setTimeout(() => historyUi.load(), 400); } });
+channel.on("history", (d) => {
+  if (d.doc !== cur) return;
+  if (collab && !readOnly) historyUi.resume();   // a restore may wait for an editor of a file open here
+  if (ui.drawer && ui.drawerTab === "history") { clearTimeout(historyTimer); historyTimer = setTimeout(() => historyUi.load(), 400); }
+});
 let historyTimer;
 channel.on("forward", (b) => { if (b.doc !== cur) pick(b.doc); else if (shownFocus()) return; pdfView.reveal(b); });
 channel.on("transport", (mode) => {
