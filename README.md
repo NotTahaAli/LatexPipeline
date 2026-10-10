@@ -283,8 +283,9 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 | cold build (`--force`) | 93 s | 55 s |
 | one-line text edit | 47 s | 13 s |
 | one-line text edit in a file that holds a figure | n/a | 13 s (was 23 s) |
-| edit one figure | 24 s | 16 s (was 23 s) |
+| edit one figure | 24 s | 18 s (was 23 s) |
 | `--focus Chapters/chapter5` | n/a | 1.7 s |
+| live preview of `Chapters/chapter5` in the editor | n/a | 0.7 s |
 
 A no-op rebuild takes 0.12 s (plain latexmk: 0.12 s). The figure edit now lists only the changed files instead of typesetting the whole document first; plain latexmk needs 27 s for the same edit. The two optimizations before were measured on a busier machine (median of 3): `--force` 87 s to 55 s (figures 35 s to 14 s), a text edit in a file holding a figure 23 s to 13 s, other text edits unchanged at 13 s (one LaTeX pass).
 
