@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import functools
+import html
 import json
 import os
 import posixpath
@@ -605,7 +606,18 @@ def pdfa_metadata(settings: dict) -> str:
     """The \\DocumentMetadata line for build.toml's pdfa, or "" when it is off."""
     if not settings["pdfa"]:
         return ""
-    return f"\\DocumentMetadata{{pdfstandard={settings['pdfa']},lang={settings['lang']}}}"
+    level = settings["pdfa"]
+    lines = [f"\\DocumentMetadata{{pdfstandard={level},lang={settings['lang']}}}",
+             # veraPDF: xcolor's cmyk colours break PDF/A with the RGB OutputIntent, and pdfTeX
+             # writes no ToUnicode for symbol glyphs (CMEX) without the glyph name maps.
+             r"\PassOptionsToPackage{rgb}{xcolor}",
+             r"\ifdefined\pdfgentounicode\input{glyphtounicode}\InputIfFileExists{glyphtounicode-cmr}{}{}"
+             r"\pdfgentounicode=1 \fi"]
+    if level.startswith("a-1"):
+        # PDF/A-1 forbids object streams.
+        lines.append(r"\ifdefined\pdfobjcompresslevel\pdfobjcompresslevel=0 \fi"
+                     r"\ifdefined\pdfvariable\pdfvariable objcompresslevel=0 \fi")
+    return "".join(lines)  # one -usepretex argument: no newlines
 
 
 def pdfa_check(pdf: Path, level: str) -> str:
@@ -629,7 +641,26 @@ def pdfa_check(pdf: Path, level: str) -> str:
         missing.append("OutputIntent")
     if missing:
         return f"PDF/A {level} requested, but the PDF has no {' or '.join(missing)} (needs LaTeX 2023-06 or newer)."
-    return f"PDF/A {level}: XMP pdfaid and OutputIntent present (not validated; run veraPDF to check conformance)."
+    verapdf = shutil.which("verapdf")
+    if verapdf is None:
+        return (f"PDF/A {level}: XMP pdfaid and OutputIntent present "
+                "(not validated; install veraPDF to check conformance).")
+    return verapdf_note(verapdf, pdf, level)
+
+
+def verapdf_note(verapdf: str, pdf: Path, level: str) -> str:
+    """Validate with veraPDF (on PATH): a one-line pass, or fail with the broken rules."""
+    try:
+        result = subprocess.run([verapdf, "--format", "xml", "--flavour", level.removeprefix("a-"), str(pdf)],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"PDF/A {level}: veraPDF did not run ({error})."
+    if 'isCompliant="true"' in result.stdout:
+        return f"PDF/A {level}: veraPDF passed."
+    rules = list(dict.fromkeys(re.findall(r"<description>([^<]*)</description>", result.stdout)))
+    if 'isCompliant="false"' not in result.stdout or not rules:
+        return f"PDF/A {level}: veraPDF gave no verdict (exit {result.returncode})."
+    return f"PDF/A {level}: veraPDF failed {len(rules)} rule(s): " + " | ".join(html.unescape(r) for r in rules[:3])
 
 
 def parse_latex_errors(console: str) -> list[dict]:

@@ -11,7 +11,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 - **Co-editing and sharing** (`serve.py --share`): token-gated view and edit links over cloudflared, ngrok, localtunnel, pinggy, localhost.run or `local`; live shared editing (Yjs) with cursors and presence; `--share-selftest`.
 - **TikZ/pgfplots externalization**: figures compile once, in parallel, and are cached by source hash, so a text edit no longer re-typesets figures. Falls back to a plain build when it cannot apply.
 - **Grammar checking** with LanguageTool (`scripts/grammar.py`): local server, or the public API only by explicit opt-in; `ci_report.py lint --grammar`; Grammar tab with underlines and quick fixes in the editor; `grammar`, `grammar_url`, `disabled_rules` in `build.toml`.
-- **`build.toml` keys**: `externalize`, `pdfa`, `lang`, `timeout` (and the grammar keys). Opt-in PDF/A (`pdfa = "2b"`) with a presence check of the PDF/A markers.
+- **`build.toml` keys**: `externalize`, `pdfa`, `lang`, `timeout` (and the grammar keys). Opt-in PDF/A (`pdfa = "2b"`) with a presence check of the PDF/A markers, and validation by veraPDF when `verapdf` is on `PATH`. The pretex fixes what veraPDF flagged (xcolor cmyk, missing ToUnicode for math symbols, object streams in PDF/A-1): `1b`, `2b`, `2u`, `3b` pass.
 - `build.py` flags: `--source DIR`, `--focus`, `--profile`, `--timeout`, `--new`, `--changed-since`, `--watch --open`, `-j`; per-document `phases` (figures, LaTeX) in `out/build-report.json`; PDF size in the report and CI table.
 - Build errors come with hints (`scripts/hints.py`); `-synctex=1` on every build; log lines no longer wrap at 79 columns.
 - Files outside a document's directory count for rebuild detection once a build has recorded them (latexmk `.fls`).
