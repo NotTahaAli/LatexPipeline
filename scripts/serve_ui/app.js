@@ -16,7 +16,7 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app" }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
@@ -209,7 +209,7 @@ async function activate(tab, line, opts = {}) {
     if (line) gotoLine(line);
     if (!opts.noFocus) view.focus();
   }
-  renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors();
+  renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors(); renderFocus();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
 }
@@ -321,9 +321,13 @@ async function saveTab(tab, opts) {
 }
 
 // External changes arrive on the bus.
+let autoFocusTimer;
 async function onFsEvent(msg) {
   if (msg.doc !== cur) return;
   loadFiles();
+  if (settings.focusAuto && !readOnly && isChapter(active) && msg.changed.includes(active.path)) {   // "Build it after each save"
+    clearTimeout(autoFocusTimer); autoFocusTimer = setTimeout(() => isChapter(active) && previewChapter(true), 600);
+  }
   for (const path of [...msg.changed, ...msg.removed]) {
     const tab = tabs.get(path);
     if (tab?.collab) { tab.collab.onFs(msg.removed.includes(path)); continue; }   // The room's leader folds it into the shared text.
@@ -437,13 +441,54 @@ pdfView.fitMode = settings.fit; $("zFit").setAttribute("aria-pressed", String(se
   let t; new ResizeObserver(() => { clearTimeout(t); t = setTimeout(() => pdfView.fitMode && pdfView.sizes.length && pdfView.fit(), 120); }).observe($("viewer"));
 }
 
+/** The chapter preview the PDF pane should show, if the person asked for one and it is built; else null (the full PDF). */
+const mineFocus = () => { const f = docs[cur]?.focus; return focusView && focusView.started != null && f && f.path === focusView.path && f.started >= focusView.started ? f : null; };   // Not an older preview's state.
+const shownFocus = () => { const f = mineFocus(); return f && f.status === "ok" ? f : null; };
+const wantedVersion = () => shownFocus() ? "focus:" + shownFocus().version : docs[cur]?.version;
 async function loadPdf() {
-  const d = docs[cur];
+  const d = docs[cur], f = shownFocus();
   if (!d || !d.version) { pdfView.clear(); showEmpty(d); return; }
   $("empty").hidden = true;
   window.__loadStart = performance.now();
-  await pdfView.load(api.pdfUrl(cur, d.version), d.version);
+  const version = wantedVersion();
+  await pdfView.load(api.pdfUrl(cur, f ? f.version : d.version, !!f), version);
   if (pdfView.fitMode) pdfView.fit();
+}
+
+// ---- chapter preview: build only the chapter being edited; the chip says so and leads back to the full PDF ----------
+let focusView = null;   // {path} while the person asked for a chapter preview of that file
+const isChapter = (tab) => tab?.kind === "text" && tab.path.endsWith(".tex") && tab.path !== "main.tex";
+async function previewChapter(quiet) {
+  if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
+  const path = active.path;
+  await saveTab(active);   // The preview is built from the files on disk.
+  focusView = { path, started: null };
+  renderFocus();
+  try { focusView.started = (await api.focus(cur, path)).started; renderFocus(); if (wantedVersion() !== pdfView.version) loadPdf(); }
+  catch (e) { if (e.status === 409 && /already building/.test(e.message)) { focusView.started = docs[cur]?.focus?.started ?? 0; return; } focusView = null; renderFocus(); if (!quiet || e.status !== 409) toast(el("span", { textContent: e.message })); }
+}
+function backToFull() { focusView = null; renderFocus(); loadPdf(); $("live").textContent = "Showing the full PDF"; }
+function renderFocus() {
+  const f = mineFocus(), note = $("focusNote");
+  if (f && f.status === "failed") {   // Say it once; the full PDF stays.
+    focusView = null; toast(el("span", { textContent: `Chapter preview failed: ${f.error}` }));
+  }
+  const building = focusView && (!f || f.status === "building");
+  const on = !!shownFocus();
+  note.hidden = !(building || on);
+  $("pdfPane").classList.toggle("focusing", !note.hidden);
+  note.classList.toggle("busy", !!building);
+  if (building) note.replaceChildren(el("b", { textContent: "Chapter preview" }), el("span", { textContent: "building..." }));
+  else if (on) {
+    const again = el("button", { type: "button", textContent: "Refresh", title: "Build the chapter again", onclick: () => previewChapter() });
+    again.disabled = readOnly;
+    note.replaceChildren(el("b", { textContent: "Chapter preview" }), el("span", { className: "path", textContent: f.target || f.path, title: f.path }), again,
+      el("button", { type: "button", textContent: "Back to full PDF", onclick: backToFull }));
+  }
+  const button = $("focusBtn");
+  button.hidden = !isChapter(active);
+  button.disabled = readOnly || !!building;
+  button.title = readOnly ? "Chapter preview needs the edit link" : "Build only the chapter you are editing, with the numbering and references of the full document";
 }
 /** The PDF pane before there is a PDF: a page-shaped skeleton and what is going on, never a blank pane. */
 function showEmpty(d) {
@@ -470,10 +515,11 @@ async function forwardSearch(path, line) {
   if (!path) return;
   try { pdfView.reveal(await api.forward(cur, path, line)); } catch (e) { toast(el("span", { textContent: e.message })); }
 }
-const toCursor = () => active?.kind === "text" && forwardSearch(active.path, view.state.doc.lineAt(view.state.selection.main.head).number);
+const onFocusPdf = () => shownFocus() && (toast(el("span", { textContent: "This is the chapter preview. Go back to the full PDF to jump between source and PDF." })), true);
+const toCursor = () => !onFocusPdf() && active?.kind === "text" && forwardSearch(active.path, view.state.doc.lineAt(view.state.selection.main.head).number);
 
 async function inverse(e) {
-  const page = e.target.closest(".page"); if (!page) return;
+  const page = e.target.closest(".page"); if (!page || onFocusPdf()) return;
   const r = page.getBoundingClientRect(), z = pdfView.zoom;
   try {
     const res = await api.inverse(cur, +page.dataset.i + 1, (e.clientX - r.left) / z, (e.clientY - r.top) / z);
@@ -773,6 +819,8 @@ const COMMANDS = [
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
+  { id: "focus", edit: true, title: "Preview this chapter", run: () => previewChapter() },
+  { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
@@ -815,6 +863,7 @@ function openSettings() {
   $("sAutosave").value = settings.autosave; $("sTheme").value = settings.theme; $("sKeys").value = settings.keys;
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
+  $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
   $("settings").showModal();
   $("sName").focus();
 }
@@ -831,6 +880,8 @@ bind("sFont", (n) => settings.font = Math.max(10, Math.min(28, +n.value || 14)))
 bind("sZoom", (n) => pdfView.setZoom((+n.value || 133) / 100));
 bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
+bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
+$("focusBtn").onclick = () => previewChapter();
 for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { if (e.target === $(d)) $(d).close(); });
 
 $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnly && c.edit)), { title: "Close dialogs and panels", keys: "Esc" }].flatMap((c) => [el("dt", { textContent: c.title }), el("dd", {}, el("kbd", { textContent: c.keys }))]));
@@ -1001,13 +1052,14 @@ channel.on("state", (data) => {
   const wasBuilding = lastStatus === "building";
   lastStatus = docs[cur].status;
   renderStatus();
-  if (docs[cur].version !== pdfView.version) loadPdf();
+  renderFocus();
+  if (wantedVersion() !== pdfView.version) loadPdf();
   loadWarnings();   // Cheap: it fetches only when a build finished since the last look.
   if (wasBuilding && lastStatus !== "building") { loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
 });
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
-channel.on("forward", (b) => { if (b.doc !== cur) pick(b.doc); pdfView.reveal(b); });
+channel.on("forward", (b) => { if (b.doc !== cur) pick(b.doc); else if (shownFocus()) return; pdfView.reveal(b); });
 channel.on("transport", (mode) => {
   document.documentElement.dataset.transport = mode;
   if (mode === "revoked") $("revoked").hidden = false;
@@ -1022,6 +1074,7 @@ async function pick(name) {
   if (changing) await Promise.all([...tabs.values()].map((t) => t.collab?.leave()));
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
   $("doc").value = name;
+  focusView = null; renderFocus();
   tabs.clear(); active = null; files = []; outlineData = null; refs = { labels: {}, bib: {} };
   pdfView.version = null;
   warnKey = warnLoaded = null; warnings = []; renderWarnings();

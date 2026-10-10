@@ -780,6 +780,51 @@ class ShareHttp(SharedState, ServerCase):
         # A client id is bound to the role that first used it.
         self.assertEqual(self.get("GET", "/api/poll?since=0&cid=p1", "edit")[0], 403)
 
+    def test_focus_only_the_edit_link_and_the_owner_can_start_one_and_only_for_the_shared_document(self):
+        started = []
+        with mock.patch.object(serve, "start_focus", side_effect=lambda name, rel: started.append((name, rel))):
+            url = "/api/focus?doc=demo&path=main.tex"
+            self.assertEqual(self.get("POST", url)[0], 401)  # no token
+            self.assertEqual(self.get("POST", url, "view")[0], 403)
+            self.assertEqual(self.get("POST", "/api/focus?doc=second&path=main.tex", "edit")[0], 403)
+            self.assertEqual(self.get("POST", "/api/focus?doc=second&path=main.tex", "view")[0], 403)
+            self.assertEqual(started, [])
+            self.assertEqual(self.get("POST", url, "edit")[0], 200)
+            self.assertEqual(self.get("POST", url, "owner")[0], 200)
+            self.assertEqual(self.get("POST", "/api/focus?doc=second&path=main.tex", "owner")[0], 200)
+            self.assertEqual(started, [("demo", "main.tex"), ("demo", "main.tex"), ("second", "main.tex")])
+
+    def test_previews_count_against_the_rebuild_limit_of_editors(self):
+        with mock.patch.object(serve, "start_focus", return_value=1.0):
+            limit = serve.REBUILD_LIMIT[0]
+            codes = [self.get("POST", "/api/focus?doc=demo&path=main.tex", "edit")[0] for _ in range(limit + 1)]
+        self.assertEqual(codes, [200] * limit + [429])
+
+    def test_the_preview_pdf_and_log_are_readable_for_the_shared_document_only(self):
+        (self.root / "demo.focus.pdf").write_bytes(b"%PDF")
+        with mock.patch.object(build, "focus_paths", return_value=(self.root / "demo.focus.pdf", self.root / "x.log")):
+            self.assertEqual(self.get("GET", "/pdf/demo?focus=1", "view")[0], 200)
+            self.assertEqual(self.get("GET", "/pdf/second?focus=1", "view")[0], 403)
+            self.assertEqual(self.get("GET", "/log/second?focus=1", "edit")[0], 403)
+            self.assertEqual(self.get("GET", "/pdf/demo?focus=1")[0], 401)
+
+    def test_the_preview_state_of_another_document_never_reaches_a_shared_session(self):
+        state = {"rev": 1, "topic": "doc", "type": "state", "data": {"docs": [
+            {"name": "demo", "focus": {"status": "ok"}},
+            {"name": "second", "focus": {"status": "ok", "path": "secret.tex"}}]}}
+        shown = serve.visible([state], "view")[0]["data"]["docs"]
+        self.assertEqual([d["name"] for d in shown], ["demo"])
+
+    def test_a_preview_while_sharing_uses_the_guarded_settings(self):
+        # build_focus reads build.toml through build.read_settings, which refuses code-running options while sharing.
+        (self.root / "build.toml").write_text('latexmk_args = ["-shell-escape"]\n', encoding="utf-8")
+        main = self.root / "main.tex"
+        with mock.patch.object(build, "ROOT_DIR", self.base), mock.patch.object(build, "SOURCE_DIR", self.base), \
+                mock.patch.object(build, "error") as error, \
+                mock.patch.object(build.subprocess, "run", side_effect=AssertionError("LaTeX must not start")):
+            self.assertFalse(build.build_focus(main, "latexmk", "x"))
+        self.assertIn("not allowed while sharing", error.call_args[0][0])
+
 
 class Rooms(SharedState):
     def setUp(self):
@@ -1366,6 +1411,106 @@ class LogWarnings(ServerCase):
             self.log.write_text(self.LOG, encoding="utf-8")
             pdf.unlink()
             self.assertIsNone(serve.fresh_state("demo", self.root / "main.tex")["pages"])  # no PDF, no result
+
+
+class FocusPreview(ServerCase):
+    """Chapter preview: validation, state, and serving out/<name>.focus.pdf (LaTeX itself is mocked)."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("Chapters/one.tex", "chapter one\n")
+        self.write("notes.txt", "x")
+        self.map = self.root / "doc.focusmap"
+        self.pdf, self.log = self.root / "demo.focus.pdf", self.root / "demo.focus.log"
+        for target, value in (
+            (serve, {"focus_map": lambda main: self.map}),
+            (build, {"focus_paths": lambda main: (self.pdf, self.log)}),
+        ):
+            for name, fn in value.items():
+                mock.patch.object(target, name, fn).start()
+        mock.patch.object(build, "output_path_for", return_value=self.root / "demo.pdf").start()
+        mock.patch.dict(serve.STATE, {"demo": {"name": "demo", "focus": None}}).start()
+        self.addCleanup(serve.FOCUS_BUSY.clear)
+
+    def tree(self):
+        self.map.write_text("", encoding="utf-8")
+        mock.patch.object(build.accel, "read_focusmap", return_value=[]).start()
+        chapter = lambda entries, rel: "Chapters/one" if "one" in rel else None  # noqa: E731
+        mock.patch.object(build.accel, "top_unit", side_effect=chapter).start()
+
+    def test_bad_requests_are_refused_before_any_build_starts(self):
+        self.tree()
+        with mock.patch.object(serve, "run_focus") as run:
+            for rel, status in (("notes.txt", 400), ("../secret.tex", 400), ("Chapters/none.tex", 404),
+                                ("main.tex", 409), ("fig.tex", 404), ("", 400)):
+                with self.subTest(rel=rel):
+                    self.assertEqual(self.request("POST", f"/api/focus?doc=demo&path={rel}")[0], status)
+            self.assertEqual(self.request("POST", "/api/focus?doc=nope&path=main.tex")[0], 404)
+            self.write("loose.tex", "not input anywhere")
+            self.assertEqual(self.request("POST", "/api/focus?doc=demo&path=loose.tex")[0], 409)
+            run.assert_not_called()
+
+    def test_a_chapter_starts_once_and_publishes_building_then_the_result(self):
+        self.tree()
+        gate = threading.Event()
+        def slow_build(*args):
+            gate.wait(5)
+            self.pdf.write_bytes(b"%PDF")
+            return True
+
+        with mock.patch.object(build, "build_focus", side_effect=slow_build):
+            status, reply = self.request("POST", "/api/focus?doc=demo&path=Chapters/one.tex")
+            self.assertEqual(status, 200)
+            # The browser tells this preview from an older one by its start time.
+            self.assertEqual(serve.STATE["demo"]["focus"]["started"], reply["started"])
+            again = self.request("POST", "/api/focus?doc=demo&path=Chapters/one.tex")
+            self.assertEqual(again[0], 409)  # already running
+            self.assertEqual(serve.STATE["demo"]["focus"]["status"], "building")
+            gate.set()
+            deadline = time.time() + 5
+            while serve.FOCUS_BUSY and time.time() < deadline:
+                time.sleep(0.02)
+        focus = serve.STATE["demo"]["focus"]
+        self.assertEqual((focus["status"], focus["target"], focus["path"]), ("ok", "Chapters/one", "Chapters/one.tex"))
+        self.assertTrue(focus["version"])
+        status, body = self.request("GET", "/pdf/demo?focus=1")
+        self.assertEqual((status, body), (200, b"%PDF"))
+        self.assertEqual(self.request("GET", "/pdf/demo")[0], 404)  # the full PDF is a different file
+
+    def test_a_failed_preview_reports_the_first_error_and_frees_the_slot(self):
+        self.tree()
+        self.log.write_text("Focus build of x (y): FAILED\nfiles/demo/Chapters/one.tex:3: Undefined control sequence\n"
+                            "\n===== LaTeX output =====\nnoise\n", encoding="utf-8")
+        with mock.patch.object(build, "build_focus", return_value=False):
+            serve.FOCUS_BUSY.add("demo")
+            serve.run_focus("demo", "Chapters/one.tex")
+        focus = serve.STATE["demo"]["focus"]
+        self.assertEqual(focus["status"], "failed")
+        self.assertIn("Undefined control sequence", focus["error"])
+        self.assertEqual(self.request("GET", "/log/demo?focus=1")[1][:11], b"Focus build")
+        self.assertNotIn("demo", serve.FOCUS_BUSY)
+
+    def test_without_a_recorded_input_tree_the_full_build_comes_first_and_a_stranger_file_has_no_chapter(self):
+        calls = []
+        self.pdf.write_bytes(b"%PDF")
+        def full_build(*args, **kwargs):
+            calls.append((args[2], kwargs))
+            self.tree()
+
+        with mock.patch.object(serve, "run_build", side_effect=full_build), \
+                mock.patch.object(build, "build_focus", return_value=True) as focus:
+            serve.run_focus("demo", "Chapters/one.tex")
+            self.assertEqual(calls, [(True, {"record": True})])
+            focus.assert_called_once()
+            serve.run_focus("demo", "stray.tex")
+        self.assertEqual(serve.STATE["demo"]["focus"]["status"], "failed")
+        self.assertIn("has no chapter", serve.STATE["demo"]["focus"]["error"])
+
+    def test_a_crash_is_a_failed_preview_not_a_dead_thread(self):
+        self.tree()
+        with mock.patch.object(build, "build_focus", side_effect=RuntimeError("boom")):
+            serve.run_focus("demo", "Chapters/one.tex")
+        self.assertIn("boom", serve.STATE["demo"]["focus"]["error"])
 
 
 class UiWiring(unittest.TestCase):

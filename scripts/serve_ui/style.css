@@ -194,6 +194,14 @@ button.tip:hover{background:color-mix(in srgb,var(--acc-fg) 14%,transparent)}
 @keyframes slide{from{margin-left:-35%}to{margin-left:100%}}
 .pdf-note{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:6;display:flex;align-items:center;gap:10px;padding:5px 12px;border-radius:99px;background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad);font-size:12px;box-shadow:var(--shadow)}
 .pdf-note .link{color:inherit}
+.focus-note{display:flex;align-items:center;gap:8px;padding:5px 12px;background:var(--acc-bg);color:var(--acc-fg);border-bottom:1px solid color-mix(in srgb,var(--acc-fg) 25%,transparent);font-size:12.5px;white-space:nowrap;flex:none}
+.focus-note b{font-weight:700}
+.focus-note .path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;opacity:.85}
+.focus-note button{height:24px;padding:0 10px;border-radius:99px;border-color:color-mix(in srgb,var(--acc-fg) 40%,transparent);color:inherit;font-size:12px}
+.focus-note button:hover:not(:disabled){background:color-mix(in srgb,var(--acc-fg) 16%,transparent)}
+.focus-note.busy::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--warn);animation:pulse 1s infinite}
+#pdfPane.focusing .pdf-tools{top:52px}
+#pdfPane.focusing .pdf-note{top:52px}
 
 /* Drawer */
 #drawer{flex:none;max-height:min(38vh,340px);background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;min-height:0}

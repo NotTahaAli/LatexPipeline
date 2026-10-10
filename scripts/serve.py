@@ -57,7 +57,9 @@ LOCK = threading.Lock()
 STATE: dict[str, dict] = {}  # doc name -> status dict sent to browsers
 DOCS: dict[str, Path] = {}  # doc name -> main.tex
 FORCE: set[str] = set()  # documents the browser asked to rebuild from scratch
-SETTINGS = {"editor": "vscode", "check_host": True}
+SETTINGS = {"editor": "vscode", "check_host": True, "latexmk": "latexmk"}
+BUILD_LOCK = threading.RLock()  # One LaTeX run at a time: the watcher's builds and chapter previews share the cache.
+FOCUS_BUSY: set[str] = set()  # documents with a chapter preview in flight
 BUS_MAX_BYTES = 16 * 1024 * 1024  # JSON size of the durable log; the ephemeral one gets a quarter
 
 
@@ -440,10 +442,11 @@ def doc_warnings(name: str) -> list[dict]:
     return parse_warnings(text, main_tex.parent)
 
 
-def run_build(main_tex: Path, latexmk: str, force: bool) -> None:
+def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -> None:
     name = build.doc_name(main_tex)
     publish(name, status="building", started=time.time())
-    entry, _ = build.build_safely(main_tex, latexmk, False, force)
+    with BUILD_LOCK:
+        entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record)
     remember_build(entry)
     try:
         log_text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
@@ -463,6 +466,76 @@ def run_build(main_tex: Path, latexmk: str, force: bool) -> None:
         errors=errors, finished=time.time(), version=pdf_version(main_tex),
     )
     build.info(f"{'ok    ' if entry['ok'] else 'FAILED'} {name} ({entry['seconds']}s)")
+
+
+# --- Chapter preview: build.build_focus for the chapter that holds a file, shown as out/<name>.focus.pdf ---------
+
+def focus_map(main_tex: Path) -> Path:
+    return build.cache_dir_for(main_tex) / f"{main_tex.stem}.focusmap"
+
+
+def focus_target(main_tex: Path, rel: str) -> str | None:
+    """The top-level file (read by main.tex) that holds rel, from the last full build's recorded input tree."""
+    if not focus_map(main_tex).exists():
+        return None
+    return build.accel.top_unit(build.accel.read_focusmap(focus_map(main_tex)), rel)
+
+
+def focus_error(main_tex: Path) -> str:
+    """Why the last chapter preview failed: its first error line, else a pointer to the log."""
+    try:
+        rows = build.focus_paths(main_tex)[1].read_text(encoding="utf-8", errors="replace").split("\n")
+        stop = rows.index("===== LaTeX output =====") if "===== LaTeX output =====" in rows else len(rows)
+        first = next((r for r in rows[1:stop] if r.strip()), "")
+        return first[:300] or "The chapter preview failed."
+    except (OSError, ValueError):
+        return "The chapter preview failed."
+
+
+def run_focus(name: str, rel: str, began: float | None = None) -> None:
+    main_tex = DOCS[name]
+    began = began or time.time()
+    result: dict = {"status": "failed", "path": rel, "target": None, "started": began, "error": None}
+    try:
+        with BUILD_LOCK:
+            if not focus_map(main_tex).exists():
+                run_build(main_tex, SETTINGS["latexmk"], True, record=True)  # First time: the input tree comes first.
+            target = focus_target(main_tex, rel)
+            result["target"] = target
+            if target is None:
+                result["error"] = f"{rel} is not read by main.tex with \\input or \\include, so it has no chapter."
+            elif build.build_focus(main_tex, SETTINGS["latexmk"], target):
+                result.update(status="ok", version=str(build.focus_paths(main_tex)[0].stat().st_mtime_ns))
+            else:
+                result["error"] = focus_error(main_tex)
+    except Exception as exc:  # noqa: BLE001 - a failed preview must not take the server down.
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        FOCUS_BUSY.discard(name)
+        publish(name, focus={**result, "finished": time.time()})
+
+
+def start_focus(name: str, rel) -> float:
+    """
+    Start a chapter preview in the background; returns its start time, which the "focus" state carries so a
+    browser can tell this preview from an older one. Raises ApiError for a bad file, or one already running.
+    """
+    main_tex = DOCS[name]
+    if not isinstance(rel, str) or not rel.endswith(".tex"):
+        raise ApiError("Open a .tex file of a chapter to preview it.", 400)
+    if not resolve_in_doc(main_tex.parent, rel).is_file():
+        raise ApiError("No such file.", 404)
+    if rel == "main.tex" or (focus_map(main_tex).exists() and focus_target(main_tex, rel) is None):
+        raise ApiError("This file is not a chapter: main.tex does not \\input or \\include it.", 409)
+    with LOCK:
+        if name in FOCUS_BUSY:
+            raise ApiError("A chapter preview is already building.", 409)
+        FOCUS_BUSY.add(name)
+    began = time.time()
+    if name in STATE:
+        publish(name, focus={"status": "building", "path": rel, "target": None, "started": began})
+    threading.Thread(target=run_focus, args=(name, rel, began), daemon=True).start()
+    return began
 
 
 def watcher(latexmk: str, patterns: list[str], interval: float = 0.5) -> None:
@@ -1765,6 +1838,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many rebuilds; wait a moment.", 429)
+    elif method == "POST" and path == "/api/focus":
+        need_edit()  # Starts LaTeX, so it counts like a rebuild.
+        scoped(doc)
+        if not rate_ok("rebuild", *REBUILD_LIMIT):
+            raise ApiError("Too many rebuilds; wait a moment.", 429)
     elif method == "PUT" and path == "/api/file":
         need_edit()
         scoped(doc)
@@ -1913,6 +1991,8 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 FORCE.add(name)
             self.json({"ok": True})
+        elif url.path == "/api/focus" and name in DOCS:
+            self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
             data = self.body()
             client = str(query.get("cid", ["?"])[0])[:64]
@@ -1975,7 +2055,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/events":
             self.events()
         elif path.startswith(("/pdf/", "/log/")):
-            self.file(path)
+            self.file(path, "focus" in query)
         elif path == "/api/files":
             self.json({"files": list_files(self.doc_root(query))})
         elif path == "/api/file":
@@ -2032,13 +2112,16 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("Not an image.", 415)
         self.image(path)
 
-    def file(self, path: str) -> None:
+    def file(self, path: str, focus: bool = False) -> None:
         kind, _, name = path[1:].partition("/")
         if name not in DOCS:
             self.reply(404, b"Unknown document", "text/plain")
             return
         main_tex = DOCS[name]
-        target = build.output_path_for(main_tex) if kind == "pdf" else build.log_path_for(main_tex)
+        if focus:
+            target = build.focus_paths(main_tex)[0 if kind == "pdf" else 1]
+        else:
+            target = build.output_path_for(main_tex) if kind == "pdf" else build.log_path_for(main_tex)
         try:
             body = target.read_bytes()
         except OSError:
@@ -2320,6 +2403,7 @@ def main() -> int:
 
     latexmk = build.check_latex()
     SETTINGS["editor"] = args.editor
+    SETTINGS["latexmk"] = latexmk
     SETTINGS["check_host"] = args.host in LOOPBACK_HOSTS | {"::1"}
     if not SETTINGS["check_host"]:
         build.error(f"Listening on {args.host}: anyone who can reach this port can read and EDIT your documents.")

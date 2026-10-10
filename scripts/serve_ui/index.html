@@ -50,6 +50,7 @@
     <symbol id="i-bold" viewBox="0 0 24 24"><path d="M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z"/></symbol>
     <symbol id="i-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/></symbol>
     <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12h.01"/></symbol>
+    <symbol id="i-focus" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
   </defs>
 </svg>
@@ -121,6 +122,7 @@
       <span id="saveState" aria-live="polite">Saved</span>
       <span class="spacer"></span>
       <span id="cursorPos" class="mute">Ln 1, Col 1</span>
+      <button id="focusBtn" class="mini" hidden title="Build only the chapter you are editing, with the numbering and references of the full document"><svg class="ic"><use href="#i-focus"/></svg>Preview chapter</button>
       <button id="proseBtn" class="mini" aria-controls="prose" aria-expanded="false" title="Edit paragraph as rich text"><svg class="ic"><use href="#i-para"/></svg>Paragraph</button>
     </div>
   </section>
@@ -135,6 +137,7 @@
       <button id="zFit" class="icon" aria-label="Fit width" title="Fit width"><svg class="ic"><use href="#i-fit"/></svg></button>
       <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
     </div>
+    <div id="focusNote" class="focus-note" role="status" hidden></div>
     <div id="pdfNote" class="pdf-note" hidden></div>
     <div id="viewer" tabindex="0" aria-label="PDF pages"><div id="pages"></div><div id="empty" hidden></div></div>
   </section>
@@ -203,6 +206,8 @@
       <div class="fields">
         <label for="sZoom">Zoom (%)</label>
         <input id="sZoom" type="number" min="30" max="500" step="10">
+        <label for="sFocusAuto">Chapter preview</label>
+        <label class="check"><input id="sFocusAuto" type="checkbox"> Build it after each save</label>
         <label for="sInverse">Double-click in PDF</label>
         <select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select>
       </div>
