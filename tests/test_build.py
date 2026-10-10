@@ -220,7 +220,11 @@ class ReadSettingsTests(unittest.TestCase):
         for value in ("2b", "a-2b", "A-2B"):
             settings = self.settings(self.PLAIN, f'pdfa = "{value}"\nlang = "de-DE"\n')
             self.assertEqual(settings["pdfa"], "a-2b")
-            self.assertEqual(build.pdfa_metadata(settings), r"\DocumentMetadata{pdfstandard=a-2b,lang=de-DE}")
+            meta = build.pdfa_metadata(settings)
+            self.assertTrue(meta.startswith(r"\DocumentMetadata{pdfstandard=a-2b,lang=de-DE}"))
+            self.assertNotIn("\n", meta)  # a single latexmk -usepretex argument
+            self.assertNotIn("objcompresslevel", meta)
+        self.assertIn(r"\pdfobjcompresslevel=0", build.pdfa_metadata(self.settings(self.PLAIN, 'pdfa = "1b"\n')))
         self.assertEqual(build.pdfa_metadata(self.settings(self.PLAIN)), "")
         self.assertConfigError(self.PLAIN, 'pdfa = "9z"\n')
         self.assertConfigError(self.PLAIN, 'pdfa = true\n')
@@ -233,6 +237,19 @@ class ReadSettingsTests(unittest.TestCase):
             self.assertIn("present", build.pdfa_check(pdf, "a-2b"))
             pdf.write_bytes(b"%PDF-1.7\n")
             self.assertIn("no XMP pdfaid or OutputIntent", build.pdfa_check(pdf, "a-2b"))
+
+    def test_verapdf_note(self):
+        def run(stdout):
+            done = subprocess.CompletedProcess([], 1, stdout=stdout, stderr="")
+            with mock.patch.object(build.subprocess, "run", return_value=done) as call:
+                note = build.verapdf_note("verapdf", Path("a.pdf"), "a-2b")
+            self.assertEqual(call.call_args[0][0][:5], ["verapdf", "--format", "xml", "--flavour", "2b"])
+            return note
+        self.assertEqual(run('<validationReport isCompliant="true">'), "PDF/A a-2b: veraPDF passed.")
+        failed = run('isCompliant="false"><description>Fonts &amp; glyphs</description><description>Fonts &amp; glyphs'
+                     '</description>')
+        self.assertEqual(failed, "PDF/A a-2b: veraPDF failed 1 rule(s): Fonts & glyphs")
+        self.assertIn("no verdict", run("garbage"))
 
     def test_size_text(self):
         self.assertEqual(build.size_text(101324), "101 KB")
