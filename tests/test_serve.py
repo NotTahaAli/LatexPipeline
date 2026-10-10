@@ -568,10 +568,17 @@ class GatewayQuota(GatewayMode):
     def setUp(self):
         super().setUp()
         used = serve.folder_bytes(self.base)
-        mock.patch.dict(serve.QUOTA, {"bytes": used + 1000, "area": self.base}).start()
+        # Room for three small new files: each costs at least one block (serve.ENTRY_BYTES).
+        mock.patch.dict(serve.QUOTA, {"bytes": used + 3 * serve.ENTRY_BYTES + 200, "area": self.base}).start()
 
     def put(self, path, text):
         return self.as_("edit", "PUT", f"/api/file?doc=demo&path={path}", {"text": text})[0]
+
+    def test_empty_files_and_folders_cost_a_block(self):
+        before = serve.folder_bytes(self.base)
+        (self.base / "empty").mkdir()
+        (self.base / "empty" / "a").touch()
+        self.assertEqual(serve.folder_bytes(self.base) - before, 2 * serve.ENTRY_BYTES)
 
     def test_parallel_writes_cannot_pass_on_a_stale_size(self):
         results = []
@@ -586,7 +593,7 @@ class GatewayQuota(GatewayMode):
 
     def test_every_write_path_refuses_over_quota_but_shrinking_and_deleting_work(self):
         (self.base / ".cache").mkdir()
-        (self.base / ".cache" / "big").write_bytes(b"0" * 2000)  # build output counts too
+        (self.base / ".cache" / "big").write_bytes(b"0" * 4 * serve.ENTRY_BYTES)  # build output counts too
         self.assertEqual(self.put("a.tex", "x"), 507)
         self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=newfile&path=b.tex")[0], 507)
         self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=mkdir&path=dir")[0], 507)
@@ -605,6 +612,7 @@ class GatewayQuota(GatewayMode):
         (out / "old.pdf").write_bytes(b"old")
         old = time.time() - 60
         os.utime(out / "old.pdf", (old, old))
+        serve.QUOTA["bytes"] = serve.folder_bytes(self.base) + serve.ENTRY_BYTES + 1000  # room for one small PDF
         name = serve.build.doc_name(self.root / "main.tex")
         serve.STATE[name] = serve.fresh_state(name, self.root / "main.tex")
         self.addCleanup(serve.STATE.pop, name, None)
@@ -614,7 +622,7 @@ class GatewayQuota(GatewayMode):
             return {"ok": True, "errors": [], "seconds": 0, "pages": 1, "warnings": 0, "engine": "pdflatex",
                     "error": None}, None
 
-        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=5000)):
+        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=3 * serve.ENTRY_BYTES)):
             serve.run_build(self.root / "main.tex", "latexmk", True)
         state = serve.STATE[name]
         self.assertEqual(state["status"], "failed")
@@ -625,7 +633,7 @@ class GatewayQuota(GatewayMode):
                 mock.patch.object(serve, "remember_build"):
             serve.run_build(self.root / "main.tex", "latexmk", True)
         self.assertEqual(serve.STATE[name]["status"], "ok")
-        (self.root / "huge.tex").write_bytes(b"0" * 5000)
+        (self.root / "huge.tex").write_bytes(b"0" * 3 * serve.ENTRY_BYTES)
         ran.reset_mock()
         with mock.patch.object(serve.build, "build_safely", side_effect=small_build) as ran:
             serve.run_build(self.root / "main.tex", "latexmk", True)

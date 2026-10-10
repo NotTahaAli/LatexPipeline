@@ -81,6 +81,20 @@ def problem() -> str | None:
     return None
 
 
+TMP_BYTES = 256 * 1024 * 1024  # /tmp (also HOME) inside the sandbox lives in RAM
+
+
+@functools.cache
+def tmp_size() -> tuple[str, ...]:
+    """bwrap's --size for the /tmp tmpfs (bubblewrap 0.7 or newer); without it tmpfs may grow to half of RAM."""
+    try:
+        text = subprocess.run([shutil.which("bwrap") or "bwrap", "--help"], capture_output=True, text=True,
+                              errors="replace", timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    return ("--size", str(TMP_BYTES)) if "--size" in text else ()
+
+
 def check() -> None:
     """Raise SandboxError if the sandbox is on but unusable."""
     if enabled() and problem():
@@ -121,7 +135,7 @@ def wrap(cmd: list[str], cwd: Path, writable: list[Path], readable: list[Path] =
     """The bwrap command line that runs cmd in cwd with only `writable` writable; cwd and `readable` read-only."""
     args = [
         shutil.which("bwrap") or "bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--proc", "/proc", "--dev", "/dev", *tmp_size(), "--tmpfs", "/tmp",
     ]
     for path in readable_dirs(cmd[0]):
         args += ["--ro-bind-try", path, path]

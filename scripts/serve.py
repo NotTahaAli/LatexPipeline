@@ -755,14 +755,18 @@ WRITE_LOCK = threading.Lock()
 QUOTA: dict = {"bytes": 0, "area": None}
 
 
+ENTRY_BYTES = 4096  # quota charge per file or folder: one disk block
+
+
 def folder_bytes(root: Path) -> int:
     """Apparent size of every file below root, symlinks not followed. Same rule as host.py's."""
     total = 0
     for current, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+        total += ENTRY_BYTES * len(dirs)
         for name in names:
-            try:
-                total += os.lstat(os.path.join(current, name)).st_size
+            try:  # Every entry costs at least ENTRY_BYTES, so thousands of empty files count too.
+                total += max(os.lstat(os.path.join(current, name)).st_size, ENTRY_BYTES)
             except OSError:
                 pass
     return total

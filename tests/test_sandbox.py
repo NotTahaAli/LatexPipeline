@@ -23,6 +23,13 @@ SYS_OK = os.path.exists(PYTHON) and not sandbox.problem()
 
 
 class CommandTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bwrap") and sandbox.problem() is None, "needs working bwrap")
+    def test_tmp_is_capped(self):
+        if not sandbox.tmp_size():
+            self.skipTest("bwrap without --size")
+        cmd = sandbox.wrap(["python3", "-c", "open('/tmp/x','wb').write(b'0'*(300*2**20))"], Path("/usr"), [])
+        self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)  # 300 MB > 256 MB cap
+
     def test_off_by_default_and_unknown_values_refused(self):
         with mock.patch.dict(os.environ, {"LATEX_SANDBOX": ""}):
             self.assertEqual(sandbox.spawn(["pdflatex", "x"], Path("/d"), Path("/b")),

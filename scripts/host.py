@@ -526,13 +526,17 @@ def zip_folder(root: Path, out) -> None:
                 archive.write(path, f"{root.name}/{path.relative_to(base).as_posix()}")
 
 
+ENTRY_BYTES = 4096  # quota charge per file or folder: one disk block
+
+
 def folder_bytes(root: Path) -> int:
     total = 0
     for current, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+        total += ENTRY_BYTES * len(dirs)
         for name in names:
-            try:
-                total += os.lstat(os.path.join(current, name)).st_size
+            try:  # Every entry costs at least ENTRY_BYTES, so thousands of empty files count too.
+                total += max(os.lstat(os.path.join(current, name)).st_size, ENTRY_BYTES)
             except OSError:
                 pass
     return total
