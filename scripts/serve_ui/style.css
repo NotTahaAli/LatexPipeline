@@ -247,6 +247,10 @@ button.tip:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
 .focus-note button:hover:not(:disabled){background:var(--sunk)}
 .focus-note.busy::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ochre);animation:pulse 1s infinite}
 #pdfPane.focusing .pdf-note{top:94px}
+.live-state{order:-1;margin-right:auto;font-size:12px;color:var(--muted);white-space:nowrap}
+.live-state.busy::before{content:"";display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:var(--ochre);animation:pulse 1s infinite}
+.live-state.bad{color:var(--ink-2)}
+.page.spliced{outline:2px solid var(--accent-soft)}
 
 /* Drawer */
 #drawer{flex:none;max-height:min(40vh,360px);background:var(--surface);border-top:1px solid var(--rule);display:flex;flex-direction:column;min-height:0}

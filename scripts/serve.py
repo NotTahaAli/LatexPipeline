@@ -49,6 +49,7 @@ import bibfix
 import build
 import grammar
 import hints
+import preview
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 UI_DIR = Path(__file__).resolve().parent / "serve_ui"
@@ -458,6 +459,8 @@ def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -
         if over is None:
             entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record, validate=False)
             over = quota_after_build(started)
+            if entry["ok"] and over is None and main_tex in preview.WARM:
+                refresh_preview(main_tex)
     if over is not None:
         publish(name, status="failed", ok=False, error=over, error_hint=None, errors=[], finished=time.time(),
                 version=pdf_version(main_tex))
@@ -558,6 +561,47 @@ def start_focus(name: str, rel) -> float:
         publish(name, focus={"status": "building", "path": rel, "target": None, "started": began})
     threading.Thread(target=run_focus, args=(name, rel, began), daemon=True).start()
     return began
+
+
+# --- Live preview: the chapter around the cursor, typeset by a warm TeX process from the editor's text ----------
+
+def refresh_preview(main_tex: Path) -> None:
+    """(BUILD_LOCK held, after a good full build) Fresh references for previews; restart TeX if the preamble moved."""
+    try:
+        preview.snapshot(main_tex)
+        preview.warm_for(main_tex).warm_up()
+    except (OSError, build.ConfigError) as exc:
+        build.error(f"{build.doc_name(main_tex)}: live preview not refreshed: {exc}")
+
+
+def live_preview(name: str, client: str, data: dict) -> tuple[dict, bytes | None]:
+    """POST /api/preview: typeset the chapter holding data["path"] with data["text"] in place of that file."""
+    main_tex = DOCS[name]
+    rel, text = data.get("path"), data.get("text")
+    if not isinstance(rel, str) or not rel.endswith(".tex") or rel == "main.tex" or is_rc(rel):
+        raise ApiError("Live preview works on the chapters of a document (not main.tex).", 400)
+    if not resolve_in_doc(main_tex.parent, rel).is_file():
+        raise ApiError("No such file.", 404)
+    if text is not None and not isinstance(text, str):
+        raise ApiError("Bad text.", 400)
+    if not preview.has_snapshot(main_tex):
+        with BUILD_LOCK:  # First preview of this document: its input tree and references come from a full build.
+            if not focus_map(main_tex).exists():
+                run_build(main_tex, SETTINGS["latexmk"], False, record=True)
+            if not focus_map(main_tex).exists() or STATE.get(name, {}).get("ok") is False:
+                raise ApiError("Live preview starts once the document builds without errors.", 409)
+            preview.snapshot(main_tex)
+    try:
+        result = preview.warm_for(main_tex).compile(client, rel, text)
+    except preview.PreviewError as exc:
+        raise ApiError(str(exc), 409)
+    except build.ConfigError as exc:
+        raise ApiError(str(exc), 409)
+    pdf = result.pop("pdf")
+    result.pop("log")
+    for found in result["errors"]:
+        found["hint"] = found.get("hint") or hints.explain(found["message"])
+    return result, pdf
 
 
 def watcher(latexmk: str, patterns: list[str], interval: float = 0.5) -> None:
@@ -2438,6 +2482,11 @@ def check_permission(role: str, method: str, path: str, query: dict) -> None:
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
             raise ApiError("Too many lookups; wait a moment.", 429)
+    elif method == "POST" and path == "/api/preview":
+        need_edit()  # Runs LaTeX on text the client sends, like a save and a chapter preview together.
+        scoped(doc)
+        if not rate_ok("preview", 120, 60.0):
+            raise ApiError("Too many previews; wait a moment.", 429)
     elif method == "POST" and path == "/api/focus":
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
@@ -2644,6 +2693,12 @@ class Handler(BaseHTTPRequestHandler):
             self.json(box)
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
+        elif url.path == "/api/preview" and name in DOCS:
+            meta, pdf = live_preview(name, str(query.get("cid", ["?"])[0])[:64], self.body())
+            if pdf is None:
+                self.json(meta)
+            else:  # One round trip: the PDF itself, what it is in a header.
+                self.reply(200, pdf, "application/pdf", {"X-Preview": json.dumps(meta)})
         elif url.path == "/api/send":  # Long-poll transport: client -> server.
             data = self.body()
             client = str(query.get("cid", ["?"])[0])[:64]
@@ -3158,6 +3213,7 @@ def main() -> int:
     finally:
         STOP.set()
         share_disable()
+        preview.shutdown()
         server.shutdown()
         server.server_close()
     return 0
