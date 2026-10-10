@@ -27,7 +27,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 
 * [Requirements](#requirements)
 * [Building](#building)
-* [Documents and settings](#documents-and-settings): [build.toml keys](#buildtoml-keys), [grammar](#grammar), [PDF/A](#pdfa)
+* [Documents and settings](#documents-and-settings): [build.toml keys](#buildtoml-keys), [grammar](#grammar), [PDF/A](#pdfa-and-tagged-pdf)
 * [Large documents](#large-documents) and [benchmarks](#benchmarks)
 * [VS Code](#vs-code)
 * [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds)
@@ -136,7 +136,8 @@ The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex` 
 | `shell_escape` | `false` | Allow `\write18`. Forced off while [sharing](#sharing). |
 | `latexmk_args` | `[]` | Extra latexmk arguments (list of strings). While sharing, ones that run code or move output fail the build. |
 | `externalize` | `true` | Compile TikZ/pgfplots figures once and cache them, see [Large documents](#large-documents). |
-| `pdfa` | off | PDF/A level, `"2b"` or `"a-2b"` (part 1, 2 or 3 with conformance a, b or u, such as `"3b"`), see [PDF/A](#pdfa). |
+| `pdfa` | off | PDF/A level, `"2b"` or `"a-2b"` (part 1, 2 or 3 with conformance a, b or u, such as `"3b"`), see [PDF/A and tagged PDF](#pdfa-and-tagged-pdf). |
+| `tagged` | `false` | Tagged PDF (accessibility, PDF/UA-1), see [PDF/A and tagged PDF](#pdfa-and-tagged-pdf). |
 | `lang` | `"en-US"` | Document language: PDF/A metadata and the grammar checker. |
 | `timeout` | `600` | Seconds (10 to 7200) before a latexmk run is killed. `--timeout` changes the default; sharing caps it at 300. |
 | `grammar` | `"auto"` | `"auto"`, `"off"`, `"local"` or `"public"`, see [Grammar](#grammar). |
@@ -159,9 +160,13 @@ Grammar and style checks come from [LanguageTool](https://languagetool.org). `sc
 
 `python scripts/ci_report.py lint --grammar` adds the findings to the lint report, annotations and `.lint-baseline` like the other lint findings (as notices; a server that cannot be reached is skipped with a message). The workflow does not pass `--grammar`. In GitHub Actions `grammar = "public"` is ignored unless `GRAMMAR_PUBLIC_OK=1` is set too.
 
-### PDF/A
+### PDF/A and tagged PDF
 
-`pdfa = "2b"` (also `"a-2b"`, `"3b"`, ...) injects `\DocumentMetadata{pdfstandard=a-2b,lang=...}` before `\documentclass` through latexmk's `-usepretex`, so remove any `\DocumentMetadata` from `main.tex`. It needs LaTeX 2023-06 or newer. The same pretex also asks xcolor for RGB output (cmyk colours break PDF/A against the RGB OutputIntent), loads pdfTeX's glyph-to-Unicode maps (including `glyphtounicode-cmr` for math symbols, needed by the `u` level) and, for PDF/A-1, turns off object streams. After the build the PDF is checked for the XMP `pdfaid` declaration and an OutputIntent; if [veraPDF](https://verapdf.org) (`verapdf`) is on `PATH` the PDF is then validated against the requested level and the log note says passed, or which rules failed. The editor's builds skip veraPDF (it takes seconds); CLI builds run it, except `--focus`. Checked with veraPDF 1.30 on TeX Live 2023: `1b`, `2b`, `2u` and `3b` pass with pdfLaTeX, `2b` with XeLaTeX and LuaLaTeX, `1b` with LuaLaTeX, and `bench/sample-report` (TikZ, pgfplots, xcolor) passes `2b`. Images embedded as CMYK and transparency in included PDFs are not converted, and the `a` levels need tagging, which is not switched on (`tagging=on`), so they fail validation.
+`pdfa = "2b"` (also `"a-2b"`, `"3b"`, ...) injects `\DocumentMetadata{pdfstandard=a-2b,lang=...}` before `\documentclass` through latexmk's `-usepretex`, so remove any `\DocumentMetadata` from `main.tex`. It needs LaTeX 2023-06 or newer. The same pretex also asks xcolor for RGB output (cmyk colours break PDF/A against the RGB OutputIntent), loads pdfTeX's glyph-to-Unicode maps (including `glyphtounicode-cmr` for math symbols, needed by the `u` level) and, for PDF/A-1, turns off object streams. After the build the PDF is checked for the XMP `pdfaid` declaration and an OutputIntent; if [veraPDF](https://verapdf.org) (`verapdf`) is on `PATH` the PDF is then validated against the requested level and the log note says passed, or which rules failed. The editor's builds skip veraPDF (it takes seconds); CLI builds run it, except `--focus`. Checked with veraPDF 1.30 on TeX Live 2023: `1b`, `2b`, `2u` and `3b` pass with pdfLaTeX, `2b` with XeLaTeX and LuaLaTeX, `1b` with LuaLaTeX, and `bench/sample-report` (TikZ, pgfplots, xcolor) passes `2b`. Images embedded as CMYK and transparency in included PDFs are not converted, and the `a` levels need tagging (`tagged = true`, below).
+
+`tagged = true` adds a structure tree (headings, lists, links, a language) for screen readers and PDF/UA. It goes into the same `\DocumentMetadata` line, one `-usepretex` argument, and combines with `pdfa`; with `pdfa = "2a"` (the accessible level) the PDF/A-2a rules are met too. The key depends on the LaTeX kernel, which the pretex tests itself with `\IfFormatAtLeastTF`, so one setting works everywhere: kernel 2025-06-01 or newer gets `tagging=on`; 2023-06-01 up to that gets `testphase={phase-III,firstaid}` (TeX Live 2023 to 2025); an older kernel prints `WARNING: tagged = true needs LaTeX 2023-06-01 or newer` into the log and builds an untagged PDF. After the build, the PDF is checked for a `/StructTreeRoot` (the note says if it is missing), and, without `pdfa`, veraPDF validates it as PDF/UA-1 (`--flavour ua1`, the XMP carries `pdfuaid:part` 1). With `pdfa` set, the PDF/UA-1 identification is left out, because a list of standards (`pdfstandard={a-2b,ua-1}`) is not accepted by TeX Live 2023, and only PDF/A is validated. Also: the pretex asks hyperref for `pdfdisplaydoctitle`; set the title yourself with `\hypersetup{pdftitle={...}}`, which PDF/UA-1 requires.
+
+Checked here with TeX Live 2023 (kernel 2023-11-01) and veraPDF 1.28.2: a small document with `pdftitle` passes `ua1` with LuaLaTeX and XeLaTeX, with pdfLaTeX in the tests above, and `a-2a` passes for pdfLaTeX and LuaLaTeX. Not checked: TeX Live 2025 (`tagging=on` branch). Limits: tagging is still maturing; classes and packages that are not tagging-ready can produce an incomplete tree, and tagging slows the LaTeX run. pdfTeX can fail veraPDF's glyph-width rule on the synthetic `PdfTeX-Space` font that tagging adds for real spaces (seen in an `article` with `\textbf` and `hyperref`); LuaLaTeX does not. Math is not tagged as MathML.
 
 `build-report.json` and the CI summary table list each PDF's size. A `qpdf --object-streams=generate` pass was measured and dropped: pdfTeX already writes object streams, and it saved 0.3% (`files/test`, 101 KB) to 0.9% (`bench/sample-report`, 1.6 MB).
 
@@ -259,10 +264,10 @@ Limits (use `externalize = false` in `build.toml` if they bite, or `--force` to 
 | cold build (`--force`) | 93 s | 55 s |
 | one-line text edit | 47 s | 13 s |
 | one-line text edit in a file that holds a figure | n/a | 13 s (was 23 s) |
-| edit one figure | 24 s | 23 s |
+| edit one figure | 24 s | 16 s (was 23 s) |
 | `--focus Chapters/chapter5` | n/a | 1.7 s |
 
-The last two optimizations were measured on a busier machine (median of 3): `--force` 87 s to 55 s (figures 35 s to 14 s), a text edit in a file holding a figure 23 s to 13 s, other text edits unchanged at 13 s (one LaTeX pass).
+A no-op rebuild takes 0.12 s (plain latexmk: 0.12 s). The figure edit now lists only the changed files instead of typesetting the whole document first; plain latexmk needs 27 s for the same edit. The two optimizations before were measured on a busier machine (median of 3): `--force` 87 s to 55 s (figures 35 s to 14 s), a text edit in a file holding a figure 23 s to 13 s, other text edits unchanged at 13 s (one LaTeX pass).
 
 How this compares with plain latexmk, an Overleaf-style build, a naive pdflatex/bibtex script, arara and Tectonic (including where plain latexmk wins) is in [docs/benchmarks.md](docs/benchmarks.md).
 

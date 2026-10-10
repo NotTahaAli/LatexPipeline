@@ -507,7 +507,7 @@ def docx_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "lang", "timeout",
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout",
                "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
 # Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
 DEFAULT_TIMEOUT = 600
@@ -559,7 +559,7 @@ def read_settings(main_tex: Path) -> dict:
     Raises ConfigError for invalid values.
     """
     settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
-                "pdfa": None, "lang": "en-US", "timeout": DEFAULT_TIMEOUT}
+                "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -586,7 +586,7 @@ def read_settings(main_tex: Path) -> dict:
         )
     settings["engine"] = engine.lower()
 
-    for key in ("shell_escape", "externalize"):
+    for key in ("shell_escape", "externalize", "tagged"):
         if not isinstance(settings[key], bool):
             raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: {key} must be true or false")
 
@@ -614,25 +614,62 @@ def read_settings(main_tex: Path) -> dict:
     return settings
 
 
-def pdfa_metadata(settings: dict) -> str:
-    """The \\DocumentMetadata line for build.toml's pdfa, or "" when it is off."""
-    if not settings["pdfa"]:
+# \DocumentMetadata keys for tagging: the kernel has tagging=on from 2025-06-01; TeX Live 2023 to 2025
+# (kernel 2023-06 on) has the same through testphase. Older kernels cannot tag, so the build goes on untagged.
+TAGGING_NEW = "2025-06-01"
+TAGGING_OLD = "2023-06-01"
+
+
+def document_metadata(settings: dict) -> str:
+    """The pretex for build.toml's pdfa and tagged (PDF/A, tagged PDF/UA), or "" when both are off."""
+    level, tagged = settings["pdfa"], settings["tagged"]
+    if not level and not tagged:
         return ""
-    level = settings["pdfa"]
-    lines = [f"\\DocumentMetadata{{pdfstandard={level},lang={settings['lang']}}}",
-             # veraPDF: xcolor's cmyk colours break PDF/A with the RGB OutputIntent, and pdfTeX
-             # writes no ToUnicode for symbol glyphs (CMEX) without the glyph name maps.
-             r"\PassOptionsToPackage{rgb}{xcolor}",
-             r"\ifdefined\pdfgentounicode\input{glyphtounicode}\InputIfFileExists{glyphtounicode-cmr}{}{}"
-             r"\pdfgentounicode=1 \fi"]
-    if level.startswith("a-1"):
-        # PDF/A-1 forbids object streams.
-        lines.append(r"\ifdefined\pdfobjcompresslevel\pdfobjcompresslevel=0 \fi"
-                     r"\ifdefined\pdfvariable\pdfvariable objcompresslevel=0 \fi")
-    return "".join(lines)  # one -usepretex argument: no newlines
+    base = f"lang={settings['lang']}"
+    extras = []
+    if level:
+        base = f"pdfstandard={level},{base}"
+        extras = [
+            # veraPDF: xcolor's cmyk colours break PDF/A with the RGB OutputIntent, and pdfTeX
+            # writes no ToUnicode for symbol glyphs (CMEX) without the glyph name maps.
+            r"\PassOptionsToPackage{rgb}{xcolor}",
+            r"\ifdefined\pdfgentounicode\input{glyphtounicode}\InputIfFileExists{glyphtounicode-cmr}{}{}"
+            r"\pdfgentounicode=1 \fi"]
+        if level.startswith("a-1"):
+            # PDF/A-1 forbids object streams.
+            extras.append(r"\ifdefined\pdfobjcompresslevel\pdfobjcompresslevel=0 \fi"
+                          r"\ifdefined\pdfvariable\pdfvariable objcompresslevel=0 \fi")
+    if not tagged:
+        return f"\\DocumentMetadata{{{base}}}" + "".join(extras)
+    ua = "" if level else "pdfstandard=ua-1,"  # PDF/UA-1 identification (a list of standards needs a newer kernel)
+    new = f"\\DocumentMetadata{{{ua}{base},tagging=on}}"
+    old = f"\\DocumentMetadata{{{ua}{base},testphase={{phase-III,firstaid}}}}"
+    warning = (r"\typeout{WARNING: tagged = true needs LaTeX " + TAGGING_OLD
+               + r" or newer; building an untagged PDF.}")
+    return (
+        rf"\IfFormatAtLeastTF{{{TAGGING_NEW}}}{{{new}}}{{\IfFormatAtLeastTF{{{TAGGING_OLD}}}{{{old}}}{{{warning}}}}}"
+        # A tagged PDF/UA file must show its title (set pdftitle with \hypersetup in the document).
+        r"\PassOptionsToPackage{pdfdisplaydoctitle=true}{hyperref}" + "".join(extras)
+    )  # one -usepretex argument: no newlines
 
 
-def pdfa_check(pdf: Path, level: str, validate: bool = True) -> str:
+def tagged_check(pdf: Path) -> str:
+    """Does the PDF carry a structure tree? Returns a one-line note."""
+    data = pdf.read_bytes()
+    streams = [data]
+    for chunk in re.findall(rb"stream\r?\n(.*?)endstream", data, re.DOTALL):  # object streams hide the catalog
+        try:
+            streams.append(zlib.decompress(chunk))
+        except zlib.error:
+            pass
+    text = b"\n".join(streams)
+    if b"/StructTreeRoot" in text and b"/MarkInfo" in text:
+        return "Tagged PDF: structure tree present."
+    return ("Tagged PDF requested, but the PDF has no structure tree: tagging needs LaTeX "
+            f"{TAGGING_OLD} or newer (see the LaTeX log).")
+
+
+def pdfa_check(pdf: Path, level: str, validate: bool = True, tagged: bool = False) -> str:
     """
     A cheap look, not validation (use veraPDF for that): does the PDF carry
     the XMP pdfaid declaration and an OutputIntent? Returns a one-line note.
@@ -659,22 +696,35 @@ def pdfa_check(pdf: Path, level: str, validate: bool = True) -> str:
     if verapdf is None:
         return (f"PDF/A {level}: XMP pdfaid and OutputIntent present "
                 "(not validated; install veraPDF to check conformance).")
-    return verapdf_note(verapdf, pdf, level)
+    return verapdf_note(verapdf, pdf, level, tagged)
 
 
-def verapdf_note(verapdf: str, pdf: Path, level: str) -> str:
-    """Validate with veraPDF (on PATH): a one-line pass, or fail with the broken rules."""
-    try:
-        result = subprocess.run([verapdf, "--format", "xml", "--flavour", level.removeprefix("a-"), str(pdf)],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return f"PDF/A {level}: veraPDF did not run ({error})."
-    if 'isCompliant="true"' in result.stdout:
-        return f"PDF/A {level}: veraPDF passed."
-    rules = list(dict.fromkeys(re.findall(r"<description>([^<]*)</description>", result.stdout)))
-    if 'isCompliant="false"' not in result.stdout or not rules:
-        return f"PDF/A {level}: veraPDF gave no verdict (exit {result.returncode})."
-    return f"PDF/A {level}: veraPDF failed {len(rules)} rule(s): " + " | ".join(html.unescape(r) for r in rules[:3])
+def verapdf_note(verapdf: str, pdf: Path, level: str, tagged: bool = False) -> str:
+    """
+    Validate with veraPDF (on PATH): a one-line pass, or fail with the broken rules. A tagged
+    file is also checked as PDF/UA-1 (level "ua-1" checks only that).
+    """
+    checks = [] if level == "ua-1" else [(level.removeprefix("a-"), f"PDF/A {level}")]
+    if tagged:
+        checks.append(("ua1", "PDF/UA-1"))
+    notes = []
+    for flavour, label in checks:
+        try:
+            result = subprocess.run([verapdf, "--format", "xml", "--flavour", flavour, str(pdf)],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            notes.append(f"{label}: veraPDF did not run ({error}).")
+            continue
+        if 'isCompliant="true"' in result.stdout:
+            notes.append(f"{label}: veraPDF passed.")
+            continue
+        rules = list(dict.fromkeys(re.findall(r"<description>([^<]*)</description>", result.stdout)))
+        if 'isCompliant="false"' not in result.stdout or not rules:
+            notes.append(f"{label}: veraPDF gave no verdict (exit {result.returncode}).")
+        else:
+            notes.append(f"{label}: veraPDF failed {len(rules)} rule(s): "
+                         + " | ".join(html.unescape(r) for r in rules[:3]))
+    return " ".join(notes)
 
 
 def parse_latex_errors(console: str) -> list[dict]:
@@ -926,7 +976,7 @@ def build_document(
         # Switching between plain and externalized output needs a rebuild latexmk can't see.
         mode_file = build_dir / ".mode"
         # \DocumentMetadata must precede \documentclass, which is what -usepretex gives it.
-        meta = pdfa_metadata(settings)
+        meta = document_metadata(settings)
         mode = "plain"
         if settings["externalize"] and accel.uses_tikz(main_tex.parent):
             mode = "externalized"
@@ -991,6 +1041,13 @@ def build_document(
                     if settings["pdfa"]:
                         notes.append(pdfa_check(output_pdf, settings["pdfa"], validate))
                         say(notes[-1])
+                    if settings["tagged"]:
+                        notes.append(tagged_check(output_pdf))
+                        say(notes[-1])
+                        verapdf = shutil.which("verapdf") if validate and not settings["pdfa"] else None
+                        if verapdf and "structure tree present" in notes[-1]:
+                            notes.append(verapdf_note(verapdf, output_pdf, "ua-1", True))
+                            say(notes[-1])
                 except OSError as exc:
                     errors.append(f"Could not copy generated PDF: {exc}")
 
