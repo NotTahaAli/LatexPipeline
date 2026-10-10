@@ -21,6 +21,7 @@ from pathlib import Path
 
 import accel
 import hints
+import sandbox
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,6 +50,7 @@ MAX_SUMMARY_ERRORS = 10
 GLOBAL_INPUTS = (
     "scripts/build.py",
     "scripts/accel.py",
+    "scripts/sandbox.py",
     "scripts/hints.py",
     "scripts/publish_release.py",
     "scripts/ci_report.py",
@@ -235,6 +237,12 @@ def check_latex() -> str:
     Verify that latexmk is installed and accessible.
     """
     latexmk = find_latexmk()
+
+    try:
+        sandbox.check()
+    except sandbox.SandboxError as exc:
+        error(str(exc))
+        raise SystemExit(1)
 
     if latexmk:
         return latexmk
@@ -827,9 +835,8 @@ def build_document(
         def stream(command: list[str]) -> int:
             try:
                 process = subprocess.Popen(
-                    command,
-                    cwd=main_tex.parent,
-                    env={**os.environ, **LATEX_LOG_ENV, **epoch},
+                    **sandbox.spawn(command, main_tex.parent, build_dir, {**os.environ, **LATEX_LOG_ENV, **epoch},
+                                    settings["timeout"]),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -861,6 +868,7 @@ def build_document(
                 raise
             finally:
                 watchdog.cancel()
+                sandbox.scrub(build_dir)
             if expired.is_set():
                 errors.append(f"Build timed out after {settings['timeout']} s (the document may loop forever)")
             return code
@@ -1118,8 +1126,8 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
     generated.unlink(missing_ok=True)
     try:
         process = subprocess.run(
-            command, cwd=main_tex.parent, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-            timeout=FOCUS_TIMEOUT,
+            **sandbox.spawn(command, main_tex.parent, build_dir, cpu=FOCUS_TIMEOUT),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=FOCUS_TIMEOUT,
         )
     except subprocess.TimeoutExpired:  # run() kills the child before raising.
         error(f"{relative.as_posix()}: focus build timed out after {FOCUS_TIMEOUT}s.")
@@ -1128,6 +1136,8 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
             encoding="utf-8",
         )
         return False
+    finally:
+        sandbox.scrub(build_dir)
     log_file = focus_dir / f"{main_tex.stem}.log"
     log_text = log_file.read_text(encoding="utf-8", errors="replace") if log_file.exists() else ""
     ok = process.returncode == 0 and generated.exists()
@@ -1592,6 +1602,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Run LaTeX under bubblewrap (Linux): no network, writes only to the build directory "
+             "(sets LATEX_SANDBOX=bwrap; README, 'Sandboxed builds').",
+    )
+
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Remove out/ and the .latex-cache/ directory, then exit.",
@@ -1767,6 +1784,8 @@ def main() -> int:
     global SOURCE_DIR
 
     args = parse_args()
+    if args.sandbox:
+        os.environ[sandbox.VARIABLE] = "bwrap"
     if args.timeout is not None:
         global DEFAULT_TIMEOUT
         DEFAULT_TIMEOUT = args.timeout

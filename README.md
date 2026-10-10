@@ -30,7 +30,7 @@ With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --hel
 * [Documents and settings](#documents-and-settings): [build.toml keys](#buildtoml-keys), [grammar](#grammar), [PDF/A](#pdfa)
 * [Large documents](#large-documents) and [benchmarks](#benchmarks)
 * [VS Code](#vs-code)
-* [Live preview and editor](#live-preview-and-editor), [sharing](#sharing)
+* [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds)
 * [Lint and CI reports](#lint-and-ci-reports)
 * [GitHub Actions](#github-actions)
 * [Tests and lint](#tests-and-lint)
@@ -213,10 +213,23 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 * Grammar checks need the edit role (the view role cannot start one; 30 a minute) and only for the shared document. Settings are owner-only. While sharing, public mode is refused for everyone, build.toml's `grammar = "public"` included, unless the owner ticked "Allow the public API while sharing"; the Share dialog says which applies. The server never sends the local URL to non-owners.
 * Builds while sharing are restricted, because LaTeX source is code:
   * Shell escape is off (`shell_escape=f`) for the whole server, and `latexmk` runs with `-norc`, so no `latexmkrc` is read. A `build.toml` whose `latexmk_args` enable shell escape, name programs or code to run (`-e`, `-r`, `-pdflatex=...`, `-latexoption`, `-pretex`, `-usepretex`, `-cnf-line`), or move the output (`-outdir`, `-auxdir`, `-jobname`) fails the build.
-  * LuaLaTeX stays allowed, but Lua can write files even with shell escape off, so **an edit link to a document that uses (or is switched to) LuaLaTeX can run code on your computer**. The Share dialog says so. Give edit links only to people you trust; view links are safe.
+  * LuaLaTeX stays allowed, but Lua can write files even with shell escape off, so **an edit link to a document that uses (or is switched to) LuaLaTeX can run code on your computer**. The Share dialog says so. Give edit links only to people you trust; view links are safe. On Linux, `serve.py --share --sandbox` confines that code ([sandboxed builds](#sandboxed-builds)).
   * TeX may only read and write inside the document's directory (`openin_any=p`, `openout_any=p`): `\input{/etc/passwd}` fails, and so do inputs that leave the directory with `..` (for example `\input{../shared/x}`) and dotfiles. Such a document builds again when you stop sharing. Your own `latexmkrc` is also ignored until then.
 * Responses carry a Content-Security-Policy that allows only this origin and the pinned CDNs, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `frame-ancestors 'none'`. The Host header must be loopback or the tunnel's own host.
 * Anyone with the edit link can change every file of that document and make this machine compile it, so share links only with people you trust, and treat the edit link like a password. These restrictions make that much safer, but compiling someone else's LaTeX is never risk-free, and they do not cover `--host 0.0.0.0`, which is not what sharing is for.
+
+### Sandboxed builds
+
+On Linux, `build.py --sandbox` or `serve.py --sandbox` (both set `LATEX_SANDBOX=bwrap`, which you can also set yourself) run every LaTeX process under [bubblewrap](https://github.com/containers/bubblewrap) (`apt-get install bubblewrap`): latexmk with its pdflatex/xelatex/lualatex and bibtex/biber runs, the TikZ figure jobs and `--focus` previews. Hosted workers always run this way. Inside the sandbox:
+
+* No network, no other processes (own PID namespace), a private `/tmp`, and `$HOME=/tmp`. The environment holds only `PATH`, locale, `SOURCE_DATE_EPOCH` and TeX's own variables, so tokens and secrets of the server are not visible.
+* Read-only: `/usr`, the libraries, fonts and fontconfig, the TeX installation (from `kpsewhich`: `TEXMFROOT`, `TEXMFDIST`, `TEXMFLOCAL`, `TEXMFSYSVAR`, `TEXMFSYSCONFIG`) and the document's own directory. Not `/etc` (only its fonts, texmf, perl and linker files), not your home, not other documents.
+* Writable: only the document's build directory in `.latex-cache/` (a figure job: only its own work directory). luaotfload's and fontconfig's caches live there too (`texmf-var/`), so the first LuaLaTeX build of a document takes a few seconds longer; `luaotfload-tool -u` as root fills the shared read-only cache instead. The PDF and the log are copied to `out/` by `build.py` outside the sandbox, and symlinks a build leaves in its build directory are deleted first, so a document cannot make it read or write another file.
+* Limits per run: CPU seconds = the build timeout, 2 GB address space, 512 MB per file, 1024 open files. The number of processes is not capped (that limit counts all of a user's processes); a hosted operator sets systemd `TasksMax=` on the workers.
+* So LuaLaTeX, and even shell escape, can only change the document's own build output: `io.open("/etc/passwd")`, writes to `$HOME` and network sockets fail.
+* Not available: `~/texmf` (personal packages) and files outside the document's directory (`\input{../shared/x}`); your `~/.latexmkrc` is not read.
+
+If `LATEX_SANDBOX=bwrap` and bubblewrap is missing or cannot create namespaces (some containers disable unprivileged user namespaces), every build fails with a message saying so; nothing ever runs unsandboxed. Any other value than `bwrap` (or empty) is refused too. Each sandboxed run costs about 10 ms to start (bwrap), plus about 0.1 s once per `build.py` process for the checks: `files/test` builds in 0.53 s instead of 0.44 s, and `bench/sample-report` (303 pages, 25 figure jobs) in 52 s either way. CI does not sandbox (it builds only the repository's own documents); `synctex`, `texcount`, veraPDF and pandoc (owner-only) run outside it.
 
 ---
 
