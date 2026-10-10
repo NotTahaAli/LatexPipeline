@@ -1543,6 +1543,13 @@ Body of the letter (%(title)s).
 }
 
 
+def template_files(title: str, template: str = "article") -> dict[str, str]:
+    """{relative path: text} of a template, with the title (LaTeX-escaped) filled into main.tex."""
+    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
+    escaped = "".join(LATEX_SPECIAL.get(char, char) for char in title)
+    return {rel: text % {"title": escaped} if rel == "main.tex" else text for rel, text in files.items()}
+
+
 def new_document(name: str, template: str = "article") -> int:
     """
     Create files/<name>/main.tex (plus companion files for some templates). Never overwrites.
@@ -1554,19 +1561,17 @@ def new_document(name: str, template: str = "article") -> int:
         return 1
 
     target = SOURCE_DIR / path / "main.tex"
-    files = TEMPLATES.get(template) or {"main.tex": NEW_TEMPLATE}
+    files = template_files(name, template)
 
     for rel in files:
         if (target.parent / rel).exists():
             error(f"Already exists: {display(target.parent / rel)}")
             return 1
 
-    title = "".join(LATEX_SPECIAL.get(char, char) for char in name)
-
     for rel, text in files.items():
         out = target.parent / rel
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text % {"title": title} if rel == "main.tex" else text, encoding="utf-8")
+        out.write_text(text, encoding="utf-8")
 
     info(f"Created: {display(target)}")
     return 0

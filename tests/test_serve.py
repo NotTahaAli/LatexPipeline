@@ -345,6 +345,17 @@ class ServerCase(TempDoc):
 
 
 class HttpApi(ServerCase):
+    def test_forward_search_moves_other_viewers_only_on_post(self):
+        box = {"page": 1, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+        with mock.patch.object(serve, "forward", lambda query, only=None: ("demo", dict(box))):
+            rev = serve.BUS.rev
+            self.assertEqual(self.request("GET", "/forward?doc=demo&file=main.tex&line=1")[0], 200)
+            self.assertEqual([m for m in serve.BUS.since(rev) if m["type"] == "forward"], [])  # a GET changes nothing
+            self.assertEqual(self.request("POST", "/forward?doc=demo&file=main.tex&line=1")[0], 200)
+            self.assertEqual([m["data"]["doc"] for m in serve.BUS.since(rev) if m["type"] == "forward"], ["demo"])
+            cross = {"Origin": "https://evil.example"}
+            self.assertEqual(self.request("POST", "/forward?doc=demo&file=main.tex&line=1", headers=cross)[0], 403)
+
     def test_health(self):
         status, data = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
@@ -454,6 +465,172 @@ class SharedState(unittest.TestCase):
         serve.share_enable(doc, "local", serve.SHARE["port"])
         return serve.SHARE["tokens"]
 
+
+class GatewayMode(SharedState, ServerCase):
+    """serve.py --gateway: only scripts/host.py may talk to it, and everyone is a shared editor or viewer."""
+
+    SECRET = "s" * 40
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable(self.SECRET, "demo")
+        self.write("build.toml", "shell_escape = true\n")
+
+    def as_(self, role, method, path, body=None, user="7;Ada", secret=None, headers=None):
+        hdrs = {"X-Host-Secret": self.SECRET if secret is None else secret, "X-Host-Role": role,
+                "X-Host-User": quote(user, safe=";"), **(headers or {})}
+        return self.request(method, path, body, hdrs)
+
+    def test_missing_or_forged_secret_is_401(self):
+        self.assertEqual(self.request("GET", "/api/health")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health", secret="s" * 39 + "t")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health", secret="")[0], 401)
+        self.assertEqual(self.as_("owner", "GET", "/api/health")[0], 401)  # never the owner
+        self.assertEqual(self.as_("edit", "GET", "/api/health", user="no-separator")[0], 401)
+        self.assertEqual(self.as_("edit", "GET", "/api/health")[0], 200)
+
+    def test_share_tokens_and_cookies_do_not_authenticate(self):
+        self.assertEqual(self.request("GET", "/?token=anything")[0], 401)
+        self.assertEqual(self.request("GET", "/", headers={"Cookie": f"{serve.cookie_name()}=x"})[0], 401)
+        self.assertEqual(self.as_("view", "GET", "/?token=anything")[0], 200)  # no redirect, no cookie
+
+    def test_role_header_is_honoured(self):
+        self.assertEqual(self.as_("view", "GET", "/api/config")[1]["role"], "view")
+        self.assertTrue(self.as_("view", "GET", "/api/config")[1]["hosted"])
+        self.assertEqual(self.as_("view", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 403)
+        self.assertEqual(self.as_("view", "POST", "/rebuild?doc=demo")[0], 403)
+        self.assertEqual(self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 200)
+        self.assertEqual((self.root / "main.tex").read_text(), "x")
+
+    def test_owner_only_features_are_unavailable(self):
+        for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
+                             ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
+                             ("GET", "/events")]:
+            with self.subTest(path=path):
+                self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
+        self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
+
+    def test_build_config_files_cannot_be_written(self):
+        for name in ("build.toml", ".latexmkrc", "sub/latexmkrc"):
+            with self.subTest(name=name):
+                status, _ = self.as_("edit", "PUT", f"/api/file?doc=demo&path={quote(name)}", {"text": "x"})
+                self.assertEqual(status, 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=rename&path=main.tex&to=.latexmkrc")[0], 403)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=newfile&path=build.toml")[0], 403)
+        serve.bind_client("c1", "edit", "7;Ada")
+        reply = serve.handle_client_message(
+            {"type": "y-join", "data": {"doc": "demo", "path": "build.toml"}}, "c1", "edit", "7;Ada")
+        self.assertEqual(reply["data"]["status"], 403)
+
+    def test_builds_always_use_the_sharing_restrictions(self):
+        for key, value in serve.SHARE_ENV.items():
+            self.assertEqual(os.environ.get(key), value)
+        settings = build.read_settings(self.root / "main.tex")
+        self.assertFalse(settings["shell_escape"])  # build.toml asked for it
+        self.assertEqual(settings["latexmk_args"][0], "-norc")
+        self.assertLessEqual(settings["timeout"], serve.SHARE_TIMEOUT)
+        self.write("build.toml", "latexmk_args = ['-e', '$x=1']\n")
+        with self.assertRaises(build.ConfigError):
+            build.read_settings(self.root / "main.tex")
+
+    def test_names_and_client_ids_belong_to_the_gateway_user(self):
+        hello = {"type": "hello", "data": {"name": "Mallory", "doc": "demo"}}
+        serve.handle_client_message(hello, "c1", "edit", "7;Ada")
+        self.assertEqual([u["name"] for u in serve.presence("edit")["users"]], ["Ada"])
+        reply = serve.handle_client_message({"type": "bye"}, "c1", "edit", "8;Bob")  # Bob saw c1 in presence
+        self.assertEqual(reply["type"], "error")
+        self.assertIn("c1", serve.CLIENTS)
+
+    def test_view_role_bus_messages_over_long_poll_cannot_write(self):
+        def send(*messages):
+            return self.as_("view", "POST", "/api/send?cid=v1", {"messages": list(messages)})[1]["replies"]
+
+        joined = send({"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}})
+        self.assertEqual(joined[0]["type"], "y-state")
+        replies = send({"type": "y-update", "data": {"room": "demo\nmain.tex", "u": "AAA"}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "build.toml", "aid": 1}})
+        self.assertEqual([r["data"]["status"] for r in replies], [403, 403])
+        self.assertEqual(serve.ROOMS["demo\nmain.tex"]["log"], [])
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+
+    def test_host_header_is_not_checked_but_origin_is(self):
+        self.assertEqual(self.as_("edit", "GET", "/api/health", headers={"Host": "latex.example.org"})[0], 200)
+        bad = {"Host": "latex.example.org", "Origin": "https://evil.example"}
+        self.assertEqual(self.as_("edit", "POST", "/rebuild?doc=demo", headers=bad)[0], 403)
+
+
+
+class GatewayQuota(GatewayMode):
+    """The worker enforces the project quota itself: every write path, fresh sizes, and build output."""
+
+    def setUp(self):
+        super().setUp()
+        used = serve.folder_bytes(self.base)
+        mock.patch.dict(serve.QUOTA, {"bytes": used + 1000, "area": self.base}).start()
+
+    def put(self, path, text):
+        return self.as_("edit", "PUT", f"/api/file?doc=demo&path={path}", {"text": text})[0]
+
+    def test_parallel_writes_cannot_pass_on_a_stale_size(self):
+        results = []
+        threads = [threading.Thread(target=lambda n=n: results.append(self.put(f"f{n}.tex", "x" * 300)))
+                   for n in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(results), [200] * 3 + [507] * 5)
+        self.assertLessEqual(serve.folder_bytes(self.base), serve.QUOTA["bytes"])
+
+    def test_every_write_path_refuses_over_quota_but_shrinking_and_deleting_work(self):
+        (self.base / ".cache").mkdir()
+        (self.base / ".cache" / "big").write_bytes(b"0" * 2000)  # build output counts too
+        self.assertEqual(self.put("a.tex", "x"), 507)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=newfile&path=b.tex")[0], 507)
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=mkdir&path=dir")[0], 507)
+        with self.assertRaises(serve.ApiError) as up:
+            serve.save_upload("demo", "x.png", b"\x89PNG\r\n\x1a\n0")
+        self.assertEqual(up.exception.status, 507)
+        self.assertEqual(self.put("main.tex", "y"), 200)  # smaller than before
+        self.assertEqual(self.as_("edit", "POST", "/api/fs?doc=demo&op=delete&path=fig.png")[0], 200)
+
+    def test_a_build_over_quota_loses_its_new_output(self):
+        out = self.base / ".out"
+        out.mkdir()
+        for name, value in (("ROOT_DIR", self.base), ("SOURCE_DIR", self.base), ("FILES_DIR", self.base),
+                            ("OUT_DIR", out), ("CACHE_DIR", self.base / ".cache")):
+            mock.patch.object(serve.build, name, value).start()
+        (out / "old.pdf").write_bytes(b"old")
+        old = time.time() - 60
+        os.utime(out / "old.pdf", (old, old))
+        name = serve.build.doc_name(self.root / "main.tex")
+        serve.STATE[name] = serve.fresh_state(name, self.root / "main.tex")
+        self.addCleanup(serve.STATE.pop, name, None)
+
+        def small_build(*args, size=10, **kwargs):
+            (out / "doc.pdf").write_bytes(b"0" * size)
+            return {"ok": True, "errors": [], "seconds": 0, "pages": 1, "warnings": 0, "engine": "pdflatex",
+                    "error": None}, None
+
+        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=5000)):
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        state = serve.STATE[name]
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("quota", state["error"])
+        self.assertFalse((out / "doc.pdf").exists())
+        self.assertTrue((out / "old.pdf").exists())  # older output stays
+        with mock.patch.object(serve.build, "build_safely", side_effect=small_build) as ran, \
+                mock.patch.object(serve, "remember_build"):
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        self.assertEqual(serve.STATE[name]["status"], "ok")
+        (self.root / "huge.tex").write_bytes(b"0" * 5000)
+        ran.reset_mock()
+        with mock.patch.object(serve.build, "build_safely", side_effect=small_build) as ran:
+            serve.run_build(self.root / "main.tex", "latexmk", True)
+        ran.assert_not_called()  # already over quota: no LaTeX run at all
+        self.assertIn("quota", serve.STATE[name]["error"])
 
 class TunnelParsing(unittest.TestCase):
     def test_urls_from_each_tools_output(self):
@@ -634,7 +811,8 @@ class ShareHttp(SharedState, ServerCase):
             ("GET", "/api/files?doc=second"), ("GET", "/api/file?doc=second&path=main.tex"), ("GET", "/pdf/second"),
             ("GET", "/api/warnings?doc=second"),
             ("GET", "/events"), ("GET", "/api/share"), ("GET", "/forward?doc=demo&file=main.tex&line=1"),
-            ("POST", "/rebuild?doc=demo"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
+            ("POST", "/rebuild?doc=demo"), ("POST", "/forward?doc=demo&file=main.tex&line=1"),
+            ("POST", "/api/share"), ("POST", "/api/share/stop"),
             ("POST", "/api/share/regenerate"), ("PUT", "/api/file?doc=demo&path=main.tex"),
         ]
         for method, path in denied:
