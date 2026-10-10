@@ -82,7 +82,10 @@ DEFINES = re.compile(
     r"\\(?:[gex]?def|let|global|(?:re)?new(?:command|environment|counter|length|if|theorem|toks|box)"
     r"|provide\w*|Declare\w*|\w*DocumentCommand|set(?:length|counter)|addto\w*|stepcounter|refstepcounter"
     r"|definecolor|colorlet|usepackage|RequirePackage|makeat\w*|catcode|AddToHook|Expl\w*|\w*setup"
-    r"|\w*set|selectlanguage|tikz\w*|pgf\w*|use\w*library|include)(?![a-zA-Z])"
+    r"|\w*set|selectlanguage|tikz\w*|pgf\w*|use\w*library|include"
+    # Not definitions, but they change what a later figure looks like when left switched on:
+    r"|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|fontsize|selectfont|linespread"
+    r"|\w*family|\w*series|\w*shape|color|(?:one|two)column|\w*geometry|setstretch)(?![a-zA-Z])"
 )
 COMMENT = re.compile(r"(?<!\\)%.*")
 PICTURE = re.compile(r"(?s)\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}")

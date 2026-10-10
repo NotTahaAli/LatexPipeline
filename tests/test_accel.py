@@ -58,6 +58,14 @@ class FocusTests(unittest.TestCase):
         self.assertNotIn("Chapters/ch1", text)
 
 
+class SkipDetectionTests(unittest.TestCase):
+    def test_switches_that_change_later_figures_block_skipping(self):
+        for text in (r"\newcommand{\x}{1}", r"\small", r"\twocolumn", r"\color{red}", r"\sffamily", r"\newgeometry{}"):
+            self.assertTrue(accel.DEFINES.search(text), text)
+        for text in (r"Plain \textbf{words} and \cite{k}.", r"\section{Intro}\label{s}", r"\textcolor{red}{x}"):
+            self.assertFalse(accel.DEFINES.search(text), text)
+
+
 class TikzDetectionTests(unittest.TestCase):
     def test_only_documents_that_mention_tikz_are_externalized(self):
         with tempfile.TemporaryDirectory() as tmp:
