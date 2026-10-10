@@ -622,7 +622,8 @@ class GatewayQuota(GatewayMode):
             return {"ok": True, "errors": [], "seconds": 0, "pages": 1, "warnings": 0, "engine": "pdflatex",
                     "error": None}, None
 
-        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=3 * serve.ENTRY_BYTES)):
+        big = 3 * serve.ENTRY_BYTES
+        with mock.patch.object(serve.build, "build_safely", side_effect=lambda *a, **k: small_build(size=big)):
             serve.run_build(self.root / "main.tex", "latexmk", True)
         state = serve.STATE[name]
         self.assertEqual(state["status"], "failed")
