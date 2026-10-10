@@ -1250,6 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
+                self.read_exact(size)  # read the accepted body so the client sees the reply, not a reset (Windows)
                 raise HttpError(507, f"This project is over its {limit // 1048576} MB quota. Delete files first.")
         stream = upgrade or rest in ("/api/poll", "/events")
         if stream:
