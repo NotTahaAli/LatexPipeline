@@ -237,6 +237,11 @@ class DB:
         with self.lock:
             return self.conn.execute(sql, args).lastrowid
 
+    def change(self, sql: str, *args) -> int:
+        """Run an UPDATE or DELETE; the number of rows it changed (1 = this caller won a race)."""
+        with self.lock:
+            return self.conn.execute(sql, args).rowcount
+
     @contextlib.contextmanager
     def tx(self):
         with self.lock:
@@ -710,6 +715,8 @@ class App:
         self.public = urlsplit(config["public_url"])
         self.https = self.public.scheme == "https"
         self.cookie = "__Host-lp_session" if self.https else "lp_session"
+        self.device_cookie = "__Host-lp_device" if self.https else "lp_device"
+        self.device_key = device_key(self.db)
         self.login_ip, self.login_account = Throttle(20), Throttle(5)
         self.codes = Throttle(5)  # TOTP / recovery codes per account
         self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
@@ -773,6 +780,16 @@ class App:
         return size
 
 
+def device_key(db: DB) -> bytes:
+    """The server secret that signs known-device cookies; made once, kept in the settings table (never shown)."""
+    db.run("INSERT OR IGNORE INTO settings VALUES ('_device_key', ?)", json.dumps(secrets.token_hex(32)))
+    return bytes.fromhex(json.loads(db.one("SELECT value FROM settings WHERE key = '_device_key'")["value"]))
+
+
+def device_mac(user_id: int, nonce: str) -> str:
+    return b64(hmac.new(APP.device_key, f"{user_id}.{nonce}".encode(), hashlib.sha256).digest())
+
+
 def audit_log(app: App, action: str, user_id: int | None, ip: str | None, tenant: str | None = None,
               detail: str | None = None) -> None:
     app.db.run("INSERT INTO audit(at, user_id, ip, action, tenant_id, detail) VALUES (?, ?, ?, ?, ?, ?)",
@@ -801,10 +818,14 @@ def personal_tenant(app: App, user_id: int, name: str) -> str:
     """A new account's own workspace: one per person, and only for someone in no workspace yet."""
     if app.db.one("SELECT 1 FROM members WHERE user_id = ?", user_id):
         raise HttpError(409, "You already have a workspace.")
+    tenant_room(app)
+    return create_tenant(app, f"{name}'s workspace", user_id)
+
+
+def tenant_room(app: App) -> None:
     limit = app.settings()["max_tenants"]
     if limit and app.db.one("SELECT COUNT(*) AS n FROM tenants")["n"] >= limit:
         raise HttpError(403, "This server has reached its limit of workspaces. Ask the administrator for an invite.")
-    return create_tenant(app, f"{name}'s workspace", user_id)
 
 
 def signup_allowed(app: App, email: str, verified: bool) -> None:
@@ -869,6 +890,7 @@ MAX_JSON = 64 * 1024
 MAX_PROXY_BODY = 20 * 1024 * 1024
 PROXY_TIMEOUT = 75.0  # longer than serve.py's 25 s long-poll
 WS_IDLE = 120.0  # the editor pings every 20 s
+DEVICE_SECONDS = 365 * 86400  # a known-device cookie lasts this long
 RECHECK = 15.0  # an open WebSocket re-checks the session and role this often
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
@@ -1022,6 +1044,14 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return session_for(token_hash(token))
 
+    def known_device(self, user: dict | None) -> str | None:
+        """The device id from a valid known-device cookie of this user, else None."""
+        parts = (self.cookie_value(APP.device_cookie) or "").split(".")
+        if user and len(parts) == 3 and parts[0] == str(user["id"]) and len(parts[1]) <= 64 \
+                and hmac.compare_digest(parts[2].encode(), device_mac(user["id"], parts[1]).encode()):
+            return parts[1]
+        return None
+
     def start_session(self, user: dict, stage: str) -> dict:
         """A new session id at every step up (password, then code): an old cookie never gains rights."""
         if self.session:
@@ -1030,10 +1060,14 @@ class Handler(BaseHTTPRequestHandler):
         lifetime = APP.config["session_days"] * 86400 if stage == "full" else 600
         APP.db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)", token_hash(token), user["id"], csrf, stage,
                    now, now, now + lifetime, self.ip)
-        self.pending_cookie = self.set_cookie(APP.cookie, token, int(lifetime))
+        self.pending_cookies.append(self.set_cookie(APP.cookie, token, int(lifetime)))
         self.session = session_for(token_hash(token))
         if stage == "full":
             audit_log(APP, "login", user["id"], self.ip)
+            if not self.known_device(user):  # This browser signed in: wrong passwords from others never lock it out.
+                nonce = secrets.token_urlsafe(16)
+                self.pending_cookies.append(self.set_cookie(
+                    APP.device_cookie, f"{user['id']}.{nonce}.{device_mac(user['id'], nonce)}", DEVICE_SECONDS))
         return {"stage": stage, "csrf": csrf}
 
     # --- dispatch ---------------------------------------------------------------------------------------------
@@ -1051,7 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch()
 
     def dispatch(self) -> None:
-        self.pending_cookie = None
+        self.pending_cookies: list[tuple[str, str]] = []
         try:
             if not self.host_ok():
                 raise HttpError(421, "Unknown host name (check public_url in config.toml).")
@@ -1109,7 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def ok(self, data=None, status: int = 200) -> None:
         self.send_json({"ok": True} if data is None else data, status,
-                       [self.pending_cookie] if self.pending_cookie else None)
+                       self.pending_cookies)
 
     # --- static -----------------------------------------------------------------------------------------------
 
@@ -1308,19 +1342,23 @@ def api_me(h: Handler) -> None:
 def api_login(h: Handler) -> None:
     data = h.json_body()
     email = str(data.get("email") or "").strip().casefold()[:254]
-    wait = max(APP.login_ip.wait(h.ip), APP.login_account.wait(email))
+    user = APP.db.one("SELECT * FROM users WHERE email = ?", email)
+    # A browser this account signed in from before has its own backoff, so someone guessing the password
+    # elsewhere cannot lock the owner out; failures from unknown browsers share the account's.
+    device = h.known_device(user)
+    account = f"{email}#{device}" if device else email
+    wait = max(APP.login_ip.wait(h.ip_group), APP.login_account.wait(account))
     if wait:
         raise HttpError(429, f"Too many attempts. Try again in {int(wait) + 1} seconds.",
                         {"Retry-After": str(int(wait) + 1)})
-    user = APP.db.one("SELECT * FROM users WHERE email = ?", email)
     if not verify_password(data.get("password"), user["pw_hash"] if user else None):
-        APP.login_ip.fail(h.ip)
-        APP.login_account.fail(email)
+        APP.login_ip.fail(h.ip_group)
+        APP.login_account.fail(account)
         audit_log(APP, "login_failed", user["id"] if user else None, h.ip, detail=email)
         raise HttpError(401, "Wrong email or password.")
     if user["disabled"]:
         raise HttpError(403, "This account is disabled.")
-    APP.login_account.clear(email)
+    APP.login_account.clear(account)
     h.ok(h.start_session(user, "mfa" if user["totp_secret"] else "full"))
 
 
@@ -1344,17 +1382,13 @@ def api_login_code(h: Handler) -> None:
 def check_second_factor(user: dict, code: str) -> bool:
     """A current TOTP code (each one works once) or an unused recovery code (spent here)."""
     step = totp_match(user["totp_secret"], code, user["totp_step"]) if user["totp_secret"] else None
-    if step is not None:
-        APP.db.run("UPDATE users SET totp_step = ? WHERE id = ? AND totp_step < ?", step, user["id"], step)
+    if step is not None:  # Only the request whose UPDATE moved the step on wins; a parallel replay changes 0 rows.
+        return APP.db.change("UPDATE users SET totp_step = ? WHERE id = ? AND totp_step < ?",
+                             step, user["id"], step) == 1
+    if len(code) == 12 and APP.db.change("DELETE FROM recovery_codes WHERE user_id = ? AND code_hash = ?",
+                                         user["id"], token_hash(code)) == 1:
+        audit_log(APP, "recovery_code_used", user["id"], None)
         return True
-    if len(code) == 12:
-        with APP.db.tx():
-            if APP.db.one("SELECT 1 FROM recovery_codes WHERE user_id = ? AND code_hash = ?", user["id"],
-                          token_hash(code)):
-                APP.db.run("DELETE FROM recovery_codes WHERE user_id = ? AND code_hash = ?", user["id"],
-                           token_hash(code))
-                audit_log(APP, "recovery_code_used", user["id"], None)
-                return True
     return False
 
 
@@ -1381,16 +1415,27 @@ def api_signup(h: Handler) -> None:
         if found["email"] and found["email"] != email:
             raise HttpError(403, f"This invite is for {found['email']}.")
     else:
+        # Open sign-up answers the same whether or not the address has an account (status, body, about the same
+        # time, no session): the browser signs in next, and a wrong password there says only "wrong email or
+        # password". Everything that can refuse comes before the lookup.
         signup_allowed(APP, email, verified=False)
+        tenant_room(APP)
+        APP.signups.fail(h.ip_group)
+        if APP.db.one("SELECT id FROM users WHERE email = ?", email):
+            hash_password(password)  # The time a new account takes.
+            audit_log(APP, "signup_existing_email", None, h.ip, detail=email)
+        else:
+            uid = create_user(APP, email, name, password)
+            audit_log(APP, "signup", uid, h.ip, detail=email)
+            personal_tenant(APP, uid, name)
+        h.ok({"signin": True})
+        return
     APP.signups.fail(h.ip_group)
     # An invite sent to this exact address counts as proof of it (for linking sign-in providers later).
-    uid = create_user(APP, email, name, password, verified=bool(invite and found["email"]))
+    uid = create_user(APP, email, name, password, verified=bool(found["email"]))
     user = APP.db.one("SELECT * FROM users WHERE id = ?", uid)
     audit_log(APP, "signup", uid, h.ip, detail=email)
-    if invite:
-        use_invite(APP, invite, user, h.ip)
-    else:
-        personal_tenant(APP, uid, name)
+    use_invite(APP, invite, user, h.ip)
     h.ok(h.start_session(user, "full"))
 
 
@@ -1980,7 +2025,7 @@ def auth_callback(h: Handler, name: str) -> None:
         audit_log(APP, "oauth_failed", h.session["id"] if h.session else None, h.ip, detail=f"{name}: {exc.message}")
         h.redirect("/#error=" + quote(exc.message), [clear])
         return
-    h.redirect(target, [clear, *([h.pending_cookie] if h.pending_cookie else [])])
+    h.redirect(target, [clear, *h.pending_cookies])
 
 
 def finish_sign_in(h: Handler, name: str) -> str:

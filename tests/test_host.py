@@ -339,7 +339,7 @@ class Login(HostCase):
         self.assertIn("HttpOnly", res.getheader("Set-Cookie"))
         self.assertEqual(client.call("GET", "/api/me")[1]["user"]["email"], "ada@example.org")
         self.assertEqual(client.call("POST", "/api/logout")[0], 200)
-        self.assertIsNone(client.cookie)
+        self.assertEqual(list(client.jar), ["lp_device"])  # the session is gone; the browser stays known
         self.assertIsNone(client.call("GET", "/api/me")[1]["user"])
 
     def test_old_session_cookie_dies_on_logout(self):
@@ -363,6 +363,30 @@ class Login(HostCase):
         self.assertTrue(res.getheader("Retry-After"))
         actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit")]
         self.assertEqual(actions.count("login_failed"), 6)
+
+    def test_a_known_browser_is_not_locked_out_by_someone_else_guessing(self):
+        mine = self.client("ada@example.org")
+        self.assertIn("lp_device", mine.jar)
+        mine.call("POST", "/api/logout")
+        attacker = self.client()
+        for _ in range(6):
+            attacker.call("POST", "/api/login", {"email": "ada@example.org", "password": "nope-nope-nope"})
+        self.assertEqual(attacker.login("ada@example.org")[0], 429)  # unknown browsers back off
+        self.assertEqual(Client(self).login("ada@example.org")[0], 429)
+        self.assertEqual(mine.login("ada@example.org")[0], 200)  # the owner's browser still gets in
+        forged = Client(self)
+        forged.jar["lp_device"] = mine.jar["lp_device"][:-2] + "xx"
+        self.assertEqual(forged.login("ada@example.org")[0], 429)
+        other = self.user("bob@example.org")
+        self.assertTrue(other)
+        stolen = Client(self)  # a device cookie is bound to its account
+        stolen.jar["lp_device"] = mine.jar["lp_device"]
+        for _ in range(5):
+            stolen.call("POST", "/api/login", {"email": "bob@example.org", "password": "nope-nope-nope"})
+        self.assertEqual(stolen.login("bob@example.org")[0], 429)
+        for _ in range(5):  # a known browser with wrong passwords backs off on its own
+            mine.call("POST", "/api/login", {"email": "ada@example.org", "password": "nope-nope-nope"})
+        self.assertEqual(mine.login("ada@example.org")[0], 429)
 
     def test_csrf_needs_same_origin_and_token(self):
         client = self.client("ada@example.org")
@@ -425,6 +449,29 @@ class TwoFactor(HostCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(data["codes"]), 10)
         return secret, data["codes"]
+
+    def test_parallel_use_of_one_code_succeeds_once(self):
+        secret, codes = self.enable()
+        user = self.app.db.one("SELECT * FROM users WHERE id = ?", self.uid)  # both requests read the same row
+        step = int(time.time() // 30) + 1  # a step not used by enable()
+        code = host.totp_code(secret, step)
+        def race(attempt):
+            barrier, results = threading.Barrier(4), []
+
+            def use():
+                barrier.wait()
+                results.append(host.check_second_factor(user, attempt))
+
+            threads = [threading.Thread(target=use) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            return sorted(results)
+
+        with mock.patch.object(host.time, "time", return_value=step * 30.0):
+            self.assertEqual(race(code), [False, False, False, True])
+            self.assertEqual(race(host.norm_code(codes[0])), [False, False, False, True])
 
     def test_login_needs_the_code_after_the_password(self):
         secret, _ = self.enable()
@@ -543,10 +590,18 @@ class Workspaces(HostCase):
         self.assertEqual(Client(self).call("POST", "/api/signup", body)[0], 403)  # password emails are unverified
         self.app.save_settings({"signup_mode": "open"})
         solo = Client(self)
-        self.assertEqual(solo.call("POST", "/api/signup", body)[0], 200)
+        new = solo.call("POST", "/api/signup", body)
+        self.assertEqual(new[:2], (200, {"signin": True}))
+        self.assertIsNone(solo.cookie)  # signs in next, like anyone
+        self.assertEqual(solo.login("solo@y.org")[0], 200)
         tenants = solo.call("GET", "/api/me")[1]["user"]["tenants"]
         self.assertEqual([(t["name"], t["role"]) for t in tenants], [("Solo's workspace", "admin")])
-        self.assertEqual(Client(self).call("POST", "/api/signup", body)[0], 409)
+        again = Client(self)
+        taken = again.call("POST", "/api/signup", {**body, "password": "other-password"})
+        self.assertEqual(taken[:2], new[:2])  # no account enumeration
+        self.assertIsNone(again.cookie)
+        self.assertEqual(again.login("solo@y.org", "other-password")[0], 401)
+        self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM users WHERE email = 'solo@y.org'")["n"], 1)
         self.app.signups = host.Throttle(2, 3600)  # signups_per_ip_hour = 2
         for n in range(2):
             Client(self).call("POST", "/api/signup", {**body, "email": f"x{n}@y.org"})

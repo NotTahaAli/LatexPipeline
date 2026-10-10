@@ -122,7 +122,11 @@ function signupForm(invite, email) {
     field("Password", input("password", "password", { required: true, minLength: info.min_password, autocomplete: "new-password" }),
       `At least ${info.min_password} characters.`),
   ], "Create account", async (v) => {
-    await api("/api/signup", "POST", { ...v, invite: invite || undefined });
+    const r = await api("/api/signup", "POST", { ...v, invite: invite || undefined });
+    if (r.signin) {  // Open sign-up never says whether the address had an account: sign in like anyone else.
+      const login = await api("/api/login", "POST", { email: v.email, password: v.password });
+      if (login.stage === "mfa") return codePage(() => go("#home"));
+    }
     await loadMe(); go("#home");
   });
 }
