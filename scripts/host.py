@@ -1047,6 +1047,20 @@ class Handler(BaseHTTPRequestHandler):
     def redirect(self, location: str, extra=None) -> None:
         self.send(302, b"", "text/plain", [("Location", location), *(extra or [])])
 
+    def linger(self) -> None:
+        """After refusing a body without reading it: end our side, then drain a little of what the client still sends,
+        so closing does not reset the connection (Windows drops the reply on a reset)."""
+        self.close_connection = True
+        self.wfile.flush()
+        self.connection.shutdown(socket.SHUT_WR)
+        self.connection.settimeout(2)
+        deadline, drained = time.monotonic() + 2, 0
+        while time.monotonic() < deadline and drained < 64 * 1024 * 1024:
+            chunk = self.rfile.read1(65536) if hasattr(self.rfile, "read1") else self.rfile.read(65536)
+            if not chunk:
+                break
+            drained += len(chunk)
+
     def read_exact(self, size: int) -> bytes:
         data = bytearray()
         while len(data) < size:
@@ -1184,6 +1198,8 @@ class Handler(BaseHTTPRequestHandler):
         except HttpError as exc:
             try:
                 self.send_json({"error": exc.message}, exc.status, exc.headers)
+                if exc.status in (411, 413, 507):
+                    self.linger()
             except OSError:
                 pass
         except (OSError, socket.timeout):
