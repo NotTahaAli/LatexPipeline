@@ -1,8 +1,10 @@
 # Changelog
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes on this branch relative to `origin/main`.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-12
 
 ### Fixed
 
@@ -104,3 +106,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes
 
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
+
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/NotTahaAli/LatexPipeline/releases/tag/v0.1.0
