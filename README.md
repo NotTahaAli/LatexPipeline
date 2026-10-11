@@ -23,6 +23,16 @@ python scripts/build.py --new MyDoc        # new document from a template (files
 
 With uv, `uv run scripts/build.py ...` works too. `python scripts/build.py --help` and `python scripts/serve.py --help` list every flag.
 
+### Just compiling LaTeX
+
+You only need `files/` and `scripts/build.py`. Everything else (editor, MCP, hosting, tests, `bench/`) is optional and stays out of your way.
+
+1. Click **Use this template** on GitHub, or clone the repository.
+2. Put each document in its own folder: `files/<name>/main.tex`, with its `.bib`, `.cls` and figures beside it.
+3. Build locally with `python scripts/build.py`, or push to `main`: CI builds every changed document and publishes the PDFs to your own `pdfs` release.
+
+In a copy made from the template, CI runs only the build. The unit tests, ruff and the PDF/A fixture check run only in this repository.
+
 ## Contents
 
 * [Requirements](#requirements)

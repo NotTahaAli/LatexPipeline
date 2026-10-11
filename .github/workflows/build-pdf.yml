@@ -43,6 +43,8 @@ permissions:
 
 jobs:
   requirements:
+    # Maintainer check: skipped in copies made from the template.
+    if: github.repository == 'NotTahaAli/LatexPipeline'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -89,7 +91,8 @@ jobs:
   tagged-pdf:
     runs-on: ubuntu-latest
     needs: texlive-cache
-    if: ${{ !cancelled() }}
+    # Maintainer check: skipped in copies made from the template.
+    if: ${{ !cancelled() && github.repository == 'NotTahaAli/LatexPipeline' }}
     steps:
       - uses: actions/checkout@v7
       - name: Restore TeX Live cache
