@@ -16,6 +16,8 @@ import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { tablePaste } from "./tablepaste.js";
+import { navSupport } from "./nav.js";
+import { navPanels } from "./navpanels.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -28,7 +30,7 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false, check: true, pdfDark: false }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false, check: true, pdfDark: false, labelNumbers: true, mathPreview: false, follow: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
@@ -140,6 +142,7 @@ function extensionsFor(tab) {
     readOnly ? [] : TP,
     REV.extension,
     tab.tex.folding, tab.tex.hover, checkC.of(settings.check ? tab.tex.check : []),
+    nav.extension(tab),
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
@@ -258,6 +261,7 @@ async function applyConfig() {
     visualC.reconfigure(settings.visual && active?.kind === "text" ? [visualField, env] : []),
     spellC.reconfigure(spellAttr()),
     checkC.reconfigure(settings.check && active?.tex ? active.tex.check : []),
+    ...nav.reconfigure(),
   ] });
   $("proseBody").spellcheck = !!settings.spell;
   $("cm").classList.toggle("visual", !!settings.visual);
@@ -270,7 +274,7 @@ async function openFile(path, line, opts = {}) {
   if (!tab) {
     const info = files.find((f) => f.path === path);
     const kind = info?.kind || (/\.(png|jpe?g|gif|svg|webp)$/i.test(path) ? "image" : "text");
-    tab = { path, kind, dirty: false, version: null, eol: "\n", savedDoc: null, state: null, conflict: null };
+    tab = { path, kind, dirty: false, version: null, eol: "\n", savedDoc: null, state: null, conflict: null, fresh: true };
     if (kind === "text") {
       try {
         const f = await api.read(cur, path);
@@ -316,6 +320,8 @@ async function activate(tab, line, opts = {}) {
       tab.fromDisk = false;
       await applyConfig();
     }
+    if (tab.fresh && !line) nav.restoreCursor(tab.path, view);   // first time open in this page: where it was left
+    tab.fresh = false;
     if (line) gotoLine(line);
     if (!opts.noFocus) view.focus();
   }
@@ -462,6 +468,7 @@ async function onFsEvent(msg) {
     void info;
   }
   if (outlineVisible()) loadOutline();
+  nav.refresh();
 }
 
 // ---- sidebar: file tree ---------------------------------------------------------------------
@@ -641,6 +648,7 @@ async function loadOutline() {
     if (goal) wrap.style.setProperty("--p", Math.min(100, (it.words / goal) * 100) + "%");
     return wrap;
   }));
+  navUi.outline();
 }
 
 const narrow = () => window.matchMedia("(max-width: 1000px)").matches;
@@ -681,7 +689,7 @@ async function loadPdf() {
   pdfView.focused = !!f;
   if (pdfView.fitMode) pdfView.fit();
   liveOff.clear();
-  if (!f) await live.afterLoad(d.started);
+  if (!f) { await live.afterLoad(d.started); nav.afterBuild(); }
 }
 
 // ---- live preview: the chapter being typed, spliced over its pages a moment after typing stops (preview.js) ----------
@@ -1028,6 +1036,37 @@ const searchUi = searchPanel($("panel-search"), {
   },
   async room(path) { if (!tabs.has(path)) await openFile(path, 0, { noFocus: true }); const r = tabs.get(path)?.collab; return r?.ready && r.canEdit ? r : null; },
 });
+// Navigation (nav.js, navpanels.js): definitions, references, label rename and numbers, bookmarks, TODOs, the file
+// graph, symbols, typeset selection, presentation. A label rename changes room files through their rooms, like search.
+async function jumpAt(path, line, col = 0, len = 0) {
+  if (narrow()) setSide(false);
+  await openFile(path, line);
+  if (active?.path !== path || active.kind !== "text") return;
+  const at = view.state.doc.line(Math.max(1, Math.min(line, view.state.doc.lines))).from + col;
+  if (at + len <= view.state.doc.length) view.dispatch({ selection: { anchor: at, head: at + len }, effects: EditorView.scrollIntoView(at, { y: "center" }) });
+}
+const nav = navSupport({ S, V, loadKatex }, {
+  api, el, doc: () => cur, view: () => (active?.kind === "text" ? view : null), activePath: () => (active?.kind === "text" ? active.path : null),
+  canEdit: !readOnly, store, settings, jump: jumpAt, toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  texts: async () => Object.fromEntries(await Promise.all([...tabs.values()].filter((t) => t.kind === "text").map(async (t) => [t.path, await bibCtx.text(t.path)]))),
+  forward: (path, line) => !shownFocus() && api.forward(cur, path, line).then((b) => pdfView.reveal(b), () => {}),
+  async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
+  async room(path) { if (!tabs.has(path)) await openFile(path, 0, { noFocus: true }); const r = tabs.get(path)?.collab; return r?.ready && r.canEdit ? r : null; },
+  pdf: async () => { await pdfView.ready; return pdfView.lib; },
+});
+const navUi = navPanels({
+  el, nav, open: jumpAt, view: () => (active?.kind === "text" ? view : null), pdfView, toast: (m) => toast(el("span", { textContent: m })),
+  pdfUrl: () => (docs[cur]?.version ? new URL(api.pdfUrl(cur, docs[cur].version), location.href).href : null),
+  lineText: (path, n) => { const t = tabs.get(path); const d = t === active ? view.state.doc : t?.state?.doc; return d && n <= d.lines ? d.line(n).text.trim().slice(0, 120) : null; },
+  insert: readOnly && !reviewer ? null : (text, at) => {
+    if (active?.kind !== "text") { toast(el("span", { textContent: "Open a file first: symbols go in at its cursor." })); return; }
+    const s = view.state.selection.main;
+    view.dispatch({ changes: { from: s.from, to: s.to, insert: text }, selection: { anchor: s.from + (at ?? text.length) }, scrollIntoView: true, userEvent: "input" });
+    view.focus();
+  },
+});
+$("presentBtn").onclick = () => navUi.present();
+$("pdfTabBtn").onclick = () => navUi.newTab();
 REV.mount($("dpanel-review"));
 $("commentBtn").onclick = () => REV.startComment();
 $("suggestBtn").onclick = () => toggleSuggest();
@@ -1140,7 +1179,7 @@ async function loadLog() {
   try { $("logText").textContent = await (await fetch(api.logUrl(cur))).text(); } catch { $("logText").textContent = "No log yet."; }
 }
 
-const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "log"];
+const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "todos", "bookmarks", "log"];
 function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
   $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
@@ -1155,6 +1194,7 @@ function setDrawer(open, tabName) {
   if (open && ui.drawerTab === "log") loadLog();
   if (open && ui.drawerTab === "review") REV.load();
   if (open && ui.drawerTab === "history") historyUi.load();
+  if (open) navUi.drawer(ui.drawerTab);
 }
 for (const n of DRAWER_TABS) $("dtab-" + n).onclick = () => setDrawer(true, n);
 const toggleDrawer = () => setDrawer(!ui.drawer);
@@ -1168,7 +1208,7 @@ $("drawerClose").onclick = () => setDrawer(false);
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
   $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
-  for (const n of ["files", "search", "outline", "refs", "ai"]) {
+  for (const n of ["files", "search", "outline", "refs", "symbols", "ai"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
@@ -1181,6 +1221,7 @@ $("tab-outline").onclick = () => setSide(true, "outline");
 $("tab-search").onclick = () => setSide(true, "search");
 const showSearch = () => { setSide(true, "search"); searchUi.focus(active?.kind === "text" ? view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to) : ""); };
 $("tab-refs").onclick = () => setSide(true, "refs");
+$("tab-symbols").onclick = () => setSide(true, "symbols");
 $("tab-ai").onclick = () => setSide(true, "ai");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------
@@ -1271,6 +1312,7 @@ const COMMANDS = [
   { id: "search", title: "Search and replace in all files", keys: `${mod}+Shift+F`, run: () => showSearch() },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
+  { id: "symbols", title: "Symbol palette", run: () => (ui.side && ui.sideTab === "symbols") ? setSide(false) : setSide(true, "symbols") },
   { id: "assistant", title: "Toggle AI assistant", run: () => (ui.side && ui.sideTab === "ai") ? setSide(false) : setSide(true, "ai") },
   ...aiUi.commands,
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
@@ -1282,6 +1324,22 @@ const COMMANDS = [
   { id: "suggest", edit: true, title: "Toggle suggest mode (track changes)", keys: `${mod}+Alt+S`, run: () => toggleSuggest() },
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
+  { id: "definition", title: "Go to definition", keys: "F12", run: () => view && nav.run.definition(view) },
+  { id: "references", title: "Find references", keys: "Shift+F12", run: () => view && nav.run.references(view) },
+  { id: "renamelabel", edit: true, title: "Rename label everywhere", keys: "F2", run: () => view && nav.run.rename(view) },
+  { id: "pkgdoc", title: "Package documentation (texdoc.org)", run: () => { const s = active?.kind === "text" && nav.under(view.state, view.state.selection.main.head); if (s?.kind === "package") window.open(nav.docUrl(s.name), "_blank", "noopener"); else toast(el("span", { textContent: "Put the cursor on a package name in \\usepackage{...}." })); } },
+  { id: "bookmark", title: "Bookmark: set or clear on this line", keys: `${mod}+Alt+K`, run: () => view && nav.run.toggleMark(view) },
+  { id: "bmnext", title: "Bookmark: next", keys: `${mod}+Alt+L`, run: () => view && nav.run.next(view) },
+  { id: "bmprev", title: "Bookmark: previous", keys: `${mod}+Alt+J`, run: () => view && nav.run.prev(view) },
+  { id: "bookmarks", title: "Show bookmarks", run: () => setDrawer(true, "bookmarks") },
+  { id: "todos", title: "Show TODOs", run: () => setDrawer(true, "todos") },
+  { id: "graph", title: "File graph (inputs, figures, bibliography)", run: async () => { await nav.load().catch(() => {}); navUi.graph(); } },
+  { id: "typeset", edit: true, title: "Typeset selection", run: () => view && nav.run.typesetSelection(view) },
+  { id: "present", title: "Present the PDF (full screen)", run: () => navUi.present() },
+  { id: "pdftab", title: "Open the PDF in a new tab", run: () => navUi.newTab() },
+  { id: "numbers", get title() { return `Label numbers: ${settings.labelNumbers ? "on" : "off"} (change)`; }, run: () => { settings.labelNumbers = !settings.labelNumbers; saveSettings(); applyConfig(); } },
+  { id: "mathprev", get title() { return `Math preview under equations: ${settings.mathPreview ? "on" : "off"} (change)`; }, run: () => { settings.mathPreview = !settings.mathPreview; saveSettings(); applyConfig(); } },
+  { id: "follow", get title() { return `PDF follows the cursor: ${settings.follow ? "on" : "off"} (change)`; }, run: () => { settings.follow = !settings.follow; saveSettings(); if (settings.follow) nav.afterBuild(); } },
   { id: "reviewpdf", edit: true, title: "Build with suggestions (PDF)", run: () => buildReviewPdf() },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
@@ -1344,6 +1402,7 @@ function openSettings() {
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
   $("sCheck").checked = settings.check; $("sPdfDark").checked = settings.pdfDark;
+  $("sNums").checked = settings.labelNumbers; $("sMathPrev").checked = settings.mathPreview; $("sFollow").checked = settings.follow;
   $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
   $("sLive").checked = settings.live; $("sLive").disabled = readOnly;
   $("sGrammarBox").hidden = role !== "owner";
@@ -1366,6 +1425,9 @@ bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
 bind("sCheck", (n) => { settings.check = n.checked; applyConfig(); });
+bind("sNums", (n) => { settings.labelNumbers = n.checked; applyConfig(); });
+bind("sMathPrev", (n) => { settings.mathPreview = n.checked; applyConfig(); });
+bind("sFollow", (n) => { settings.follow = n.checked; if (n.checked) nav.afterBuild(); });
 bind("sPdfDark", (n) => settings.pdfDark = n.checked);
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
 bind("sLive", (n) => { settings.live = n.checked; if (!n.checked) { live.stop(); $("liveState").hidden = true; } });
@@ -1387,8 +1449,8 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
-    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
+  const groups = [["Panels", ["files", "outline", "references", "symbols", "assistant", "todos", "bookmarks"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format", "typeset"]), "visual", "graph", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
@@ -1587,7 +1649,7 @@ channel.on("state", (data) => {
   renderFocus();
   if (wantedVersion() !== pdfView.version) loadPdf();
   loadWarnings();   // Cheap: it fetches only when a build finished since the last look.
-  if (wasBuilding && lastStatus !== "building") { loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
+  if (wasBuilding && lastStatus !== "building") { nav.refresh(0); loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
 });
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
@@ -1629,7 +1691,7 @@ async function restoreTabs() {
   for (const p of open) await openFile(p, 0, { noFocus: true });
   const want = tabs.get(saved?.active) || [...tabs.values()][0];
   if (want) await activate(want, 0, { noFocus: true });
-  loadRefs();
+  loadRefs(); nav.refresh(0);
   if (ui.side && ui.sideTab === "refs") refsUi.load();
 }
 
@@ -1643,4 +1705,4 @@ applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); b
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
 pushGrammarSettings();
-window.__app = { REV, get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };
+window.__app = { REV, nav, navUi, applyConfig, get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };

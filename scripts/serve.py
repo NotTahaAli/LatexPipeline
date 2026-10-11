@@ -49,10 +49,12 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import ai
 import bibfix
 import build
+import fragment
 import grammar
 import hints
 import history
 import mcp_tools
+import navigate
 import preview
 import review
 import share_links as named
@@ -3405,14 +3407,15 @@ def replace_text(text: str, pattern: re.Pattern, data: dict) -> tuple[str, int]:
     return new, count
 
 
-def replace_project(name: str, role: str, data: dict, author: str) -> dict:
+def replace_project(name: str, role: str, data: dict, author: str, pattern: re.Pattern | None = None) -> dict:
     """
     Replace in one file or all of them. With `text` (a file open in a co-editing room, as the editor has it): only
     compute; the editor applies the result to the room's shared text. Otherwise the server writes every file that has
     no open room, like an editor save (history before and after, base version), and returns the room files, which the
     editor changes through their rooms: the server never writes a file that has an open co-editing room.
+    pattern: one the server built (rename_label), in place of the client's query.
     """
-    pattern = search_pattern(role, data)
+    pattern = pattern or search_pattern(role, data)
     rel = data.get("path")
     if "text" in data:
         text = data["text"]
@@ -3440,6 +3443,84 @@ def replace_project(name: str, role: str, data: dict, author: str) -> dict:
     if written:
         broadcast("fs", {"doc": name, "changed": [w["path"] for w in written], "removed": []})
     return {"files": written, "count": sum(w["count"] for w in written), "rooms": [f["path"] for f, _, _ in rooms]}
+
+
+# --- Navigation: definitions, references, label numbers, TODOs, the file graph (navigate.py) ---------------------
+
+def symbols(name: str, role: str, data: dict) -> dict:
+    """
+    POST /api/symbols: navigate.index over the document's .tex/.sty/.cls/.bib files, read from disk except the ones
+    the editor sends in `texts` (unsaved text of open files; other paths are ignored), plus the label numbers of the
+    last good build (the live preview's .aux snapshot). Build-config files only for the owner. Read-only.
+    """
+    texts = data.get("texts") or {}
+    if not isinstance(texts, dict) or not all(isinstance(v, str) and len(v) <= MAX_TEXT for v in texts.values()):
+        raise ApiError("Bad file texts.", 400)
+    uses = data.get("uses")
+    if uses is not None and (not isinstance(uses, str) or len(uses) > 300):
+        raise ApiError("Bad name.", 400)
+    root = DOCS[name].parent
+    listed = list_files(root)
+    found = {}
+    for item in listed:
+        path = item["path"]
+        if item["kind"] != "text" or not navigate.INDEXED.search(path) or (role != "owner" and is_rc(path)):
+            continue
+        if path in texts:
+            found[path] = texts[path].replace("\r\n", "\n")
+            continue
+        try:
+            if resolve_in_doc(root, path).stat().st_size <= SEARCH_FILE_MAX:
+                found[path] = read_text_file(root, path)["text"]
+        except (ApiError, OSError):
+            continue
+    return navigate.index(found, [item["path"] for item in listed], navigate.aux_numbers(aux_texts(name)), uses)
+
+
+def aux_texts(name: str) -> list[str]:
+    """The last build's main .aux and the ones it \\@input's (\\include), from the build directory; while a build
+    writes there, from the live preview's snapshot of the last good build (if there is one)."""
+    main_tex = DOCS[name]
+    try:
+        base = preview.root_for(main_tex) / "aux" if STATE.get(name, {}).get("status") == "building" \
+            else build.cache_dir_for(main_tex)
+    except ValueError:
+        return []
+    out, todo, seen = [], [f"{main_tex.stem}.aux"], set()
+    while todo and len(out) < 500:
+        rel = todo.pop()
+        if rel in seen or rel.startswith(("/", "\\")) or ".." in rel.split("/"):
+            continue
+        seen.add(rel)
+        try:
+            text = (base / rel).read_text("utf-8", "replace")
+        except OSError:
+            continue
+        out.append(text)
+        todo += re.findall(r"\\@input\{([^{}]+)\}", text)
+    return out
+
+
+def rename_label(name: str, role: str, data: dict, author: str) -> dict:
+    """
+    POST /api/rename: \\label{old} and every \\ref-like use of it become `new`, through replace_project: files
+    without an open co-editing room are written here (with history), room files come back in `rooms` and the
+    editor sends each room's text (`path` + `text`) to get it renamed, then applies it to the room.
+    """
+    old, new = data.get("old"), data.get("new")
+    if not navigate.good_label(old) or not navigate.good_label(new) or old == new:
+        raise ApiError("Labels cannot be empty or hold spaces, braces, commas, %, # or backslashes.", 400)
+    body = {key: data[key] for key in ("path", "text") if key in data}
+    body.update(regex=True, replace=navigate.rename_template(new))  # our own pattern, not the client's
+    return replace_project(name, role, body, author, navigate.rename_pattern(old))
+
+
+def typeset_selection(name: str, data: dict) -> bytes:
+    """POST /api/typeset: the selected LaTeX set with the document's preamble (fragment.py, sandboxed)."""
+    try:
+        return fragment.typeset(DOCS[name], data.get("text"))
+    except fragment.FragmentError as exc:
+        raise ApiError(str(exc), exc.status)
 
 
 # ---------------------------------------------------------------------------
@@ -3606,6 +3687,20 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)
         if not rate_ok("replace", 60, 60.0):  # each written file is a version; a room file is one request each
             raise ApiError("Too many replacements; wait a moment.", 429)
+    elif method == "POST" and path == "/api/symbols":
+        scoped(doc)  # Read-only for every role; POST only to carry the unsaved text of the open files.
+        if not rate_ok("symbols", 120, 60.0):  # reads every file of the document, like a search
+            raise ApiError("Too many requests; wait a moment.", 429)
+    elif method == "POST" and path == "/api/rename":
+        need_edit()  # replace_project with the server's own pattern: no build config for guests, no room file.
+        scoped(doc)
+        if not rate_ok("replace", 60, 60.0):
+            raise ApiError("Too many replacements; wait a moment.", 429)
+    elif method == "POST" and path == "/api/typeset":
+        need_edit()  # Runs LaTeX on text the client sends (fragment.py, through sandbox.spawn).
+        scoped(doc)
+        if not rate_ok("typeset", 20, 60.0):
+            raise ApiError("Too many typeset requests; wait a moment.", 429)
     elif method == "POST" and path == "/api/upload":
         need_edit()
         scoped(doc)
@@ -3911,6 +4006,12 @@ class Handler(BaseHTTPRequestHandler):
             self.json(review_change(name, self.role, self.user, self.body()))
         elif url.path == "/api/replace" and name in DOCS:
             self.json(replace_project(name, self.role, self.body(), self.author(query)))
+        elif url.path == "/api/symbols" and name in DOCS:
+            self.json(symbols(name, self.role, self.body()))
+        elif url.path == "/api/rename" and name in DOCS:
+            self.json(rename_label(name, self.role, self.body(), self.author(query)))
+        elif url.path == "/api/typeset" and name in DOCS:
+            self.reply(200, typeset_selection(name, self.body()), "application/pdf", {})
         elif url.path == "/api/grammar" and name in DOCS:
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/bib/lookup" and name in DOCS:

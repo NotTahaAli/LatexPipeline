@@ -58,6 +58,10 @@ export const api = {
   reviewOp: (doc, body) => call(`api/review?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   search: (doc, q, flags) => call(`api/search?${qs({ doc, q, ...flags })}`),
   replace: (doc, body) => call(`api/replace?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  symbols: (doc, body) => call(`api/symbols?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  rename: (doc, body) => call(`api/rename?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  // The raw Response: the PDF, or a JSON error.
+  typeset: (doc, text) => fetch(`api/typeset?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }),
   grammarSettings: (s) => call("api/grammar/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(s) }),
   health: () => call("api/health"),
   rebuild: (doc) => call(`rebuild?${qs({ doc })}`, { method: "POST" }),

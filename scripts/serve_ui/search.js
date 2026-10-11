@@ -4,6 +4,24 @@
 // gets the replaced text back and applies it to the room's shared text as one edit, like every other edit.
 // Regular expressions are Python's and for the owner only (a guest's pattern could keep the server busy).
 
+/**
+ * One replace request (call(body) -> the server's answer), then each file it left to its co-editing room: the room's
+ * text goes to the server (`path`, `text`) and the answer back into the room as one edit. The label rename too (nav.js).
+ */
+export async function replaceThroughRooms(call, body, room) {
+  const res = await call(body);
+  let count = res.count;
+  const missed = [];
+  for (const path of res.rooms) {
+    const r = await room(path).catch(() => null);
+    const base = r?.text();
+    const out = r ? await call({ ...body, path, text: base }) : null;
+    if (out && r.applyText(out.text, base)) { count += out.count; await r.save(); }   // so the next search sees it (a no-op unless this tab writes the room's file)
+    else missed.push(path);
+  }
+  return { count, missed };
+}
+
 /** ctx = {api, el, doc(), role, readOnly, open(path, line, col, len), room(path) -> Promise<Room|null>, toast(msg), live(msg)} */
 export function searchPanel(root, ctx) {
   const { el } = ctx;
@@ -61,17 +79,8 @@ export function searchPanel(root, ctx) {
     if (!which && !confirm(`Replace ${S.data.truncated ? "every" : S.data.total} ${S.data.total === 1 ? "match" : "matches"} of "${o.q}" with "${rep.value}" in all files?`)) return;
     S.busy = true; allBtn.disabled = true;
     let count = 0, missed = [];
-    try {
-      const res = await ctx.api.replace(ctx.doc(), body);
-      count += res.count;
-      for (const path of res.rooms) {
-        const room = await ctx.room(path).catch(() => null);
-        const base = room?.text();
-        const out = room ? await ctx.api.replace(ctx.doc(), { ...body, path, text: base }) : null;
-        if (out && room.applyText(out.text, base)) { count += out.count; await room.save(); }   // so the next search sees it (a no-op unless this tab writes the room's file)
-        else missed.push(path);
-      }
-    } catch (e) { ctx.toast(e.message); }
+    try { ({ count, missed } = await replaceThroughRooms((b) => ctx.api.replace(ctx.doc(), b), body, ctx.room)); }
+    catch (e) { ctx.toast(e.message); }
     S.busy = false;
     const msg = `Replaced ${count} ${count === 1 ? "match" : "matches"}` + (missed.length ? `; not changed (open and busy): ${missed.join(", ")}` : "");
     ctx.live(msg);
