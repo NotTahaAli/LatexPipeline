@@ -15,8 +15,8 @@ the files it reads, local .cls/.sty files, build settings, the engine, or the bu
 snapshot taken after each successful full build, never from a build that is still writing them.
 
 Labels the chapter defines and citations of keys the full build did not cite are resolved in the same
-preview: a second (and third) pass on the next waiting process reads the first pass's labels, and BibTeX
-(in the sandbox, on the snapshot's citations plus the new ones) writes the bibliography it needs.
+preview: a second (and third) pass on the next waiting process reads the first pass's labels, and BibTeX or
+biber (in the sandbox, on the snapshot's citations plus the new ones) writes the bibliography it needs.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ import sandbox
 
 # Engines whose warm start was checked to give the same PDF as a plain focus build.
 ENGINES = {"pdflatex", "xelatex", "lualatex"}
-SNAPSHOT = {".aux", ".bbl", ".toc", ".lof", ".lot", ".out", ".focusmap"}
+SNAPSHOT = {".aux", ".bbl", ".toc", ".lof", ".lot", ".out", ".focusmap", ".bcf"}  # .bcf: read, not copied
 FIGURE_FILES = {".pdf", ".dpth"}  # of the full build's externalized TikZ figures (build_dir/tikz/)
 # Files that can change what the preamble does without changing main.tex (besides files it \input's).
 PREAMBLE_DEPS = {".cls", ".sty", ".def", ".cfg", ".clo", ".fd", ".ldf", ".toml", ".latexmkrc"}
@@ -47,7 +47,7 @@ ENV_KEYS = ("shell_escape", "openin_any", "openout_any", sandbox.VARIABLE)
 IDLE = 600.0  # seconds a waiting process is kept before it is stopped
 ACTIVE = 60.0  # seconds after a preview during which full builds and figure jobs run below normal priority
 TIMEOUT = 120  # seconds one preview may take
-PASSES = 3  # at most: labels of the chapter itself, then a bibliography BibTeX rewrote, then its citations
+PASSES = 3  # at most: labels of the chapter itself, then a bibliography BibTeX/biber rewrote, then its citations
 TRIGGER = "pgfwarm-go"  # file names in the process's own directory (its -output-directory)
 OVERLAY = "pgfwarm-ov"
 SOURCE = "source.snap"  # main.tex as the snapshot's build saw it (not copied into the processes)
@@ -108,6 +108,10 @@ LABEL = re.compile(r"^\\(?:newlabel|bibcite)\{([^{}]*)\}", re.M)
 CITATION = re.compile(r"^\\citation\{([^{}]*)\}", re.M)
 UNDEFINED_CITE = re.compile(r"Citation [`']([^']+)' (?:on page \S+ )?undefined")
 LABEL_CMD = re.compile(r"\\label(?:\[[^\]]*\])?\{[^{}]*\}")
+# biblatex's control file (.bcf) for biber: cited keys per refsection, and the files to read.
+BCF_KEY = re.compile(r"<bcf:citekey [^>]*>([^<]*)</bcf:citekey>")
+BCF_SECTION = re.compile(r'(<bcf:section number="(\d+)">)(.*?)(</bcf:section>)', re.S)
+BCF_SOURCE = re.compile(r"[ \t]*<bcf:datasource ([^>]*)>([^<]*)</bcf:datasource>\n?")
 
 
 class PreviewError(Exception):
@@ -329,7 +333,7 @@ class Proc:
 
     def _copy_snapshot(self) -> None:
         for path in (self.root / "aux").iterdir():
-            if path.suffix == ".snap":
+            if path.suffix in (".snap", ".bcf"):  # A .bcf in the process's directory is one its run wrote.
                 continue
             if path.is_dir():  # Figures: linked, not copied (TeX only reads them).
                 (self.dir / path.name).mkdir(exist_ok=True)
@@ -594,7 +598,7 @@ class Warm:
                     inject.update(changed)
                 missing = set(UNDEFINED_CITE.findall(result["log"])) - set(inject)
                 if missing and not bbls:
-                    new = self.bibtex(proc, missing)
+                    new = self.bibtex(proc, missing) or self.biber(proc, missing)
                     if new:
                         bbls.update(new)
                         again = True
@@ -706,9 +710,9 @@ class Warm:
         """
         New .bbl files for citations the snapshot's bibliography lacks: BibTeX (sandboxed, in the finished
         process's directory) on the snapshot's citations plus this run's, for every .aux that names a .bib.
-        Only bibliographies that now hold one of the missing keys are returned. Biber (biblatex) is not run.
+        Only bibliographies that now hold one of the missing keys are returned. biblatex's biber: see biber().
         """
-        doc, aux_dir = self.main_tex.parent, root_for(self.main_tex) / "aux"
+        aux_dir = root_for(self.main_tex) / "aux"
         found: dict[str, bytes] = {}
         for i, path in enumerate(sorted(proc.dir.rglob("*.aux"))):
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -725,12 +729,7 @@ class Warm:
             style = re.search(r"^\\bibstyle\{[^{}]*\}", text, re.M)
             lines += [data.group(0), *([style.group(0)] if style else [])]
             for bib in data.group(1).split(","):  # BibTeX runs in the process directory: copy what it reads.
-                bib = bib.strip() if bib.strip().endswith(".bib") else bib.strip() + ".bib"
-                source = (doc / bib).resolve()
-                if ".." not in Path(bib).parts and not Path(bib).is_absolute() and source.is_file() \
-                        and doc.resolve() in source.parents:
-                    (proc.dir / bib).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(source, proc.dir / bib)
+                self.copy_bib(proc, bib.strip() if bib.strip().endswith(".bib") else bib.strip() + ".bib")
             job = f"pgfwarm-bib{i}"
             (proc.dir / f"{job}.aux").write_text("\n".join(lines) + "\n", encoding="utf-8")
             try:
@@ -747,6 +746,60 @@ class Warm:
                 if any(b"{" + key.encode() + b"}" in data_bbl for key in missing):
                     found[path.with_suffix(".bbl").relative_to(proc.dir).as_posix()] = data_bbl
         return found
+
+    def copy_bib(self, proc: Proc, bib: str) -> bool:
+        """Copy the document's file bib into the process directory, where BibTeX and biber run; False if not one."""
+        doc = self.main_tex.parent
+        source = (doc / bib).resolve()
+        if ".." in Path(bib).parts or Path(bib).is_absolute() or not source.is_file() \
+                or doc.resolve() not in source.parents:
+            return False
+        (proc.dir / bib).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source, proc.dir / bib)
+        return True
+
+    def biber(self, proc: Proc, missing: set[str]) -> dict[str, bytes]:
+        """
+        A new .bbl for citations the snapshot's biblatex bibliography lacks: biber (sandboxed, in the finished
+        process's directory) on the .bcf this run wrote, each refsection holding the snapshot's keys first (their
+        order, and so sorting=none numbers, stays) and then this run's. Only local data files of the document are
+        read (copies; remote and other sources are left out). Only runs when the run wrote a .bcf, which biblatex
+        does only with backend=biber; with backend=bibtex its \\bibdata goes through bibtex().
+        """
+        stem = self.main_tex.stem
+        try:
+            bcf = (proc.dir / f"{stem}.bcf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {}
+        if not missing & set(BCF_KEY.findall(bcf)):
+            return {}
+        try:
+            before = (root_for(self.main_tex) / "aux" / f"{stem}.bcf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            before = ""
+        earlier = {m.group(2): BCF_KEY.findall(m.group(3)) for m in BCF_SECTION.finditer(before)}
+
+        def section(m: re.Match) -> str:
+            keys = dict.fromkeys([*earlier.get(m.group(2), []), *BCF_KEY.findall(m.group(3))])
+            return m.group(1) + "\n" + "".join(f'    <bcf:citekey order="{n}" intorder="1">{key}</bcf:citekey>\n'
+                                                for n, key in enumerate(keys, 1)) + "  " + m.group(4)
+
+        def source(m: re.Match) -> str:
+            return m.group(0) if 'type="file"' in m.group(1) and self.copy_bib(proc, m.group(2)) else ""
+
+        job = "pgfwarm-bib"
+        (proc.dir / f"{job}.bcf").write_text(BCF_SOURCE.sub(source, BCF_SECTION.sub(section, bcf)), encoding="utf-8")
+        try:
+            spec = sandbox.spawn(["biber", job], proc.dir, proc.root, cpu=60, work=proc.dir, urgent=True)
+            subprocess.run(**spec, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        finally:
+            sandbox.scrub(proc.dir)
+        bbl = proc.dir / f"{job}.bbl"
+        data = bbl.read_bytes() if bbl.is_file() else b""
+        return {f"{stem}.bbl": data} if any(b"{" + key.encode() + b"}" in data for key in missing) else {}
 
     # --- SyncTeX -----------------------------------------------------------------------------------------------
 

@@ -355,3 +355,93 @@ class LabelTests(unittest.TestCase):
         self.assertTrue(preview.referenced("x", "\\label{x} see \\ref{x}"))
         self.assertTrue(preview.referenced("x@cref", "\\cref{a, x}"))
         self.assertTrue(preview.referenced("key", "\\citep[p.~3]{other,key}"))
+
+
+BLX = r"""\documentclass{article}
+\ifdefined\pdfobjcompresslevel\pdfcompresslevel=0 \pdfobjcompresslevel=0 \fi
+\usepackage[backend=%s,sorting=none]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+\input{ch/one}
+\input{ch/two}
+\printbibliography
+\end{document}
+"""
+
+
+@unittest.skipUnless(LATEX and shutil.which("biber") and shutil.which("pdftotext"), "needs latexmk, biber, pdftotext")
+class BiberTests(unittest.TestCase):
+    """biblatex: a key the full build never cited resolves through biber; backend=bibtex keeps BibTeX."""
+
+    def preview(self, backend, typed):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "doc", BLX % backend)
+            (main.parent / "ch").mkdir()
+            (main.parent / "ch" / "one.tex").write_text("\\section{One}See \\cite{known}.\n")
+            (main.parent / "ch" / "two.tex").write_text("\\section{Two}Chapter two, \\cite{other}.\n")
+            (main.parent / "refs.bib").write_text(BIB + "@misc{other, title={Other}, author={C. Author}, year=2002}\n")
+            entry, _ = build.build_safely(main, shutil.which("latexmk"), False, False, record=True)
+            self.assertTrue(entry["ok"], entry)
+            preview.snapshot(main)
+            warm = preview.Warm(main)
+            try:
+                warm.warm_up()
+                with mock.patch.object(warm, "biber", wraps=warm.biber) as biber:
+                    plain = warm.compile("c", "ch/two.tex", "\\section{Two}Edited, \\cite{other}.\n")
+                    result = warm.compile("c", "ch/two.tex", typed)
+            finally:
+                warm.shutdown()
+        self.assertTrue(plain["ok"] and result["ok"], (plain["errors"], result["errors"]))
+        self.assertEqual(plain["passes"], 1)
+        return result, text(result["pdf"]), biber
+
+    def test_new_key_resolves_through_biber_and_known_numbers_stay(self):
+        result, words, biber = self.preview("biber", "\\section{Two}Now \\cite{fresh} and \\cite{other}.\n")
+        self.assertEqual(biber.call_count, 1)  # Only for the preview with a new key.
+        self.assertNotIn("fresh", words)  # biblatex prints an undefined key as [fresh]
+        self.assertIn("[3]", words)  # fresh comes after the full build's known [1] and other [2] (sorting=none)
+        self.assertIn("[2]", words)
+        self.assertEqual(result["passes"], 2)
+
+    def test_backend_bibtex_keeps_the_bibtex_path(self):
+        result, words, biber = self.preview("bibtex", "\\section{Two}Now \\cite{fresh}.\n")
+        self.assertEqual(biber.call_count, 0)
+        self.assertNotIn("fresh", words)
+        self.assertEqual(result["passes"], 2)  # biblatex reads its labels from the .bbl: no third pass
+
+
+class BcfTests(unittest.TestCase):
+    """The .bcf biber reads: the snapshot's keys first, then this run's; only local data files of the document."""
+
+    def test_merged_control_file(self):
+        bcf = ('<bcf:controlfile>\n  <bcf:bibdata section="0">\n'
+               '    <bcf:datasource type="file" datatype="bibtex" glob="false">refs.bib</bcf:datasource>\n'
+               '    <bcf:datasource type="file" datatype="bibtex" glob="false">../out.bib</bcf:datasource>\n'
+               '    <bcf:datasource type="url" datatype="bibtex" glob="false">http://example.org/x.bib</bcf:datasource>\n'
+               '  </bcf:bibdata>\n  <bcf:section number="0">\n'
+               '    <bcf:citekey order="1" intorder="1">new</bcf:citekey>\n'
+               '    <bcf:citekey order="2" intorder="1">old</bcf:citekey>\n  </bcf:section>\n</bcf:controlfile>\n')
+        with fake_repo() as root:
+            main = write_doc(root, "doc", "x")
+            (main.parent / "refs.bib").write_text("")
+            aux = preview.root_for(main) / "aux"
+            aux.mkdir(parents=True)
+            (aux / "main.bcf").write_text(bcf.replace(">new<", ">first<"))
+            proc = mock.Mock(dir=root / "p", root=preview.root_for(main))
+            proc.dir.mkdir()
+            warm = preview.Warm(main)
+            with mock.patch.object(preview.subprocess, "run") as ran:
+                self.assertEqual(warm.biber(proc, {"new"}), {})  # No .bcf: biblatex with backend=bibtex, or none.
+                (proc.dir / "main.bcf").write_text(bcf)
+                self.assertEqual(warm.biber(proc, {"elsewhere"}), {})  # Not a key of this run's .bcf.
+                ran.assert_not_called()
+                ran.side_effect = lambda **_: (proc.dir / "pgfwarm-bib.bbl").write_text("\\entry{new}{misc}{}")
+                self.assertEqual(warm.biber(proc, {"new"}), {"main.bbl": b"\\entry{new}{misc}{}"})
+                self.assertIn("biber", ran.call_args.kwargs["args"])
+            written = (proc.dir / "pgfwarm-bib.bcf").read_text()
+            self.assertEqual(preview.BCF_KEY.findall(written), ["first", "old", "new"])
+            self.assertIn('order="3" intorder="1">new<', written)
+            self.assertIn(">refs.bib<", written)
+            self.assertNotIn("out.bib", written)
+            self.assertNotIn("example.org", written)
+            self.assertTrue((proc.dir / "refs.bib").is_file())
