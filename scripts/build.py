@@ -1589,6 +1589,83 @@ def export_docx_all(documents: list[Path]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Formatting (optional: needs tex-fmt, https://github.com/WGUNDERWOOD/tex-fmt)
+# ---------------------------------------------------------------------------
+
+TEXFMT_MISSING = "tex-fmt was not found on your PATH (https://github.com/WGUNDERWOOD/tex-fmt)."
+FORMAT_TIMEOUT = 60
+
+
+def _texfmt_problem(result: subprocess.CompletedProcess) -> str:
+    lines = [line for line in (result.stderr or "").splitlines() if line.strip()]
+    return lines[-1] if lines else f"tex-fmt exited with {result.returncode}"
+
+
+def format_sources(folder: Path, check: bool = False) -> tuple[list[str], list[str]]:
+    """
+    tex-fmt on every .tex file in a document directory (hidden ones skipped), run there so it reads that
+    directory's tex-fmt.toml. Returns (files it changed, or with check would change; problems). tex-fmt is not
+    a TeX engine (it only rewrites text), so it runs outside the sandbox. Raises FileNotFoundError without it.
+    """
+    texfmt = shutil.which("tex-fmt")
+    if not texfmt:
+        raise FileNotFoundError(TEXFMT_MISSING)
+    changed: list[str] = []
+    problems: list[str] = []
+    for path in sorted(folder.rglob("*.tex")):
+        rel = path.relative_to(folder)
+        if any(part.startswith(".") for part in rel.parts) or not path.is_file():
+            continue
+        before = path.read_bytes()
+        try:
+            result = subprocess.run([texfmt, *(["--check"] if check else []), rel.as_posix()], cwd=folder,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    timeout=FORMAT_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"{rel.as_posix()}: {exc}")
+            continue
+        if check and result.returncode == 1:  # --check: 1 means "Incorrect formatting"
+            changed.append(rel.as_posix())
+        elif result.returncode != 0:
+            problems.append(f"{rel.as_posix()}: {_texfmt_problem(result)}")
+        elif not check and path.read_bytes() != before:
+            changed.append(rel.as_posix())
+    return changed, problems
+
+
+def format_text(folder: Path, text: str) -> str:
+    """tex-fmt --stdin on one file's text, with the tex-fmt.toml of `folder`. Raises FileNotFoundError, ValueError."""
+    texfmt = shutil.which("tex-fmt")
+    if not texfmt:
+        raise FileNotFoundError(TEXFMT_MISSING)
+    try:
+        result = subprocess.run([texfmt, "--stdin"], cwd=folder, input=text, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"tex-fmt failed: {exc}")
+    if result.returncode != 0:
+        raise ValueError(f"tex-fmt failed: {_texfmt_problem(result)}")
+    return result.stdout
+
+
+def format_all(documents: list[Path]) -> int:
+    """The --format step: rewrite each document's .tex files in place; 1 if tex-fmt failed (a missing tex-fmt is only
+    a message, like a missing chktex in the lint)."""
+    failed = 0
+    for document in documents:
+        try:
+            changed, problems = format_sources(document.parent)
+        except FileNotFoundError as exc:
+            info(str(exc))
+            return 0
+        info(f"Format {doc_name(document)}: " + (", ".join(changed) if changed else "nothing to change"))
+        for problem in problems:
+            error(f"  {problem}")
+        failed += bool(problems)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
 # Creating documents
 # ---------------------------------------------------------------------------
 
@@ -1777,6 +1854,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--format",
+        action="store_true",
+        help="Rewrite the .tex files of each selected document with tex-fmt (must be installed; reads a "
+             "tex-fmt.toml in the document directory), then exit without building.",
+    )
+
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List discovered main.tex files without building them.",
@@ -1856,6 +1940,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.docx and (args.watch or args.focus):
         parser.error("--docx cannot be combined with --watch or --focus")
+
+    if args.format and (args.watch or args.focus or args.docx):
+        parser.error("--format cannot be combined with --watch, --focus or --docx")
 
     return args
 
@@ -1987,6 +2074,9 @@ def main() -> int:
             info(f"    -> {display(output)}{status}")
 
         return 0
+
+    if args.format:
+        return format_all(documents)
 
     if args.docx and not shutil.which("pandoc"):
         error("--docx needs pandoc, which was not found on your PATH (https://pandoc.org/installing.html).")

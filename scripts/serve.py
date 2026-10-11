@@ -1420,6 +1420,38 @@ def bib_lookup(data: dict) -> dict:
         return {"fields": {}, "error": str(exc)}
 
 
+def bib_verify(data: dict) -> dict:
+    """Is one entry on Crossref? {"status": verified|mismatch|not-found|unchecked, "message", "doi"}, or {"error"}.
+
+    The editor sends the entry's fields as the References panel shows them; only its DOI or title (and first
+    author's surname) leave the machine. Nothing is written."""
+    fields = data.get("fields")
+    if not (isinstance(fields, dict) and len(fields) <= 100
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in fields.items())
+            and sum(len(k) + len(v) for k, v in fields.items()) <= 100_000):
+        raise ApiError("Send the entry's fields.", 400)
+    try:
+        return bibfix.verify({k.lower(): v for k, v in fields.items()})
+    except bibfix.BibLookupError as exc:
+        return {"status": None, "error": str(exc)}
+
+
+FORMAT_MAX_CHARS = 1_000_000
+
+
+def format_source(name: str, text) -> dict:
+    """{"text"}: tex-fmt's version of one open file's text, with the document's tex-fmt.toml. Nothing is written:
+    the editor applies the result as one edit, so co-editing rooms stay consistent."""
+    if not isinstance(text, str) or len(text) > FORMAT_MAX_CHARS:
+        raise ApiError("Bad or oversized text (1 MB limit).", 413)
+    try:
+        return {"text": build.format_text(DOCS[name].parent, text)}
+    except FileNotFoundError as exc:
+        raise ApiError(str(exc), 501)
+    except ValueError as exc:
+        raise ApiError(str(exc), 422)
+
+
 def utf16_offsets(text: str):
     """index -> UTF-16 offset in `text` (what CodeMirror counts), O(log n) per call after one pass."""
     astral = [i for i, char in enumerate(text) if ord(char) > 0xFFFF]
@@ -3357,6 +3389,16 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
             raise ApiError("Too many lookups; wait a moment.", 429)
+    elif method == "POST" and path == "/api/bib/verify":
+        need_edit()  # Sends one DOI or title to Crossref, like Look up, and shares its guest limit.
+        scoped(doc)
+        if not rate_ok("bib-guest", 10, 60.0):
+            raise ApiError("Too many lookups; wait a moment.", 429)
+    elif method == "POST" and path == "/api/format":
+        need_edit()  # Runs tex-fmt (not a TeX engine, so outside the sandbox) on the text the editor sends.
+        scoped(doc)
+        if not rate_ok("format", 20, 60.0):
+            raise ApiError("Too many format requests; wait a moment.", 429)
     elif method == "POST" and path == "/api/zotero/preview" and not GATEWAY["secret"]:
         need_edit()  # The owner's key fetches; the owner opted in (share_editors), and the key never leaves here.
         scoped(doc)
@@ -3621,6 +3663,10 @@ class Handler(BaseHTTPRequestHandler):
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/bib/lookup" and name in DOCS:
             self.json(bib_lookup(self.body()))
+        elif url.path == "/api/bib/verify" and name in DOCS:
+            self.json(bib_verify(self.body()))
+        elif url.path == "/api/format" and name in DOCS:
+            self.json(format_source(name, self.body().get("text")))
         elif url.path == "/api/bib" and name in DOCS:
             self.json(bib_overview(name, self.body().get("texts")))
         elif url.path == "/api/bib/edit" and name in DOCS:

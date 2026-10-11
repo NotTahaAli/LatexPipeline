@@ -2491,6 +2491,86 @@ class BibLookupApi(SharedState, ServerCase):
         self.assertEqual(self.lookup({"text": "x" * serve.BIB_MAX_CHARS, "key": "k"})[0], 200)
 
 
+class BibVerifyApi(SharedState, ServerCase):
+    """POST /api/bib/verify: roles, the Look up rate limit, input checks and the reply. Crossref is mocked."""
+
+    FIELDS = {"doi": "10.1000/xyz_123", "title": "Deep Learning & Beyond: A 100% Study", "year": "2019",
+              "author": "Lovelace, Ada and Turing, Alan"}
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import bibfix
+        self.bibfix = bibfix
+        work = json.loads((Path(__file__).parent / "fixtures" / "crossref_work.json").read_text(encoding="utf-8"))
+        self.fetch = mock.patch.object(bibfix, "get_json", return_value=work).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def verify(self, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/bib/verify?doc={doc}", body or {"fields": self.FIELDS}, hdrs)
+
+    def test_statuses_and_bad_input(self):
+        self.assertEqual(self.verify()[1]["status"], "verified")
+        self.assertEqual(self.verify({"fields": {**self.FIELDS, "year": "2010"}})[1]["status"], "mismatch")
+        self.fetch.side_effect = self.bibfix.NotFound("gone")
+        self.assertEqual(self.verify()[1]["status"], "not-found")
+        self.fetch.side_effect = self.bibfix.BibLookupError("Too many Crossref lookups; wait a moment.")
+        self.assertEqual(self.verify()[1], {"status": None, "error": "Too many Crossref lookups; wait a moment."})
+        for bad in ({"fields": "x"}, {"fields": {"title": 3}}, {"fields": {"t": "x" * 100_001}}):
+            with self.subTest(bad=str(bad)[:40]):
+                self.assertEqual(self.verify(bad)[0], 400)
+
+    def test_roles_and_shared_rate_limit(self):
+        self.tokens = self.share_on()
+        self.assertEqual(self.verify(role="view")[0], 403)
+        self.assertEqual(self.fetch.call_count, 0)
+        self.assertEqual(self.verify(role="edit", doc="demo2")[0], 403)
+        codes = [self.verify(role="edit")[0] for _ in range(11)]
+        self.assertEqual(codes.count(429), 1)
+        self.assertEqual(self.request("POST", "/api/bib/lookup?doc=demo", {"text": "@a{k, title={T}}", "key": "k"},
+                                      {"Cookie": f"{serve.cookie_name()}={self.tokens['edit']}"})[0], 429)
+        self.assertEqual(self.verify(role="owner")[0], 200)
+
+
+class FormatApi(SharedState, ServerCase):
+    """POST /api/format: tex-fmt on the editor's text, never a write; roles, rate limit, size cap."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.fmt = mock.patch.object(serve.build, "format_text", side_effect=lambda folder, text: text.upper()).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def fmt_request(self, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/format?doc={doc}", body or {"text": "a\n"}, hdrs)
+
+    def test_returns_the_formatted_text_and_writes_nothing(self):
+        before = {p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}
+        self.assertEqual(self.fmt_request(), (200, {"text": "A\n"}))
+        self.assertEqual(self.fmt.call_args[0][0], serve.DOCS["demo"].parent)
+        self.assertEqual({p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}, before)
+
+    def test_size_cap_errors_and_missing_tex_fmt(self):
+        self.assertEqual(self.fmt_request({"text": "x" * (serve.FORMAT_MAX_CHARS + 1)})[0], 413)
+        self.assertEqual(self.fmt_request({"text": 4})[0], 413)
+        self.fmt.side_effect = FileNotFoundError("tex-fmt was not found on your PATH")
+        status, body = self.fmt_request()
+        self.assertEqual(status, 501)
+        self.assertIn("tex-fmt", body["error"])
+        self.fmt.side_effect = ValueError("tex-fmt failed: boom")
+        self.assertEqual(self.fmt_request()[0], 422)
+
+    def test_view_role_cannot_format_edit_role_is_rate_limited(self):
+        self.tokens = self.share_on()
+        self.assertEqual(self.fmt_request(role="view")[0], 403)
+        self.assertEqual(self.fmt.call_count, 0)
+        self.assertEqual(self.fmt_request(role="edit", doc="demo2")[0], 403)
+        codes = [self.fmt_request(role="edit")[0] for _ in range(21)]
+        self.assertEqual(codes.count(429), 1)
+
+
 class BibPanelApi(SharedState, ServerCase):
     """POST /api/bib, /api/bib/edit, /api/bib/import: the References panel. Crossref is mocked."""
 

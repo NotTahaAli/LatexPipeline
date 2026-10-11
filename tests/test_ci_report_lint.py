@@ -188,6 +188,19 @@ class LintCommandTests(unittest.TestCase):
         self.assertEqual([f["kind"] for f in report], ["bib-suggestion"])
         self.assertEqual(code, 0, output)
 
+    def test_format_findings_are_notices_and_a_missing_tex_fmt_is_only_a_message(self):
+        self.run_lint(update_baseline=True)
+        code, output = self.run_lint(strict=True, format=True)  # shutil.which is None here: no tex-fmt
+        self.assertEqual(code, 0, output)
+        self.assertIn("format check skipped: tex-fmt was not found", output)
+        with mock.patch.object(ci_report, "format_sources", return_value=(["main.tex"], ["x.tex: boom"])) as run:
+            code, output = self.run_lint(strict=True, format=True)
+        run.assert_called_once_with(self.doc, check=True)
+        report = json.loads(ci_report.LINT_PATH.read_text(encoding="utf-8"))["documents"]["doc"]["findings"]
+        self.assertEqual([(f["kind"], f["path"], f["level"]) for f in report], [("format", "main.tex", "info")])
+        self.assertIn("tex-fmt: x.tex: boom", output)
+        self.assertEqual(code, 0, output)  # formatting never fails --strict, let alone CI
+
     def test_strict_fails_then_baseline_suppresses(self):
         code, output = self.run_lint(strict=True)
         self.assertEqual(code, 1)
