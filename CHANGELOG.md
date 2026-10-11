@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Single-file binaries of `build.py` and `serve.py` for Linux, macOS and Windows (PyInstaller), attached to each `v*` release by `.github/workflows/binaries.yml`; a binary uses the directory it is started in as the repository.
 - Live preview: citations of keys the full build never cited now resolve with biblatex and biber too (biber runs in the sandbox on the preview's `.bcf` plus the full build's keys, only when there are new keys).
 - Reviewer role: a "can review" named share link and a hosted `reviewer` workspace role (between viewer and editor; new `host.db` migration) comment, reply, resolve and suggest (Suggest mode locked on, "Reviewer" chip) and withdraw their own suggestions, but cannot save, change files, rebuild, accept or reject; the server refuses their co-editing updates, and over MCP they get the review tools only.
+- `build.py --format [DOC ...]` rewrites a document's `.tex` files with tex-fmt (its `tex-fmt.toml` applies), `ci_report.py lint --format` lists files tex-fmt would change as notices, and the editor's "Format file (tex-fmt)" command formats the open file as one edit (`POST /api/format`, edit role). A missing tex-fmt is a message, never a failure.
+- `ci_report.py lint --verify-citations` (opt-in) flags `.bib` entries whose DOI does not resolve on Crossref, whose title has no close Crossref match, or whose record disagrees on title, year or first author, as possibly fabricated or wrong references; the References panel's "Verify with Crossref" shows a verified / mismatch / not found badge per entry (`POST /api/bib/verify`, edit role, Look up's rate limits).
+- A plain-language hint for biber's "Found biblatex control file version X, expected version Y" (mismatched biber and biblatex).
 
 ## [0.1.1] - 2026-10-12
 

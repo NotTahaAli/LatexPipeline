@@ -690,6 +690,24 @@ async function exportDocx() {
   try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
   catch (e) { toast(el("span", { textContent: e.message })); }
 }
+// tex-fmt runs on the server on the text in the editor; the result goes back in as one edit (only the changed middle),
+// so co-editing rooms, history and undo see an ordinary change and the normal save writes the file.
+async function formatFile() {
+  if (readOnly || active?.kind !== "text" || !/\.tex$/i.test(active.path)) { toast(el("span", { textContent: "Open a .tex file to format it." })); return; }
+  const tab = active, text = view.state.doc.toString();
+  try {
+    const out = (await api.format(cur, text)).text;
+    if (active !== tab || view.state.doc.toString() !== text) { toast(el("span", { textContent: "The file changed while tex-fmt ran; format again." })); return; }
+    if (out === text) { toast(el("span", { textContent: "Already formatted." })); return; }
+    let a = 0, b = 0;
+    while (a < text.length && a < out.length && text[a] === out[a]) a++;
+    while (b < text.length - a && b < out.length - a && text[text.length - 1 - b] === out[out.length - 1 - b]) b++;
+    if (a && /[\uD800-\uDBFF]/.test(text[a - 1])) a--;   // never split a surrogate pair
+    if (b && /[\uDC00-\uDFFF]/.test(text[text.length - b])) b--;
+    view.dispatch({ changes: { from: a, to: text.length - b, insert: out.slice(a, out.length - b) }, userEvent: "input.format" });
+    toast(el("span", { textContent: `Formatted ${tab.path} with tex-fmt.` }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
 async function previewChapter(quiet) {
   if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
   const path = active.path;
@@ -1214,6 +1232,7 @@ const COMMANDS = [
   { id: "focus", edit: true, title: "Preview this chapter", run: () => previewChapter() },
   { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
+  { id: "format", edit: true, title: "Format file (tex-fmt)", run: () => formatFile() },
   { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
@@ -1298,7 +1317,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 function buildMenu() {
   const m = $("moreMenu");
   const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history"]],
-    ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {

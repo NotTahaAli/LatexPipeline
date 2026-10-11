@@ -8,13 +8,14 @@ Subcommands:
 - lint        Structural checks (labels, references, figures, bib), overfull boxes from
               the cached log, chktex and word counts into out/lint-report.json. --grammar adds
               LanguageTool findings (grammar.py); --bib-lookup suggests missing bib fields
-              from Crossref (bibfix.py).
+              from Crossref (bibfix.py); --verify-citations flags entries Crossref does not
+              confirm; --format lists .tex files tex-fmt would change.
               Findings are GitHub annotations in Actions; --strict fails on them.
 - diff        latexdiff of every document changed since --base, PDFs into --out
               (keep --out outside out/, so the PDFs are not published to the release).
 - pr-comment  Create or update the sticky pull request comment (needs gh and GH_TOKEN).
 
-Stdlib only. A missing chktex, texcount or latexdiff leaves its values blank
+Stdlib only. A missing chktex, texcount, tex-fmt or latexdiff leaves its values blank
 instead of failing the run.
 """
 
@@ -34,7 +35,17 @@ from typing import NamedTuple
 
 import bibfix
 import grammar
-from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, ConfigError, read_settings, size_text
+from build import (
+    ENGINES,
+    LATEXMK_ARGS,
+    OUT_DIR,
+    ROOT_DIR,
+    SOURCE_DIR,
+    ConfigError,
+    format_sources,
+    read_settings,
+    size_text,
+)
 from hints import overfull_boxes
 
 REPORT_PATH = OUT_DIR / "build-report.json"
@@ -538,6 +549,44 @@ def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]
     return out
 
 
+def verify_findings(doc_dir: Path) -> list[Finding]:
+    """Entries Crossref does not know, or knows differently: possibly fabricated or wrong (sends a DOI or title)."""
+    out = []
+    bibfix.LOOKUP_WAIT = 60.0
+    for path in visible_files(doc_dir):
+        if path.suffix != ".bib":
+            continue
+        rel = path.relative_to(doc_dir).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for entry in bibfix.parse(text):
+            fields: dict[str, str] = {}
+            for field in entry.fields:
+                fields.setdefault(field.name, field.value)
+            try:
+                result = bibfix.verify(fields)
+            except bibfix.BibLookupError as error:  # Not checked is not a finding: never guess.
+                print(f"{rel}: could not verify '{entry.key}': {error}")
+                continue
+            if result["status"] in ("not-found", "mismatch"):
+                out.append(Finding("unverified-citation", rel, line_of(text, entry.start),
+                                   f"possibly fabricated or wrong reference '{entry.key}': {result['message']}",
+                                   entry.key))
+    return out
+
+
+def format_findings(name: str, doc_dir: Path) -> list[Finding]:
+    """.tex files tex-fmt would change (--check), as notices. A missing tex-fmt is a message, like chktex."""
+    try:
+        changed, problems = format_sources(doc_dir, check=True)
+    except FileNotFoundError as error:
+        print(f"{name}: format check skipped: {error}")
+        return []
+    for problem in problems:
+        print(f"{name}: tex-fmt: {problem}")
+    return [Finding("format", rel, None, f"tex-fmt would reformat {rel} (python scripts/build.py --format fixes it)",
+                    rel, level="info") for rel in changed]
+
+
 def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
     """LanguageTool findings for every .tex file the document pulls in. Quiet and empty when grammar is off."""
     try:
@@ -636,6 +685,10 @@ def cmd_lint(args: argparse.Namespace) -> int:
             findings += grammar_findings(name, doc_dir)
         if getattr(args, "bib_lookup", False):
             findings += bib_lookup_findings(doc_dir, findings)
+        if getattr(args, "verify_citations", False):
+            findings += verify_findings(doc_dir)
+        if getattr(args, "format", False):
+            findings += format_findings(name, doc_dir)
         suppressed = 0
         if args.update_baseline:
             write_baseline(doc_dir, findings)
@@ -653,7 +706,8 @@ def cmd_lint(args: argparse.Namespace) -> int:
             "suppressed": suppressed,
             "findings": [finding.as_dict() for finding in findings],
         }
-        total += sum(finding.kind != "bib-suggestion" for finding in findings)  # Suggestions are notices, not failures.
+        # Suggestions and formatting are notices, not failures.
+        total += sum(finding.kind not in ("bib-suggestion", "format") for finding in findings)
         print(f"{name}: words={lint[name]['words']} chktex={lint[name]['chktex']} "
               f"lint={len(findings)} suppressed={lint[name]['suppressed']}")
         annotate(name, findings)
@@ -787,6 +841,11 @@ def main() -> int:
 
     lint.add_argument("--bib-lookup", action="store_true",
                       help="suggest missing bib fields from Crossref (sends DOIs and titles; off by default)")
+    lint.add_argument("--verify-citations", action="store_true",
+                      help="flag bib entries Crossref does not know or knows differently (sends DOIs and titles; "
+                           "off by default)")
+    lint.add_argument("--format", action="store_true",
+                      help="report .tex files tex-fmt would change (a missing tex-fmt is only a message)")
 
     diff = commands.add_parser("diff", help="latexdiff of changed documents")
     diff.add_argument("--base", required=True, help="git ref to compare against")

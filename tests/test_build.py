@@ -828,3 +828,42 @@ class ParanoidReadsTests(unittest.TestCase):
                 self.assertTrue(report["ok"], (name, report["errors"]))
                 self.assertNotIn("rebuilt without it", text)  # Externalization itself must work.
                 self.assertEqual(build.build_document(main, shutil.which("latexmk"), live=False)[0]["ok"], True)
+
+
+class FormatTests(unittest.TestCase):
+    """--format / tex-fmt: the real binary when installed; a missing one is a message, never a failure."""
+
+    UGLY = "\\begin{document}\n\\begin{itemize}\n\\item a\n\\end{itemize}\n\\end{document}\n"
+
+    def test_missing_tex_fmt(self):
+        with mock.patch.object(build.shutil, "which", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                build.format_sources(Path("."))
+            with self.assertRaises(FileNotFoundError):
+                build.format_text(Path("."), "x")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(build.format_all([Path("doc/main.tex")]), 0)
+        self.assertIn("tex-fmt was not found", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("tex-fmt"), "tex-fmt is not installed")
+    def test_check_rewrite_stdin_and_the_document_tex_fmt_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "main.tex").write_text(self.UGLY, encoding="utf-8")
+            (folder / "Chapters").mkdir()
+            (folder / "Chapters" / "a.tex").write_text("plain\n", encoding="utf-8")
+            (folder / ".hidden").mkdir()
+            (folder / ".hidden" / "x.tex").write_text(self.UGLY, encoding="utf-8")
+            (folder / "tex-fmt.toml").write_text("tabsize = 4\n", encoding="utf-8")
+            self.assertEqual(build.format_sources(folder, check=True), (["main.tex"], []))
+            self.assertEqual((folder / "main.tex").read_text(encoding="utf-8"), self.UGLY)  # --check writes nothing
+            self.assertIn("\n    \\item a\n", build.format_text(folder, self.UGLY))
+            self.assertEqual(build.format_sources(folder), (["main.tex"], []))
+            self.assertIn("\n    \\item a\n", (folder / "main.tex").read_text(encoding="utf-8"))
+            self.assertEqual((folder / ".hidden" / "x.tex").read_text(encoding="utf-8"), self.UGLY)
+            self.assertEqual(build.format_sources(folder, check=True), ([], []))
+            (folder / "tex-fmt.toml").write_text("wraplen = \"x\"\n", encoding="utf-8")  # tex-fmt panics on it
+            changed, problems = build.format_sources(folder, check=True)
+            self.assertEqual((changed, len(problems)), ([], 2))
+            with self.assertRaises(ValueError):
+                build.format_text(folder, self.UGLY)
