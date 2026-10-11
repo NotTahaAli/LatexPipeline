@@ -2633,10 +2633,7 @@ MAX_CLEAN_DAYS = 36500
 
 
 def history_folder(name: str) -> Path:
-    try:  # the build cache's key, so bench/x and files/x stay apart
-        key = build.cache_dir_for(DOCS[name]).name
-    except ValueError:  # --source outside the repository
-        key = build.escape_name(name)
+    key = build.cache_dir_for(DOCS[name]).name  # the build cache's key, so bench/x, files/x and /elsewhere/x stay apart
     return Path(HISTORY["dir"] or build.CACHE_DIR.parent / ".latex-history") / key
 
 

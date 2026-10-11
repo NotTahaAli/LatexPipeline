@@ -240,6 +240,26 @@ class Outline(TempDoc):
         self.assertIn("l.3 \\foo", out)
 
 
+@unittest.skipUnless(shutil.which("pdflatex") and shutil.which("synctex"), "needs pdflatex and synctex")
+class OutsideSource(TempDoc):
+    """--source outside the repository: the cache (SyncTeX data) is keyed by the source's path."""
+
+    def test_forward_search_finds_the_line(self):
+        self.write("main.tex", "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n")
+        main = (self.root / "main.tex").resolve()
+        with tempfile.TemporaryDirectory() as repo, \
+                mock.patch.object(build, "ROOT_DIR", Path(repo).resolve()), \
+                mock.patch.object(build, "CACHE_DIR", Path(repo).resolve() / ".latex-cache"), \
+                mock.patch.object(build, "SOURCE_DIR", self.base.resolve()), \
+                mock.patch.dict(serve.DOCS, {"doc": main}, clear=True):
+            cache = build.cache_dir_for(main)
+            cache.mkdir(parents=True)
+            subprocess.run(["pdflatex", "-interaction=batchmode", "-synctex=1", f"-output-directory={cache}",
+                            "main.tex"], cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+            name, box = serve.forward({"doc": ["doc"], "file": ["main.tex"], "line": ["3"]})
+        self.assertEqual((name, box["page"]), ("doc", 1))
+
+
 class BusTests(unittest.TestCase):
     def test_resume_from_revision(self):
         bus = serve.Bus(keep=3)

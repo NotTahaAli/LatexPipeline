@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -496,6 +497,31 @@ class SourceDirTests(unittest.TestCase):
             self.assertEqual(build.find_documents(), [self.bench_doc])
             self.assertEqual(build.doc_name(self.bench_doc), "shared")
         self.assertEqual(build.find_documents(), [self.files_doc])
+
+    def test_source_outside_the_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp).resolve()
+            main = outside / "a" / "main.tex"
+            main.parent.mkdir()
+            main.write_text("x", encoding="utf-8")
+            with mock.patch.object(build, "SOURCE_DIR", outside), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(build.find_documents(), [main])
+                cache = build.cache_dir_for(main)
+                self.assertEqual(cache.parent, self.root / ".latex-cache")
+                self.assertTrue(cache.name.startswith("_x"))
+                self.assertNotEqual(cache, build.cache_dir_for(self.files_doc))
+                self.assertEqual(build.figure_cache_for(main).name, cache.name)
+                self.assertEqual(build.output_path_for(main), self.root / "out" / "a.pdf")
+                self.assertEqual(build.display(main), main.as_posix())
+                self.assertEqual(build.new_document("b"), 0)
+                self.assertTrue((outside / "b" / "main.tex").is_file())
+            # Another directory with the same document names gets its own cache.
+            with tempfile.TemporaryDirectory() as tmp2:
+                other = Path(tmp2).resolve() / "a" / "main.tex"
+                with mock.patch.object(build, "SOURCE_DIR", other.parent.parent):
+                    self.assertNotEqual(build.cache_dir_for(other), cache)
+        self.assertEqual(build.cache_dir_for(self.bench_doc), self.root / ".latex-cache" / "bench_2Fshared")
+        self.assertEqual(build.cache_dir_for(self.files_doc), self.root / ".latex-cache" / "shared")
 
     def test_prune_keeps_outputs_of_every_known_source(self):
         out = self.root / "out"

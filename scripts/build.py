@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import functools
+import hashlib
 import html
 import json
 import os
@@ -129,13 +130,14 @@ def separator() -> None:
 def source_root(main_tex: Path) -> Path:
     """
     The source directory a document belongs to: SOURCE_DIR (files/, or the
-    --source directory), else files/ or bench/. Output and cache names are
-    relative to it.
+    --source directory), else files/ or bench/, else the document folder's
+    parent (a document the editor was pointed at directly). Output and cache
+    names are relative to it.
     """
     for root in (SOURCE_DIR, FILES_DIR, BENCH_DIR):
         if root in main_tex.parents:
             return root
-    return SOURCE_DIR
+    return main_tex.parent.parent
 
 
 def known_sources() -> list[Path]:
@@ -179,7 +181,13 @@ def cache_dir_for(main_tex: Path) -> Path:
     name = doc_name(main_tex)
     root = source_root(main_tex)
     if root != FILES_DIR:
-        prefix = root.relative_to(ROOT_DIR).as_posix()
+        try:
+            prefix = root.relative_to(ROOT_DIR).as_posix()
+        except ValueError:
+            # A --source outside the repository: keyed by its resolved path. "_x" never comes out of
+            # escape_name ("_" is always followed by two hex digits), so no in-repo name collides.
+            digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+            return CACHE_DIR / (f"_x{digest}" + ("" if name == "." else "_2F" + escape_name(name)))
         name = prefix if name == "." else f"{prefix}/{name}"
     return CACHE_DIR / ("_root" if name == "." else escape_name(name))
 
@@ -536,8 +544,11 @@ class ConfigError(Exception):
 
 
 def display(path: Path) -> str:
-    """Path relative to the repository root, with forward slashes."""
-    return path.relative_to(ROOT_DIR).as_posix()
+    """Path relative to the repository root, with forward slashes (absolute outside it: --source /elsewhere)."""
+    try:
+        return path.relative_to(ROOT_DIR).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def read_toml(path: Path) -> dict:
@@ -854,7 +865,7 @@ def build_document(
     validate=False skips veraPDF (the editor's builds: validation takes seconds).
     """
     began = time.monotonic()
-    relative = main_tex.relative_to(ROOT_DIR)
+    relative = Path(display(main_tex))
     name = doc_name(main_tex)
     output_pdf = output_path_for(main_tex)
     log_path = log_path_for(main_tex)
@@ -874,7 +885,7 @@ def build_document(
 
     say(RULE)
     say(f"Building: {relative}")
-    say(f"Output:  {output_pdf.relative_to(ROOT_DIR)}")
+    say(f"Output:  {display(output_pdf)}")
     say(RULE)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -1139,13 +1150,13 @@ def build_document(
     seconds = round(time.monotonic() - began, 1)
 
     say()
-    say(f"Log:     {log_path.relative_to(ROOT_DIR)}")
+    say(f"Log:     {display(log_path)}")
     say(f"Time:    {seconds:.1f}s")
 
     if errors:
         say(paint(f"FAILED:  {relative.as_posix()}", RED))
     else:
-        say(paint(f"SUCCESS: {output_pdf.relative_to(ROOT_DIR)}", GREEN))
+        say(paint(f"SUCCESS: {display(output_pdf)}", GREEN))
 
     entry = {
         "name": name,
@@ -1176,7 +1187,7 @@ def build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int = DEFAUL
     try:
         return _build_focus(main_tex, latexmk, focus, fig_jobs)
     except Exception as exc:  # noqa: BLE001 - a watch loop must survive a failed preview.
-        error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: focus build crashed: {exc}")
+        error(f"{display(main_tex)}: focus build crashed: {exc}")
         return False
 
 
@@ -1188,7 +1199,7 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
     citations, counters and page numbers match the full document.
     Returns True on success.
     """
-    relative = main_tex.relative_to(ROOT_DIR)
+    relative = Path(display(main_tex))
     build_dir = cache_dir_for(main_tex)
     mapfile = build_dir / f"{main_tex.stem}.focusmap"
 
@@ -1268,11 +1279,11 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
     if ok:
         shutil.copy(generated, out_pdf)
         count = f"{pages[-1]} pages, " if pages else ""
-        info(paint(f"SUCCESS: {out_pdf.relative_to(ROOT_DIR)}", GREEN) + f" ({count}{seconds:.1f}s, preview)")
+        info(paint(f"SUCCESS: {display(out_pdf)}", GREEN) + f" ({count}{seconds:.1f}s, preview)")
     else:
         for item in found[:MAX_SUMMARY_ERRORS]:
             info("  " + error_text(doc_name(main_tex), item))
-        info(paint(f"FAILED:  {relative.as_posix()} (focus {focus}); log: {out_log.relative_to(ROOT_DIR)}", RED))
+        info(paint(f"FAILED:  {relative.as_posix()} (focus {focus}); log: {display(out_log)}", RED))
     return ok
 
 
@@ -1288,7 +1299,7 @@ def build_safely(
         return build_document(main_tex, latexmk, live, force, fig_jobs, record, validate)
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
-        error(f"{main_tex.relative_to(ROOT_DIR).as_posix()}: {message}")
+        error(f"{display(main_tex)}: {message}")
         name = doc_name(main_tex)
         entry = {
             "name": name,
@@ -1486,7 +1497,7 @@ def prune(documents: list[Path]) -> None:
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx")]:
         if path not in expected:
-            info(f"Removing stale: {path.relative_to(ROOT_DIR)}")
+            info(f"Removing stale: {display(path)}")
             path.unlink()
 
 
@@ -1501,7 +1512,7 @@ def clean() -> None:
         return
 
     for path in targets:
-        info(f"Removing: {path.relative_to(ROOT_DIR)}")
+        info(f"Removing: {display(path)}")
 
         try:
             shutil.rmtree(path)
@@ -1788,8 +1799,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source",
         metavar="DIR",
-        help="Build the documents under DIR (relative to the repository root, e.g. bench) "
-             "instead of files/. Outputs go to out/ as usual, named relative to DIR.",
+        help="Build the documents under DIR (relative to the repository root, e.g. bench, or absolute, also "
+             "outside the repository) instead of files/. Outputs go to out/ as usual, named relative to DIR.",
     )
 
     parser.add_argument(
@@ -1931,7 +1942,7 @@ def main() -> int:
         prune(all_documents())
 
     if not documents:
-        info(f"No main.tex files found under {SOURCE_DIR.relative_to(ROOT_DIR)}/.")
+        info(f"No main.tex files found under {display(SOURCE_DIR)}/.")
         return 0
 
     documents = select_documents(documents, args.docs)
@@ -1949,9 +1960,9 @@ def main() -> int:
 
         for document in documents:
             output = output_path_for(document)
-            info(f"  {document.relative_to(ROOT_DIR)}")
+            info(f"  {display(document)}")
             status = "" if is_stale(document) else "  (up to date)"
-            info(f"    -> {output.relative_to(ROOT_DIR)}{status}")
+            info(f"    -> {display(output)}{status}")
 
         return 0
 
