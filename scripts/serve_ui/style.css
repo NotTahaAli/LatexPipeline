@@ -621,3 +621,25 @@ dialog::backdrop{background:var(--scrim)}
 .sr-one{font-size:12px;flex:none}
 #toast button.tp-go{margin-left:10px;color:inherit;font-weight:600;text-decoration:underline}
 .rx-dlg{width:440px}.rx-dlg form>p,.rx-dlg form>.rv-actions{padding:0 22px 16px}
+
+/* Team features (review.js card, notify.js, team.js) */
+.cm-sug-card{padding:8px 10px;max-width:min(420px,85vw);font:13px/1.4 var(--sans)}
+.cm-sug-card .rv-head{display:flex;align-items:center;gap:6px}
+.cm-sug-card .rv-change{margin:6px 0}
+.cm-sug-card del{color:var(--ox);background:var(--ox-soft)}
+.cm-sug-card ins{color:var(--moss);background:var(--moss-soft);text-decoration:none}
+.cm-sug-card .rv-c{border-top:1px solid var(--rule);padding-top:4px;margin-top:4px}
+.cm-sug-card .rv-body{margin:2px 0;white-space:pre-wrap}
+.cm-sug-card button.icon.ok{color:var(--moss)}
+.cm-sug-card button.icon.no{color:var(--ox)}
+.bell .count{position:absolute;margin:-14px 0 0 14px}
+.bell-list{min-width:320px;max-height:60vh;overflow:auto}
+.bell-list button.row{display:block;height:auto;white-space:normal;padding:6px 10px;line-height:1.35}
+.bell-list .bell-text{display:block;color:var(--ink-2);font-size:12px}
+.mention-list{position:relative;top:0;right:auto;min-width:200px;list-style:none;margin:2px 0;padding:4px}
+.mention-list li{padding:4px 8px;border-radius:5px;cursor:pointer}
+.mention-list li.on{background:var(--accent-soft);color:var(--accent)}
+.role.locked{background:var(--ox-soft);color:var(--ox)}
+.tag.linked{margin-left:auto;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+#panel-files.drop{outline:2px dashed var(--accent);outline-offset:-4px}
+#viewer.pick .page{cursor:crosshair}

@@ -56,6 +56,7 @@ import mcp_tools
 import preview
 import review
 import share_links as named
+import team
 import zotero
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
@@ -156,7 +157,8 @@ Y_KINDS = ("y-update", "y-aware", "y-leader", "y-gone", "y-closed")  # data["roo
 def visible(messages: list[dict], role: str) -> list[dict]:
     """
     What a role may see on the bus: shared sessions only hear about the shared document. A whitelist: a message
-    type not handled here (or one naming another document or a build-config file) is dropped.
+    type not handled here (or one naming another document or a build-config file) is dropped, e.g. "access"
+    (a request for more access, the owner's).
     """
     if role == "owner":
         return messages
@@ -338,7 +340,7 @@ def fresh_state(name: str, main_tex: Path) -> dict:
     return {
         "name": name, "status": "idle", "ok": None, "seconds": None, "pages": None, "warnings": 0,
         "engine": None, "error": None, "errors": [], "finished": None, "started": None,
-        "version": pdf_version(main_tex), "focus": None, **saved_result(name, main_tex),
+        "version": pdf_version(main_tex), "focus": None, "locked": lock_info(name), **saved_result(name, main_tex),
     }
 
 
@@ -979,6 +981,7 @@ def _same_file(a: Path, b: Path) -> bool:
 
 def fs_operation(doc: str, op, rel, to=None) -> dict:
     """Run one file tree operation in document `doc` and tell the browsers; raises ApiError."""
+    check_writable(doc)
     root = DOCS[doc].parent
     changed: list[str] = []
     removed: list[str] = []
@@ -999,6 +1002,26 @@ def fs_operation(doc: str, op, rel, to=None) -> dict:
                 os.close(os.open(source, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
                 changed.append(rel)
             close_rooms(doc, rel)
+        elif op == "copy":
+            if not (source.exists() or source.is_symlink()):
+                raise ApiError("No such file or folder.", 404)
+            target = fs_path(root, to, "name for the copy")
+            if target.exists() or target.is_symlink():
+                raise ApiError("Something with that name already exists.", 409)
+            if target == source or target.is_relative_to(source):
+                raise ApiError("A folder cannot be copied into itself.", 400)
+            if not target.parent.is_dir():
+                raise ApiError("The folder you are copying into does not exist.", 404)
+            folder = source.is_dir() and not source.is_symlink()
+            quota_check(folder_bytes(source) if folder else max(os.lstat(source).st_size, ENTRY_BYTES))
+            try:  # Symbolic links are copied as links, never followed: a copy reads nothing the document cannot.
+                if folder:
+                    shutil.copytree(source, target, symlinks=True)
+                else:
+                    shutil.copy2(source, target, follow_symlinks=False)
+            except OSError as exc:
+                raise ApiError(f"Could not copy {rel}: {exc.strerror or exc}", 500)
+            changed += [to + "/" + f["path"] for f in list_files(target)] if folder else [to]
         elif op in ("rename", "delete"):
             if not (source.exists() or source.is_symlink()):
                 raise ApiError("No such file or folder.", 404)
@@ -1042,7 +1065,7 @@ def fs_operation(doc: str, op, rel, to=None) -> dict:
         else:
             raise ApiError("Unknown operation.", 400)
     broadcast("fs", {"doc": doc, "changed": changed, "removed": removed})
-    return {"ok": True, "path": to if op == "rename" else rel}
+    return {"ok": True, "path": to if op in ("rename", "copy") else rel}
 
 
 # --- Figure upload: drag and drop or paste into the editor ----------------------------------------------------
@@ -1054,6 +1077,7 @@ MAX_UPLOAD = 8 * 1024 * 1024
 
 def save_upload(doc: str, name, data: bytes) -> dict:
     """Store an image in the document (in Figures/ when it exists) under a safe, unused name."""
+    check_writable(doc)
     root = DOCS[doc].parent
     base = re.sub(r"[^A-Za-z0-9._-]+", "_", posixpath.basename(str(name or "").replace("\\", "/")))
     stem, ext = posixpath.splitext(base)
@@ -1081,6 +1105,42 @@ def save_upload(doc: str, name, data: bytes) -> dict:
             raise ApiError("Too many files with that name.", 409)
     close_rooms(doc, rel, below=False)
     broadcast("fs", {"doc": doc, "changed": [rel], "removed": []})
+    return {"ok": True, "path": rel}
+
+
+def place_upload(doc: str, rel, data: bytes, author: str) -> dict:
+    """
+    One file of a dropped folder, at its own path (fs_path rules, never over an existing file): a text file (UTF-8)
+    or a png, jpg or pdf whose bytes match its type, like save_upload.
+    """
+    check_writable(doc)
+    root = DOCS[doc].parent
+    target = fs_path(root, rel)
+    text = None
+    if file_kind(rel) == "text":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(f"{rel} is not valid UTF-8 text.", 415)
+        if "\0" in text or len(data) > MAX_TEXT:
+            raise ApiError(f"{rel} is not a text file the editor can open.", 415)
+    elif not data.startswith(UPLOAD_TYPES.get(posixpath.splitext(rel)[1].lower(), b"\0none")):
+        raise ApiError(f"{rel}: only text files and png, jpg and pdf images can be added.", 415)
+    with WRITE_LOCK:
+        if any(parent.is_file() for parent in target.parents if root.resolve() in parent.parents):
+            raise ApiError("A file is in the way of that folder.", 409)
+        quota_check(len(data))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            raise ApiError(f"{rel} already exists.", 409)
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+    close_rooms(doc, rel, below=False)
+    broadcast("fs", {"doc": doc, "changed": [rel], "removed": []})
+    if text is not None:
+        remember(doc, rel, text, [author])
     return {"ok": True, "path": rel}
 
 
@@ -2114,13 +2174,13 @@ def share_link_create(data: dict) -> dict:
             root = link_root(SHARE["doc"])
             if root is None:
                 raise named.LinkError("The shared document is not available.")
-            named.create(links, data.get("name"), data.get("role"), SHARE["doc"], root)
+            made = named.create(links, data.get("name"), data.get("role"), SHARE["doc"], root)
             named.save(links)
         except named.LinkError as exc:
             raise ApiError(str(exc), 400)
         except OSError as exc:
             raise ApiError(f"Could not save the link: {exc}", 500)
-    return share_info()
+    return {**share_info(), "made": made["id"]}
 
 
 def share_link_revoke(data: dict) -> dict:
@@ -2578,6 +2638,8 @@ def on_update(message: dict, client: str, role: str) -> dict | None:
         doc, _, path = str(rid).partition("\n")
         if doc != SHARE["doc"] or is_rc(path):
             return reply_error(ApiError("This file cannot be edited through a shared link.", 403))
+    if STATE.get(str(rid).partition("\n")[0], {}).get("locked"):
+        return reply_error(ApiError("This document is locked: it is read-only until the owner unlocks it.", 423))
     with COLLAB_LOCK:
         room = ROOMS.get(rid)
         if room is None or client not in room["members"]:
@@ -2860,6 +2922,12 @@ def history_before_fs(name: str, op: str, rel) -> list[str]:
 
 def history_after_fs(name: str, op: str, rel: str, to: str | None, paths: list[str], author: str) -> None:
     root = DOCS[name].parent
+    if op == "copy" and isinstance(to, str):
+        for path in text_files(name, to):
+            try:
+                remember(name, path, read_text_file(root, path)["text"], [author], "auto", f"Copied from {rel}"[:300])
+            except ApiError:
+                pass
     for path in paths:
         if op == "delete":
             remember(name, path, None, [author], "delete")
@@ -3000,6 +3068,7 @@ def history_restore(name: str, role: str, vid, path: str | None, author: str) ->
     The rest are written here. Each restored file gets a "restore" version.
     """
     global PENDING_DOCS
+    check_writable(name)
     store, row = history_row(name, vid)
     if path:
         if role != "owner" and is_rc(path):
@@ -3019,10 +3088,10 @@ def history_restore(name: str, role: str, vid, path: str | None, author: str) ->
     root = DOCS[name].parent
     note = f"Restored {row['label'] or 'version ' + str(row['id'])}"[:300]
     out: dict = {"written": [], "pending": [], "skipped": [], "failed": []}
-    later = []
+    later, linked = [], linked_files(name)
     for rel in sorted(targets):  # first the files open in rooms: what is left to do is on record before any write
         text = targets[rel]
-        if role != "owner" and is_rc(rel):
+        if (role != "owner" and is_rc(rel)) or rel in linked:
             out["skipped"].append(rel)
             continue
         try:
@@ -3078,6 +3147,8 @@ def history_claim(name: str, role: str, cid: str | None, data: dict) -> dict:
     applied at all (it stays in the history and can be restored again).
     """
     path, op = data.get("path"), data.get("op")
+    if op == "claim":
+        check_writable(name)
     if not isinstance(path, str) or (role != "owner" and is_rc(path)):
         raise ApiError("No such pending restore.", 404)
     if cid is None:
@@ -3259,6 +3330,8 @@ REVIEWER_OPS = ("comment", "reply", "resolve", "delete", "suggest", "reject")
 def review_change(name: str, role: str, user: str | None, data: dict) -> dict:
     who = reviewer(role, user, data)
     op = data.get("op")
+    if op in ("suggest", "accept"):
+        check_writable(name)
     if role == "review":
         if op not in REVIEWER_OPS:
             raise ApiError("Reviewers can comment and suggest; accepting suggestions needs the edit role.", 403)
@@ -3424,9 +3497,12 @@ def replace_project(name: str, role: str, data: dict, author: str) -> dict:
         return {"path": rel, "text": new, "count": count}
     if data.get("nth") is not None and not rel:
         raise ApiError("Replacing one match needs its file.", 400)
+    check_writable(name)
     found, _ = search_files(name, role, rel)
-    planned, rooms = [], []
+    planned, rooms, linked = [], [], linked_files(name)
     for f in found:
+        if f["path"] in linked:
+            continue
         new, count = replace_text(f["text"], pattern, data)
         if new == f["text"]:
             continue
@@ -3440,6 +3516,240 @@ def replace_project(name: str, role: str, data: dict, author: str) -> dict:
     if written:
         broadcast("fs", {"doc": name, "changed": [w["path"] for w in written], "removed": []})
     return {"files": written, "count": sum(w["count"] for w in written), "rooms": [f["path"] for f, _, _ in rooms]}
+
+
+# --- Team: locks, linked files, version zips and diffs, access requests, people (team.py) ---------------------
+
+ACCESS = team.Requests()  # requests for more access from view and review links (local sharing)
+MAX_ZIP = 64 * 1024 * 1024  # a version's zip, uncompressed
+
+
+def lock_info(name: str) -> dict | None:
+    try:
+        return team.read_lock(history_folder(name))
+    except KeyError:  # not a served document
+        return None
+
+
+def check_writable(name: str, rel: str | None = None) -> None:
+    """Refuse a change to a locked document (423), or to a linked file (409: it is refreshed from its source)."""
+    if lock_info(name):
+        raise ApiError("This document is locked: it is read-only until the owner unlocks it.", 423)
+    if rel and rel in linked_files(name):
+        raise ApiError(f"{rel} is a linked file and read-only: refresh it from its source instead.", 409)
+
+
+def lock_set(name: str, data: dict, author: str) -> dict:
+    """POST /api/lock (the owner, or a workspace admin behind the gateway): lock or unlock for everyone."""
+    try:
+        info = team.write_lock(history_folder(name), author if data.get("locked") else None)
+    except OSError as exc:
+        raise ApiError(f"Could not save the lock: {exc}", 500)
+    publish(name, locked=info)
+    return {"locked": info}
+
+
+def linked_files(name: str) -> dict:
+    """{path: source} of the document's linked files that still exist (a renamed one is an ordinary file)."""
+    try:
+        links = team.read_links(history_folder(name))
+    except team.TeamError as exc:
+        raise ApiError(str(exc), exc.status)
+    root = DOCS[name].parent
+    return {path: entry for path, entry in links.items() if isinstance(entry, dict) and (root / path).is_file()}
+
+
+def linked_change(name: str, role: str, data: dict, author: str) -> dict:
+    """
+    POST /api/linked: op "add" (the owner: a new read-only file from an https URL or another served document),
+    "refresh" (the edit role: fetch it again) or "remove" (the owner: it becomes an ordinary file).
+    """
+    op, rel = data.get("op"), data.get("path")
+    if op != "refresh" and role != "owner":
+        raise ApiError("Only the owner links files.", 403)
+    folder, root = history_folder(name), DOCS[name].parent
+    try:
+        links = team.read_links(folder)
+    except team.TeamError as exc:
+        raise ApiError(str(exc), exc.status)
+    if op == "remove":
+        if links.pop(rel, None) is None:
+            raise ApiError("That file is not linked.", 404)
+        team.write_links(folder, links)
+        broadcast("fs", {"doc": name, "changed": [rel], "removed": []})
+        return {"ok": True}
+    check_writable(name)
+    target = fs_path(root, rel)
+    if op == "add":
+        if file_kind(rel) != "text" and posixpath.splitext(rel)[1].lower() not in UPLOAD_TYPES:
+            raise ApiError("A linked file is a text file or a png, jpg or pdf image.", 415)
+        if rel in links or target.exists() or target.is_symlink():
+            raise ApiError("Something with that name already exists.", 409)
+        if len(links) >= team.MAX_LINKS:
+            raise ApiError(f"A document has at most {team.MAX_LINKS} linked files.", 409)
+        if data.get("url"):
+            try:
+                entry = {"url": team.check_url(data["url"])}
+            except team.TeamError as exc:
+                raise ApiError(str(exc), exc.status)
+        else:
+            entry = {"doc": data.get("doc"), "path": data.get("from")}
+            if entry["doc"] not in DOCS or entry["doc"] == name or not isinstance(entry["path"], str):
+                raise ApiError("Pick another document this editor serves, and one of its files.", 400)
+    elif op == "refresh":
+        entry = links.get(rel)
+        if not isinstance(entry, dict):
+            raise ApiError("That file is not linked.", 404)
+    else:
+        raise ApiError("Unknown operation.", 400)
+    text = file_kind(rel) == "text"
+    cap = MAX_TEXT if text else MAX_UPLOAD
+    if "url" in entry:
+        try:
+            body = team.http_get(entry["url"], cap)
+        except team.TeamError as exc:
+            raise ApiError(str(exc), exc.status)
+    else:
+        source = resolve_in_doc(DOCS[entry["doc"]].parent, entry["path"])
+        if not source.is_file() or source.stat().st_size > cap:
+            raise ApiError(f"{entry['path']} is missing from {entry['doc']} or too large.", 404)
+        body = source.read_bytes()
+    if text:
+        try:
+            if "\0" in body.decode("utf-8"):
+                raise UnicodeDecodeError("utf-8", b"", 0, 1, "NUL")
+        except UnicodeDecodeError:
+            raise ApiError("The source is not UTF-8 text.", 415)
+    elif not body.startswith(UPLOAD_TYPES[posixpath.splitext(rel)[1].lower()]):
+        raise ApiError("The source is not the image type its name says.", 415)
+    with WRITE_LOCK:
+        if not target.parent.is_dir() and any(p.is_file() for p in target.parents if root.resolve() in p.parents):
+            raise ApiError("A file is in the way of that folder.", 409)
+        quota_check(len(body) - (target.stat().st_size if target.is_file() else 0))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, body)
+    close_rooms(name, rel, below=False)
+    if text:
+        remember(name, rel, body.decode("utf-8"), [author], "outside", "Linked file refreshed")
+    entry.update(fetched=time.time(), by=author)
+    links[rel] = entry
+    team.write_links(folder, links)
+    broadcast("fs", {"doc": name, "changed": [rel], "removed": []})
+    return {"ok": True, "path": rel, "size": len(body)}
+
+
+def version_texts(name: str, role: str, vid) -> tuple[dict, dict]:
+    """
+    (row, {path: text}) of the project at a version, for a zip or latexdiff: the text files history has at that
+    version, plus the ones it never recorded as they are now. Build-config files only for the owner.
+    """
+    store, row = history_row(name, vid)
+    try:
+        texts = {p: store.blob(h) for p, h in store.state_at(row["id"]).items()}
+        for path in text_files(name):
+            if path not in texts and row["manifest"] is None:
+                first = store.first(path)
+                if first is None:  # never edited here: as it is now
+                    try:
+                        texts[path] = read_text_file(DOCS[name].parent, path)["text"]
+                    except ApiError:
+                        continue  # too large or not UTF-8: not something the editor versions
+                elif first["kind"] == "outside" and first["hash"]:  # the text before the editor first changed it
+                    texts[path] = store.blob(first["hash"])
+    except KeyError:
+        raise ApiError("This version's text is gone (pruned).", 410)
+    return row, {p: t for p, t in texts.items() if role == "owner" or not is_rc(p)}
+
+
+def history_zip(name: str, role: str, vid) -> tuple[bytes, str]:
+    """GET /api/history/zip: a version as a zip. History keeps text only: images and other files are as they are now."""
+    row, texts = version_texts(name, role, vid)
+    files, total = {p: t.encode("utf-8") for p, t in texts.items()}, sum(len(t) for t in texts.values())
+    root = DOCS[name].parent
+    for f in list_files(root):
+        if f["kind"] != "text" and f["path"] not in files:
+            total += f["size"]
+            if total > MAX_ZIP:
+                raise ApiError(f"This version is larger than {MAX_ZIP // 1048576} MB.", 413)
+            try:
+                files[f["path"]] = resolve_in_doc(root, f["path"]).read_bytes()
+            except OSError:
+                continue
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", row["label"] or f"version-{row['id']}").strip("-")[:60] or "version"
+    return team.zip_bytes(files), f"{posixpath.basename(name) or 'document'}-{label}.zip"
+
+
+def latexdiff_pdf(name: str, role: str, data: dict) -> dict:
+    """POST /api/latexdiff: out/<name>.diff.pdf, what changed between a version and now (build.build_diff_pdf)."""
+    _, texts = version_texts(name, role, data.get("id"))
+    main_tex = DOCS[name]
+    with BUILD_LOCK:
+        started = time.time()
+        over = quota_after_build(started)
+        if over is None:
+            try:
+                result = build.build_diff_pdf(main_tex, SETTINGS["latexmk"], texts, live=False)
+            except Exception as exc:  # noqa: BLE001 - a failed diff build must not take the server down.
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            over = quota_after_build(started)
+    if over is not None:
+        raise ApiError(over, 507)
+    try:
+        result["version"] = str(build.diff_paths(main_tex)[0].stat().st_mtime_ns)
+    except OSError:
+        result["version"] = None
+    return result
+
+
+def people(name: str, role: str) -> dict:
+    """GET /api/people: names to @mention: who commented or suggested, who is here, and the owner's named links."""
+    names = set()
+    try:
+        data = review_store(name).load()
+    except review.ReviewError:
+        data = {"threads": [], "suggestions": []}
+    for item in [*data["threads"], *data["suggestions"]]:
+        names.update(c.get("name") for c in [item, *(item.get("comments") or [])])
+    names.update(u["name"] for u in presence(role)["users"] if u.get("doc") == name)
+    if SHARE["on"] and SHARE["doc"] == name and not GATEWAY["secret"]:
+        root = link_root(name)
+        names.update(x["name"] for x in named.current() if x["doc"] == name and x["root"] == root)
+    clean = {n.replace(" (unverified name)", "").strip() for n in names if isinstance(n, str)}
+    return {"people": sorted(n for n in clean if n)[:200]}
+
+
+def access_request(role: str, user: str | None, data: dict) -> dict:
+    """POST /api/access/request: someone on a view or review link asks the owner for more (local sharing)."""
+    if role not in ("view", "review") or GATEWAY["secret"]:
+        raise ApiError("Only people on a view or review link can ask for more access here.", 403)
+    try:
+        ticket = ACCESS.add(display_name(role, user, data.get("name")), role, data.get("role"), data.get("note") or "")
+    except team.TeamError as exc:
+        raise ApiError(str(exc), exc.status)
+    BUS.publish("access", {"doc": SHARE["doc"]})  # the owner's Share dialog; visible() keeps it from everyone else
+    return {"ticket": ticket}
+
+
+def access_status(ticket) -> dict:
+    try:
+        return ACCESS.status(ticket)
+    except team.TeamError as exc:
+        raise ApiError(str(exc), exc.status)
+
+
+def access_decide(data: dict) -> dict:
+    """POST /api/access/decide (owner): grant a named link with the role asked for, or deny."""
+    try:
+        found = ACCESS.take(data.get("id"))
+        url = None
+        if data.get("grant"):
+            name = found["name"].replace(" (unverified name)", "").strip()[:40] or "Guest"
+            info = share_link_create({"name": name, "role": found["want"]})
+            url = next(x["url"] for x in info["named"] if x["id"] == info["made"])
+        ACCESS.decide(found["id"], url)
+    except team.TeamError as exc:
+        raise ApiError(str(exc), exc.status)
+    return {"requests": ACCESS.pending(), "url": url}
 
 
 # ---------------------------------------------------------------------------
@@ -3459,7 +3769,7 @@ DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
     "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
-    "/api/review", "/api/search",
+    "/api/review", "/api/search", "/api/people", "/api/history/zip",
 }
 
 
@@ -3564,6 +3874,7 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
 
     if method == "GET":
         if path == "/" or path.startswith("/ui/") or path in ("/api/config", "/api/health", "/ws", "/api/poll") \
+                or path == "/api/access/status" \
                 or path == "/api/ai":  # ai_info answers per role and never holds the key
             return
         if path == "/api/zotero" and not GATEWAY["secret"]:
@@ -3609,6 +3920,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
     elif method == "POST" and path == "/api/upload":
         need_edit()
         scoped(doc)
+        if is_rc((query.get("path") or [""])[0]):  # a dropped folder's file goes to its own path
+            raise ApiError("This file configures the build and cannot be added through a shared link.", 403)
         if not rate_ok("upload", 30, 60.0):
             raise ApiError("Too many uploads; wait a moment.", 429)
     elif method == "POST" and path == "/api/grammar":
@@ -3661,6 +3974,24 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         # Settings stay owner only (the default deny below); hosted workers fetch nothing (the gateway does).
         scoped(doc)
         if not rate_ok("zotero-apply", 20, 60.0):  # CPU only, but a guest could still keep the server busy
+            raise ApiError("Too many requests; wait a moment.", 429)
+    elif method == "POST" and path == "/api/lock":
+        if not admin:  # Read-only for everyone until unlocked: the local owner, or a workspace admin.
+            raise ApiError("Only the owner or a workspace admin can lock or unlock the document.", 403)
+        scoped(doc)
+    elif method == "POST" and path == "/api/linked":
+        need_edit()  # linked_change: adding and removing a link is the owner's, refreshing the edit role's
+        scoped(doc)
+        if not rate_ok("linked", 10, 60.0):
+            raise ApiError("Too many refreshes; wait a moment.", 429)
+    elif method == "POST" and path == "/api/latexdiff":
+        need_edit()  # Runs latexdiff and LaTeX, so it counts like a rebuild; viewers open the PDF (/pdf/?diff=1).
+        scoped(doc)
+        if not rate_ok("rebuild", *REBUILD_LIMIT):
+            raise ApiError("Too many rebuilds; wait a moment.", 429)
+    elif method == "POST" and path == "/api/access/request":
+        scoped(doc)  # access_request: view and review links only
+        if not rate_ok("access", 5, 60.0):
             raise ApiError("Too many requests; wait a moment.", 429)
     elif method == "POST" and path == "/api/history/clean":
         if not admin:  # Deletes versions for everyone: the local owner, or a workspace admin behind the gateway.
@@ -3890,7 +4221,10 @@ class Handler(BaseHTTPRequestHandler):
                 size = -1
             if not 0 < size <= MAX_UPLOAD:
                 raise ApiError("Bad or oversized image.", 413)
-            self.json(save_upload(name, query.get("name", [""])[0], self.rfile.read(size)))
+            if "path" in query:  # one file of a dropped folder
+                self.json(place_upload(name, query["path"][0], self.rfile.read(size), self.author(query)))
+            else:
+                self.json(save_upload(name, query.get("name", [""])[0], self.rfile.read(size)))
         elif url.path == "/api/fs" and name in DOCS:
             op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
             touched = history_before_fs(name, op, rel)
@@ -3909,6 +4243,16 @@ class Handler(BaseHTTPRequestHandler):
             self.json(history_clean(name, self.body()))
         elif url.path == "/api/review" and name in DOCS:
             self.json(review_change(name, self.role, self.user, self.body()))
+        elif url.path == "/api/lock" and name in DOCS:
+            self.json(lock_set(name, self.body(), self.author(query)))
+        elif url.path == "/api/linked" and name in DOCS:
+            self.json(linked_change(name, self.role, self.body(), self.author(query)))
+        elif url.path == "/api/latexdiff" and name in DOCS:
+            self.json(latexdiff_pdf(name, self.role, self.body()))
+        elif url.path == "/api/access/request" and name in DOCS:
+            self.json(access_request(self.role, self.user, self.body()))
+        elif url.path == "/api/access/decide":  # owner only: check_permission denies every other role
+            self.json(access_decide(self.body()))
         elif url.path == "/api/replace" and name in DOCS:
             self.json(replace_project(name, self.role, self.body(), self.author(query)))
         elif url.path == "/api/grammar" and name in DOCS:
@@ -4011,6 +4355,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not found", "text/plain")
             return
         root = self.doc_root(query)
+        check_writable(query["doc"][0], query.get("path", [""])[0])
         data = self.body()
         remember_disk(query["doc"][0], query.get("path", [""])[0])  # what is on disk now, if history lacks it
         result = write_text_file(
@@ -4035,7 +4380,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(health(self.role))
         elif path == "/api/config":
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
-                       "cleanup": self.role == "owner" or self.admin,
+                       "cleanup": self.role == "owner" or self.admin, "lock": self.role == "owner" or self.admin,
                        "name": display_name(self.role, self.user, None) if self.user else None,  # set by link/account
                        "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
@@ -4045,6 +4390,10 @@ class Handler(BaseHTTPRequestHandler):
             self.json(ai_info(self.role))
         elif path == "/api/share":
             self.json(share_info())
+        elif path == "/api/access":  # owner only (default deny)
+            self.json({"requests": ACCESS.pending()})
+        elif path == "/api/access/status":
+            self.json(access_status(query.get("ticket", [None])[0]))
         elif path == "/ws":
             self.websocket(query)
         elif path == "/api/poll":
@@ -4052,10 +4401,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/events":
             self.events()
         elif path.startswith(("/pdf/", "/log/", "/docx/", "/arxiv/")):
-            self.file(path, "focus" in query, "review" in query)
+            self.file(path, "focus" in query, "review" in query, "diff" in query)
         elif path == "/api/files":
             root = self.doc_root(query)
-            self.json({"files": list_files(root), "dirs": empty_dirs(root)})
+            self.json({"files": list_files(root), "dirs": empty_dirs(root), "linked": linked_files(query["doc"][0])})
         elif path == "/api/file":
             self.json(read_text_file(self.doc_root(query), query.get("path", [""])[0]))
         elif path == "/api/raw":
@@ -4082,6 +4431,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/search":
             self.doc_root(query)
             self.json(search_project(query["doc"][0], self.role, {k: v[0] for k, v in query.items()}))
+        elif path == "/api/people":
+            self.doc_root(query)
+            self.json(people(query["doc"][0], self.role))
+        elif path == "/api/history/zip":
+            self.doc_root(query)
+            body, filename = history_zip(query["doc"][0], self.role, query.get("id", [None])[0])
+            self.reply(200, body, "application/zip", {"Content-Disposition": attachment_header(filename)})
         elif path in ("/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
                       "/api/review"):
             self.doc_root(query)  # 404 for an unknown document
@@ -4138,7 +4494,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("Not an image.", 415)
         self.image(path)
 
-    def file(self, path: str, focus: bool = False, review: bool = False) -> None:
+    def file(self, path: str, focus: bool = False, review: bool = False, diff: bool = False) -> None:
         kind, _, name = path[1:].partition("/")
         if name not in DOCS:
             self.reply(404, b"Unknown document", "text/plain")
@@ -4148,8 +4504,9 @@ class Handler(BaseHTTPRequestHandler):
             target = build.docx_path_for(main_tex)
         elif kind == "arxiv":
             target = build.arxiv_path_for(main_tex)
-        elif focus or review:
-            target = (build.focus_paths if focus else build.review_paths)(main_tex)[0 if kind == "pdf" else 1]
+        elif focus or review or diff:
+            paths = build.focus_paths if focus else build.review_paths if review else build.diff_paths
+            target = paths(main_tex)[0 if kind == "pdf" else 1]
         else:
             target = build.output_path_for(main_tex) if kind == "pdf" else build.log_path_for(main_tex)
         try:

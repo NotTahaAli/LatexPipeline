@@ -174,7 +174,7 @@ export function historyPanel(root, ctx) {
     const acts = [];
     if (ctx.canEdit && path) acts.push(btn(`Restore ${path.split("/").pop()}`, () => restore(v, path), "btn", "Put this file back as it was in this version; the current text stays in the history"));
     if (ctx.canEdit && v.kind === "label") acts.push(btn("Restore all files", () => restore(v, null), "btn", "Put every file back as it was in this version"));
-    foot.replaceChildren(el("span", { className: "mute", textContent: [v.authors.join(", "), new Date(v.time * 1000).toLocaleString()].filter(Boolean).join(" · ") }), el("span", { className: "spacer" }), ...acts, btn("Close", () => dlg.close(), "btn primary"));
+    foot.replaceChildren(el("span", { className: "mute", textContent: [v.authors.join(", "), new Date(v.time * 1000).toLocaleString()].filter(Boolean).join(" · ") }), el("span", { className: "spacer" }), ...acts, ...(ctx.versionActions?.(v) || []), btn("Close", () => dlg.close(), "btn primary"));
   }
 
   function renderDiff(d) {

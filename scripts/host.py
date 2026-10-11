@@ -299,6 +299,14 @@ MIGRATIONS = [
     DROP TABLE invites;
     ALTER TABLE invites_new RENAME TO invites;
     """,
+    # Requests for more access from the editor (a viewer or reviewer asks; a workspace admin grants or dismisses).
+    """
+    CREATE TABLE access_requests(
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('editor', 'reviewer')), project_id TEXT, note TEXT NOT NULL DEFAULT '',
+        created REAL NOT NULL, PRIMARY KEY(tenant_id, user_id));
+    """,
 ]
 
 
@@ -836,6 +844,7 @@ class App:
         self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
         self.invite_tries = Throttle(10, 3600)  # wrong invite links per address
         self.zotero_syncs = Throttle(10, 600)  # Zotero previews per account (hard cap)
+        self.access_requests = Throttle(5, 3600)  # requests for a better role per account and hour
         self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
         self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
@@ -1347,6 +1356,9 @@ class Handler(BaseHTTPRequestHandler):
         if rest in ("/api/zotero", "/api/zotero/fetch", "/api/zotero/preview"):
             self.zotero_sync(rest, role, size)
             return
+        if rest in ("/api/people", "/api/access/request", "/api/access/status"):
+            self.team(project, rest, tenant_role_, size)
+            return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
             if APP.project_bytes(project) + size > limit:
@@ -1480,6 +1492,42 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             ZOTERO_SLOTS.release()
         self.send_json({"text": text, "version": version, "cached": cached, "source": "web"})
+
+    def team(self, project: dict, rest: str, tenant_role_: str, size: int) -> None:
+        """/p/<id>/api/people (workspace members to @mention) and /api/access/* (ask the workspace admins for a
+        better role) stop here: the worker knows neither the members nor the roles."""
+        tid, uid = project["tenant_id"], self.session["id"]
+        if rest == "/api/people" and self.command == "GET":
+            rows = APP.db.all("SELECT u.name FROM members m JOIN users u ON u.id = m.user_id WHERE m.tenant_id = ? "
+                              "ORDER BY u.name LIMIT 500", tid)
+            self.send_json({"people": [r["name"] for r in rows]})
+        elif rest == "/api/access/status" and self.command == "GET":
+            row = APP.db.one("SELECT role FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, uid)
+            self.send_json({"state": "pending" if row else "none", "want": row and row["role"]})
+        elif rest == "/api/access/request" and self.command == "POST":
+            if size > MAX_JSON:
+                raise HttpError(413, "Too large.")
+            try:
+                data = json.loads(self.read_exact(size) or b"{}")
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise HttpError(400, "Expected a JSON object.")
+            want = {"edit": "editor", "review": "reviewer"}.get(data.get("role"))
+            note = data.get("note") or ""
+            if not isinstance(note, str) or len(note) > 300:
+                raise HttpError(400, "Keep the note under 300 characters.")
+            if want is None or tenant_role_ not in ("viewer", "reviewer") or want == tenant_role_:
+                raise HttpError(400, "Viewers can ask for the editor or reviewer role, reviewers for editor.")
+            if APP.access_requests.full(f"access:{uid}"):
+                raise HttpError(429, "Too many requests; wait a while.")
+            APP.access_requests.fail(f"access:{uid}")
+            APP.db.run("INSERT OR REPLACE INTO access_requests(tenant_id, user_id, role, project_id, note, created) "
+                       "VALUES (?, ?, ?, ?, ?, ?)", tid, uid, want, project["id"], note.strip(), time.time())
+            audit_log(APP, "access_requested", uid, self.ip, tid, want)
+            self.send_json({"state": "pending", "want": want})
+        else:
+            raise HttpError(405, "Method not allowed.")
 
     def assistant_stream(self, data: dict, key: str, model: str, record) -> None:
         """?stream: the gateway reads Anthropic's stream itself and relays the answer as NDJSON (ai.relay); usage is
@@ -1951,6 +1999,10 @@ def api_tenant(h: Handler, tid: str) -> None:
                                     "ON u.id = m.user_id WHERE m.tenant_id = ? ORDER BY u.name", tid)
         out["invites"] = APP.db.all("SELECT id, role, email, created, expires FROM invites WHERE tenant_id = ? "
                                     "AND used IS NULL AND expires > ? ORDER BY created DESC", tid, time.time())
+        out["requests"] = APP.db.all("SELECT r.user_id AS id, u.name, u.email, r.role, r.note, r.created, "
+                                     "p.name AS project FROM access_requests r JOIN users u ON u.id = r.user_id "
+                                     "LEFT JOIN projects p ON p.id = r.project_id WHERE r.tenant_id = ? "
+                                     "ORDER BY r.created", tid)
     h.ok(out)
 
 
@@ -1999,7 +2051,16 @@ def api_member_role(h: Handler, tid: str, uid: str) -> None:
         if member["role"] == "admin" and role != "admin" and not admins_left(tid, int(uid)):
             raise HttpError(409, "A workspace needs at least one admin.")
         APP.db.run("UPDATE members SET role = ? WHERE tenant_id = ? AND user_id = ?", role, tid, int(uid))
+        APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))  # answered
     audit_log(APP, "role_changed", h.user["id"], h.ip, tid, f"user {uid}: {member['role']} -> {role}")
+    h.ok()
+
+
+@route("DELETE", r"/api/tenants/([0-9a-f]{16})/requests/(\d+)")
+def api_request_dismiss(h: Handler, tid: str, uid: str) -> None:
+    need_role(h, tid, ("admin",))
+    APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
+    audit_log(APP, "access_dismissed", h.user["id"], h.ip, tid, f"user {uid}")
     h.ok()
 
 
@@ -2013,6 +2074,7 @@ def api_member_remove(h: Handler, tid: str, uid: str) -> None:
         if member["role"] == "admin" and not admins_left(tid, int(uid)):
             raise HttpError(409, "A workspace needs at least one admin.")
         APP.db.run("DELETE FROM members WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
+        APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
     audit_log(APP, "member_removed", h.user["id"], h.ip, tid, f"user {uid}")
     h.ok()
 

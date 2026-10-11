@@ -450,6 +450,12 @@ class Store:
             r = con.execute("SELECT MAX(id) FROM versions WHERE path = ? AND id < ?", (path, vid)).fetchone()
         return r[0]
 
+    def first(self, path: str) -> dict | None:
+        """The oldest row of `path` still kept (None: history never recorded it)."""
+        with LOCK, closing(self._db()) as con:
+            r = con.execute("SELECT * FROM versions WHERE path = ? ORDER BY id LIMIT 1", (path,)).fetchone()
+        return None if r is None else {**self._row(r), "hash": r["hash"]}
+
     def latest(self, path: str) -> dict | None:
         with LOCK, closing(self._db()) as con:
             r = con.execute("SELECT * FROM versions WHERE path = ? ORDER BY id DESC LIMIT 1", (path,)).fetchone()

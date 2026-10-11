@@ -1488,6 +1488,70 @@ def build_review_pdf(main_tex: Path, latexmk: str, review_file: Path | None = No
     return result
 
 
+def diff_paths(main_tex: Path) -> tuple[Path, Path]:
+    """out/<name>.diff.pdf and out/<name>.diff.log: latexdiff of an older version against now (never published)."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.diff.pdf"), pdf.with_name(f"{pdf.stem}.diff.log")
+
+
+LATEXDIFF_CPU = 120  # seconds of CPU latexdiff may use
+
+
+def build_diff_pdf(main_tex: Path, latexmk: str, old_texts: dict, live: bool = True) -> dict:
+    """
+    out/<name>.diff.pdf: latexdiff (a Perl script, so it runs through sandbox.spawn() like TeX) of the document as
+    old_texts ({path: text} of an older version) against the files now, built from a copy in the build cache through
+    build_document. The document's own files are never written. Returns {"ok", "error"}.
+    """
+    work = CACHE_DIR / "_diff" / cache_dir_for(main_tex).name
+    old, new = work / "old", work / "src"
+    for folder in (old, new):
+        shutil.rmtree(folder, ignore_errors=True)
+    generated = {path.resolve() for path in (CACHE_DIR, OUT_DIR, CACHE_DIR.parent / ".latex-history")}
+
+    def ignore(folder: str, names: list[str]) -> list[str]:
+        return [name for name in names if name == ".git" or (Path(folder) / name).resolve() in generated]
+
+    pdf, log = diff_paths(main_tex)
+    pdf.unlink(missing_ok=True)
+    if main_tex.name not in old_texts:
+        return {"ok": False, "error": f"{main_tex.name} did not exist in that version."}
+    try:
+        shutil.copytree(main_tex.parent, new, symlinks=True, ignore=ignore)  # links stay links, as in the document
+        shutil.copytree(new, old, symlinks=True)  # figures and classes the old text uses, then the old text over it
+        root = old.resolve()
+        for rel, text in old_texts.items():
+            target = old / rel
+            if root not in target.resolve().parents:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.unlink(missing_ok=True)  # a symbolic link is replaced, never written through
+            target.write_text(text, encoding="utf-8")
+        sandbox.wait_turn()
+        try:
+            run = subprocess.run(capture_output=True, **sandbox.spawn(
+                ["latexdiff", "--flatten", f"old/{main_tex.name}", f"src/{main_tex.name}"], work, work,
+                cpu=LATEXDIFF_CPU))
+        except FileNotFoundError:
+            return {"ok": False, "error": "latexdiff is not installed (Debian/Ubuntu: apt install latexdiff)."}
+        except sandbox.SandboxError as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            sandbox.scrub(work)
+        if run.returncode or not run.stdout:
+            message = run.stderr.decode("utf-8", "replace").strip().splitlines()
+            return {"ok": False, "error": "latexdiff failed: " + (message[-1] if message else "no output")}
+        main = new / main_tex.name
+        main.unlink()
+        main.write_bytes(run.stdout)  # flattened: every \input is in this one file
+        entry, _ = build_document(main, latexmk, live, False, validate=False, target=(work / "build", pdf))
+    finally:
+        shutil.rmtree(old, ignore_errors=True)
+        shutil.rmtree(new, ignore_errors=True)
+    first = entry["error"] or next((e["message"] for e in entry["errors"]), None)
+    return {"ok": entry["ok"], "error": None if entry["ok"] else first or f"The diff PDF failed; see {log.name}."}
+
+
 def build_safely(
     main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS, record: bool = False,
     validate: bool = True,
@@ -1695,6 +1759,7 @@ def prune(documents: list[Path]) -> None:
     expected |= {log_path_for(document) for document in documents}
     expected |= {path for document in documents for path in focus_paths(document)}
     expected |= {path for document in documents for path in review_paths(document)}
+    expected |= {path for document in documents for path in diff_paths(document)}
     expected |= {docx_path_for(document) for document in documents}
     expected |= {arxiv_path_for(document) for document in documents}
 

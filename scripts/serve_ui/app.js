@@ -16,6 +16,8 @@ import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { tablePaste } from "./tablepaste.js";
+import { teamSupport } from "./team.js";
+import { notifySupport } from "./notify.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -85,7 +87,18 @@ const REV = reviewSupport(S, V, {
   fromYjs: () => !!active?.collab?.yTx,
   dropHeld: (v) => { const t = heldRoom?.held?.text; if (t == null) return false; const h = hunk(v.state.doc.toString(), t); if (h.to > h.from || h.insert) v.dispatch({ changes: h, annotations: REV.bypass.of(true) }); return true; },
   hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
+  mention: (area) => NOTE.mention(area), onData: () => NOTE.update(),
 });
+// Locks, access requests, linked files, folder upload, PDF comments, version zips and diffs, crash recovery (team.js).
+const TEAM = teamSupport({
+  el, icon, api, S, role, config, me: () => me, doc: () => cur, view: () => view, activePath: () => (active?.kind === "text" ? active.path : null),
+  toast, live: (m) => { $("live").textContent = m; }, openFile: (p, line, opts) => openFile(p, line, opts), startComment: () => REV.startComment(),
+  fsDialog: (o) => fsDialog(o), files: () => files, loadFiles: () => loadFiles(), treeTarget: () => treeTarget(),
+  pdfPoint: (e) => { const page = e.target.closest?.(".page"), n = page && pdfView.fullPage(+page.dataset.i); if (n == null) return null; const r = page.getBoundingClientRect(); return { page: n, x: (e.clientX - r.left) / pdfView.zoom, y: (e.clientY - r.top) / pdfView.zoom }; },
+  shareOpen: () => $("share").open, refreshShare: () => refreshShare(), openShare: () => openShare(),
+});
+// The bell: mentions and replies, from the review data (notify.js).
+const NOTE = notifySupport({ el, icon, api, doc: () => cur, myName: () => config.name || me.name, data: () => REV.data, open: (id) => REV.focusItem(id), store });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
 const TP = tablePaste(V, { el, toast, preamble: async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => "")) });
 function toggleSuggest() {
@@ -139,6 +152,7 @@ function extensionsFor(tab) {
     readOnly ? [] : GR.extension,
     readOnly ? [] : TP,
     REV.extension,
+    TEAM.extension(tab),
     tab.tex.folding, tab.tex.hover, checkC.of(settings.check ? tab.tex.check : []),
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
@@ -174,6 +188,7 @@ function onUpdate(u) {
     if (!active.fromDisk) { renderTabs(); showSaveState(); scheduleAutosave(); }
   }
   if (u.docChanged) scheduleGrammar();
+  if (u.docChanged && !readOnly) { const tab = active; TEAM.keep(tab, () => (tab === active ? view.state.doc : tab.state.doc).toString()); }   // crash recovery
   if (u.docChanged && u.transactions.some((t) => t.annotation(S.Transaction.userEvent))) live.edited();   // Own typing, not a co-editor's.
   if (u.docChanged || u.selectionSet) {
     const head = u.state.selection.main.head, line = u.state.doc.lineAt(head);
@@ -285,6 +300,9 @@ async function openFile(path, line, opts = {}) {
       } catch (e) { toast(el("span", { textContent: `${path}: ${e.message}` })); return; }
     }
     tabs.set(path, tab);
+    if (kind === "text" && !readOnly) {   // unsaved text from a session that crashed: offered back
+      TEAM.offer(tab, tab.state.doc.toString(), async (text) => { await openFile(path); view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, userEvent: "input.recover" }); });
+    }
   }
   await activate(tab, line, opts);
 }
@@ -320,7 +338,7 @@ async function activate(tab, line, opts = {}) {
     if (!opts.noFocus) view.focus();
   }
   renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors(); renderFocus();
-  if (tab.kind === "text") REV.refresh(view);
+  if (tab.kind === "text") { REV.refresh(view); TEAM.refresh(); }
   if (ui.drawer && ui.drawerTab === "history" && !same) historyUi.load();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
@@ -468,7 +486,7 @@ async function onFsEvent(msg) {
 const openDirs = new Set(store.json("dirs", [""]));
 async function loadFiles() {
   if (!cur) return;
-  try { const r = await api.files(cur); files = r.files; emptyDirs = r.dirs || []; } catch { return; }
+  try { const r = await api.files(cur); files = r.files; emptyDirs = r.dirs || []; TEAM.linked = r.linked; } catch { return; }
   if (ui.side) renderTree();
 }
 
@@ -505,6 +523,7 @@ function renderTree() {
   };
   walk(root, "", 0);
   out.replaceChildren(...rows);
+  TEAM.decorateTree(out);
   showTreeTools();
 }
 
@@ -829,6 +848,12 @@ $("zIn").onclick = () => pdfView.setZoom(pdfView.zoom * 1.2);
 $("zOut").onclick = () => pdfView.setZoom(pdfView.zoom / 1.2);
 $("zFit").onclick = () => pdfView.fit();
 $("toCursor").onclick = toCursor;
+{   // Comment on the PDF: a point or a dragged region, found in the source by inverse SyncTeX (team.js).
+  const b = el("button", { className: "icon", id: "pdfComment", title: "Comment on the PDF: click a point or drag over a region", onclick: () => TEAM.pdfComment($("viewer")) }, icon("comment"));
+  b.setAttribute("aria-label", "Comment on the PDF"); b.hidden = readOnly && !reviewer;
+  $("toCursor").after(b);
+  TEAM.pdfPicker($("viewer"));
+}
 
 // ---- build status and problems ----------------------------------------------------------------------
 let announced = null;
@@ -1015,6 +1040,7 @@ const historyUi = historyPanel($("dpanel-history"), {
   inRoom: (path) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit); },
   roomApply: (path, text, base) => !!tabs.get(path)?.collab?.applyText(text, base),   // false while an IME composition holds the room
   send: (message) => channel.send(message),
+  versionActions: (v) => TEAM.versionActions(v),
 });
 $("diffClose").onclick = () => $("diffDlg").close();
 // Search and replace in all files (search.js): a file open in a co-editing room is changed through its room.
@@ -1283,6 +1309,15 @@ const COMMANDS = [
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
   { id: "reviewpdf", edit: true, title: "Build with suggestions (PDF)", run: () => buildReviewPdf() },
+  { id: "sugcard", title: "Open the suggestion at the cursor", keys: "Alt+Enter", run: () => view && REV.openCard(view) },
+  { id: "pdfcomment", title: "Comment on the PDF...", run: () => TEAM.pdfComment($("viewer")) },
+  { id: "notifications", title: "Notifications (mentions and replies)", run: () => NOTE.node.querySelector("button").click() },
+  ...(config.lock ? [{ id: "lock", get title() { return TEAM.locked ? "Unlock the document" : "Lock the document (read-only for everyone)"; }, run: () => TEAM.toggleLock() }] : []),
+  ...(role === "view" || role === "review" ? [{ id: "access", title: "Request access...", run: () => TEAM.accessBtn.click() }] : []),
+  { id: "copy", edit: true, title: "Copy file or folder...", run: () => { setSide(true, "files"); TEAM.copyTarget(); } },
+  { id: "linkfile", owner: true, title: "Link a file from a URL or another document...", run: () => TEAM.linkFile() },
+  { id: "refreshlinked", edit: true, title: "Refresh linked file", run: () => TEAM.refreshLinked() },
+  { id: "unlink", owner: true, title: "Unlink file (make it an ordinary file)", run: () => TEAM.unlink() },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
   { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
@@ -1503,6 +1538,7 @@ function renderShare(info) {
       linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline. Anyone with it picks their own name, shown as unverified."),
       linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Names are unverified too."),
       namedLinks(info, { el, api, linkRow, refresh: refreshShare }),
+      TEAM.shareSection(),
       el("p", { className: "caution" }, el("b", { textContent: "Share edit links only with people you trust." }), " Shell escape stays off, but LuaLaTeX can still run code on this computer."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
       el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }),
@@ -1515,6 +1551,10 @@ $("shareBtn").onclick = openShare;
 $("share").addEventListener("click", (e) => { if (e.target === $("share")) $("share").close(); });
 $("share").addEventListener("close", () => clearTimeout(shareTimer));
 if (readOnly || role !== "owner") $("shareBtn").hidden = true;
+$("roleChip").before(TEAM.chip, NOTE.node, TEAM.accessBtn);
+TEAM.treeTools(document.querySelector("#panel-files .tree-tools"));
+TEAM.dropFolder($("panel-files"));
+if (role === "view" || role === "review") setTimeout(() => TEAM.poll(), 1000);   // a request from an earlier visit
 else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
 // Roles: say who you are, and keep what you cannot do visible but disabled, with the reason.
 if (role !== "owner") {
@@ -1577,6 +1617,7 @@ const collab = collabLibs && config.collab !== false ? new Collab(channel, api, 
 channel.on("state", (data) => {
   const list = data.docs;
   docs = Object.fromEntries(list.map((d) => [d.name, d]));
+  queueMicrotask(() => TEAM.setLocked(docs[cur]?.locked));
   const names = list.map((d) => d.name);
   if ([...$("doc").options].map((o) => o.value).join("\n") !== names.join("\n")) $("doc").replaceChildren(...names.map((n) => new Option(n, n)));
   if (!docs[cur] || !booted) { booted = true; pick(docs[cur] ? cur : docs[store.get("doc")] ? store.get("doc") : names[0]); return; }
@@ -1592,6 +1633,7 @@ channel.on("state", (data) => {
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
 channel.on("review", (d) => { if (d.doc === cur) REV.changed(); });
+channel.on("access", () => TEAM.onAccess());
 channel.on("history", (d) => {
   if (d.doc !== cur) return;
   if (collab && !readOnly) historyUi.resume();   // a restore may wait for an editor of a file open here
