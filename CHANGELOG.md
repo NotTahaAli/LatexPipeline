@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ### Added
 
 - Single-file binaries of `build.py` and `serve.py` for Linux, macOS and Windows (PyInstaller), attached to each `v*` release by `.github/workflows/binaries.yml`; a binary uses the directory it is started in as the repository.
+- Live preview: citations of keys the full build never cited now resolve with biblatex and biber too (biber runs in the sandbox on the preview's `.bcf` plus the full build's keys, only when there are new keys).
 
 ## [0.1.1] - 2026-10-12
 
