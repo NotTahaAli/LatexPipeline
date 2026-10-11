@@ -256,7 +256,7 @@ class Figures:
 
     def __init__(
         self, main_tex: Path, build_dir: Path, engine: str, shell_escape: bool, jobs: int,
-        env: dict[str, str] | None = None, cache: Path | None = None,
+        env: dict[str, str] | None = None, cache: Path | None = None, pretex: str = "",
     ):
         self.main_tex = main_tex
         self.build_dir = build_dir
@@ -268,8 +268,10 @@ class Figures:
         # Outside build_dir: a clean-cache retry wipes build_dir, not the compiled figures.
         self.cache = cache or build_dir / "figcache"
         self.environment = environment_hash(main_tex, engine, shell_escape)
+        if pretex:  # build.py's review markup: figures that use it follow its mode
+            self.environment = hashlib.sha1(f"{self.environment}{pretex}".encode()).hexdigest()
         (build_dir / "tikz").mkdir(exist_ok=True)
-        self.pretex = write_inject(build_dir, main_tex.parent, "_inject.tex", INJECT)
+        self.pretex = pretex + write_inject(build_dir, main_tex.parent, "_inject.tex", INJECT)
         # The main run also records the \input tree (figure jobs must not).
         self.main_pretex = self.pretex + write_inject(build_dir, main_tex.parent, "_record.tex", RECORD)
         # When the run that wrote <stem>.focusmap started; figure jobs trust the map only if

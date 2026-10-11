@@ -1225,6 +1225,35 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("GET", "/log/second?focus=1", "edit")[0], 403)
             self.assertEqual(self.get("GET", "/pdf/demo?focus=1")[0], 401)
 
+    def test_review_pdf_is_built_by_editors_and_read_by_viewers_of_the_shared_document_only(self):
+        built = []
+        with mock.patch.object(serve, "review_pdf", side_effect=lambda name, data: built.append((name, data)) or {}):
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", None, {})[0], 401)
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", "view", {})[0], 403)
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=second", "edit", {})[0], 403)
+            self.assertEqual(built, [])
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", "edit", {"comments": False})[0], 200)
+            self.assertEqual(built, [("demo", {"comments": False})])
+            limit = serve.REBUILD_LIMIT[0]
+            codes = [self.get("POST", "/api/review-pdf?doc=demo", "edit", {})[0] for _ in range(limit)]
+        self.assertEqual(codes[-1], 429)  # counts against the rebuild limit
+        (self.root / "demo.review.pdf").write_bytes(b"%PDF")
+        with mock.patch.object(build, "review_paths", return_value=(self.root / "demo.review.pdf", self.root / "x")):
+            self.assertEqual(self.get("GET", "/pdf/demo?review=1", "view")[0], 200)
+            self.assertEqual(self.get("GET", "/pdf/second?review=1", "view")[0], 403)
+            self.assertEqual(self.get("GET", "/pdf/demo?review=1")[0], 401)
+
+    def test_review_pdf_reads_the_documents_review_data_and_hides_build_config_paths(self):
+        result = {"ok": True, "applied": 1, "notes": 0, "error": None, "skipped": [
+            {"id": "a", "kind": "suggestion", "path": "build.toml", "reason": "x"},
+            {"id": "b", "kind": "suggestion", "path": "ch.tex", "reason": "y"}]}
+        with mock.patch.object(build, "build_review_pdf", return_value=result) as run, \
+                mock.patch.object(serve, "quota_after_build", return_value=None):
+            reply = serve.review_pdf("demo", {"comments": False})
+        self.assertEqual([s["id"] for s in reply["skipped"]], ["b"])
+        args = run.call_args[0]
+        self.assertEqual((args[2], args[3]), (serve.history_folder("demo") / "review.json", False))
+
     def test_the_preview_state_of_another_document_never_reaches_a_shared_session(self):
         state = {"rev": 1, "topic": "doc", "type": "state", "data": {"docs": [
             {"name": "demo", "focus": {"status": "ok"}},

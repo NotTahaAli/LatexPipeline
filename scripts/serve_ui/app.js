@@ -689,6 +689,17 @@ async function exportDocx() {
   try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
   catch (e) { toast(el("span", { textContent: e.message })); }
 }
+// ---- review PDF: the open suggestions marked as changes and the unresolved comments as notes, built from a copy ----
+async function buildReviewPdf() {
+  toast(el("span", { textContent: "Building the PDF with suggestions..." }));
+  try {
+    const r = await api.reviewPdf(cur, true);
+    const url = api.reviewPdfUrl(cur, r.version);
+    const skipped = r.skipped.length ? ` ${r.skipped.length} skipped (not plain text, overlapping, or no longer in the file): ${r.skipped.slice(0, 3).map((s) => s.reason).join("; ")}.` : "";
+    toast(el("span", {}, el("span", { textContent: r.ok ? `${r.applied} suggestion(s) and ${r.notes} comment(s) marked.${skipped} ` : `The PDF with suggestions failed: ${r.error}${skipped} ` }),
+      ...(r.ok ? [el("a", { href: url, target: "_blank", rel: "noopener", textContent: "Open" }), el("span", { textContent: " · " }), el("a", { href: url, download: "", textContent: "Download" })] : [])));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
 async function previewChapter(quiet) {
   if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
   const path = active.path;
@@ -1204,6 +1215,7 @@ const COMMANDS = [
   { id: "suggest", edit: true, title: "Toggle suggest mode (track changes)", keys: `${mod}+Alt+S`, run: () => toggleSuggest() },
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
+  { id: "reviewpdf", edit: true, title: "Build with suggestions (PDF)", run: () => buildReviewPdf() },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
   { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
@@ -1296,7 +1308,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? [] : ["comment", "suggest"]), "review", "history"]],
+  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? [] : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
     ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },

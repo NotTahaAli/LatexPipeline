@@ -188,7 +188,7 @@ def preamble_of(text: str) -> str:
 def preamble_key(main_tex: Path, settings: dict) -> str:
     """What a waiting process depends on. A different key means it must be replaced."""
     digest = hashlib.sha1(repr((
-        settings["engine"], bool(settings["shell_escape"]), [os.environ.get(k) for k in ENV_KEYS],
+        settings["engine"], bool(settings["shell_escape"]), [os.environ.get(k) for k in ENV_KEYS], settings["review"],
     )).encode())
     digest.update(preamble_of(main_tex.read_text(encoding="utf-8", errors="replace")).encode())
     for path in accel.preamble_files(main_tex):
@@ -283,7 +283,8 @@ class Proc:
             settings["engine"], "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-synctex=1",
             f"-output-directory={self.dir}", f"-jobname={main_tex.stem}",
             *(["-shell-escape"] if settings["shell_escape"] else []),
-            accel.write_inject(self.dir, main_tex.parent, "pgfwarm-wait.tex", WAIT) + f"\\input{{{main_tex.name}}}",
+            build.review_pretex(settings) + accel.write_inject(self.dir, main_tex.parent, "pgfwarm-wait.tex", WAIT)
+            + f"\\input{{{main_tex.name}}}",
         ]
         self.out = open(self.dir / "console.txt", "w+", encoding="utf-8", errors="replace")
         try:

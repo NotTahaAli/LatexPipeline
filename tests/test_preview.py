@@ -29,7 +29,7 @@ Front.
 \end{document}
 """
 LATEX = shutil.which("latexmk") and shutil.which("pdflatex")
-SETTINGS = {"engine": "pdflatex", "shell_escape": False}
+SETTINGS = {"engine": "pdflatex", "shell_escape": False, "review": "off"}
 
 
 def text(pdf: bytes) -> str:
@@ -65,6 +65,7 @@ class KeyTests(unittest.TestCase):
             self.assertEqual(preview.preamble_key(main, SETTINGS), key)  # A chapter is read after the trigger.
             self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "engine": "xelatex"}), key)
             self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "shell_escape": True}), key)
+            self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "review": "show"}), key)
             for name, value in (("openin_any", "p"), ("LATEX_SANDBOX", "bwrap")):  # Sharing or the sandbox turned on.
                 with mock.patch.dict(os.environ, {name: value}):
                     on = preview.preamble_key(main, SETTINGS)
