@@ -680,6 +680,7 @@ class Doc:
                 "note": f"{path} is open in the editor, so this became a suggestion for the people there to accept."}
 
     def save(self, path: str, text: str, current: dict | None) -> dict:
+        self.s.check_writable(self.name, path)  # locked document, linked file
         self.s.remember_disk(self.name, path)  # what is on disk now, if history lacks it
         written = self.s.write_text_file(self.root, path, text, current["version"] if current else None,
                                          current["eol"] if current else "\n")

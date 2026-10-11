@@ -302,8 +302,15 @@ async function tenantPage(tid) {
     button("Revoke", async () => { await api(`/api/tenants/${tid}/invites/${i.id}`, "DELETE"); renderInvites(await api(`/api/tenants/${tid}`)); }, "btn ghost", { ariaLabel: `Revoke invite for ${i.email || i.role}` }))))
     : el("p", { className: "empty", textContent: "No open invites." }));
   renderInvites(t);
+  // Requests for a better role, sent from the editor (host.py Handler.team); granting changes the member's role.
+  const requests = (t.requests || []).length ? el("section", { ariaLabel: "Access requests" }, el("h2", { textContent: "Access requests" }),
+    el("ul", { className: "list card" }, t.requests.map((r) => el("li", {},
+      el("span", { className: "tag", textContent: roleName[r.role] }),
+      el("span", { className: "grow", textContent: `${r.name} (${r.email})${r.project ? " in " + r.project : ""} · ${when(r.created)}${r.note ? ": " + r.note : ""}` }),
+      button("Grant", async () => { try { await api(`/api/tenants/${tid}/members/${r.id}`, "POST", { role: r.role }); await reload(); announce(`${r.name} is now ${r.role}.`); } catch (err) { show(box, err.message); } }, "btn", { ariaLabel: `Make ${r.name} ${roleName[r.role].toLowerCase()}` }),
+      button("Dismiss", async () => { try { await api(`/api/tenants/${tid}/requests/${r.id}`, "DELETE"); await reload(); } catch (err) { show(box, err.message); } }, "btn ghost", { ariaLabel: `Dismiss the request from ${r.name}` }))))) : null;
   page({ title: t.name, eyebrow: "Workspace · members and invites", layout: "split" },
-    el("div", { className: "content" }, box,
+    el("div", { className: "content" }, box, requests,
       el("section", { ariaLabel: "Members" }, el("h2", { className: "sr", textContent: "Members" }), members),
       el("section", { ariaLabel: "Open invites" }, el("h2", { textContent: "Open invites" }), pending)),
     el("aside", { ariaLabel: "Invites" }, el("section", { className: "card" }, el("h2", { textContent: "Invite people" }), invite, linkOut,

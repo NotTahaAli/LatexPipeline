@@ -2596,5 +2596,55 @@ class ApiTokens(HostCase):
         self.assertEqual(actions, ["api_token_created", "api_token_revoked", "api_token_created"])
 
 
+class TeamGateway(HostCase):
+    """/p/<id>/api/people and /api/access/*: the gateway answers (members, roles); a worker is never started."""
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ad@x.org", "admin", self.tenant)
+        self.user("ed@x.org", "editor", self.tenant)
+        self.vid = self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker")).start()
+
+    def test_people_are_the_workspace_members(self):
+        status, data, _ = self.client("vi@x.org").call("GET", f"/p/{self.pid}/api/people")
+        self.assertEqual((status, data["people"]), (200, ["Ad", "Ed", "Vi"]))
+        self.assertEqual(self.client("out@x.org").call("GET", f"/p/{self.pid}/api/people")[0], 404)
+
+    def test_a_viewer_asks_and_an_admin_grants(self):
+        viewer, admin, editor = self.client("vi@x.org"), self.client("ad@x.org"), self.client("ed@x.org")
+        url = f"/p/{self.pid}/api/access/request"
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1]["state"], "none")
+        self.assertEqual(viewer.call("POST", url, {"role": "admin"})[0], 400)
+        self.assertEqual(viewer.call("POST", url, {"role": "edit", "note": "x" * 301})[0], 400)
+        self.assertEqual(viewer.call("POST", url, {"role": "edit"}, origin="http://evil.example")[0], 403)
+        self.assertEqual(editor.call("POST", url, {"role": "edit"})[0], 400)  # already an editor
+        self.assertEqual(viewer.call("POST", url, {"role": "edit", "note": "Please"})[0], 200)
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1],
+                         {"state": "pending", "want": "editor"})
+        self.assertNotIn("requests", editor.call("GET", f"/api/tenants/{self.tenant}")[1])  # admins only
+        found = admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"]
+        self.assertEqual([(r["id"], r["role"], r["note"], r["project"]) for r in found],
+                         [(self.vid, "editor", "Please", "Doc")])
+        member = f"/api/tenants/{self.tenant}/members/{self.vid}"
+        self.assertEqual(admin.call("POST", member, {"role": "editor"})[0], 200)
+        self.assertEqual(admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"], [])  # answered
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1]["state"], "none")
+
+    def test_dismiss_is_for_admins_and_requests_are_rate_limited(self):
+        viewer, admin, editor = self.client("vi@x.org"), self.client("ad@x.org"), self.client("ed@x.org")
+        url = f"/p/{self.pid}/api/access/request"
+        for _ in range(5):
+            self.assertEqual(viewer.call("POST", url, {"role": "review"})[0], 200)
+        self.assertEqual(viewer.call("POST", url, {"role": "review"})[0], 429)
+        self.assertEqual(editor.call("DELETE", f"/api/tenants/{self.tenant}/requests/{self.vid}")[0], 403)
+        self.assertEqual(admin.call("DELETE", f"/api/tenants/{self.tenant}/requests/{self.vid}")[0], 200)
+        self.assertEqual(admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

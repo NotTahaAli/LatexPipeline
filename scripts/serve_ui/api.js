@@ -74,6 +74,18 @@ export const api = {
   focus: (doc, path) => call(`api/focus?${qs({ doc, path })}`, { method: "POST" }),
   reviewPdf: (doc, comments) => call(`api/review-pdf?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comments }) }),
   reviewPdfUrl: (doc, v) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}&review=1`,
+  // Team features (team.js, notify.js; serve.py and team.py; hosted, host.py answers people and access itself).
+  people: (doc) => call(`api/people?${qs({ doc })}`),
+  lock: (doc, locked) => call(`api/lock?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ locked }) }),
+  linked: (doc, body) => call(`api/linked?${qs({ doc, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  uploadTo: (doc, file, path) => call(`api/upload?${qs({ doc, path, cid: api.cid || "" })}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }),
+  historyZipUrl: (doc, id) => `api/history/zip?${qs({ doc, id })}`,
+  latexdiff: (doc, id) => call(`api/latexdiff?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }),
+  diffPdfUrl: (doc, v) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}&diff=1`,
+  accessRequest: (doc, body) => call(`api/access/request?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  accessStatus: (doc, ticket) => call(`api/access/status?${qs(ticket ? { doc, ticket } : { doc })}`),
+  accessList: () => call("api/access"),
+  accessDecide: (id, grant) => call("api/access/decide", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, grant }) }),
   pdfUrl: (doc, v, focus) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}${focus ? "&focus=1" : ""}`,
   logUrl: (doc) => `log/${doc.split("/").map(enc).join("/")}`,
 };
