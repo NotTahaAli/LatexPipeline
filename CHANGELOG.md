@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
+- Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
+- Hosted personal API tokens (Account > API tokens): hashed, scoped to chosen projects, revocable, ended by a password change; `Authorization: Bearer` on `/p/<project>/...` and `GET /api/token` (`scripts/host_tokens.py`).
+- VS Code extension in `vscode/` (install with `vsce package`): connects to a local editor, a share link or a hosted project (API token), shows the document as a folder, saves through the editor's API, builds, shows build errors as Problems and the PDF in a tab.
+
 - Single-file binaries of `build.py` and `serve.py` for Linux, macOS and Windows (PyInstaller), attached to each `v*` release by `.github/workflows/binaries.yml`; a binary uses the directory it is started in as the repository.
 - Live preview: citations of keys the full build never cited now resolve with biblatex and biber too (biber runs in the sandbox on the preview's `.bcf` plus the full build's keys, only when there are new keys).
 - Reviewer role: a "can review" named share link and a hosted `reviewer` workspace role (between viewer and editor; new `host.db` migration) comment, reply, resolve and suggest (Suggest mode locked on, "Reviewer" chip) and withdraw their own suggestions, but cannot save, change files, rebuild, accept or reject; the server refuses their co-editing updates, and over MCP they get the review tools only.

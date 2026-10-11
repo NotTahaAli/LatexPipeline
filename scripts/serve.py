@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import ai
 import bibfix
 import build
+import gitops
 import grammar
 import hints
 import history
@@ -1787,6 +1788,30 @@ def ai_settings(data: dict) -> dict:
         raise ApiError(str(exc), exc.status)
     ai.save_settings(saved)
     return ai_info()
+
+
+def git_panel(name: str, path: str, query: dict, data: dict | None = None) -> dict:
+    """
+    The Git panel: the document folder's repository through the user's own git (gitops). Owner only, never for a
+    share link or behind the gateway: check_permission lets no other role reach /api/git*. Pull, switch and abort
+    rewrite files under WRITE_LOCK; an open co-editing room then merges them like any edit made outside the editor
+    (fs_watcher tells its leader, whose next save gets 409 and merges, or room_drift for the next leader).
+    """
+    if GATEWAY["secret"]:
+        raise ApiError("Git is not available here.", 404)
+    folder = DOCS[name].parent
+    try:
+        if data is not None:
+            return gitops.operate(folder, data, WRITE_LOCK)
+        if path == "/api/git/diff":
+            return gitops.diff(folder, query.get("path", [""])[0], query.get("staged", ["0"])[0] == "1")
+        if path == "/api/git/log":
+            return gitops.log(folder)
+        if path == "/api/git/branches":
+            return gitops.branches(folder)
+        return gitops.status(folder)
+    except gitops.GitError as exc:
+        raise ApiError(str(exc), exc.status, **exc.extra)
 
 
 def grammar_info(role: str = "owner") -> dict:
@@ -3621,6 +3646,7 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)
         if not rate_ok("ai", 10, 60.0):
             raise ApiError("Too many AI requests; wait a moment.", 429)
+    # /api/git* (the Git panel) is owner only: no branch here lets a share link or a gateway role reach it.
     # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
     # link could otherwise put /etc/passwd into a download. POST /api/arxiv and GET /arxiv/ too: the archive is
     # the owner's source tree, comments included in what it was made from.
@@ -3941,6 +3967,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(ai_run(self.role, self.body(), guest))
         elif url.path == "/api/ai/settings" and self.role == "owner":
             self.json(ai_settings(self.body()))
+        elif url.path == "/api/git" and name in DOCS and self.role == "owner":  # check_permission: owner only too
+            self.json(git_panel(name, url.path, query, self.body()))
         elif url.path == "/api/grammar/settings" and self.role == "owner":
             self.json(grammar_settings(self.body()))
         elif url.path == "/api/docx" and name in DOCS:
@@ -4071,6 +4099,9 @@ class Handler(BaseHTTPRequestHandler):
             data = outline(DOCS[name])
             data["pages"] = STATE.get(name, {}).get("pages")
             self.json(data)
+        elif path in ("/api/git", "/api/git/diff", "/api/git/log", "/api/git/branches"):
+            self.doc_root(query)  # owner only (check_permission)
+            self.json(git_panel(query["doc"][0], path, query))
         elif path == "/api/refs":
             self.json(references(self.doc_root(query)))
         elif path == "/api/lint":

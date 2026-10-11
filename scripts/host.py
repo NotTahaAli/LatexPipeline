@@ -51,7 +51,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import host_git
 import host_mcp
+import host_tokens
 import zotero
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -298,6 +300,20 @@ MIGRATIONS = [
         SELECT id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used FROM invites;
     DROP TABLE invites;
     ALTER TABLE invites_new RENAME TO invites;
+    """,
+    # Git sync (host_git.py): each person's token for the Git host, each project's remote. Personal API tokens
+    # (host_tokens.py, stored as SHA-256) for scripts and the VS Code extension.
+    """
+    CREATE TABLE git_tokens(
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, username TEXT NOT NULL,
+        token TEXT NOT NULL);
+    CREATE TABLE git_remotes(
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, url TEXT NOT NULL,
+        branch TEXT NOT NULL, user_id INTEGER, created REAL NOT NULL, synced REAL, commit_id TEXT);
+    CREATE TABLE api_tokens(
+        id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE, projects TEXT NOT NULL, created REAL NOT NULL, used REAL);
+    CREATE INDEX api_tokens_user ON api_tokens(user_id);
     """,
 ]
 
@@ -836,6 +852,7 @@ class App:
         self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
         self.invite_tries = Throttle(10, 3600)  # wrong invite links per address
         self.zotero_syncs = Throttle(10, 600)  # Zotero previews per account (hard cap)
+        self.git_syncs = Throttle(20, 600)  # Git pulls and pushes per account (hard cap)
         self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
         self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
@@ -1318,6 +1335,9 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(404, "Not found.")
         pid, rest = match.group(1), match.group(2)
         upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
+        token = host_tokens.bearer(self)  # an API token (scripts, VS Code): never mixed with the cookie session
+        if token is not None:
+            self.session = token
         if self.command == "GET" and not upgrade and self.headers.get("Sec-Fetch-Site") == "cross-site" and not (
                 self.headers.get("Sec-Fetch-Mode") == "navigate" and self.headers.get("Sec-Fetch-Dest") == "document"):
             raise HttpError(403, "Cross-site request refused.")  # Another site's <img>, fetch or <script>.
@@ -1327,7 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raise HttpError(401, "Sign in first.")
         found = project_access(APP, self.session, pid)
-        if not found:
+        if not found or (token is not None and pid not in token["token_projects"]):
             raise HttpError(404, "No such project.")
         project, tenant_role_ = found
         if rest is None:
@@ -1336,8 +1356,10 @@ class Handler(BaseHTTPRequestHandler):
         role = worker_role(tenant_role_)
         if self.command not in ("GET", "POST", "PUT"):
             raise HttpError(405, "Method not allowed.")
-        if (self.command != "GET" or upgrade) and not self.origin_ok():
-            raise HttpError(403, "Cross-site request refused.")
+        if (self.command != "GET" or upgrade) and token is None and not self.origin_ok():
+            raise HttpError(403, "Cross-site request refused.")  # a bearer token is never sent by a browser on its own
+        if token is not None and (upgrade or rest in host_tokens.NOT_WITH_TOKEN):
+            raise HttpError(403, "Not with an API token: open the project in the browser.")
         size = self.body_size(MAX_PROXY_BODY)
         if rest == "/api/mcp":  # only through /mcp (OAuth grant, audit, limits), never with a browser session
             raise HttpError(404, "Not found.")
@@ -1346,6 +1368,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if rest in ("/api/zotero", "/api/zotero/fetch", "/api/zotero/preview"):
             self.zotero_sync(rest, role, size)
+            return
+        if rest == "/api/git" or rest.startswith("/api/git/"):  # the gateway syncs; workers have no Git at all
+            if rest != "/api/git/remote":
+                raise HttpError(404, "Not found.")
+            host_git.handle(self, project, role)
             return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
@@ -1769,6 +1796,7 @@ def api_reset(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), row["user_id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ?", row["user_id"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", row["user_id"])  # connected AI clients too
+        APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", row["user_id"])
     audit_log(APP, "password_reset", row["user_id"], h.ip)
     h.ok()
 
@@ -1868,6 +1896,7 @@ def api_password(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), h.user["id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ? AND id_hash != ?", h.user["id"], h.session["id_hash"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", h.user["id"])  # connected AI clients too
+        APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", h.user["id"])
     audit_log(APP, "password_changed", h.user["id"], h.ip)
     h.ok()
 
@@ -2123,6 +2152,7 @@ def delete_project(project: dict) -> None:
     APP.workers.stop(project["id"])
     APP.db.run("DELETE FROM projects WHERE id = ?", project["id"])
     shutil.rmtree(APP.project_root(project), ignore_errors=True)
+    host_git.forget(project)
 
 
 # --- site admin -------------------------------------------------------------------------------------------------
@@ -2195,6 +2225,7 @@ def api_admin_user(h: Handler, uid: str) -> None:
         if data.get("disabled"):
             APP.db.run("DELETE FROM sessions WHERE user_id = ?", int(uid))
             APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", int(uid))
+            APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", int(uid))
     audit_log(APP, "user_changed", h.user["id"], h.ip, detail=f"user {uid}: {json.dumps(data)[:200]}")
     h.ok()
 
@@ -2489,6 +2520,8 @@ def api_unlink(h: Handler, name: str) -> None:
 
 
 host_mcp.install(sys.modules[__name__])  # the consent and connected-clients API
+host_git.install(sys.modules[__name__])  # each person's Git token (Account page)
+host_tokens.install(sys.modules[__name__])  # personal API tokens (Account page)
 
 
 # ---------------------------------------------------------------------------

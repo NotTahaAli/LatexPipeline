@@ -15,6 +15,7 @@ import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
+import { gitPanel } from "./git.js";
 import { tablePaste } from "./tablepaste.js";
 
 const $ = (id) => document.getElementById(id);
@@ -1168,11 +1169,12 @@ $("drawerClose").onclick = () => setDrawer(false);
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
   $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
-  for (const n of ["files", "search", "outline", "refs", "ai"]) {
+  if (ui.sideTab === "git" && $("tab-git").hidden) ui.sideTab = "files";
+  for (const n of ["files", "search", "outline", "refs", "ai", "git"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
-  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); }
+  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); if (ui.sideTab === "git") gitUi.load(); }
 }
 $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
@@ -1182,6 +1184,12 @@ $("tab-search").onclick = () => setSide(true, "search");
 const showSearch = () => { setSide(true, "search"); searchUi.focus(active?.kind === "text" ? view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to) : ""); };
 $("tab-refs").onclick = () => setSide(true, "refs");
 $("tab-ai").onclick = () => setSide(true, "ai");
+// Git (git.js): the owner's repository locally; hosted, editors sync the project with a remote repository.
+const gitUi = gitPanel($("panel-git"), { el, doc: () => cur, hosted: !!config.hosted, canEdit: role === "edit" || role === "owner",
+  toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); } });
+$("tab-git").hidden = !(config.hosted ? role === "edit" : role === "owner");
+$("tab-git").onclick = () => setSide(true, "git");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------
 async function setVisual(on) {

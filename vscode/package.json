@@ -1,0 +1,22 @@
+{
+  "name": "latex-pipeline",
+  "displayName": "LaTeX Pipeline",
+  "description": "Edit, build and preview a document served by LaTeX Pipeline's editor (serve.py) or a hosted project, inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "latex-pipeline",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": { "type": "git", "url": "https://github.com/NotTahaAli/LatexPipeline" },
+  "engines": { "vscode": "^1.82.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onFileSystem:latexpipeline"],
+  "contributes": {
+    "commands": [
+      { "command": "latexPipeline.connect", "title": "Connect to an editor or hosted project", "category": "LaTeX Pipeline" },
+      { "command": "latexPipeline.disconnect", "title": "Disconnect", "category": "LaTeX Pipeline" },
+      { "command": "latexPipeline.openFile", "title": "Open a file", "category": "LaTeX Pipeline" },
+      { "command": "latexPipeline.build", "title": "Build", "category": "LaTeX Pipeline" },
+      { "command": "latexPipeline.showPdf", "title": "Show the PDF", "category": "LaTeX Pipeline" }
+    ]
+  }
+}

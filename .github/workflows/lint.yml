@@ -8,6 +8,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "vscode/**"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -16,6 +17,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "vscode/**"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -45,6 +47,9 @@ jobs:
       # Pure helpers of the editor: table paste and the review export.
       - name: Editor helper checks
         run: node tests/tablepaste_check.mjs && node tests/reviewexport_check.mjs
+      # The VS Code extension's pure helpers (vscode/lib.js, no npm install) and the Git panel's.
+      - name: VS Code extension check
+        run: node tests/vscode_check.mjs
 
   unittest:
     # Maintainer check: skipped in copies made from the template.
