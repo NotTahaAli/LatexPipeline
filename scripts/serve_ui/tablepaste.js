@@ -3,7 +3,7 @@
 // "Paste as table", which swaps the pasted text for a table environment. HTML is only parsed (DOMParser, never put
 // into the page) and only cell text is read. The pure functions are checked by tests/tablepaste_check.mjs.
 
-const SPECIAL = { "\\": "\\textbackslash{}", "&": "\\&", "%": "\\%", "$": "\\$", "#": "\\#", "_": "\\_", "{": "\\{", "}": "\\}", "~": "\\textasciitilde{}", "^": "\\textasciicircum{}" };
+export const SPECIAL = { "\\": "\\textbackslash{}", "&": "\\&", "%": "\\%", "$": "\\$", "#": "\\#", "_": "\\_", "{": "\\{", "}": "\\}", "~": "\\textasciitilde{}", "^": "\\textasciicircum{}" };
 
 /** Cell text as LaTeX: special characters escaped, line breaks and runs of white space folded to one space. */
 export const escapeLatex = (s) => String(s).replace(/\s+/g, " ").trim().replace(/[\\&%$#_{}~^]/g, (c) => SPECIAL[c]);

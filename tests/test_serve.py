@@ -2080,9 +2080,10 @@ class Upload(SharedState, ServerCase):
         SharedState.setUp(self)
         ServerCase.setUp(self)
 
-    def up(self, name, data, ctype="image/png"):
+    def up(self, name, data, ctype="image/png", folder=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("POST", f"/api/upload?doc=demo&name={quote(name, safe='%')}", data,
+        extra = "" if folder is None else f"&folder={quote(folder, safe='%')}"
+        conn.request("POST", f"/api/upload?doc=demo&name={quote(name, safe='%')}{extra}", data,
                      {"Host": f"127.0.0.1:{self.port}", "Content-Type": ctype})
         res = conn.getresponse()
         body = json.loads(res.read())
@@ -2119,6 +2120,18 @@ class Upload(SharedState, ServerCase):
                 self.assertTrue((self.root / body["path"]).is_file())
         self.assertFalse((self.base / "evil.png").exists())
         self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.suffix == ".svg"), [])
+
+    def test_figure_dialog_folder_is_made_inside_the_document_only(self):
+        self.assertEqual(self.up("a.png", self.PNG, folder="figs//plots/")[1]["path"], "figs/plots/a.png")
+        (self.root / "Figures").mkdir()
+        self.assertEqual(self.up("b.png", self.PNG, folder="/")[1]["path"], "b.png")  # "/": the document folder
+        self.assertEqual(self.up("b.png", self.PNG, folder="/etc/")[1]["path"], "etc/b.png")  # always relative
+        self.write("notadir.png", "x")
+        for folder in ("../out", ".git", "a/../../x", "build.toml", "notadir.png"):
+            with self.subTest(folder=folder):
+                self.assertEqual(self.up("c.png", self.PNG, folder=folder)[0], 400)
+        self.assertFalse((self.base / "out" / "c.png").exists())
+        self.assertFalse((self.root / "build.toml").exists())
 
     def test_upload_tells_browsers_and_never_overwrites(self):
         rev = serve.BUS.rev

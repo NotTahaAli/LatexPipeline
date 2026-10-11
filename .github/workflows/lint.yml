@@ -45,6 +45,9 @@ jobs:
       # Pure helpers of the editor: table paste and the review export.
       - name: Editor helper checks
         run: node tests/tablepaste_check.mjs && node tests/reviewexport_check.mjs
+      # Visual tools: table editor, figure dialog, TikZ parser and writer, Markdown.
+      - name: Visual tool checks
+        run: node tests/tableedit_check.mjs && node tests/figure_check.mjs && node tests/tikz_check.mjs && node tests/markdown_check.mjs
 
   unittest:
     # Maintainer check: skipped in copies made from the template.

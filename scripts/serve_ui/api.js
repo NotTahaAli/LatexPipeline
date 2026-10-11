@@ -65,7 +65,7 @@ export const api = {
   inverse: (doc, page, x, y, preview) => call(`synctex/edit?${qs({ doc, page, x, y, ...(preview ? { preview } : {}) })}`),   // preview: a live preview's cid
   rawUrl: (doc, path) => `api/raw?${qs({ doc, path })}`,
   imageUrl: (doc, name, from) => `api/image?${qs({ doc, name, from })}`,
-  upload: (doc, file, name) => call(`api/upload?${qs({ doc, name })}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }),
+  upload: (doc, file, name, folder) => call(`api/upload?${qs({ doc, name, ...(folder == null ? {} : { folder: folder || "/" }) })}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }),
   fs: (doc, op, path, to) => call(`api/fs?${qs(to == null ? { doc, op, path, cid: api.cid || "" } : { doc, op, path, to, cid: api.cid || "" })}`, { method: "POST" }),
   docx: (doc) => call(`api/docx?${qs({ doc })}`, { method: "POST" }),
   docxUrl: (doc) => `docx/${doc.split("/").map(enc).join("/")}`,

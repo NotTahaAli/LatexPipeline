@@ -16,6 +16,8 @@ import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { tablePaste } from "./tablepaste.js";
+import { editorTools } from "./tools.js";
+import { figureDialog, figureLatex, folderList, defaultFolder, withExtension } from "./figure.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -87,7 +89,13 @@ const REV = reviewSupport(S, V, {
   hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
 });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
-const TP = tablePaste(V, { el, toast, preamble: async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => "")) });
+const preamble = async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => ""));
+const TP = tablePaste(V, { el, toast, preamble });
+// Table grid, Align &, TikZ canvas, Markdown preview and conversion (tools.js); reviewers get them in suggest mode.
+const TOOLS = editorTools(L, V, stex, {
+  el, toast: (m) => toast(el("span", { textContent: m })), view: () => view, preamble, canEdit: !readOnly || reviewer, reviewer, status: $("editorStatus"),
+  mdPreview: () => ui.mdPreview !== false, setMdPreview: (on) => { ui.mdPreview = on; saveUi(); },
+});
 function toggleSuggest() {
   if (readOnly && !reviewer) return;
   REV.setSuggest(!REV.suggesting);
@@ -143,7 +151,7 @@ function extensionsFor(tab) {
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
-    L.StreamLanguage.define(stex),
+    TOOLS.extension(tab.path),
     L.syntaxHighlighting(HL.classHighlighter),
     EditorView.lineWrapping,
     EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, tabindex: "0" }),
@@ -184,7 +192,7 @@ function onUpdate(u) {
 
 const proseEdit = S.Annotation.define();
 
-// ---- figures: drop or paste an image into the editor; it is saved into the document and \includegraphics is inserted ----------
+// ---- figures: drop or paste an image into the editor; after the figure dialog it is saved and a figure is inserted ----------
 const UPLOAD_OK = /^(image\/(png|jpeg)|application\/pdf)$/;
 function dropImages(list, event, pos) {
   const all = [...(list || [])];
@@ -200,10 +208,15 @@ async function uploadImages(fs, pos) {
   for (const f of fs) {
     try {
       const name = f.name && f.name !== "image.png" ? f.name : `pasted-${Date.now()}.${f.type === "image/jpeg" ? "jpg" : f.type === "application/pdf" ? "pdf" : "png"}`;
-      const { path } = await api.upload(cur, f, name);
+      // The figure dialog (figure.js) asks for name, folder, caption, label, width and placement first.
+      const folders = folderList(files.map((x) => x.path), emptyDirs);
+      const opt = await figureDialog({ el }, { name, folders, folder: defaultFolder(folders) });
+      if (!opt) continue;
+      const { path } = await api.upload(cur, f, withExtension(opt.name, name), opt.folder);
       if (active !== tab) { toast(el("span", { textContent: `Saved ${path}.` })); continue; }
-      const text = `\\includegraphics[width=0.8\\linewidth]{${path}}\n`;
       pos = Math.min(pos, view.state.doc.length);
+      const atLineStart = pos === view.state.doc.lineAt(pos).from;
+      const text = (opt.figure && !atLineStart ? "\n" : "") + figureLatex({ ...opt, path });
       view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length }, scrollIntoView: true, userEvent: "input.drop" });
       pos += text.length;
       toast(el("span", { textContent: `Saved ${path} and inserted it.` }));
@@ -1273,6 +1286,7 @@ const COMMANDS = [
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
   { id: "assistant", title: "Toggle AI assistant", run: () => (ui.side && ui.sideTab === "ai") ? setSide(false) : setSide(true, "ai") },
   ...aiUi.commands,
+  ...TOOLS.commands,
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
