@@ -154,7 +154,9 @@ UNSAFE = re.compile(r"remember\s*picture|overlay|tikzmark|tikzpagenodes|current\
 LOCAL_INPUT = re.compile(r"\\(?:input|InputIfFileExists)\s*\{([^}]+)\}")
 # Statements in the document body that change how a picture draws without changing its
 # source text: styles and libraries always count, a macro or colour only when a picture names it.
-STYLES = re.compile(r"\\(?:tikzset|tikzstyle|pgfplotsset|pgfkeys|use(?:tikz|pgfplots)library|pgfplotstableread)(?![a-zA-Z@])")
+STYLES = re.compile(
+    r"\\(?:tikzset|tikzstyle|pgfplotsset|pgfkeys|use(?:tikz|pgfplots)library|pgfplotstableread)(?![a-zA-Z@])"
+)
 MACRO_DEF = re.compile(
     r"\\(?:[gex]?def|let|(?:re|provide)?newcommand\*?|(?:New|Renew|Provide|Declare)DocumentCommand)"
     r"\s*\{?\s*\\([a-zA-Z@]+)"
@@ -218,7 +220,7 @@ def preamble_files(main_tex: Path) -> list[Path]:
 
 
 def statement(text: str, start: int) -> str:
-    """The command at text[start] with its arguments: up to the end of the line or the next command once a group closed."""
+    """The command at text[start] and its arguments: to the line end, or the next command once a group closed."""
     depth, closed, i = 0, False, start + 1
     while i < len(text):
         char = text[i]

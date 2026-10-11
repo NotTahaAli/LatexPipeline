@@ -630,8 +630,8 @@ def refresh_preview(main_tex: Path) -> None:
 def live_preview(name: str, client: str, data: dict) -> tuple[dict, bytes | None]:
     """
     POST /api/preview: typeset the chapter holding data["path"] with data["text"] in place of that file (main.tex:
-    the part around the edit). An edit of the preamble, a class or a package answers status "preamble": the
-    full build after the save (the watcher's) brings previews back.
+    the part around the edit). An edit of the preamble, a class or a package typesets the chapter this client
+    previewed last on a TeX process started from the edited (even unsaved) preamble (preview.Warm.overrides).
     """
     main_tex = DOCS[name]
     rel, text = data.get("path"), data.get("text")
@@ -3572,6 +3572,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             raise ApiError("Only the owner can download the DOCX export.", 403)
         if path.startswith("/arxiv/"):
             raise ApiError("Only the owner can download the arXiv export.", 403)
+        if path.startswith("/html/"):
+            raise ApiError("Only the owner can download the HTML export.", 403)
         if path.startswith(("/pdf/", "/log/")):
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
@@ -3623,7 +3625,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             raise ApiError("Too many AI requests; wait a moment.", 429)
     # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
     # link could otherwise put /etc/passwd into a download. POST /api/arxiv and GET /arxiv/ too: the archive is
-    # the owner's source tree, comments included in what it was made from.
+    # the owner's source tree, comments included in what it was made from. POST /api/html and GET /html/ too: TeX4ht
+    # runs LaTeX on the source with the owner's settings (sandboxed only when the owner asked for it).
     elif method == "POST" and path == "/api/bib":
         scoped(doc)  # Read-only (the sources and .bib files a view link can already read), POST to carry unsaved text.
     elif method == "POST" and path == "/api/bib/edit":
@@ -3950,6 +3953,13 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 raise ApiError(message, 500)
             self.json({"ok": True})
+        elif url.path == "/api/html" and name in DOCS:
+            if SHARE["on"]:
+                raise ApiError("HTML export is off while sharing.", 409)
+            ok, message = build.export_html(DOCS[name])
+            if not ok:
+                raise ApiError(message, 500)
+            self.json({"ok": True, "message": message})
         elif url.path == "/api/arxiv" and name in DOCS:
             if SHARE["on"]:
                 raise ApiError("arXiv export is off while sharing.", 409)
@@ -4037,7 +4047,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"editor": SETTINGS["editor"], "role": self.role, "collab": True,
                        "cleanup": self.role == "owner" or self.admin,
                        "name": display_name(self.role, self.user, None) if self.user else None,  # set by link/account
-                       "pandoc": shutil.which("pandoc") is not None, "hosted": bool(GATEWAY["secret"]),
+                       "pandoc": shutil.which("pandoc") is not None, "make4ht": shutil.which("make4ht") is not None,
+                       "hosted": bool(GATEWAY["secret"]),
                        "grammar": grammar_info(self.role)})
         elif path == "/api/zotero" and not GATEWAY["secret"]:
             self.json(zotero_info(self.role))
@@ -4051,7 +4062,7 @@ class Handler(BaseHTTPRequestHandler):
             self.poll(query)
         elif path == "/events":
             self.events()
-        elif path.startswith(("/pdf/", "/log/", "/docx/", "/arxiv/")):
+        elif path.startswith(("/pdf/", "/log/", "/docx/", "/arxiv/", "/html/")):
             self.file(path, "focus" in query, "review" in query)
         elif path == "/api/files":
             root = self.doc_root(query)
@@ -4148,6 +4159,8 @@ class Handler(BaseHTTPRequestHandler):
             target = build.docx_path_for(main_tex)
         elif kind == "arxiv":
             target = build.arxiv_path_for(main_tex)
+        elif kind == "html":  # the zip only: the pages themselves are the document's code, never served from here
+            target = build.html_paths(main_tex)[1]
         elif focus or review:
             target = (build.focus_paths if focus else build.review_paths)(main_tex)[0 if kind == "pdf" else 1]
         else:
@@ -4157,8 +4170,8 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.reply(404, b"Not built yet", "text/plain")
             return
-        types = {"pdf": "application/pdf", "docx": DOCX_TYPE, "arxiv": "application/zip"}
-        download = {"docx": ".docx", "arxiv": ".arxiv.zip"}.get(kind)
+        types = {"pdf": "application/pdf", "docx": DOCX_TYPE, "arxiv": "application/zip", "html": "application/zip"}
+        download = {"docx": ".docx", "arxiv": ".arxiv.zip", "html": ".html.zip"}.get(kind)
         self.reply(200, body, types.get(kind, "text/plain; charset=utf-8"),
                    {"Content-Disposition": attachment_header(posixpath.basename(name) + download)}
                    if download else None)

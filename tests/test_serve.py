@@ -583,7 +583,8 @@ class GatewayMode(SharedState, ServerCase):
     def test_owner_only_features_are_unavailable(self):
         for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
                              ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
-                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events")]:
+                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events"),
+                             ("POST", "/api/html?doc=demo"), ("GET", "/html/demo")]:
             with self.subTest(path=path):
                 self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
         self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
@@ -1227,6 +1228,24 @@ class ShareHttp(SharedState, ServerCase):
             for who in ("view", "edit"):
                 self.assertEqual(self.get("GET", "/arxiv/demo", who)[0], 403)
             self.assertEqual(self.get("GET", "/arxiv/demo", "owner"), (200, b"PK"))
+
+    def test_html_export_is_owner_only_off_while_sharing_and_downloads_the_zip(self):
+        url = "/api/html?doc=demo"
+        with mock.patch.object(build, "export_html", return_value=(True, "out/demo.html/index.html")) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)  # sharing is on
+            export.assert_not_called()
+            serve.SHARE["on"] = False
+            self.assertEqual(self.get("POST", url, "owner"), (200, {"ok": True, "message": "out/demo.html/index.html"}))
+        with mock.patch.object(build, "export_html", return_value=(False, "make4ht was not found")):
+            self.assertEqual(self.get("POST", url, "owner"), (500, {"error": "make4ht was not found"}))
+        serve.SHARE["on"] = True
+        (self.root / "demo.html.zip").write_bytes(b"PK")
+        with mock.patch.object(build, "html_paths", return_value=(self.root / "x", self.root / "demo.html.zip")):
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/html/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/html/demo", "owner"), (200, b"PK"))
 
     def test_docx_download_name_has_an_ascii_fallback_and_a_utf8_name(self):
         header = serve.attachment_header("Отчёт 1.docx")

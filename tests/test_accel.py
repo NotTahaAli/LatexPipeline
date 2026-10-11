@@ -243,7 +243,8 @@ class ExternalizedBuildTests(unittest.TestCase):
         self.assertEqual(self.render(), ["two"])
 
     def test_a_file_input_inside_a_picture_invalidates_figures(self):
-        self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}\\input{node}\\end{tikzpicture}\n\\end{document}\n")
+        self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}\\input{node}\\end{tikzpicture}\n"
+                                      "\\end{document}\n")
         self.write("node.tex", "\\node{one};\n")
         self.assertEqual(self.render(), ["one"])
         self.write("node.tex", "\\node{two};\n")

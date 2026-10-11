@@ -71,7 +71,8 @@ def scan(doc_dir: Path, rel: str = "main.tex", seen: set | None = None, depth: i
         line = text.count("\n", 0, match.start()) + 1
         if match.group("frame") is not None:
             body = text[match.end():].split("\\end{frame}", 1)[0]
-            titled = FRAME_TITLE.match(body) or "\\frametitle" in body or re.search(r"\\(?:titlepage|maketitle)\b", body)
+            titled = FRAME_TITLE.match(body) or "\\frametitle" in body \
+                or re.search(r"\\(?:titlepage|maketitle)\b", body)
             found.append(("frame", rel, line, bool(titled), None))
         elif match.group("heading"):
             found.append(("heading", rel, line, match.group("heading"), None))
@@ -142,7 +143,8 @@ def check(doc_dir: Path, pdf_text: bytes | None) -> list[dict]:
                 "\\begin{frame}{Title}.")
         elif kind == "load" and value in NOTES and value not in loaded:
             loaded.add(value)
-            add("a11y-class", rel, line, NOTES[value], f"Consider ltx-talk for a tagged presentation; see {STATUS_URL}.")
+            add("a11y-class", rel, line, NOTES[value],
+                f"Consider ltx-talk for a tagged presentation; see {STATUS_URL}.")
         elif kind == "load" and value in INCOMPATIBLE and value not in loaded:
             loaded.add(value)
             add("a11y-package", rel, line, f"{value} is {INCOMPATIBLE[value]} with tagging "

@@ -91,3 +91,18 @@ class UploadOnlyDocumentOutputsTests(unittest.TestCase):
                 self.assertEqual(publish_release.main(), 0)
         uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
         self.assertEqual(uploaded, ["a.log", "a.pdf"])
+
+    def test_html_zip_is_uploaded_only_for_documents_that_opt_in(self):
+        with fake_repo() as root:
+            write_doc(root, "a", "x", "html = true\n")
+            write_doc(root, "b", "x")
+            out = root / "out"
+            out.mkdir()
+            for name in ("a.pdf", "a.html.zip", "b.pdf", "b.html.zip"):
+                (out / name).write_bytes(b"%PDF")
+            calls = []
+            with mock.patch.object(publish_release, "gh", side_effect=lambda *a: calls.append(a) or ""), \
+                    mock.patch.object(publish_release, "load_documents", return_value=[]):
+                self.assertEqual(publish_release.main(), 0)
+        uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
+        self.assertEqual(uploaded, ["a.html.zip", "a.pdf", "b.pdf"])

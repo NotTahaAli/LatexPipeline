@@ -3,7 +3,8 @@
 Sync out/ to the GitHub release tagged `pdfs`, which always holds the latest
 PDF of every document.
 
-- Uploads every PDF and <name>.log in out/ (replacing older ones).
+- Uploads every PDF and <name>.log in out/ (replacing older ones), and the
+  <name>.html.zip of documents with html = true in build.toml.
   out/ holds only what this run built: a failed document keeps its previous
   PDF on the release, next to the log of the failed build.
 - Deletes assets whose main.tex no longer exists.
@@ -32,8 +33,10 @@ from build import (
     SOURCE_DIR,
     escape_name,
     find_documents,
+    html_paths,
     log_path_for,
     output_path_for,
+    wants_html,
 )
 from ci_report import cell, load_documents
 
@@ -161,9 +164,10 @@ def main() -> int:
     documents = find_documents()
     expected = {asset_name(output_path_for(document)) for document in documents}
     expected |= {asset_name(log_path_for(document)) for document in documents}
+    expected |= {asset_name(html_paths(document)[1]) for document in documents if wants_html(document)}
 
     with tempfile.TemporaryDirectory() as staging:
-        for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]):
+        for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.html.zip")]):
             label = path.relative_to(OUT_DIR).as_posix()
             if asset_name(path) not in expected:  # e.g. a review or chapter preview PDF: never published
                 print(f"Not published: {label}", flush=True)
