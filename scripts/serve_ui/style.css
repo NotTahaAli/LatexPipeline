@@ -521,6 +521,13 @@ dialog::backdrop{background:var(--scrim)}
 .ai-diff{margin:0;max-height:260px;overflow:auto;font:12px/1.45 var(--mono);background:var(--code);border:1px solid var(--rule);border-radius:var(--r);padding:6px 8px}
 .ai-diff div{white-space:pre-wrap;overflow-wrap:anywhere}
 .ai-diff .del{color:var(--ox)}.ai-diff .add{color:var(--moss)}
+.ai-claims{margin:0;padding-left:20px;display:grid;gap:8px;font-size:13px}
+.ai-claims p{overflow-wrap:anywhere}
+.ai-cands{display:grid;gap:6px}
+.ai-cand{border-left:2px solid var(--rule-strong);padding-left:8px;font-size:12.5px;overflow-wrap:anywhere}
+.lib-list{max-height:360px;overflow:auto}
+.lib-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid var(--rule);font-size:12.5px}
+.lib-title{flex:1;min-width:0;overflow-wrap:anywhere}
 
 /* Review: comments and suggestions (review.js) */
 .cm-cmt{background:color-mix(in srgb,var(--ochre) 18%,transparent);border-bottom:2px solid color-mix(in srgb,var(--ochre) 70%,transparent)}

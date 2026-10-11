@@ -49,11 +49,13 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import ai
 import bibfix
 import build
+import citedbib
 import fragment
 import gitops
 import grammar
 import hints
 import history
+import library
 import mcp_tools
 import navigate
 import preview
@@ -1588,6 +1590,18 @@ def bib_lookup(data: dict) -> dict:
         return {"fields": {}, "error": str(exc)}
 
 
+def bib_search(data: dict) -> dict:
+    """{"candidates": [{"type", "fields"}]} from Crossref for one search phrase (the AI claims scan suggests it;
+    only the phrase leaves the machine, through bibfix.get_json), or {"candidates": [], "error"}. Writes nothing."""
+    query = data.get("query")
+    if not isinstance(query, str) or len(query) > 1000:
+        raise ApiError("Send a search phrase.", 400)
+    try:
+        return {"candidates": bibfix.search(query)}
+    except bibfix.BibLookupError as exc:
+        return {"candidates": [], "error": str(exc)}
+
+
 def bib_verify(data: dict) -> dict:
     """Is one entry on Crossref? {"status": verified|mismatch|not-found|unchecked, "message", "doi"}, or {"error"}.
 
@@ -1754,6 +1768,26 @@ def bib_import(data: dict) -> dict:
     return {"entries": found, "error": error}
 
 
+def library_call(fn, *args) -> dict:
+    """The owner's personal reference library (scripts/library.py); its errors become API errors."""
+    try:
+        return fn(*args)
+    except library.LibraryError as exc:
+        raise ApiError(str(exc), exc.status)
+    except OSError as exc:
+        raise ApiError(f"Cannot read or write the library file: {exc}", 500)
+
+
+def cited_bib(name: str) -> dict:
+    """{"text", "keys", "missing", "files", "notes"}: only the entries the last build cited (citedbib.py), for the
+    editor's download. Reads the build cache and .bib files inside the document directory; writes nothing."""
+    main = DOCS[name]
+    try:
+        return citedbib.export(main.parent, build.cache_dir_for(main), main.stem)
+    except (OSError, ValueError) as exc:
+        raise ApiError(f"No cited .bib yet: {exc}", 409)
+
+
 def zotero_call(fn, *args) -> dict:
     """Owner-only Zotero settings and sync (scripts/zotero.py); its errors become API errors."""
     try:
@@ -1825,26 +1859,46 @@ def ai_sandboxed() -> bool:
         return False
 
 
+def ai_conf(saved: dict) -> dict:
+    """{"provider", "model", "key", "base_url"} for ai.ask from the owner's settings. Keys from the environment
+    (ANTHROPIC_API_KEY, OPENAI_API_KEY, taken out of os.environ by ai.env_key) win over saved ones."""
+    if saved["provider"] == "openai":
+        return {"provider": "openai", "model": saved["openai_model"], "base_url": saved["base_url"],
+                "key": ai.env_key(ai.OPENAI_KEY_ENV) or saved["openai_key"]}
+    return {"provider": "anthropic", "model": saved["model"], "base_url": "",
+            "key": ai.env_key() or saved["key"]}
+
+
 def ai_info(role: str = "owner") -> dict:
     """What the editor may show. The key is never sent; only the owner learns where it comes from."""
     saved = ai.load_settings()
-    key = ai.env_key() or saved["key"]
-    on = bool(saved["enabled"] and key and not GATEWAY["secret"])
+    conf = ai_conf(saved)
+    ready = bool(conf["base_url"] and conf["model"]) if conf["provider"] == "openai" else bool(conf["key"])
+    on = bool(saved["enabled"] and ready and not GATEWAY["secret"])
     share = saved["share"] and ai_sandboxed()  # guests only when their LaTeX cannot read the key
-    allowed = on and (role == "owner" or (role == "edit" and share))
-    info = {"enabled": allowed, "model": saved["model"], "notice": ai.NOTICE,
+    local = conf["provider"] == "openai" and ai.is_local_url(conf["base_url"])  # the owner's own model server
+    allowed = on and (role == "owner" or (role == "edit" and share and not local))
+    info = {"enabled": allowed, "model": conf["model"], "notice": ai.notice(conf["provider"], conf["base_url"]),
+            "vision": True,
             "reason": None if allowed else "View-only links cannot use the assistant." if role == "view"
             else "Reviewers cannot use the assistant." if role == "review"
+            else "The owner's assistant runs on a model server on their own network, for the owner only."
+            if on and share and local
             else "The owner has not allowed the assistant for shared links." if on
             else "The AI assistant is off. The owner can turn it on in the Assistant panel."}
     if role == "owner":
         info.update(on=saved["enabled"], share=share, models=list(ai.MODELS), sandboxed=ai_sandboxed(),
-                    key="environment" if ai.env_key() else "settings" if saved["key"] else None)
+                    provider=conf["provider"], providers=list(ai.PROVIDERS), anthropic_model=saved["model"],
+                    base_url=saved["base_url"], openai_model=saved["openai_model"], local=local,
+                    key="environment" if ai.env_key() else "settings" if saved["key"] else None,
+                    openai_key="environment" if ai.env_key(ai.OPENAI_KEY_ENV)
+                    else "settings" if saved["openai_key"] else None)
     return info
 
 
-def ai_begin(role: str, guest: str = "") -> tuple[str, str]:
-    """(key, model) for one request, after the role, consent and guest checks. guest identifies a link visitor."""
+def ai_begin(role: str, guest: str = "") -> dict:
+    """ai.ask's provider, model, key and base URL for one request, after the role, consent and guest checks. guest
+    identifies a link visitor."""
     info = ai_info(role)
     if not info["enabled"]:
         raise ApiError(info["reason"], 403)
@@ -1854,8 +1908,7 @@ def ai_begin(role: str, guest: str = "") -> tuple[str, str]:
         if not rate_ok("ai-guest:" + guest, AI_GUEST_HOURLY, 3600.0):
             raise ApiError(f"You have used your {AI_GUEST_HOURLY} AI requests for this hour.", 429)
         AI["guest_used"] += 1
-    saved = ai.load_settings()
-    return ai.env_key() or saved["key"], saved["model"]
+    return ai_conf(ai.load_settings())
 
 
 def ai_guest(token: str | None, user: str | None, ip: str) -> str:
@@ -1868,9 +1921,9 @@ def ai_guest(token: str | None, user: str | None, ip: str) -> str:
 
 
 def ai_run(role: str, data: dict, guest: str = "") -> dict:
-    key, model = ai_begin(role, guest)
+    conf = ai_begin(role, guest)
     try:
-        return ai.ask(data, key=key, model=model)
+        return ai.ask(data, **conf)
     except ai.AiError as exc:
         raise ApiError(str(exc), exc.status)
 
@@ -1886,12 +1939,24 @@ def ai_settings(data: dict) -> dict:
                 raise ApiError("Shared links can use the assistant only with sandboxed builds (serve.py --sandbox): "
                                "otherwise LuaLaTeX from an edit link could read your API key.", 409)
             saved["share"] = data["share"] is True
+        if "provider" in data:
+            if data["provider"] not in ai.PROVIDERS:
+                raise ApiError("Unknown AI provider.", 400)
+            saved["provider"] = data["provider"]
         if "model" in data:
             saved["model"] = ai.check_model(data["model"])
+        if "openai_model" in data:
+            saved["openai_model"] = ai.check_model(data["openai_model"], "openai")
+        if "base_url" in data:
+            saved["base_url"] = ai.check_base_url(data["base_url"])
         if data.get("key"):
             saved["key"] = ai.check_key(data["key"])
+        if data.get("openai_key"):
+            saved["openai_key"] = ai.check_other_key(data["openai_key"])
         if data.get("forget_key"):
             saved["key"] = None
+        if data.get("forget_openai_key"):
+            saved["openai_key"] = None
     except ai.AiError as exc:
         raise ApiError(str(exc), exc.status)
     ai.save_settings(saved)
@@ -3923,7 +3988,7 @@ DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
     "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
-    "/api/review", "/api/search", "/api/people", "/api/history/zip",
+    "/api/review", "/api/search", "/api/people", "/api/history/zip", "/api/cited-bib",
 }
 
 
@@ -4111,7 +4176,7 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
     elif method == "POST" and path == "/api/bib/edit":
         need_edit()  # Computes a splice; the editor applies it and the normal save path writes the file.
         scoped(doc)
-    elif method == "POST" and path in ("/api/bib/lookup", "/api/bib/import"):
+    elif method == "POST" and path in ("/api/bib/lookup", "/api/bib/import", "/api/bib/search"):
         need_edit()  # Sends one DOI or title to Crossref, so a view-only link cannot start it.
         scoped(doc)
         if not rate_ok("bib-guest", 10, 60.0):  # Own key and a third of bibfix.LIMITER: guests cannot starve the owner.
@@ -4433,6 +4498,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, typeset_selection(name, self.body()), "application/pdf", {})
         elif url.path == "/api/grammar" and name in DOCS:
             self.json(grammar_check(name, self.body().get("text")))
+        elif url.path == "/api/bib/search" and name in DOCS:
+            self.json(bib_search(self.body()))
         elif url.path == "/api/bib/lookup" and name in DOCS:
             self.json(bib_lookup(self.body()))
         elif url.path == "/api/bib/verify" and name in DOCS:
@@ -4451,6 +4518,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json(zotero_apply(self.body()))
         elif url.path == "/api/zotero/preview" and name in DOCS:  # role checked in check_permission
             self.json(zotero_preview(self.body()))
+        elif url.path == "/api/library" and self.role == "owner" and not GATEWAY["secret"]:
+            self.json(library_call(library.change, self.body()))  # the owner's own library (check_permission)
         elif url.path == "/api/zotero/settings" and self.role == "owner":
             self.json(zotero_settings(self.body()))
         elif url.path == "/api/ai" and name in DOCS:
@@ -4566,6 +4635,12 @@ class Handler(BaseHTTPRequestHandler):
             self.json(zotero_info(self.role))
         elif path == "/api/ai":
             self.json(ai_info(self.role))
+        elif path == "/api/library" and self.role == "owner" and not GATEWAY["secret"]:
+            self.json(library_call(lambda: library.listing(library.read())))  # hosted: host.py answers it
+        elif path == "/api/cited-bib":
+            name = query.get("doc", [""])[0]
+            self.doc_root(query)
+            self.json(cited_bib(name))
         elif path == "/api/share":
             self.json(share_info())
         elif path == "/api/access":  # owner only (default deny)
@@ -4804,7 +4879,7 @@ class Handler(BaseHTTPRequestHandler):
     def ai_stream(self, data: dict, guest: str) -> None:
         """POST /api/ai?stream: the answer as NDJSON lines while the model writes it (ai.relay). No Content-Length:
         the body ends when the connection closes, which passes through the gateway's relay and share tunnels."""
-        key, model = ai_begin(self.role, guest)
+        conf = ai_begin(self.role, guest)
 
         def begin() -> None:
             self.send_response(200)
@@ -4818,7 +4893,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            ai.relay(ai.ask_stream(data, key=key, model=model), begin, write)
+            ai.relay(ai.ask_stream(data, **conf), begin, write)
         except ai.AiError as exc:
             raise ApiError(str(exc), exc.status)
 

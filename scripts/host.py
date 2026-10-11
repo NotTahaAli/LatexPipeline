@@ -54,6 +54,7 @@ import build
 import host_git
 import host_mcp
 import host_tokens
+import library
 import zotero
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -75,7 +76,8 @@ CONFIG_DEFAULTS: dict = {
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
     "mcp": {},
 }
-AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
+AI_DEFAULTS: dict = {"enabled": False, "provider": "anthropic", "base_url": "", "model": ai.DEFAULT_MODEL,
+                     "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
                      "daily_per_user": 50, "daily_per_workspace": 500, "daily_total": 2000,
                      "daily_tokens_per_user": 1_000_000}
 CONFIG_RANGES = {"max_connections": (8, 100000), "max_upload_mb": (1, 10000), "max_streams_per_user": (1, 1000),
@@ -115,6 +117,11 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # enabled = true
 # model = "claude-opus-5-5"            # or claude-sonnet-5-5, claude-haiku-5-5
 # api_key_env = "ANTHROPIC_API_KEY"    # the environment variable holding the key
+# Or an OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Mistral, a vLLM or Ollama server you run):
+# provider = "openai"
+# base_url = "https://api.openai.com/v1"  # http:// only for a server on this machine or network
+# model = "the-model-id"
+# api_key_env = "OPENAI_API_KEY"       # leave api_key_env = "" for a local server without a key
 # daily_per_user = 50                  # requests per person per day (UTC)
 # daily_per_workspace = 500            # requests per workspace per day
 # daily_total = 2000                   # requests for the whole server per day (the spending cap)
@@ -183,9 +190,16 @@ def load_config(data: Path) -> dict:
     if not isinstance(config["ai"], dict) or set(config["ai"]) - set(AI_DEFAULTS):
         raise ConfigError(f"{path}: [ai] takes only {', '.join(AI_DEFAULTS)}")
     config["ai"] = cfg = {**AI_DEFAULTS, **config["ai"]}
-    if not isinstance(cfg["enabled"], bool) or cfg["model"] not in ai.MODELS \
-            or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key")):
-        raise ConfigError(f"{path}: [ai] needs enabled = true/false, a model from {ai.MODELS} and text for the keys")
+    if not isinstance(cfg["enabled"], bool) or cfg["provider"] not in ai.PROVIDERS \
+            or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key", "base_url")):
+        raise ConfigError(f"{path}: [ai] needs enabled = true/false, provider = one of {ai.PROVIDERS} and text "
+                          "for the keys and base_url")
+    try:  # the operator may point at a local server (http to loopback or the local network); users never can
+        cfg["model"] = ai.check_model(cfg["model"], cfg["provider"])
+        if cfg["provider"] == "openai":
+            cfg["base_url"] = ai.check_base_url(cfg["base_url"])
+    except ai.AiError as exc:
+        raise ConfigError(f"{path}: [ai] {exc} (model must be one of {ai.MODELS} for Anthropic)") from None
     for key in ("daily_per_user", "daily_per_workspace", "daily_total", "daily_tokens_per_user"):
         if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
             raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
@@ -322,6 +336,11 @@ MIGRATIONS = [
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK(role IN ('editor', 'reviewer')), project_id TEXT, note TEXT NOT NULL DEFAULT '',
         created REAL NOT NULL, PRIMARY KEY(tenant_id, user_id));
+    """,
+    # Personal reference library (library.py): one JSON document per account, shared by all its projects.
+    """
+    CREATE TABLE library(
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL);
     """,
 ]
 
@@ -1384,6 +1403,8 @@ class Handler(BaseHTTPRequestHandler):
             host_git.handle(self, project, role)
         if rest in ("/api/people", "/api/access/request", "/api/access/status"):
             self.team(project, rest, tenant_role_, size)
+        if rest == "/api/library":
+            self.library(size)
             return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
@@ -1409,7 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
         """/p/<id>/api/ai stops here: the gateway holds the operator's key and the daily quotas, so the worker (and
         the LaTeX it runs) never sees either. GET says whether the editor may show the assistant."""
         cfg, key = ai_config(), ai_key()
-        on = bool(cfg["enabled"] and key)
+        on = bool(cfg["enabled"] and (key or cfg["provider"] == "openai"))  # a local server may need no key
+        conf = {"key": key, "model": cfg["model"], "provider": cfg["provider"], "base_url": cfg["base_url"]}
         uid, tid, day = self.session["id"], project["tenant_id"], time.strftime("%Y-%m-%d", time.gmtime())
 
         def left() -> int:
@@ -1439,7 +1461,8 @@ class Handler(BaseHTTPRequestHandler):
                   else "The AI assistant is off on this server." if not on
                   else "The daily AI limit is reached; try again tomorrow." if not left() else None)
         if self.command == "GET":
-            self.send_json({"enabled": reason is None, "model": cfg["model"], "notice": ai.NOTICE, "hosted": True,
+            self.send_json({"enabled": reason is None, "model": cfg["model"], "hosted": True, "vision": True,
+                            "notice": ai.notice(cfg["provider"], cfg["base_url"]),
                             "left": left() if on else 0, "reason": reason})
             return
         if self.command != "POST":
@@ -1464,15 +1487,51 @@ class Handler(BaseHTTPRequestHandler):
                        "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1, "
                        "output_tokens = output_tokens + excluded.output_tokens", day, uid, tid, ai.MAX_TOKENS)
         if "stream" in self.query:
-            self.assistant_stream(data, key, cfg["model"], record)
+            self.assistant_stream(data, conf, record)
             return
         try:
-            result = ai.ask(data, key=key, model=cfg["model"])
+            result = ai.ask(data, **conf)
         except ai.AiError as exc:
             record(exc.usage)  # a refusal, cut-off or malformed answer is billed too
             raise HttpError(exc.status, str(exc))
         record(result["usage"])
         self.send_json(result)
+
+    def library(self, size: int) -> None:
+        """/p/<id>/api/library stops here: the person's own reference library (host.db, one row per account),
+        the same in every project they open; workers never see it. Any role: it is the person's data, and
+        inserting an entry into a document goes through the worker's /api/bib/edit, which needs the edit role."""
+        uid = self.session["id"]
+
+        def stored() -> dict:
+            row = APP.db.one("SELECT data FROM library WHERE user_id = ?", uid)
+            return library.loads(row["data"] if row else None)
+
+        if self.command == "GET":
+            self.send_json(library.listing(stored()))
+            return
+        if self.command != "POST":
+            raise HttpError(405, "Method not allowed.")
+        if size > library.MAX_ADD + MAX_JSON:
+            raise HttpError(413, "Too large.")
+        if "json" not in self.headers.get("Content-Type", ""):
+            raise HttpError(415, "Expected application/json.")
+        try:
+            data = json.loads(self.read_exact(size) or b"{}")
+        except ValueError:
+            raise HttpError(400, "Bad JSON.")
+        if not isinstance(data, dict):
+            raise HttpError(400, "Expected a JSON object.")
+        try:
+            if "text" in data:  # parsed before the transaction, which holds the database lock
+                data = {"op": data.get("op"), "entries": library.parse_text(data["text"])}
+            with APP.db.tx():
+                lib, reply = library.apply(stored(), data)
+                APP.db.run("INSERT INTO library(user_id, data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                           "data = excluded.data", uid, library.dumps(lib))
+        except library.LibraryError as exc:
+            raise HttpError(exc.status, str(exc))
+        self.send_json({**library.listing(lib), **reply})
 
     def zotero_sync(self, rest: str, role: str, size: int) -> None:
         """/p/<id>/api/zotero[/fetch] stops here: each person's own Zotero key (Account page) lives in host.db and
@@ -1555,7 +1614,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise HttpError(405, "Method not allowed.")
 
-    def assistant_stream(self, data: dict, key: str, model: str, record) -> None:
+    def assistant_stream(self, data: dict, conf: dict, record) -> None:
         """?stream: the gateway reads Anthropic's stream itself and relays the answer as NDJSON (ai.relay); usage is
         recorded however it ends, also when the browser stops it or goes away."""
         spent = {"input": 0, "output": 0}
@@ -1572,7 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            ai.relay(ai.ask_stream(data, key=key, model=model, spent=spent), begin, write)
+            ai.relay(ai.ask_stream(data, spent=spent, **conf), begin, write)
         except ai.AiError as exc:
             raise HttpError(exc.status, str(exc))
         finally:

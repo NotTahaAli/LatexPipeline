@@ -349,6 +349,9 @@ class Streaming(unittest.TestCase):
         self.assertEqual(stream.feed('{"answer": "\\ud83d') + stream.feed('\\ude00!"}'), "\U0001F600!")
 
 
+EMPTY_OTHER = {"provider": "anthropic", "base_url": "", "openai_model": "", "openai_key": None}
+
+
 class KeysAndSettings(unittest.TestCase):
     def test_the_environment_key_is_taken_out_of_the_environment(self):
         with mock.patch.dict(os.environ, {"LP_TEST_AI_KEY": "sk-from-env"}), mock.patch.dict(ai._ENV_KEYS, clear=True):
@@ -365,15 +368,16 @@ class KeysAndSettings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cfg" / "ai.json"
             self.assertEqual(ai.load_settings(path), {"enabled": False, "share": False, "model": ai.DEFAULT_MODEL,
-                                                      "key": None})
+                                                      "key": None, **EMPTY_OTHER})
             ai.save_settings({"enabled": True, "share": False, "model": "claude-haiku-5-5", "key": "k" * 30}, path)
             self.assertEqual(ai.load_settings(path)["key"], "k" * 30)
             if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
-            path.write_text('{"enabled": "yes", "model": "gpt; rm", "key": 5}')
+            path.write_text('{"enabled": "yes", "model": "gpt; rm", "key": 5, "provider": "evil", '
+                            '"base_url": "http://example.com/v1", "openai_model": "a b"}')
             self.assertEqual(ai.load_settings(path), {"enabled": False, "share": False, "model": ai.DEFAULT_MODEL,
-                                                      "key": None})
+                                                      "key": None, **EMPTY_OTHER})
         for bad in ("short", "has space in it 12345678901234", None):
             with self.assertRaises(ai.AiError):
                 ai.check_key(bad)
@@ -635,8 +639,8 @@ class GatewayWorker(ts.SharedState, ts.ServerCase):
     def test_worker_refuses_even_with_a_key(self):
         mock.patch.dict(ai._ENV_KEYS, {"ANTHROPIC_API_KEY": "sk-should-not-be-used-xxxxxxxx"}).start()
         mock.patch.object(serve, "ai_sandboxed", return_value=True).start()
-        mock.patch.object(ai, "load_settings", return_value={"enabled": True, "share": True, "model": "m", "key": None}
-                          ).start()
+        mock.patch.object(ai, "load_settings", return_value={"enabled": True, "share": True, "model": "m",
+                                                             "key": None, **EMPTY_OTHER}).start()
         post = mock.patch.object(ai, "post_json").start()
         self.assertFalse(self.as_("edit", "GET", "/api/ai")[1]["enabled"])
         self.assertEqual(self.as_("edit", "POST", "/api/ai?doc=demo", {"task": "rewrite", "selection": {"text": "x"}}

@@ -3,6 +3,7 @@
 // like bib.js's Apply, so co-editing stays consistent and the normal save path writes the file.
 import { addBibLookup } from "./bib.js";
 import { zoteroUi } from "./zotero.js";
+import { libraryUi } from "./library.js";
 
 // Fields shown first for each type (the server's lint list wins where it has one), then the usual optional ones.
 const TYPES = {
@@ -59,10 +60,12 @@ export function refsPanel(root, ctx) {
   const addBtn = el("button", { type: "button", className: "icon", title: "New reference", hidden: ctx.readOnly }, icon("plus"));
   addBtn.setAttribute("aria-label", "New reference");
   const zotActs = ctx.readOnly ? [] : [action("Sync from Zotero...", () => zot.sync()), action("Zotero settings...", () => zot.settings())];
+  const libAct = action("My library...", () => mine.open());
+  libAct.hidden = true;   // Shown once the server says this viewer has a personal library here.
   zotActs.forEach((b) => { b.hidden = true; });   // Shown once the server says this viewer may sync (and configure).
   const more = details("More reference actions", [
     ...(ctx.readOnly ? [] : [action("Import BibTeX, RIS or DOI...", () => openImport()), action("Verify with Crossref", () => verifyAll()), ...zotActs, action("New .bib file...", () => newBib())]),
-    action("Refresh", () => load()),
+    libAct, action("Download cited-only .bib", () => citedBib()), action("Refresh", () => load()),
   ]);
   const chips = el("div", { className: "refs-chips", role: "group" });
   chips.setAttribute("aria-label", "Show");
@@ -81,6 +84,8 @@ export function refsPanel(root, ctx) {
   root.querySelector(".refs-bar").setAttribute("aria-label", "References");
 
   const zot = zoteroUi({ ...ctx, box: formBox, data: () => S.data, scope: () => S.scope, uid, authorLabel, yearOf, reload: () => load() });
+  const mine = libraryUi({ ...ctx, box: formBox, data: () => S.data, selected: () => [...S.sel], uid, suggestKey, reload: () => load() });
+  mine.probe().then((ok) => { libAct.hidden = !ok; });
   if (zotActs.length) zot.probe().then((info) => { zotActs[0].hidden = !info?.can_sync; zotActs[1].hidden = !(info?.can_configure || (info?.hosted && info.can_sync)); });
   search.oninput = () => { S.q = search.value; render(); };
   scope.onchange = () => { S.scope = scope.value; render(); };
@@ -103,6 +108,17 @@ export function refsPanel(root, ctx) {
     return d;
   }
   document.addEventListener("click", (e) => { for (const d of root.querySelectorAll("details.refs-ovf[open]")) if (!d.contains(e.target)) d.open = false; });
+
+  /** Only the entries the last build cited (serve.cited_bib, from its .aux/.bcf), as a .bib download. */
+  async function citedBib() {
+    const r = await fetch(`api/cited-bib?doc=${encodeURIComponent(ctx.doc())}`);
+    const d = await r.json().catch(() => null);
+    if (!r.ok) { ctx.toast(d?.error || r.statusText); return; }
+    const a = el("a", { href: URL.createObjectURL(new Blob([d.text], { type: "application/x-bibtex" })), download: `${ctx.doc().split("/").pop() || "references"}.cited.bib` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    ctx.toast(`${d.keys.length} cited entries.` + (d.missing.length ? ` Cited but in no .bib file: ${d.missing.slice(0, 5).join(", ")}${d.missing.length > 5 ? "..." : ""}.` : ""));
+  }
 
   // ---- data ----------------------------------------------------------------------------------------------------------
   async function fetchData() { return ctx.api.bib(ctx.doc(), await ctx.openTexts()); }
