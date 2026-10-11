@@ -6,7 +6,8 @@ Subcommands:
 
 - summary     Markdown table of this run's documents, for $GITHUB_STEP_SUMMARY.
 - lint        Structural checks (labels, references, figures, bib), overfull boxes from
-              the cached log, chktex and word counts into out/lint-report.json. --grammar adds
+              the cached log, accessibility notices of tagged documents (build-report.json),
+              chktex and word counts into out/lint-report.json. --grammar adds
               LanguageTool findings (grammar.py); --bib-lookup suggests missing bib fields
               from Crossref (bibfix.py); --verify-citations flags entries Crossref does not
               confirm; --format lists .tex files tex-fmt would change.
@@ -529,6 +530,16 @@ def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[F
     return findings
 
 
+def a11y_findings(name: str) -> list[Finding]:
+    """Accessibility findings of a tagged document from build-report.json ("a11y", build.py), as notices."""
+    entry = next((doc for doc in load_documents() if doc.get("name") == name), {})
+    return [
+        Finding(found["kind"], found["file"] or "main.tex", found["line"], found["message"],
+                re.sub(r"\s*\([^()]*:\d+\)", "", found["message"]), level="info")  # subject without line numbers
+        for found in entry.get("a11y") or []
+    ]
+
+
 def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]:
     """For entries lacking required fields: info findings naming what Crossref can fill in (sends a DOI or title)."""
     out = []
@@ -680,7 +691,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
     total = 0
     for name in lint_targets(args.documents):
         doc_dir = SOURCE_DIR / name
-        findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt)
+        findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt) + a11y_findings(name)
         if getattr(args, "grammar", False):
             findings += grammar_findings(name, doc_dir)
         if getattr(args, "bib_lookup", False):
@@ -706,8 +717,9 @@ def cmd_lint(args: argparse.Namespace) -> int:
             "suppressed": suppressed,
             "findings": [finding.as_dict() for finding in findings],
         }
-        # Suggestions and formatting are notices, not failures.
-        total += sum(finding.kind not in ("bib-suggestion", "format") for finding in findings)
+        # Suggestions, formatting and accessibility findings are notices, not failures.
+        total += sum(finding.kind not in ("bib-suggestion", "format") and not finding.kind.startswith("a11y")
+                     for finding in findings)
         print(f"{name}: words={lint[name]['words']} chktex={lint[name]['chktex']} "
               f"lint={len(findings)} suppressed={lint[name]['suppressed']}")
         annotate(name, findings)

@@ -1,0 +1,19 @@
+% !TEX program = pdflatex
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{url}
+\title{Export test}% the title
+\begin{document}
+\maketitle
+% A full-line comment that goes.
+50\% done.   % a comment after text keeps a bare percent sign
+\url{http://example.org/a%20b} and \verb|100%| stay.
+\input{chapters/one}
+\begin{verbatim}
+% kept: inside verbatim
+\end{verbatim}
+\includegraphics[width=2cm]{figures/dot}
+\cite{knuth84}
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}

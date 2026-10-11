@@ -756,7 +756,7 @@ class GlobalInputsTests(unittest.TestCase):
             self.assertFalse(editor_file.startswith(build.GLOBAL_INPUTS), editor_file)
 
     def test_ci_scripts_do_not_import_the_editor_server(self):
-        for name in ("build.py", "accel.py", "hints.py", "publish_release.py", "ci_report.py"):
+        for name in ("build.py", "accel.py", "hints.py", "a11y.py", "arxiv.py", "publish_release.py", "ci_report.py"):
             text = (self.ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)
 

@@ -20,6 +20,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import a11y
 import accel
 import hints
 import sandbox
@@ -56,6 +57,7 @@ GLOBAL_INPUTS = (
     "scripts/accel.py",
     "scripts/sandbox.py",
     "scripts/hints.py",
+    "scripts/a11y.py",
     "scripts/publish_release.py",
     "scripts/ci_report.py",
     ".github/workflows/build-pdf.yml",
@@ -73,7 +75,8 @@ LATEXMK_ARGS = [
 # kpsewhich variables naming directories of the TeX installation. Files there
 # (classes, fonts, texmf.cnf, the format file) never make a document stale.
 TEX_TREE_VARIABLES = (
-    "TEXMFROOT", "TEXMFMAIN", "TEXMFLOCAL", "TEXMFSYSCONFIG", "TEXMFSYSVAR", "TEXMFVAR", "TEXMFCONFIG",
+    "TEXMFROOT", "TEXMFMAIN", "TEXMFDIST", "TEXMFLOCAL", "TEXMFSYSCONFIG", "TEXMFSYSVAR", "TEXMFVAR", "TEXMFCONFIG",
+    "TEXMFDEBIAN",  # Debian's /usr/share/texmf (fonts, lm); empty elsewhere
 )
 
 # TeX wraps its log at 79 columns, which splits paths and errors across lines.
@@ -554,6 +557,12 @@ def docx_path_for(main_tex: Path) -> Path:
     return output_path_for(main_tex).with_suffix(".docx")
 
 
+def arxiv_path_for(main_tex: Path) -> Path:
+    """files/reports/final/main.tex -> out/reports/final.arxiv.zip (--arxiv, never published)."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.arxiv.zip")
+
+
 # ---------------------------------------------------------------------------
 # Per-document settings
 # ---------------------------------------------------------------------------
@@ -904,6 +913,11 @@ def parse_latex_errors(console: str) -> list[dict]:
     return found
 
 
+def a11y_text(name: str, found: dict) -> str:
+    """An accessibility finding as an error line (files/<doc>/<file>:<line>: message), or the bare message."""
+    return error_text(name, found) if found["file"] else found["message"]
+
+
 def error_text(name: str, found: dict) -> str:
     """
     files/<doc>/<file>:<line>: message. Editors can jump to it.
@@ -1005,6 +1019,7 @@ def build_document(
     generated_pdf = build_dir / f"{main_tex.stem}.pdf"
 
     notes: list[str] = []
+    access: list[dict] | None = None  # a11y findings, for tagged documents that built
 
     if settings is not None:
         def latexmk_command(*extra: str) -> list[str]:
@@ -1206,6 +1221,14 @@ def build_document(
                             say(notes[-1])
                 except OSError as exc:
                     errors.append(f"Could not copy generated PDF: {exc}")
+                if settings["tagged"] and not errors:
+                    try:
+                        access = a11y.check(main_tex.parent, pdf_text(output_pdf))
+                    except (OSError, ValueError) as exc:
+                        access = []
+                        notes.append(f"Accessibility check skipped: {exc}")
+                    for found in access:
+                        say(f"Accessibility: {a11y_text(name, found)}")
 
     for message in errors:
         say(f"ERROR: {message}")
@@ -1228,6 +1251,7 @@ def build_document(
         *(f"{error_text(name, found)}\n" + (f"  Hint: {found['hint']}\n" if found["hint"] else "")
           for found in latex_errors),
         *(f"NOTE: {note}\n" for note in notes),
+        *(f"ACCESSIBILITY: {a11y_text(name, found)}\n  Hint: {found['hint']}\n" for found in access or []),
         "\n===== latexmk output =====\n",
         *console,
     ]
@@ -1267,6 +1291,8 @@ def build_document(
         "error": None,
         "phases": {name: round(seconds, 1) for name, seconds in phases.items()},
     }
+    if access is not None:
+        entry["a11y"] = access
 
     return entry, "".join(shown)
 
@@ -1670,8 +1696,10 @@ def prune(documents: list[Path]) -> None:
     expected |= {path for document in documents for path in focus_paths(document)}
     expected |= {path for document in documents for path in review_paths(document)}
     expected |= {docx_path_for(document) for document in documents}
+    expected |= {arxiv_path_for(document) for document in documents}
 
-    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx")]:
+    for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx"),
+                 *OUT_DIR.rglob("*.arxiv.zip")]:
         if path not in expected:
             info(f"Removing stale: {display(path)}")
             path.unlink()
@@ -1818,6 +1846,52 @@ def format_all(documents: list[Path]) -> int:
         for problem in problems:
             error(f"  {problem}")
         failed += bool(problems)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# arXiv export (reads the last build's cache; runs no TeX)
+# ---------------------------------------------------------------------------
+
+def export_arxiv(main_tex: Path) -> tuple[list[dict] | None, list[str]]:
+    """
+    out/<name>.arxiv.zip from the last build (arxiv.py), its preflight appended to out/<name>.log.
+    Returns (findings, lines to print); findings is None when the archive could not be written.
+    """
+    import arxiv  # only here: the export is never part of a build or of CI
+
+    try:
+        settings = read_settings(main_tex)
+        if not (cache_dir_for(main_tex) / f"{main_tex.stem}.fls").is_file():
+            raise OSError("no recorded build (.fls); build the document first")
+        target = arxiv_path_for(main_tex)
+        findings = arxiv.export(main_tex, settings, cache_dir_for(main_tex), target, recorded_inputs(main_tex))
+    except (ConfigError, OSError, ValueError) as exc:
+        return None, [f"ERROR: arXiv export failed: {exc}"]
+    lines = [f"arXiv archive: {display(target)}"]
+    for found in findings:
+        where = f"{found['file']}: " if found["file"] else ""
+        lines += [f"{found['level'].upper()}: {where}{found['message']}", f"  Hint: {found['hint']}"]
+    if not findings:
+        lines.append("Preflight: no problems found.")
+    log, heading = log_path_for(main_tex), "\n===== arXiv export =====\n"
+    try:
+        kept = log.read_text(encoding="utf-8", errors="replace").split(heading)[0] if log.exists() else ""
+        log.write_text(kept + heading + "".join(f"{line}\n" for line in lines), encoding="utf-8")
+    except OSError:
+        pass  # The archive is written; a log that cannot be is not worth failing for.
+    return findings, lines
+
+
+def export_arxiv_all(documents: list[Path]) -> int:
+    """The --arxiv step: export each document and print its preflight; 1 if any failed or has an error."""
+    failed = 0
+    for document in documents:
+        findings, lines = export_arxiv(document)
+        info(f"arXiv {doc_name(document)}:")
+        for line in lines:
+            info(f"  {line}")
+        failed += findings is None or any(found["level"] == "error" for found in findings)
     return 1 if failed else 0
 
 
@@ -2017,6 +2091,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--arxiv",
+        action="store_true",
+        help="After building, write out/<name>.arxiv.zip for arXiv (the files the build read, the .bbl, "
+             "comments stripped) and print preflight checks into the summary and the log. Never published.",
+    )
+
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List discovered main.tex files without building them.",
@@ -2125,6 +2206,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.format and (args.watch or args.focus or args.docx):
         parser.error("--format cannot be combined with --watch, --focus or --docx")
+    if args.arxiv and (args.watch or args.focus):
+        parser.error("--arxiv cannot be combined with --watch or --focus")
 
     return args
 
@@ -2160,6 +2243,8 @@ def print_summary(results: list[dict], profile: bool = False) -> None:
             details.append(size_text(entry["size"]))
         if entry["warnings"]:
             details.append(f"{entry['warnings']} warning(s)")
+        if entry.get("a11y"):
+            details.append(f"{len(entry['a11y'])} accessibility finding(s)")
 
         seconds = "" if entry["seconds"] is None else f"{entry['seconds']:6.1f}s"
         info(f"  {status}  {entry['name']:<{width}}  {seconds:>7}  {', '.join(details)}")
@@ -2289,12 +2374,23 @@ def main() -> int:
 
     exported = documents
 
+    def extras(failed: bool, results: list[dict]) -> int:
+        """--docx and --arxiv after the build; --arxiv skips documents whose build failed in this run."""
+        if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
+            failed = bool(export_docx_all(exported)) or failed
+        if args.arxiv:
+            broken = {entry["name"] for entry in results if not entry["ok"]}
+            failed = bool(export_arxiv_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
+        return 1 if failed else 0
+
     if not args.force:
-        documents = [document for document in documents if is_stale(document)]
+        # --arxiv needs the .fls of a finished build, which a cleaned cache lacks even when the PDF is current.
+        documents = [document for document in documents if is_stale(document)
+                     or args.arxiv and not (cache_dir_for(document) / f"{document.stem}.fls").exists()]
 
         if not documents:
             info("Everything is up to date.")
-            return export_docx_all(exported) if args.docx else 0
+            return extras(False, [])
 
     separator()
     info(f"Found {len(documents)} document(s).")
@@ -2319,11 +2415,7 @@ def main() -> int:
     write_report(results)
     print_summary(results, args.profile)
 
-    failed = any(not entry["ok"] for entry in results)
-    if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
-        failed = bool(export_docx_all(exported)) or failed
-
-    return 1 if failed else 0
+    return extras(any(not entry["ok"] for entry in results), results)
 
 
 if __name__ == "__main__":

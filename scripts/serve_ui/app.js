@@ -744,6 +744,15 @@ async function buildReviewPdf() {
       ...(r.ok ? [el("a", { href: url, target: "_blank", rel: "noopener", textContent: "Open" }), el("span", { textContent: " · " }), el("a", { href: url, download: "", textContent: "Download" })] : [])));
   } catch (e) { toast(el("span", { textContent: e.message })); }
 }
+// arXiv archive from the last build (build.py --arxiv); the preflight findings are also at the end of the log.
+async function exportArxiv() {
+  try {
+    const { findings } = await api.arxiv(cur);
+    el("a", { href: api.arxivUrl(cur), download: "" }).click();
+    const errors = findings.filter((f) => f.level === "error").length;
+    toast(el("span", { textContent: findings.length ? `arXiv archive downloading; preflight: ${errors} error(s), ${findings.length - errors} other finding(s), listed at the end of the log.` : "arXiv archive downloading; preflight found no problems." }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
 async function previewChapter(quiet) {
   if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
   const path = active.path;
@@ -1096,8 +1105,8 @@ function grammarOnlyNote() {
 }
 
 // Warnings parsed from the LaTeX log on the server; kinds are filterable, each row jumps to its source line.
-const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"]];
-const warnGroup = (w) => w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
+const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"], ["a11y", "Accessibility"]];
+const warnGroup = (w) => w.kind === "a11y" ? "a11y" : w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
 let warnings = [], warnFilter = "all", warnKey = null, warnLoaded = null;
 function renderWarnings() {
   const real = warnings.filter((w) => w.level !== "info").length;
@@ -1285,6 +1294,7 @@ const COMMANDS = [
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
   { id: "format", edit: true, title: "Format file (tex-fmt)", run: () => formatFile() },
   { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
+  { id: "arxiv", owner: true, title: "Export for arXiv", run: () => exportArxiv() },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
@@ -1311,7 +1321,7 @@ let paletteItems = [], paletteSel = 0;
 function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && !(role === "owner" && config.pandoc))).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
   $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
     const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
@@ -1378,13 +1388,14 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 function buildMenu() {
   const m = $("moreMenu");
   const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
-    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
       const c = COMMANDS.find((x) => x.id === id);
       const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
       if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
+      if (id === "arxiv" && sharing) { b.disabled = true; b.title = "Off while sharing."; }
       return b;
     })), "mg" + g)));
 }
