@@ -1052,8 +1052,11 @@ UPLOAD_TYPES = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": 
 MAX_UPLOAD = 8 * 1024 * 1024
 
 
-def save_upload(doc: str, name, data: bytes) -> dict:
-    """Store an image in the document (in Figures/ when it exists) under a safe, unused name."""
+def save_upload(doc: str, name, data: bytes, folder=None) -> dict:
+    """
+    Store an image in the document under a safe, unused name: in `folder` (made if missing, "/" for the document
+    folder itself; the figure dialog), else in Figures/ when it exists.
+    """
     root = DOCS[doc].parent
     base = re.sub(r"[^A-Za-z0-9._-]+", "_", posixpath.basename(str(name or "").replace("\\", "/")))
     stem, ext = posixpath.splitext(base)
@@ -1064,9 +1067,19 @@ def save_upload(doc: str, name, data: bytes) -> dict:
         raise ApiError(f"Images can be up to {MAX_UPLOAD // (1024 * 1024)} MB.", 413)
     if not data.startswith(UPLOAD_TYPES[ext]):
         raise ApiError("That file is not really a png, jpg or pdf.", 415)
-    folder = "Figures" if (root / "Figures").is_dir() and not (root / "Figures").is_symlink() else ""
+    if folder is None:
+        folder = "Figures" if (root / "Figures").is_dir() and not (root / "Figures").is_symlink() else ""
+    elif folder.strip("/"):
+        folder = "/".join(p for p in folder.split("/") if p)
+        target = fs_path(root, folder, "folder")
+        if any(p in RC_NAMES for p in folder.split("/")) or (target.exists() and not target.is_dir()):
+            raise ApiError("Bad folder.", 400)
+    else:
+        folder = ""
     with WRITE_LOCK:
         quota_check(len(data))
+        if folder:
+            (root.resolve() / folder).mkdir(parents=True, exist_ok=True)
         for n in range(100):
             rel = posixpath.join(folder, f"{stem[:80]}{'' if n == 0 else '-' + str(n)}{ext}")
             target = fs_path(root, rel)
@@ -3890,7 +3903,8 @@ class Handler(BaseHTTPRequestHandler):
                 size = -1
             if not 0 < size <= MAX_UPLOAD:
                 raise ApiError("Bad or oversized image.", 413)
-            self.json(save_upload(name, query.get("name", [""])[0], self.rfile.read(size)))
+            data = self.rfile.read(size)
+            self.json(save_upload(name, query.get("name", [""])[0], data, query.get("folder", [None])[0]))
         elif url.path == "/api/fs" and name in DOCS:
             op, rel, to = query.get("op", [""])[0], query.get("path", [""])[0], query.get("to", [None])[0]
             touched = history_before_fs(name, op, rel)
