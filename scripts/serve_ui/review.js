@@ -7,6 +7,7 @@
 // Every bit of user text is rendered with textContent.
 import { makeAnchor, locate, partsOf, placeGroups } from "./anchors.js";
 import { ago } from "./history.js";
+import { exportReview } from "./reviewexport.js";
 
 const FILTERS = [["comments", "Comments"], ["suggestions", "Suggestions"], ["resolved", "Resolved"]];
 const IDLE_COMMIT = 1500;   // ms of no typing before a suggestion in progress is sent
@@ -532,7 +533,7 @@ export function reviewSupport(S, V, ctx) {
       return b;
     });
     const only = el("input", { type: "checkbox", checked: fileOnly, id: "rvOnly", onchange: () => { fileOnly = only.checked; render(); } });
-    const tools = [];
+    const tools = [btn("Export…", () => exportReview(ctx, data), "btn", "Download every comment and open suggestion as Markdown or JSON")];
     if (ctx.canEdit) {
       const sw = btn("Suggest", () => ctx.toggleSuggest(), "chip rv-switch", "Suggest mode: your edits become suggestions that others accept or reject");
       sw.setAttribute("role", "switch"); sw.setAttribute("aria-checked", String(suggesting));

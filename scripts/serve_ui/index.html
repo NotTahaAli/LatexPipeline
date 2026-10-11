@@ -111,6 +111,7 @@
     <div class="side-tabs">
       <div class="tl" role="tablist" aria-label="Sidebar">
         <button role="tab" id="tab-files" aria-controls="panel-files" aria-selected="true"><svg class="ic"><use href="#i-files"/></svg>Files</button>
+        <button role="tab" id="tab-search" aria-controls="panel-search" aria-selected="false"><svg class="ic"><use href="#i-search"/></svg>Search</button>
         <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
         <button role="tab" id="tab-refs" aria-controls="panel-refs" aria-selected="false"><svg class="ic"><use href="#i-book"/></svg>References</button>
         <button role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false"><svg class="ic"><use href="#i-spark"/></svg>Assistant</button>
@@ -128,6 +129,7 @@
       </div>
       <div id="tree" role="tree" aria-label="Files"></div>
     </div>
+    <div id="panel-search" role="tabpanel" aria-labelledby="tab-search" hidden></div>
     <div id="panel-refs" role="tabpanel" aria-labelledby="tab-refs" hidden></div>
     <div id="panel-ai" role="tabpanel" aria-labelledby="tab-ai" hidden></div>
     <div id="panel-outline" role="tabpanel" aria-labelledby="tab-outline" hidden>

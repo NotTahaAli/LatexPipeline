@@ -17,6 +17,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: live code check for unmatched `\begin`/`\end`, braces, `\left`/`\right` and math delimiters, with `%%novalidate`, `%%begin novalidate` / `%%end novalidate` and a Settings toggle.
 - Editor: completion of the document's own macros and environments, more built-in environments, and `\cite` / `\ref` keys matched by any part of the key, author or title.
 - Editor: dark PDF pages (PDF toolbar or Settings), remembered in the browser.
+- Editor: search and replace in all files of a document (sidebar Search tab, Ctrl+Shift+F; `GET /api/search`, `POST /api/replace`): match case, whole word, regular expressions for the owner only; files open in live co-editing are changed through the shared document, others written with history; build-config files stay owner-only.
+- Editor: pasting a table from a spreadsheet, Word or a web page offers "Paste as table", a `table`/`tabular` with LaTeX special characters escaped (booktabs rules when the document loads booktabs).
+- Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
 
 ## [0.1.1] - 2026-10-12
 

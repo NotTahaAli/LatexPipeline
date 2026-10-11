@@ -4004,5 +4004,97 @@ class ReviewerRole(SharedState, ServerCase):
         self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
 
 
+class SearchReplace(SharedState, ServerCase):
+    """Project-wide search (view role) and replace (edit role): caps, owner-only regexes, rooms, build config."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("main.tex", "\\section{Intro}\nThe cat sat.\n\\input{ch/one}\n")
+        self.write("ch/one.tex", "A Cat and a category.\ncat\n")
+        self.write("build.toml", "# cat\nengine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        self.tokens = {}
+
+    def call(self, method, path, body=None, role=None):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request(method, path, body, hdrs)
+
+    def search(self, q, role=None, **flags):
+        query = "".join(f"&{k}=1" for k in flags)
+        return self.call("GET", f"/api/search?doc=demo&q={quote(q)}{query}", role=role)
+
+    def replace(self, body, role=None):
+        return self.call("POST", "/api/replace?doc=demo", body, role=role)
+
+    def test_search_groups_by_file_with_options(self):
+        status, data = self.search("cat")
+        self.assertEqual(status, 200)
+        found = {f["path"]: f["matches"] for f in data["files"]}
+        self.assertEqual(sorted(found), ["build.toml", "ch/one.tex", "main.tex"])  # the owner sees build config
+        self.assertEqual([(m["line"], m["col"], m["len"]) for m in found["ch/one.tex"]],
+                         [(1, 2, 3), (1, 12, 3), (2, 0, 3)])
+        first = found["main.tex"][0]
+        self.assertEqual((first["before"], first["match"], first["after"]), ("The ", "cat", " sat."))
+        self.assertEqual(self.search("cat", case=1)[1]["total"], 4)  # "Cat" no longer matches
+        self.assertEqual(self.search("cat", word=1)[1]["total"], 4)  # not "category"
+        self.assertEqual(self.search("")[0], 400)
+        self.assertEqual(self.search("c(a)t", regex=1)[1]["total"], 5)
+        self.assertEqual(self.search("(", regex=1)[0], 400)
+
+    def test_caps(self):
+        with mock.patch.object(serve, "SEARCH_HITS", 2):
+            data = self.search("cat")[1]
+        self.assertEqual((data["total"], data["truncated"]), (2, True))
+        with mock.patch.object(serve, "SEARCH_FILE_MAX", 30):
+            data = self.search("cat")[1]
+        self.assertIn("main.tex", data["skipped"])
+        self.assertNotIn("main.tex", [f["path"] for f in data["files"]])
+
+    def test_guests_view_searches_edit_replaces_no_regex_no_build_config(self):
+        self.tokens = self.share_on()
+        status, data = self.search("cat", role="view")
+        self.assertEqual(status, 200)
+        self.assertNotIn("build.toml", [f["path"] for f in data["files"]])
+        self.assertEqual(self.search("c.t", role="edit", regex=1)[0], 403)
+        body = {"q": "cat", "replace": "dog"}
+        self.assertEqual(self.replace(body, role="view")[0], 403)
+        self.assertEqual(self.replace({**body, "regex": True}, role="edit")[0], 403)
+        self.assertEqual(self.replace({**body, "path": "build.toml"}, role="edit")[0], 403)
+        self.assertEqual(self.replace({**body, "path": "build.toml", "text": "cat"}, role="edit")[0], 403)
+        status, done = self.replace(body, role="edit")
+        self.assertEqual((status, done["count"], done["rooms"]), (200, 4, []))
+        self.assertIn("cat", (self.root / "build.toml").read_text(encoding="utf-8"))  # never touched by a guest
+        self.assertEqual((self.root / "ch/one.tex").read_text(encoding="utf-8"), "A dog and a dogegory.\ndog\n")
+
+    def test_replace_all_writes_with_history_and_leaves_room_files_to_the_editor(self):
+        rev = serve.BUS.rev
+        with mock.patch.object(serve, "room_open", lambda doc, path: path == "main.tex"):
+            status, done = self.replace({"q": "cat", "replace": "dog", "word": True})
+        self.assertEqual((status, done["rooms"], done["files"]), (200, ["main.tex"], [
+            {"path": "build.toml", "count": 1}, {"path": "ch/one.tex", "count": 2}]))
+        self.assertIn("The cat sat.", (self.root / "main.tex").read_text(encoding="utf-8"))  # the room's editor does it
+        store = serve.history_store("demo")
+        self.assertEqual(store.text_at(store.latest("ch/one.tex")["id"], "ch/one.tex"), "A dog and a category.\ndog\n")
+        fs = [m for m in serve.BUS.since(rev) if m["type"] == "fs"]
+        self.assertEqual(fs[-1]["data"]["changed"], ["build.toml", "ch/one.tex"])
+        # The editor sends the room's text and gets the result back; nothing is written.
+        status, out = self.replace({"q": "cat", "replace": "dog", "path": "main.tex", "text": "cat cat\r\n"})
+        self.assertEqual((status, out["text"], out["count"]), (200, "dog dog\n", 2))
+        self.assertIn("The cat sat.", (self.root / "main.tex").read_text(encoding="utf-8"))
+
+    def test_replace_one_and_regex_groups_for_the_owner(self):
+        body = {"q": "cat", "replace": "dog", "path": "ch/one.tex", "nth": 1, "line": 1}
+        self.assertEqual(self.replace(body)[1]["count"], 1)
+        self.assertEqual((self.root / "ch/one.tex").read_text(encoding="utf-8"), "A Cat and a dogegory.\ncat\n")
+        self.assertEqual(self.replace(body)[0], 409)  # match 1 is now on line 2: the file moved on
+        self.assertEqual(self.replace({**body, "nth": 9})[0], 409)
+        self.assertEqual(self.replace({"q": "cat", "nth": 0})[0], 400)  # one match needs its file
+        status, out = self.replace({"q": r"(\w+) sat", "replace": r"\1 stood", "regex": True, "path": "main.tex"})
+        self.assertEqual((status, out["count"]), (200, 1))
+        self.assertIn("The cat stood.", (self.root / "main.tex").read_text(encoding="utf-8"))
+        self.assertEqual(self.replace({"q": "(c)", "replace": r"\2", "regex": True, "path": "main.tex"})[0], 400)
+
+
 if __name__ == "__main__":
     unittest.main()

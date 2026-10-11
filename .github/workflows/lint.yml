@@ -42,6 +42,9 @@ jobs:
       # The editor's folding, code check and completion matching (serve_ui/latex.js).
       - name: LaTeX editor check
         run: node tests/latex_check.mjs scripts/serve_ui/latex.js
+      # Pure helpers of the editor: table paste and the review export.
+      - name: Editor helper checks
+        run: node tests/tablepaste_check.mjs && node tests/reviewexport_check.mjs
 
   unittest:
     # Maintainer check: skipped in copies made from the template.
