@@ -12,6 +12,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `build.py --format [DOC ...]` rewrites a document's `.tex` files with tex-fmt (its `tex-fmt.toml` applies), `ci_report.py lint --format` lists files tex-fmt would change as notices, and the editor's "Format file (tex-fmt)" command formats the open file as one edit (`POST /api/format`, edit role). A missing tex-fmt is a message, never a failure.
 - `ci_report.py lint --verify-citations` (opt-in) flags `.bib` entries whose DOI does not resolve on Crossref, whose title has no close Crossref match, or whose record disagrees on title, year or first author, as possibly fabricated or wrong references; the References panel's "Verify with Crossref" shows a verified / mismatch / not found badge per entry (`POST /api/bib/verify`, edit role, Look up's rate limits).
 - A plain-language hint for biber's "Found biblatex control file version X, expected version Y" (mismatched biber and biblatex).
+- Editor: code folding for sections, environments, the preamble and `% region` blocks (fold gutter and Ctrl+Shift+[ / ]).
+- Editor: hovering math in source mode shows it rendered (KaTeX); hovering a `\cite` key or `\ref` label shows the entry or the label's line.
+- Editor: live code check for unmatched `\begin`/`\end`, braces, `\left`/`\right` and math delimiters, with `%%novalidate`, `%%begin novalidate` / `%%end novalidate` and a Settings toggle.
+- Editor: completion of the document's own macros and environments, more built-in environments, and `\cite` / `\ref` keys matched by any part of the key, author or title.
+- Editor: dark PDF pages (PDF toolbar or Settings), remembered in the browser.
 
 ## [0.1.1] - 2026-10-12
 

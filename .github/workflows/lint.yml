@@ -39,6 +39,9 @@ jobs:
       # The editor's co-editing decisions that protect data (leader takeover, deleted files).
       - name: Collab check
         run: node tests/collab_check.mjs scripts/serve_ui/collab.js
+      # The editor's folding, code check and completion matching (serve_ui/latex.js).
+      - name: LaTeX editor check
+        run: node tests/latex_check.mjs scripts/serve_ui/latex.js
 
   unittest:
     # Maintainer check: skipped in copies made from the template.

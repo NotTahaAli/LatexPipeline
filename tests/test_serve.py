@@ -233,6 +233,17 @@ class Outline(TempDoc):
         self.assertEqual(found["bib"]["smith20"]["year"], "2020")
         self.assertEqual((found["labels"]["fig:b"]["file"], found["labels"]["fig:b"]["line"]), ("lab.tex", 2))
 
+    def test_references_collects_user_macros_and_environments(self):
+        self.write("defs.tex", "\\newcommand{\\R}{\\mathbb{R}}\n\\renewcommand*\\vec[1]{#1}\n"
+                               "\\DeclareMathOperator{\\Tr}{tr}\n\\def\\foo#1{#1}\n\\NewDocumentCommand{\\bar}{m}{}\n"
+                               "% \\newcommand{\\hidden}{}\n"
+                               "\\newenvironment{myproof}{}{}\n\\NewDocumentEnvironment{box*}{}{}{}\n")
+        self.write("my.sty", "\\newcommand\\fromsty{x}\n\\def\\my@internal{}\n")
+        found = serve.references(self.root)
+        self.assertLessEqual({"R", "Tr", "bar", "foo", "fromsty", "vec"}, set(found["macros"]))
+        self.assertFalse({"hidden", "my"} & set(found["macros"]))
+        self.assertLessEqual({"box*", "myproof"}, set(found["envs"]))
+
     def test_log_excerpt_starts_at_the_tex_error(self):
         log = ("summary\nfiles/x/main.tex:3: Undefined control sequence.\n\n! Undefined control sequence.\n"
                "<recently read> \\foo\n\nl.3 \\foo\n         \nmore\nextra\n")
@@ -931,7 +942,7 @@ class ShareHttp(SharedState, ServerCase):
 
     def test_view_role_is_read_only_and_confined_to_the_shared_document(self):
         ok = ["/", "/api/config", "/api/health", "/api/files?doc=demo", "/api/file?doc=demo&path=main.tex",
-              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png", "/api/warnings?doc=demo"]
+              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png", "/api/warnings?doc=demo", "/api/refs?doc=demo"]
         for path in ok:
             with self.subTest(path=path):
                 self.assertEqual(self.get("GET", path, "view")[0], 200)
@@ -940,7 +951,7 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("GET", "/api/health", "view")[1]["docs"], ["demo"])  # no 'second'
         denied = [
             ("GET", "/api/files?doc=second"), ("GET", "/api/file?doc=second&path=main.tex"), ("GET", "/pdf/second"),
-            ("GET", "/api/warnings?doc=second"),
+            ("GET", "/api/warnings?doc=second"), ("GET", "/api/refs?doc=second"),
             ("GET", "/events"), ("GET", "/api/share"), ("GET", "/forward?doc=demo&file=main.tex&line=1"),
             ("POST", "/rebuild?doc=demo"), ("POST", "/forward?doc=demo&file=main.tex&line=1"),
             ("POST", "/api/share"), ("POST", "/api/share/stop"),

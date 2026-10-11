@@ -1277,6 +1277,12 @@ def outline(main_tex: Path) -> dict:
 
 BIB_ENTRY = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,")
 LABEL = re.compile(r"\\label\{([^}]+)\}")
+# User macros and environments for the editor's completion list (names only; @-names are package internals).
+NEW_MACRO = re.compile(r"\\(?:(?:re)?newcommand|providecommand|DeclareMathOperator|DeclareRobustCommand"
+                       r"|(?:New|Renew|Provide|Declare)DocumentCommand)\*?\s*\{?\s*\\([A-Za-z]+)(?![A-Za-z@])"
+                       r"|\\[gex]?def\s*\\([A-Za-z]+)(?![A-Za-z@])")
+NEW_ENV = re.compile(r"\\(?:(?:re)?newenvironment|(?:New|Renew|Provide|Declare)DocumentEnvironment)\*?\s*"
+                     r"\{([A-Za-z*]+)\}")
 
 
 def parse_bib(text: str) -> dict[str, dict]:
@@ -1303,9 +1309,11 @@ def parse_bib(text: str) -> dict[str, dict]:
 def references(root: Path) -> dict:
     labels: dict[str, dict] = {}
     bib: dict[str, dict] = {}
+    macros: set[str] = set()
+    envs: set[str] = set()
     for item in list_files(root):
         path = item["path"]
-        if item["kind"] != "text" or not path.endswith((".tex", ".bib")):
+        if item["kind"] != "text" or not path.endswith((".tex", ".bib", ".sty", ".cls")):
             continue
         try:
             text = resolve_in_doc(root, path).read_text("utf-8", "replace")
@@ -1315,13 +1323,18 @@ def references(root: Path) -> dict:
             for key, fields in parse_bib(text).items():
                 bib.setdefault(key, {**fields, "file": path})
             continue
-        lines = strip_comments(text).split("\n")
+        code = strip_comments(text)
+        macros.update(a or b for a, b in NEW_MACRO.findall(code))
+        envs.update(NEW_ENV.findall(code))
+        if not path.endswith(".tex"):
+            continue
+        lines = code.split("\n")
         for number, line in enumerate(lines, 1):
             for match in LABEL.finditer(line):
                 near = next((lines[n].strip() for n in range(number - 1, max(number - 8, -1), -1)
                              if re.search(r"\\(?:caption|(?:sub)*section|chapter)\b", lines[n])), line.strip())
                 labels.setdefault(match.group(1), {"file": path, "line": number, "context": near[:200]})
-    return {"labels": labels, "bib": bib}
+    return {"labels": labels, "bib": bib, "macros": sorted(macros), "envs": sorted(envs)}
 
 
 def lint(doc_name: str) -> list[dict]:
