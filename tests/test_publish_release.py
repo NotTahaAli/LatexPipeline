@@ -91,3 +91,18 @@ class UploadOnlyDocumentOutputsTests(unittest.TestCase):
                 self.assertEqual(publish_release.main(), 0)
         uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
         self.assertEqual(uploaded, ["a.log", "a.pdf"])
+
+    def test_output_pdfs_of_build_toml_are_published_and_pages_extracts_are_not(self):
+        with fake_repo() as root:
+            write_doc(root, "a", "x")
+            (root / "files" / "a" / "build.toml").write_text('[[output]]\nname = "handout"\n', encoding="utf-8")
+            out = root / "out"
+            out.mkdir()
+            for name in ("a.pdf", "a.log", "a-handout.pdf", "a-handout.log", "a.pages.pdf", "a-other.pdf"):
+                (out / name).write_bytes(b"%PDF")
+            calls = []
+            with mock.patch.object(publish_release, "gh", side_effect=lambda *a: calls.append(a) or ""), \
+                    mock.patch.object(publish_release, "load_documents", return_value=[]):
+                self.assertEqual(publish_release.main(), 0)
+        uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
+        self.assertEqual(uploaded, ["a-handout.log", "a-handout.pdf", "a.log", "a.pdf"])

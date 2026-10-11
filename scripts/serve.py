@@ -1740,6 +1740,30 @@ def bib_edit(data: dict) -> dict:
     return {"from": u16(start), "to": u16(end), "insert": insert}
 
 
+def bib_tidy(data: dict) -> dict:
+    """
+    POST /api/bib/tidy: the .bib text the editor holds, sorted and aligned (bibtidy.tidy), and possible duplicates.
+    Nothing is written here: the editor applies the text as one edit, like Format.
+    """
+    import bibtidy  # only for this request
+
+    text, order = data.get("text"), data.get("order") or "key"
+    if not isinstance(text, str) or not isinstance(order, str):
+        raise ApiError("Send the .bib text.", 400)
+    if len(text) > BIB_MAX_CHARS:
+        raise ApiError("This .bib file is too large to tidy here (1 MB limit).", 413)
+    try:
+        tidied, twins = bibtidy.tidy(text, order)
+    except ValueError as exc:
+        raise ApiError(str(exc), 422)
+    return {"text": tidied, "duplicates": twins}
+
+
+def cancel_build(name: str) -> dict:
+    """POST /api/build/cancel: stop the document's running full build (build.cancel kills latexmk's group)."""
+    return {"ok": build.cancel(DOCS[name])}
+
+
 def bib_import(data: dict) -> dict:
     """Entries to add: parsed from pasted BibTeX, or from Crossref for a DOI (only the DOI leaves the machine)."""
     bibtex, doi = data.get("bibtex"), data.get("doi")
@@ -4124,6 +4148,11 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)
         if not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many rebuilds; wait a moment.", 429)
+    elif method == "POST" and path == "/api/build/cancel":
+        need_edit()  # Stopping a build is as much a change as starting one.
+        scoped(doc)
+        if not rate_ok("cancel", 20, 60.0):
+            raise ApiError("Too many requests; wait a moment.", 429)
     elif method == "POST" and path == "/api/fs":
         need_edit()
         scoped(doc)
@@ -4173,8 +4202,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
     # the owner's source tree, comments included in what it was made from.
     elif method == "POST" and path == "/api/bib":
         scoped(doc)  # Read-only (the sources and .bib files a view link can already read), POST to carry unsaved text.
-    elif method == "POST" and path == "/api/bib/edit":
-        need_edit()  # Computes a splice; the editor applies it and the normal save path writes the file.
+    elif method == "POST" and path in ("/api/bib/edit", "/api/bib/tidy"):
+        need_edit()  # Computes a splice or the tidied text; the editor applies it and the save path writes the file.
         scoped(doc)
     elif method == "POST" and path in ("/api/bib/lookup", "/api/bib/import", "/api/bib/search"):
         need_edit()  # Sends one DOI or title to Crossref, so a view-only link cannot start it.
@@ -4510,6 +4539,10 @@ class Handler(BaseHTTPRequestHandler):
             self.json(bib_overview(name, self.body().get("texts")))
         elif url.path == "/api/bib/edit" and name in DOCS:
             self.json(bib_edit(self.body()))
+        elif url.path == "/api/bib/tidy" and name in DOCS:
+            self.json(bib_tidy(self.body()))
+        elif url.path == "/api/build/cancel" and name in DOCS:
+            self.json(cancel_build(name))
         elif url.path == "/api/bib/import" and name in DOCS:
             self.json(bib_import(self.body()))
         elif url.path == "/api/zotero/compare" and name in DOCS:  # role checked in check_permission

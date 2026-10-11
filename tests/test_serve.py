@@ -2778,6 +2778,49 @@ class BibPanelApi(SharedState, ServerCase):
         self.assertEqual(self.post("/api/bib/lookup", {"text": self.BIB, "key": "used"}, role="edit")[0], 429)
 
 
+class BuildToolsApi(SharedState, ServerCase):
+    """POST /api/bib/tidy (sorted, aligned .bib text; nothing written) and /api/build/cancel (the Stop button)."""
+
+    BIB = "@misc{b, title={B}}\n@article{a,\n  year = 2020, title = {A}}\n"
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.cancel = mock.patch.object(serve.build, "cancel", return_value=True).start()
+        self.addCleanup(mock.patch.stopall)
+        self.tokens = {}
+
+    def post(self, path, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"{path}?doc={doc}", body, hdrs)
+
+    def test_tidy_returns_text_and_writes_nothing(self):
+        before = {p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}
+        status, body = self.post("/api/bib/tidy", {"text": self.BIB + "@misc{a2, title={a}}\n"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["text"].startswith("@article{a,\n  title = {A},\n  year  = 2020,\n}\n\n@misc{a2,"))
+        self.assertEqual(body["duplicates"], ["a and a2: same title"])
+        self.assertEqual({p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}, before)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": 3})[0], 400)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": self.BIB, "order": "color"})[0], 422)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": "x" * (serve.BIB_MAX_CHARS + 1)})[0], 413)
+
+    def test_cancel_stops_the_documents_build(self):
+        self.assertEqual(self.post("/api/build/cancel"), (200, {"ok": True}))
+        self.cancel.assert_called_once_with(serve.DOCS["demo"])
+
+    def test_roles(self):
+        self.tokens = self.share_on()
+        for path, body in (("/api/bib/tidy", {"text": self.BIB}), ("/api/build/cancel", None)):
+            with self.subTest(path=path):
+                self.assertEqual(self.post(path, body, role="view")[0], 403)
+                self.assertEqual(self.post(path, body, role="edit", doc="demo2")[0], 403)
+                self.assertEqual(self.post(path, body, role="edit")[0], 200)
+        self.assertEqual(self.cancel.call_count, 1)
+        codes = [self.post("/api/build/cancel", role="edit")[0] for _ in range(20)]
+        self.assertEqual(codes.count(429), 1)
+
+
 class ZoteroApi(SharedState, ServerCase):
     """/api/zotero*: owner only, except the network-free apply. Zotero itself is mocked."""
 
@@ -4035,6 +4078,8 @@ class ReviewerRole(SharedState, ServerCase):
             ("POST", "/api/grammar?doc=demo", {"text": "x"}),
             ("POST", "/api/ai?doc=demo", {"question": "x"}),
             ("POST", "/api/bib/edit?doc=demo", {}),
+            ("POST", "/api/bib/tidy?doc=demo", {"text": "@misc{a, title={A}}"}),
+            ("POST", "/api/build/cancel?doc=demo", None),
             ("POST", "/api/bib/lookup?doc=demo", {}),
             ("POST", "/api/zotero/apply?doc=demo", {}),
             ("POST", "/api/share/links", {"name": "Eve", "role": "edit"}),

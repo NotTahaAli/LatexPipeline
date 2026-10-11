@@ -62,6 +62,8 @@ GLOBAL_INPUTS = (
     "scripts/ci_report.py",
     ".github/workflows/build-pdf.yml",
     ".github/texlive-packages.txt",
+    ".github/fonts/",  # CI installs these fonts before building (README, "GitHub Actions")
+    ".github/hooks/",  # CI's pre-build and post-build hooks
 )
 
 LATEXMK_ARGS = [
@@ -415,10 +417,11 @@ def source_date_epoch(main_tex: Path) -> str:
     return found if found.isdigit() else str(int(newest_input(main_tex)))
 
 
-def recorded_inputs(main_tex: Path) -> list[Path]:
+def recorded_inputs(main_tex: Path, everything: bool = False) -> list[Path]:
     """
     Files outside the document's directory that its last build read, from the
     .fls that latexmk writes (-recorder). Empty before the first build.
+    everything=True keeps the files inside the document directory too (--deps).
 
     Files whose real path is inside the document directory are skipped (newest_input scans it; a symlinked
     folder that leads elsewhere does count), and so
@@ -451,7 +454,7 @@ def recorded_inputs(main_tex: Path) -> list[Path]:
         seen.add(name)
         name = os.path.realpath(name)
         folded = os.path.normcase(name)
-        if not folded.startswith(outside) and not folded.startswith(inside):
+        if not folded.startswith(outside) and (everything or not folded.startswith(inside)):
             found[name] = None
 
     return [Path(name) for name in found]
@@ -507,8 +510,8 @@ def review_switched(main_tex: Path) -> bool:
     """The last build used other review markup than --review or build.toml asks for now (e.g. --review show before)."""
     try:
         recorded = (cache_dir_for(main_tex) / ".mode").read_text()
-        if REVIEW_MODE is None and "\\lp@" not in recorded:
-            return False  # review markup neither asked for nor used: no settings to read
+        if REVIEW_MODE is None and not DRAFT_MODE and "\\lp@" not in recorded and "{draft}{graphicx}" not in recorded:
+            return False  # review markup and draft neither asked for nor used: no settings to read
         settings = read_settings(main_tex)
     except (OSError, ValueError, ConfigError):
         return False
@@ -552,6 +555,27 @@ def log_path_for(main_tex: Path) -> Path:
     return output_path_for(main_tex).with_suffix(".log")
 
 
+def pages_path_for(main_tex: Path) -> Path:
+    """files/reports/final/main.tex -> out/reports/final.pages.pdf (--pages, never published)."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.pages.pdf")
+
+
+def output_targets(main_tex: Path) -> list[tuple[str, Path, Path]]:
+    """
+    (name, build directory, PDF) of each [[output]] in build.toml: out/<name>-<output>.pdf, built in
+    .latex-cache/_output/ ("_o" never comes out of escape_name). Empty when build.toml is invalid.
+    """
+    try:
+        outputs = read_settings(main_tex)["output"]
+    except (OSError, ValueError, ConfigError):
+        return []
+    pdf = output_path_for(main_tex)
+    work = CACHE_DIR / "_output" / cache_dir_for(main_tex).name
+    return [(output["name"], work / output["name"], pdf.with_name(f"{pdf.stem}-{output['name']}.pdf"))
+            for output in outputs]
+
+
 def docx_path_for(main_tex: Path) -> Path:
     """files/reports/final/main.tex -> out/reports/final.docx (optional pandoc export, never published)."""
     return output_path_for(main_tex).with_suffix(".docx")
@@ -576,7 +600,19 @@ def cited_bib_path_for(main_tex: Path) -> Path:
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
 CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout", "review",
+               "draft", "strict", "anonymous", "output",
                "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
+# An [[output]] table: an extra PDF of the same document, out/<name>-<output name>.pdf (README, "build.toml keys").
+OUTPUT_KEYS = {"name", "define", "engine", "review", "draft", "anonymous"}
+OUTPUT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{0,39}")
+DEFINE_NAME = re.compile(r"[A-Za-z]{1,40}")  # a macro name: \def\<name>{} can do nothing else
+DRAFT_MODE = False  # --draft: draft = true for every document
+STRICT_MODE = False  # --strict: strict = true for every document
+QUIET_LOG = False  # --quiet-log: the console shows only the lines that need action (quiet_filter)
+# strict = true: a document fails on these LaTeX warnings and on overfull boxes wider than STRICT_OVERFULL_PT.
+STRICT_WARNING = re.compile(r"^(?:LaTeX|Package \S+|Class \S+) Warning: .*\b(?:undefined|multiply[ -]defined)\b.*",
+                            re.MULTILINE)
+STRICT_OVERFULL_PT = 1.0
 # Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
 DEFAULT_TIMEOUT = 600
 TIMEOUT_RANGE = (10, 7200)
@@ -631,7 +667,8 @@ def read_settings(main_tex: Path) -> dict:
     Raises ConfigError for invalid values.
     """
     settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
-                "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT, "review": "off"}
+                "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT, "review": "off",
+                "draft": False, "strict": False, "anonymous": False, "output": [], "define": []}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -651,7 +688,40 @@ def read_settings(main_tex: Path) -> dict:
         settings.update(data)
     if REVIEW_MODE:
         settings["review"] = REVIEW_MODE
+    if DRAFT_MODE:
+        settings["draft"] = True
+    if STRICT_MODE:
+        settings["strict"] = True
 
+    check_settings(settings, main_tex)
+    outputs = settings["output"]
+    where = display(main_tex.parent / "build.toml")
+    if not (isinstance(outputs, list) and all(isinstance(output, dict) for output in outputs)):
+        raise ConfigError(f"{where}: output must be [[output]] tables")
+    names: set[str] = set()
+    for output in outputs:
+        unknown = sorted(set(output) - OUTPUT_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) in [[output]]: {', '.join(unknown)}")
+        name = output.get("name")
+        if not (isinstance(name, str) and OUTPUT_NAME.fullmatch(name)) or name in names:
+            raise ConfigError(f"{where}: each [[output]] needs a unique name of letters, digits and _")
+        names.add(name)
+        check_settings(output_settings(settings, name), main_tex)
+    return settings
+
+
+def output_settings(settings: dict, name: str) -> dict:
+    """The settings of one [[output]]: its keys over the document's (--draft still wins)."""
+    found = next(output for output in settings["output"] if output["name"] == name)
+    merged = {**settings, **{key: value for key, value in found.items() if key != "name"}, "output": []}
+    if DRAFT_MODE:
+        merged["draft"] = True
+    return merged
+
+
+def check_settings(settings: dict, main_tex: Path) -> None:
+    """Raise ConfigError for an invalid value; normalizes engine and pdfa in place."""
     engine = settings["engine"]
     if not isinstance(engine, str) or engine.lower() not in ENGINES:
         raise ConfigError(
@@ -660,7 +730,7 @@ def read_settings(main_tex: Path) -> dict:
         )
     settings["engine"] = engine.lower()
 
-    for key in ("shell_escape", "externalize", "tagged"):
+    for key in ("shell_escape", "externalize", "tagged", "draft", "strict", "anonymous"):
         if not isinstance(settings[key], bool):
             raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: {key} must be true or false")
 
@@ -688,7 +758,9 @@ def read_settings(main_tex: Path) -> dict:
     if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
         raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: latexmk_args must be a list of strings")
 
-    return settings
+    define = settings["define"]
+    if not (isinstance(define, list) and all(isinstance(name, str) and DEFINE_NAME.fullmatch(name) for name in define)):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: define must be a list of macro names (letters)")
 
 
 # \DocumentMetadata keys for tagging: the kernel has tagging=on from 2025-06-01; TeX Live 2023 to 2025
@@ -800,8 +872,13 @@ REVIEW_PRETEX = {
 
 
 def review_pretex(settings: dict) -> str:
-    """The pretex for build.toml's review ("" when off)."""
-    return REVIEW_PRETEX[settings["review"]]
+    """
+    The pretex for build.toml's review, draft (graphicx draws boxes instead of images) and an [[output]]'s define
+    (\\def\\<name>{}); "" when none is set, so such documents stay byte-identical.
+    """
+    return (REVIEW_PRETEX[settings["review"]]
+            + (r"\PassOptionsToPackage{draft}{graphicx}" if settings.get("draft") else "")
+            + "".join(rf"\def\{name}{{}}" for name in settings.get("define", ())))
 
 
 def pdf_text(pdf: Path) -> bytes:
@@ -951,10 +1028,108 @@ def kill_tree(process: subprocess.Popen) -> None:
     process.kill()
 
 
+# Builds running now, by build directory: the latexmk being waited for (None between runs). cancel() kills it.
+ACTIVE: dict[Path, subprocess.Popen | None] = {}
+CANCELLED: set[Path] = set()
+ACTIVE_LOCK = threading.Lock()
+CANCEL_TEXT = "Build cancelled."
+# latexmk starts each pass with this line; build-report.json "steps" times them (--profile).
+RULE_START = re.compile(r"^Latexmk: applying rule '(.+?)'")
+
+
+def cancel(main_tex: Path) -> bool:
+    """
+    Stop the running full build of a document (the editor's Stop button): kill its latexmk's process group and
+    start no further run. A figure job that is already running finishes first. False when none is running.
+    """
+    build_dir = cache_dir_for(main_tex)
+    with ACTIVE_LOCK:
+        if build_dir not in ACTIVE:
+            return False
+        CANCELLED.add(build_dir)
+        process = ACTIVE[build_dir]
+    if process is not None:
+        kill_tree(process)
+    return True
+
+
+# texfot's rules (https://ctan.org/pkg/texfot), shortened: lines that need action, plus the line after an error.
+QUIET_IGNORE = re.compile(r"LaTeX Warning: You have requested package|LaTeX Font Warning: (?:Some font shapes|Size "
+                          r"substitutions)|Package caption Warning: Un(?:supported|known) document class|pdfTeX "
+                          r"warning:.*inclusion: (?:fou|mul)|libpng warning: iCCP: Not recognizing|! $")
+QUIET_NEXT = re.compile(r".*?:\d+:|!|.*pdfTeX warning|LaTeX Font Warning: Font shape|Package hyperref Warning: "
+                        r"Token not allowed|removed on input line|Runaway argument")
+QUIET_SHOW = re.compile(r"Output written|No pages of output|\(.*end occurred|(?:Und|Ov)erfull|(?:LaTeX|Package|Class"
+                        r"|Module).*(?:Error|Warning)|.*Citation.*undefined|.* Error|Missing character:|\*\*\*\s|"
+                        r"l\.\d+ |all text was ignored after line|.*Fatal error|.*for symbol.*on input line|"
+                        r"Latexmk: (?:Summary|Errors|Failure|.*failed)|=====|ERROR: |Build of ")
+
+
+def quiet_filter():
+    """A filter for log lines, texfot-like: keep(line) is True for lines that need action (--quiet-log)."""
+    after = [False]
+
+    def keep(line: str) -> bool:
+        if after[0]:
+            after[0] = False
+            return True
+        if QUIET_IGNORE.match(line):
+            return False
+        if QUIET_NEXT.match(line):
+            after[0] = True
+            return True
+        return bool(QUIET_SHOW.match(line))
+
+    return keep
+
+
+def strict_problems(log: Path) -> list[str]:
+    """strict = true: the warnings of the last LaTeX run that fail the document (STRICT_WARNING, wide boxes)."""
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    found = list(dict.fromkeys(match.group(0).strip() for match in STRICT_WARNING.finditer(text)))
+    found += [f"{file or 'main.tex'}:{line}: Overfull box {points:g}pt too wide"
+              for file, line, points in hints.overfull_boxes(text) if points > STRICT_OVERFULL_PT]
+    return found
+
+
+# anonymous = true: what gives authors away in a double-blind submission (comments are skipped).
+ANONYMITY = [
+    (re.compile(r"\\(?:author|affiliation|institute|email|thanks)\s*(?:\[[^\]]*\])?\{\s*(?!anonym)[^\s}]",
+                re.IGNORECASE), "author information (\\author, \\affiliation, \\email or \\thanks)"),
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "an e-mail address"),
+    (re.compile(r"\\(?:section|subsection|chapter|paragraph)\*?\{\s*acknowledge?ments?\s*\}|\\begin\{acks\}|"
+                r"\\acknowledge?ments\b", re.IGNORECASE), "an acknowledgements section"),
+    (re.compile(r"\b(?:our|my)\s+(?:previous|prior|earlier|own)\s+(?:work|paper|study|studies|results?)\b|"
+                r"\bwe\s+(?:previously|earlier)\s+(?:showed|proposed|presented|introduced|described)\b",
+                re.IGNORECASE), "a self-citation phrase"),
+]
+
+
+def anonymity_findings(folder: Path) -> list[str]:
+    """"<file>:<line>: <what>" for each ANONYMITY pattern in the document's .tex files (at most 20)."""
+    found = []
+    for path in sorted(folder.rglob("*.tex")):
+        rel = path.relative_to(folder)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        text = re.sub(r"(?<!\\)((?:\\\\)*)%[^\n]*", r"\1", text)  # comments, as ci_report strips them
+        for pattern, what in ANONYMITY:
+            for match in pattern.finditer(text):
+                found.append(f"{rel.as_posix()}:{text.count(chr(10), 0, match.start()) + 1}: {what}")
+    return list(dict.fromkeys(found))[:20]
+
+
 def build_document(
     main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
     record: bool = False, validate: bool = True, review: str | None = None,
-    target: tuple[Path, Path] | None = None,
+    target: tuple[Path, Path] | None = None, output: str | None = None,
 ) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
@@ -973,8 +1148,25 @@ def build_document(
     force passes latexmk -g, which rebuilds even when its cache says up to date.
     validate=False skips veraPDF (the editor's builds: validation takes seconds).
     review overrides build.toml's review; target = (build directory, PDF) replaces the document's own (the review
-    PDF's copy of a document, build_review_pdf).
+    PDF's copy of a document, build_review_pdf). output names an [[output]] of build.toml whose settings apply.
+    cancel() stops the build while it runs.
     """
+    build_dir = target[0] if target else cache_dir_for(main_tex)
+    with ACTIVE_LOCK:
+        ACTIVE[build_dir] = None
+        CANCELLED.discard(build_dir)
+    try:
+        return _build_document(main_tex, latexmk, live, force, fig_jobs, record, validate, review, target, output)
+    finally:
+        with ACTIVE_LOCK:
+            ACTIVE.pop(build_dir, None)
+            CANCELLED.discard(build_dir)
+
+
+def _build_document(
+    main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int, record: bool, validate: bool,
+    review: str | None, target: tuple[Path, Path] | None, output: str | None,
+) -> tuple[dict, str]:
     began = time.monotonic()
     relative = Path(display(main_tex))
     name = doc_name(main_tex)
@@ -1006,12 +1198,16 @@ def build_document(
     pages = None
     warnings = 0
     phases = {"figures": 0.0, "latex": 0.0}  # Seconds, for --profile and build-report.json.
+    steps: list[dict] = []  # One per latexmk rule run ("pdflatex", "bibtex main"), for --profile.
 
     try:
         settings = read_settings(main_tex)
+        if output:
+            settings = output_settings(settings, output)
+            check_settings(settings, main_tex)
         if review:
             settings["review"] = review
-    except ConfigError as exc:
+    except (ConfigError, StopIteration) as exc:
         settings = None
         errors.append(str(exc))
 
@@ -1045,6 +1241,10 @@ def build_document(
 
         def run(command: list[str], phase: str = "latex") -> int:
             """Run a command in the document's directory, streaming its output. Time goes to phases[phase]."""
+            if build_dir in CANCELLED:
+                if CANCEL_TEXT not in errors:
+                    errors.append(CANCEL_TEXT)
+                return -1
             mirror_dirs(main_tex.parent, build_dir)
             say("Running:")
             say("  " + " ".join(f'"{arg}"' if " " in arg else arg for arg in command))
@@ -1069,6 +1269,11 @@ def build_document(
             except OSError as exc:
                 errors.append(f"Could not execute {command[0]}: {exc}")
                 return -1
+            with ACTIVE_LOCK:
+                ACTIVE[build_dir] = process
+                stopped = build_dir in CANCELLED
+            if stopped:  # cancel() came between the check in run() and now
+                kill_tree(process)
 
             # Watchdog: killing the tree closes the pipe, which ends the line loop below.
             expired = threading.Event()
@@ -1080,17 +1285,33 @@ def build_document(
             watchdog = threading.Timer(settings["timeout"], expire)
             watchdog.daemon = True
             watchdog.start()
+            keep = quiet_filter() if QUIET_LOG else None
+            step: list = []  # [rule, start] of the pass running now
             try:
                 for line in process.stdout:
-                    emit(line)
+                    rule = RULE_START.match(line)
+                    if rule:
+                        now = time.monotonic()
+                        if step:
+                            steps.append({"rule": step[0], "seconds": round(now - step[1], 2)})
+                        step = [rule.group(1), now]
+                    if keep is None or keep(line):
+                        emit(line)
                     console.append(line)
                 code = process.wait()
+                if step:
+                    steps.append({"rule": step[0], "seconds": round(time.monotonic() - step[1], 2)})
             except BaseException:  # Ctrl-C: the child is in its own group and would outlive us.
                 kill_tree(process)
                 raise
             finally:
                 watchdog.cancel()
+                with ACTIVE_LOCK:
+                    if build_dir in ACTIVE:
+                        ACTIVE[build_dir] = None
                 sandbox.scrub(build_dir)
+            if build_dir in CANCELLED and CANCEL_TEXT not in errors:
+                errors.append(CANCEL_TEXT)
             if expired.is_set():
                 errors.append(f"Build timed out after {settings['timeout']} s (the document may loop forever)")
             return code
@@ -1170,6 +1391,10 @@ def build_document(
 
         say(f"Engine:  {settings['engine']}")
         say()
+        if settings["anonymous"]:
+            for finding in anonymity_findings(main_tex.parent):
+                notes.append(f"Anonymous build: {finding}")
+                say(notes[-1])
 
         while True:
             code = -1
@@ -1205,11 +1430,15 @@ def build_document(
         mode_file.write_text(used + meta)
         os.utime(mode_file, (started, started))
 
+        problems = strict_problems(build_dir / f"{main_tex.stem}.log") if settings["strict"] and code == 0 else []
         if not errors:
             if code != 0:
                 errors.append(f"LaTeX compilation failed: {relative}")
             elif not generated_pdf.exists():
                 errors.append("LaTeX reported success, but no PDF was produced.")
+            elif problems:  # strict = true: the PDF is not copied, like a failed build
+                errors.append(f"Strict mode: {len(problems)} warning(s) fail this document (first: {problems[0]})")
+                errors += problems[1:MAX_SUMMARY_ERRORS]
             else:
                 try:
                     shutil.copy(generated_pdf, output_pdf)
@@ -1294,11 +1523,13 @@ def build_document(
         "size": size,
         "errors": latex_errors,
         "warnings": warnings,
-        "error": None,
+        "error": next((text for text in errors if text == CANCEL_TEXT or text.startswith("Strict mode: ")), None),
         "phases": {name: round(seconds, 1) for name, seconds in phases.items()},
     }
     if access is not None:
         entry["a11y"] = access
+    if steps:
+        entry["steps"] = steps
 
     return entry, "".join(shown)
 
@@ -1558,16 +1789,48 @@ def build_diff_pdf(main_tex: Path, latexmk: str, old_texts: dict, live: bool = T
     return {"ok": entry["ok"], "error": None if entry["ok"] else first or f"The diff PDF failed; see {log.name}."}
 
 
+def build_outputs(main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int,
+                  validate: bool) -> tuple[list[dict], str]:
+    """
+    Build each [[output]] of build.toml after the main PDF. Returns their entries for the report's "outputs" key
+    (name, pdf, log, ok, seconds, pages, size, warnings, errors, error) and their console text.
+    """
+    taken = {output_path_for(document) for document in all_documents()}
+    found, texts = [], []
+    for name, work, pdf in output_targets(main_tex):
+        if pdf in taken:  # files/a with output "b" and a document files/a-b
+            message = f"output {name}: {display(pdf)} is the PDF of another document; rename the output"
+            error(f"{display(main_tex)}: {message}")
+            found.append({"name": name, "pdf": pdf.relative_to(OUT_DIR).as_posix(), "log": None, "ok": False,
+                          "seconds": None, "pages": None, "size": None, "warnings": 0, "errors": [], "error": message})
+            continue
+        entry, text = build_document(main_tex, latexmk, live, force, fig_jobs, validate=validate, target=(work, pdf),
+                                     output=name)
+        texts.append(text)
+        keys = ("pdf", "log", "ok", "seconds", "pages", "size", "warnings", "errors", "error")
+        found.append({"name": name, **{key: entry[key] for key in keys}})
+    return found, "".join(texts)
+
+
 def build_safely(
     main_tex: Path, latexmk: str, live: bool, force: bool, fig_jobs: int = DEFAULT_JOBS, record: bool = False,
-    validate: bool = True,
+    validate: bool = True, outputs: bool = False,
 ) -> tuple[dict, str]:
     """
     build_document, but an exception (OSError and the like) fails only this
     document: its report entry carries the message and the run goes on.
+    outputs=True also builds the [[output]] PDFs of build.toml (build_outputs); one failing fails the document.
     """
     try:
-        return build_document(main_tex, latexmk, live, force, fig_jobs, record, validate)
+        entry, text = build_document(main_tex, latexmk, live, force, fig_jobs, record, validate)
+        if outputs and entry["ok"] and output_targets(main_tex):
+            entry["outputs"], more = build_outputs(main_tex, latexmk, live, force, fig_jobs, validate)
+            text += more
+            failed = [output["name"] for output in entry["outputs"] if not output["ok"]]
+            if failed:
+                entry["ok"] = False
+                entry["error"] = f"output {', '.join(failed)} failed (see its log)"
+        return entry, text
     except Exception as exc:  # noqa: BLE001 - one document must not stop the others.
         message = f"Build crashed: {exc}"
         error(f"{display(main_tex)}: {message}")
@@ -1589,14 +1852,15 @@ def build_safely(
         return entry, ""
 
 
-def build_parallel(documents: list[Path], latexmk: str, jobs: int, force: bool) -> list[dict]:
+def build_parallel(documents: list[Path], latexmk: str, jobs: int, force: bool, outputs: bool = False) -> list[dict]:
     """
     Build in a thread pool. Ctrl+C cancels the queued documents and re-raises
     KeyboardInterrupt; the running ones finish or die with the terminal's SIGINT.
     """
     pool = ThreadPoolExecutor(max_workers=jobs)
     fig_jobs = max(1, DEFAULT_JOBS // jobs)
-    futures = [pool.submit(build_safely, document, latexmk, False, force, fig_jobs) for document in documents]
+    futures = [pool.submit(build_safely, document, latexmk, False, force, fig_jobs, outputs=outputs)
+               for document in documents]
     results: list[dict] = []
 
     try:
@@ -1679,9 +1943,11 @@ def watch_target(document: Path, focus: str | None) -> str | None:
 
 def watch(
     latexmk: str, patterns: list[str], open_pdfs: bool, focus: str | None = None, interval: float = 0.5,
+    notify: bool = False, command: list[str] | None = None,
 ) -> int:
     """
-    Poll for changes and rebuild stale documents until interrupted.
+    Poll for changes and rebuild stale documents until interrupted. notify: a desktop notification after each
+    build (doctools.notify); command: run after each successful build, with LP_DOC and LP_PDF set (--exec).
     """
     # ponytail: stdlib polling, not OS file events; fine for a handful of documents.
     info("Watching for changes. Press Ctrl+C to stop.")
@@ -1733,6 +1999,16 @@ def watch(
                 else:
                     entry, _ = build_safely(document, latexmk, True, False)
 
+                if notify:
+                    import doctools  # only here: never part of a build
+                    doctools.notify(f"{doc_name(document)}: {'built' if entry['ok'] else 'build failed'}",
+                                    f"out/{entry['pdf']}" if entry["ok"] else "See the log for the errors.")
+                if entry["ok"] and command:
+                    try:
+                        subprocess.run(command, cwd=ROOT_DIR, env={**os.environ, "LP_DOC": doc_name(document),
+                                                                   "LP_PDF": str(OUT_DIR / entry["pdf"])})
+                    except OSError as exc:
+                        error(f"--exec: {exc}")
                 if entry["ok"]:
                     built[document] = newest
                     failed.pop(document, None)
@@ -1769,6 +2045,10 @@ def prune(documents: list[Path]) -> None:
     expected |= {docx_path_for(document) for document in documents}
     expected |= {arxiv_path_for(document) for document in documents}
     expected |= {cited_bib_path_for(document) for document in documents}
+    expected |= {pages_path_for(document) for document in documents}
+    for document in documents:
+        for _name, _work, pdf in output_targets(document):
+            expected |= {pdf, pdf.with_suffix(".log")}
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx"),
                  *OUT_DIR.rglob("*.arxiv.zip"), *OUT_DIR.rglob("*.cited.bib")]:
@@ -1904,20 +2184,21 @@ def format_text(folder: Path, text: str) -> str:
     return result.stdout
 
 
-def format_all(documents: list[Path]) -> int:
+def format_all(documents: list[Path], check: bool = False) -> int:
     """The --format step: rewrite each document's .tex files in place; 1 if tex-fmt failed (a missing tex-fmt is only
-    a message, like a missing chktex in the lint)."""
+    a message, like a missing chktex in the lint). check: change nothing, 1 if a file would change."""
     failed = 0
     for document in documents:
         try:
-            changed, problems = format_sources(document.parent)
+            changed, problems = format_sources(document.parent, check)
         except FileNotFoundError as exc:
             info(str(exc))
             return 0
-        info(f"Format {doc_name(document)}: " + (", ".join(changed) if changed else "nothing to change"))
+        verb = "would change" if check else "changed"
+        info(f"Format {doc_name(document)}: " + (f"{verb} {', '.join(changed)}" if changed else "nothing to change"))
         for problem in problems:
             error(f"  {problem}")
-        failed += bool(problems)
+        failed += bool(problems) or (check and bool(changed))
     return 1 if failed else 0
 
 
@@ -2136,6 +2417,79 @@ def new_document(name: str, template: str = "article") -> int:
 # CLI
 # ---------------------------------------------------------------------------
 
+def tidy_bib_all(documents: list[Path], order: str, check: bool) -> int:
+    """--tidy-bib: sort and align each document's .bib files (bibtidy.tidy); with check, only report. Returns 1 on a
+    problem, or with check when a file would change."""
+    import bibtidy  # only here: never part of a build
+
+    failed = False
+    for document in documents:
+        for path in sorted(document.parent.rglob("*.bib")):
+            if any(part.startswith(".") for part in path.relative_to(document.parent).parts):
+                continue
+            try:
+                text = path.read_bytes().decode("utf-8")
+                new, twins = bibtidy.tidy(text, order)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                error(f"{display(path)}: {exc}")
+                failed = True
+                continue
+            for twin in twins:
+                info(f"{display(path)}: possible duplicate: {twin}")
+            if new == text:
+                continue
+            if check:
+                info(f"Would tidy: {display(path)}")
+                failed = True
+            else:
+                path.write_bytes(new.encode("utf-8"))
+                info(f"Tidied: {display(path)}")
+    return 1 if failed else 0
+
+
+def deps_all(documents: list[Path], form: str) -> int:
+    """--deps make|json: the files each document's last build read (its .fls), outside the TeX installation."""
+    import doctools  # only here: never part of a build
+
+    for document in documents:
+        if not (cache_dir_for(document) / f"{document.stem}.fls").exists():
+            error(f"{doc_name(document)}: no recorded build yet; build it first.")
+            return 1
+        inputs = sorted(display(path) for path in recorded_inputs(document, everything=True))
+        write(doctools.deps_text(display(output_path_for(document)), inputs, form))
+    return 0
+
+
+def query_all(documents: list[Path]) -> int:
+    """--query: title, author, pages, words, labels and sections of each document as JSON (from the last build)."""
+    import doctools  # only here: never part of a build
+
+    found = []
+    for document in documents:
+        build_dir = cache_dir_for(document)
+        log = build_dir / f"{document.stem}.log"
+        counts = LATEX_PAGES.findall(log.read_text(encoding="utf-8", errors="replace")) if log.exists() else []
+        found.append({"name": doc_name(document), "pdf": display(output_path_for(document)),
+                      **doctools.query(document, build_dir, int(counts[-1]) if counts else None)})
+    write(json.dumps(found, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def preflight_all(documents: list[Path]) -> int:
+    """--preflight: camera-ready checks of each built PDF (doctools.preflight). Returns 1 when one has an error."""
+    import doctools  # only here: never part of a build
+
+    failed = False
+    for document in documents:
+        pdf = output_path_for(document)
+        if not pdf.exists():
+            continue
+        for level, message in doctools.preflight(pdf, pdf_text(pdf)):
+            info(f"Preflight {display(pdf)}: {level}: {message}")
+            failed = failed or level == "error"
+    return 1 if failed else 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build all LaTeX documents containing main.tex."
@@ -2289,7 +2643,94 @@ def parse_args() -> argparse.Namespace:
         help="With --review-pdf: leave the comments out.",
     )
 
+    parser.add_argument(
+        "--draft",
+        action="store_true",
+        help="Draft PDFs: graphicx draws a box for each image (build.toml draft = true for every selected document).",
+    )
+
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail a document on undefined or multiply defined references and citations and on overfull boxes over "
+             f"{STRICT_OVERFULL_PT:g}pt (build.toml strict = true for every selected document).",
+    )
+
+    parser.add_argument(
+        "--quiet-log",
+        action="store_true",
+        help="Show only the LaTeX output lines that need action (texfot-like); the log in out/ keeps everything.",
+    )
+
+    parser.add_argument(
+        "--tidy-bib",
+        action="store_true",
+        help="Sort and align the .bib files of each selected document and report possible duplicates, then exit. "
+             "Nothing is dropped.",
+    )
+
+    parser.add_argument(
+        "--bib-sort",
+        choices=["key", "author", "year", "none"],
+        default="key",
+        help="Entry order for --tidy-bib (default key).",
+    )
+
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="With --format or --tidy-bib: change nothing, exit 1 if a file would change (pre-commit).",
+    )
+
+    parser.add_argument(
+        "--deps",
+        choices=["make", "json"],
+        help="Print the files each selected document's last build read, as a Make rule or JSON, then exit.",
+    )
+
+    parser.add_argument(
+        "--query",
+        action="store_true",
+        help="Print title, author, pages, words, labels and sections of each selected document as JSON (from its "
+             "last build), then exit.",
+    )
+
+    parser.add_argument(
+        "--pages",
+        metavar="RANGES",
+        help="After building, copy pages such as 1-3,7 of one document to out/<name>.pages.pdf (needs qpdf or "
+             "pdftk). Never published.",
+    )
+
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="After building, check each PDF for camera-ready problems: fonts not embedded, Type 3 fonts, page "
+             "sizes, PDF version (needs pdffonts and pdfinfo from poppler-utils).",
+    )
+
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="With --watch: a desktop notification after each build (osascript, notify-send or PowerShell; "
+             "nothing when none is there).",
+    )
+
+    parser.add_argument(
+        "--exec",
+        metavar="COMMAND",
+        help="With --watch: run COMMAND (split like a shell would, no shell) after each successful build, with "
+             "LP_DOC and LP_PDF set.",
+    )
+
     args = parser.parse_args()
+
+    if (args.notify or args.exec) and not args.watch:
+        parser.error("--notify and --exec need --watch")
+    if args.check and not (args.format or args.tidy_bib):
+        parser.error("--check needs --format or --tidy-bib")
+    if (args.pages or args.preflight) and (args.watch or args.focus or args.review_pdf):
+        parser.error("--pages and --preflight cannot be combined with --watch, --focus or --review-pdf")
 
     if args.no_comments and not args.review_pdf:
         parser.error("--no-comments needs --review-pdf")
@@ -2367,6 +2808,12 @@ def print_summary(results: list[dict], profile: bool = False) -> None:
 
         if profile and entry["phases"]:
             info(f"      phases: {phase_text(entry['phases'])}")
+        if profile and entry.get("steps"):
+            info("      steps: " + ", ".join(f"{step['rule']} {step['seconds']:.1f}s" for step in entry["steps"]))
+        for output in entry.get("outputs") or []:
+            status = "ok" if output["ok"] else "FAILED"
+            info(f"      output {output['name']}: {status}, out/{output['pdf']}" + (
+                f" ({output['error']})" if output["error"] else ""))
 
         # ponytail: at most MAX_SUMMARY_ERRORS shown per document; the log has all.
         for found in entry["errors"][:MAX_SUMMARY_ERRORS]:
@@ -2403,6 +2850,8 @@ def main() -> int:
     if args.review:
         global REVIEW_MODE
         REVIEW_MODE = args.review
+    global DRAFT_MODE, STRICT_MODE, QUIET_LOG
+    DRAFT_MODE, STRICT_MODE, QUIET_LOG = args.draft, args.strict, args.quiet_log
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else ROOT_DIR / args.source
@@ -2459,7 +2908,16 @@ def main() -> int:
         return 0
 
     if args.format:
-        return format_all(documents)
+        return format_all(documents, args.check)
+    if args.tidy_bib:
+        return tidy_bib_all(documents, args.bib_sort, args.check)
+    if args.deps:
+        return deps_all(documents, args.deps)
+    if args.query:
+        return query_all(documents)
+    if args.pages and len(documents) != 1:
+        error("--pages needs exactly one document; name it, e.g. build.py sample-report --pages 1-3,7")
+        return 2
 
     if args.docx and not shutil.which("pandoc"):
         error("--docx needs pandoc, which was not found on your PATH (https://pandoc.org/installing.html).")
@@ -2483,27 +2941,42 @@ def main() -> int:
         return 0 if result["ok"] else 1
 
     if args.watch:
-        return watch(latexmk, args.docs, args.open, args.focus)
+        command = None
+        if args.exec:
+            import shlex
+            command = shlex.split(args.exec, posix=os.name != "nt")
+        return watch(latexmk, args.docs, args.open, args.focus, notify=args.notify, command=command)
 
     exported = documents
 
     def extras(failed: bool, results: list[dict]) -> int:
-        """--docx, --arxiv and --cited-bib after the build; the last two skip documents whose build failed."""
+        """--docx, --arxiv, --cited-bib, --preflight and --pages after the build; all but --docx skip failed builds."""
         if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
             failed = bool(export_docx_all(exported)) or failed
+        broken = {entry["name"] for entry in results if not entry["ok"]}
         if args.arxiv:
-            broken = {entry["name"] for entry in results if not entry["ok"]}
             failed = bool(export_arxiv_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
         if args.cited_bib:
-            broken = {entry["name"] for entry in results if not entry["ok"]}
             failed = bool(export_cited_bib_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
+        if args.preflight:
+            failed = bool(preflight_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
+        if args.pages and exported[0] and doc_name(exported[0]) not in broken:
+            import doctools  # only here: never part of a build
+            problem = doctools.extract_pages(output_path_for(exported[0]), args.pages, pages_path_for(exported[0]))
+            if problem:
+                error(problem)
+                failed = True
+            else:
+                info(f"Pages {args.pages}: {display(pages_path_for(exported[0]))}")
         return 1 if failed else 0
 
     if not args.force:
         # --arxiv needs the .fls of a finished build, which a cleaned cache lacks even when the PDF is current.
         documents = [document for document in documents if is_stale(document)
                      or (args.arxiv or args.cited_bib)
-                     and not (cache_dir_for(document) / f"{document.stem}.fls").exists()]
+                     and not (cache_dir_for(document) / f"{document.stem}.fls").exists()
+                     or any(not pdf.exists() or pdf.stat().st_mtime < newest_input(document)
+                            for _name, _work, pdf in output_targets(document))]
 
         if not documents:
             info("Everything is up to date.")
@@ -2520,10 +2993,10 @@ def main() -> int:
         if jobs == 1:
             results = []
             for document in documents:
-                results.append(build_safely(document, latexmk, True, args.force)[0])
+                results.append(build_safely(document, latexmk, True, args.force, outputs=True)[0])
                 info()
         else:
-            results = build_parallel(documents, latexmk, jobs, args.force)
+            results = build_parallel(documents, latexmk, jobs, args.force, outputs=True)
     except KeyboardInterrupt:
         info()
         error("Interrupted; queued documents were not built.")

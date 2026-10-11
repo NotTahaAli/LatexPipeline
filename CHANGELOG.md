@@ -69,6 +69,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - AI assistant: Ask with "Whole project" answers from passages of all the document's text files (keyword retrieval, bounded).
 - AI assistant: "LaTeX from image..." (or pasting an image) turns a picture of an equation, table or diagram into LaTeX to insert at the cursor (PNG, JPEG, GIF, WebP; scaled in the browser, size and type checked on the server).
 - AI assistant: OpenAI-compatible endpoints (OpenAI, OpenRouter, Ollama and similar; base URL, model, `OPENAI_API_KEY` or a stored key) besides Anthropic, locally in the panel's settings and hosted with `[ai] provider = "openai"` and `base_url`; a local model server serves only the owner.
+- `build.py --tidy-bib [--bib-sort key|author|year|none] [--check]` sorts `.bib` entries, puts fields in bibtex-tidy's order with the `=` aligned and reports possible duplicates (same key, DOI or title) without dropping anything; the editor's "Tidy .bib file" command applies the same as one edit (`POST /api/bib/tidy`, edit role).
+- Editor: a Stop button while a build runs (`POST /api/build/cancel`, edit role) kills latexmk's process group; the build fails with "Build cancelled."
+- Editor: opt-in desktop notifications when a build ends while the window is in the background (Ctrl+K > "Desktop notification when a build ends"); `build.py --watch --notify` uses osascript, notify-send or PowerShell when one is there.
+- `build.toml` `draft = true` / `build.py --draft`: graphicx draws boxes instead of images (opt-in; no speed gain measured on `bench/sample-report`, see README).
+- Filtered build log: the editor's Log tab "Only lines that need action" and `build.py --quiet-log` show texfot-style lines only; the log file keeps everything.
+- `build-report.json`: optional `steps` (seconds per latexmk rule run, also in `--profile`) and `outputs` keys.
+- `build.py --deps make|json DOC` prints the files a document's last build read (from its `.fls`).
+- `build.toml` `strict = true` / `build.py --strict` fails a document on undefined or multiply defined references and citations and on overfull boxes over 1 pt.
+- `build.toml` `[[output]]` tables build extra PDFs of a document (`out/<name>-<output>.pdf`, with `define`d macros, another engine, review or draft mode); CI publishes them with the document.
+- `build.py --preflight`: fonts not embedded, Type 3 fonts, mixed page sizes, PDF version and bookmarks of each built PDF (pdffonts and pdfinfo).
+- `build.toml` `anonymous = true` notes author names, e-mail addresses, acknowledgements and self-citation phrases in the log of a double-blind build.
+- `ci_report.py lint`: duplicate labels, and notices for a breakable space before `\cite`, `\cref` / `\Cref` against the sentence start and mixed US/UK spellings.
+- `.pre-commit-hooks.yaml` with `latex-lint`, `latex-format` and `bib-tidy` hooks; `build.py --format --check` changes nothing and exits 1 when tex-fmt would.
+- CI: `TEXLIVE_VERSION` in the workflow pins the tug.org TeX Live year; fonts in `.github/fonts/` and `.github/hooks/pre-build` / `post-build` scripts run in CI only.
+- `build.py --query DOC` prints title, author, pages, words, labels and sections as JSON.
+- `build.py --pages 1-3,7 DOC` writes `out/<name>.pages.pdf` with qpdf or pdftk (never published).
+- `build.py --watch --exec "cmd"` runs a command (no shell) after each successful build, with `LP_DOC` and `LP_PDF` set.
 
 ### Changed
 
