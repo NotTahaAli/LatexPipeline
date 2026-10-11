@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import ai
 import bibfix
 import build
+import compile_api
 import grammar
 import hints
 import history
@@ -3697,6 +3698,15 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             warm = False
         if not warm and not rate_ok("rebuild", *REBUILD_LIMIT):
             raise ApiError("Too many builds; wait a moment.", 429)  # the first preview runs a full build
+    elif method == "POST" and path == "/api/v1/compile":
+        # Builds an uploaded document (compile_api.py): the local owner (returned above) for scripting, and behind
+        # host.py only the per-person compile worker, which the gateway calls with an API token's "compile" scope.
+        # A share link (view, review or edit) never: it would run its own LaTeX outside the shared document.
+        if not GATEWAY["secret"]:
+            raise ApiError("Only the owner can compile uploads.", 403)
+        need_edit()
+        if not rate_ok("compile", 30, 60.0):
+            raise ApiError("Too many compiles; wait a moment.", 429)
     elif method == "POST" and path == "/api/mcp":
         scoped(doc)  # One MCP tool call from host.py (hosted AI clients); each tool checks the role itself.
         if not rate_ok("mcp", 120, 60.0):
@@ -3820,6 +3830,31 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise ApiError("Expected a JSON object.", 400)
         return data
+
+    def compile_upload(self, query: dict) -> tuple:
+        """POST /api/v1/compile: build an uploaded zip, tar or JSON files map in the cache (compile_api.py)."""
+        limit = min(QUOTA["bytes"] or compile_api.LOCAL_MAX_BYTES, compile_api.LOCAL_MAX_BYTES)
+        try:
+            main, kind = compile_api.main_name(query), compile_api.output_kind(query)
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= limit:
+                raise ApiError("Bad or oversized upload.", 413)
+            files, skipped = compile_api.unpack(self.rfile.read(size), self.headers.get("Content-Type", ""), limit,
+                                                keep_rc=self.role == "owner")  # build.toml: the owner's own code only
+            with WRITE_LOCK:
+                quota_check(sum(len(data) + ENTRY_BYTES for data in files.values()))
+            with BUILD_LOCK:
+                started = time.time()
+                result = compile_api.compile_files(files, main, SETTINGS["latexmk"], build.CACHE_DIR / "api-compile")
+                over = quota_after_build(started)
+        except compile_api.UploadError as exc:
+            raise ApiError(str(exc), 400)
+        except ValueError:
+            raise ApiError("Bad Content-Length.", 400)
+        if over:
+            raise ApiError(over, 507)
+        result["skipped"] = skipped
+        return compile_api.reply_parts(result, kind)
 
     def author(self, query: dict) -> str:
         return author_name(self.role, self.user, str(query.get("cid", [""])[0])[:64])
@@ -3972,6 +4007,8 @@ class Handler(BaseHTTPRequestHandler):
             box["doc"] = found
             broadcast("forward", box)
             self.json(box)
+        elif url.path == "/api/v1/compile":  # role checked in check_permission
+            self.reply(*self.compile_upload(query))
         elif url.path == "/api/mcp" and name in DOCS and GATEWAY["secret"]:  # behind host.py only
             self.json(mcp_tools.worker_call(sys.modules[__name__], name, self.role, self.user, self.body()))
         elif url.path == "/api/focus" and name in DOCS:

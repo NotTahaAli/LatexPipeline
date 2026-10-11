@@ -40,7 +40,7 @@ In a copy made from the template, CI runs only the build. The unit tests, ruff a
 * [Documents and settings](#documents-and-settings): [build.toml keys](#buildtoml-keys), [review markup](#review-markup), [grammar](#grammar), [PDF/A](#pdfa-and-tagged-pdf)
 * [Large documents](#large-documents) and [benchmarks](#benchmarks)
 * [VS Code](#vs-code)
-* [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds)
+* [Live preview and editor](#live-preview-and-editor), [sharing](#sharing), [sandboxed builds](#sandboxed-builds), [compile API](#compile-api)
 * [Use with AI clients (MCP)](#use-with-ai-clients-mcp): Claude, ChatGPT, Codex, Cursor, VS Code, Windsurf, Gemini CLI with your own subscription
 * [Hosting on a VPS](#hosting-on-a-vps) (accounts, workspaces, sign-in providers)
 * [Lint and CI reports](#lint-and-ci-reports)
@@ -349,6 +349,17 @@ On Linux, `build.py --sandbox` or `serve.py --sandbox` (both set `LATEX_SANDBOX=
 
 If `LATEX_SANDBOX=bwrap` and bubblewrap is missing or cannot create namespaces (some containers disable unprivileged user namespaces), every build fails with a message saying so; nothing ever runs unsandboxed. Any other value than `bwrap` (or empty) is refused too. Each sandboxed run costs about 10 ms to start (bwrap), plus about 0.1 s once per `build.py` process for the checks: `files/test` builds in 0.53 s instead of 0.44 s, and `bench/sample-report` (303 pages, 25 figure jobs) in 52 s either way. CI does not sandbox (it builds only the repository's own documents); `synctex`, `texcount`, veraPDF and pandoc (owner-only) run outside it.
 
+### Compile API
+
+`POST /api/v1/compile` on `serve.py` builds a document you send and answers the PDF, for scripts on your own computer. The body is a zip, a tar archive (plain, gzip, bzip2 or xz) or JSON `{"files": {"main.tex": "...", "fig.png": {"base64": "..."}}}`; one folder around everything is taken off. Query parameters: `main` (default `main.tex`; a path inside the upload) and `output`: `pdf` (default: the PDF with `200`, or the build log as text with `422` when the build fails), `log` (always the log) or `json` (`ok`, `seconds`, `pages`, `errors`, `log` and the PDF in base64). The `X-Compile` header carries the summary (`ok`, `seconds`, `pages`, the first errors with file and line) in every case.
+
+```bash
+curl --fail-with-body --data-binary @paper.zip -H "Content-Type: application/zip" -o paper.pdf "http://127.0.0.1:8000/api/v1/compile"
+tar czf - -C paper . | curl --data-binary @- -H "Content-Type: application/gzip" -o talk.pdf "http://127.0.0.1:8000/api/v1/compile?main=talk.tex"
+```
+
+It is the owner's (no token: loopback without sharing, or the owner's cookie while sharing); share links of every role get `403`, and a request from another web page (`Origin`) is refused. The upload is written to `.latex-cache/api-compile/`, built like any document (its `build.toml` applies, the sandbox with `--sandbox`, one build at a time with the editor's builds) and removed afterwards; nothing goes to `out/`. Paths outside the upload (`..`, absolute, links) are refused and at most 2000 files and 200 MB unpacked. A hosted server offers the same endpoint with API tokens, see [Compile API (hosted)](#compile-api-hosted).
+
 ---
 
 ## Use with AI clients (MCP)
@@ -603,6 +614,33 @@ Security details:
 * Registration is open by design (that is how the apps connect) but rate limited per address and capped in number; unused registrations are deleted after a day. Client ID Metadata Documents (the newer alternative to registration) are not supported, because the gateway would have to fetch URLs that anyone names; every app listed falls back to registration.
 * Changing or resetting the password and disabling the account disconnect every app (re-enabling does not bring them back); leaving a workspace ends access to it. `search` reads files in the gateway, so it is limited to 10 a minute per person and 16 MB over at most 20 projects; regular expressions in `grep` are local-only. The worker's `/api/mcp` is not reachable through the editor proxy, only through `/mcp`.
 * The model and the app are untrusted: they get nothing a person with the same role could not do in the editor, never change `build.toml` or `latexmkrc` (only the local owner can, with `mcp_server.py --allow-build-config`), never accept suggestions, and their tool results are capped.
+
+### Compile API (hosted)
+
+Off unless the operator enables it in `config.toml`:
+
+```toml
+[api]
+enabled = true
+compiles_per_hour = 60             # requests per person per hour (cache hits included)
+compiles_per_day = 300             # builds per person per day (UTC; cache hits not counted)
+max_upload_mb = 20                 # largest request body
+concurrent = 2                     # builds at once on the whole server (one per person)
+cache_per_user = 20                # results kept per person
+```
+
+Account > API tokens makes a personal token (`lpat_...`, shown once; the server keeps only its SHA-256), with a name, the `compile` scope and an expiry (30 days, 90 days, a year or never), lists them with their last use, and revokes them. Then `POST https://latex.example.org/api/v1/compile` with `Authorization: Bearer lpat_...` takes the same bodies, parameters and answers as the [local endpoint](#compile-api):
+
+```bash
+curl --fail-with-body --data-binary @paper.zip -H "Content-Type: application/zip" -H "Authorization: Bearer $LATEX_TOKEN" -o paper.pdf https://latex.example.org/api/v1/compile
+```
+
+* The gateway only checks and forwards: the build runs in a worker of that person's own (`serve.py --gateway` on a placeholder project under `projects/_api/`, counted against `max_workers_per_tenant` and `max_workers` like a workspace), in the bubblewrap sandbox with the sharing restrictions and the project size quota (`max_project_mb`), with the upload's `build.toml` and `latexmkrc` left out (`X-Compile`'s `skipped` names them). The worker's endpoint is not reachable through the editor proxy (`/p/<id>/api/v1/...` is `404`).
+* Only `Authorization: Bearer` counts (cookies are ignored, no CSRF token needed); a request whose `Origin` is another site is `403`. A wrong, expired or revoked token, or a disabled account, is `401` with `WWW-Authenticate: Bearer`; 30 wrong tokens from one address within 15 minutes block it for 15 minutes (`429`).
+* Limits: the body size (`413`), requests per hour and builds per day per person (`429` with `Retry-After`), one build per person at a time (`429`) and `concurrent` on the server (`503`).
+* Cache: the SHA-256 of the person, `main`, the content type and the body; the same request again is answered from the last `cache_per_user` results of that person without a build (`X-Compile-Cache: hit`), so CI that sends an unchanged document costs nothing. Cached results live in `api-cache/<user id>/` in the data directory.
+* Every compile, cache hit, token made and token revoked is in the audit log (`api_compile`, `api_token_created`, `api_token_revoked`); `api_usage` in `host.db` counts builds and cache hits per person and day. Changing or resetting the password and disabling the account revoke every token.
+* Tokens are generic (`api_tokens.scopes`): another client adds its scope to `compile_api.SCOPES` and checks it with `compile_api.bearer(h, scope)`.
 
 ### TLS with Caddy, and systemd
 

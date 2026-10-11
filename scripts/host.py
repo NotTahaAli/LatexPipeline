@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import compile_api
 import host_mcp
 import zotero
 
@@ -71,7 +72,7 @@ CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
-    "mcp": {},
+    "mcp": {}, "api": {},
 }
 AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
                      "daily_per_user": 50, "daily_per_workspace": 500, "daily_total": 2000,
@@ -117,7 +118,7 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # daily_per_workspace = 500            # requests per workspace per day
 # daily_total = 2000                   # requests for the whole server per day (the spending cap)
 # daily_tokens_per_user = 1000000      # input + output tokens per person per day
-""" + host_mcp.CONFIG_TEMPLATE
+""" + host_mcp.CONFIG_TEMPLATE + compile_api.CONFIG_TEMPLATE
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
 SETTING_DEFAULTS: dict = {
@@ -188,6 +189,7 @@ def load_config(data: Path) -> dict:
         if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
             raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
     host_mcp.check_config(config, path)
+    compile_api.check_config(config, path)
     return config
 
 
@@ -298,6 +300,18 @@ MIGRATIONS = [
         SELECT id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used FROM invites;
     DROP TABLE invites;
     ALTER TABLE invites_new RENAME TO invites;
+    """,
+    # Personal API tokens (compile_api.py): stored as SHA-256, space-separated scopes, revoked instead of deleted
+    # (the audit log names them); api_usage counts compiles per person and UTC day.
+    """
+    CREATE TABLE api_tokens(
+        id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL, created REAL NOT NULL, expires REAL, used REAL,
+        revoked REAL);
+    CREATE INDEX api_tokens_user ON api_tokens(user_id);
+    CREATE TABLE api_usage(
+        day TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        compiles INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day, user_id));
     """,
 ]
 
@@ -1248,6 +1262,8 @@ class Handler(BaseHTTPRequestHandler):
             self.session = self.load_session()
             if host_mcp.endpoint(self, url.path):  # /mcp, /oauth/*, /.well-known/oauth-*: no cookies, no CSRF
                 return
+            if compile_api.endpoint(self, url.path):  # /api/v1/*: API tokens only, no cookies, no CSRF
+                return
             if url.path.startswith("/p/"):
                 self.project_proxy(url.path, url.query)
                 return
@@ -1339,8 +1355,8 @@ class Handler(BaseHTTPRequestHandler):
         if (self.command != "GET" or upgrade) and not self.origin_ok():
             raise HttpError(403, "Cross-site request refused.")
         size = self.body_size(MAX_PROXY_BODY)
-        if rest == "/api/mcp":  # only through /mcp (OAuth grant, audit, limits), never with a browser session
-            raise HttpError(404, "Not found.")
+        if rest == "/api/mcp" or (rest or "").startswith("/api/v1/"):
+            raise HttpError(404, "Not found.")  # only through /mcp and /api/v1 (grant or token, audit, limits)
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
@@ -1769,6 +1785,7 @@ def api_reset(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), row["user_id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ?", row["user_id"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", row["user_id"])  # connected AI clients too
+        compile_api.revoke_all(row["user_id"])  # and API tokens
     audit_log(APP, "password_reset", row["user_id"], h.ip)
     h.ok()
 
@@ -1868,6 +1885,7 @@ def api_password(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), h.user["id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ? AND id_hash != ?", h.user["id"], h.session["id_hash"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", h.user["id"])  # connected AI clients too
+        compile_api.revoke_all(h.user["id"])  # and API tokens
     audit_log(APP, "password_changed", h.user["id"], h.ip)
     h.ok()
 
@@ -2195,6 +2213,7 @@ def api_admin_user(h: Handler, uid: str) -> None:
         if data.get("disabled"):
             APP.db.run("DELETE FROM sessions WHERE user_id = ?", int(uid))
             APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", int(uid))
+            compile_api.revoke_all(int(uid))
     audit_log(APP, "user_changed", h.user["id"], h.ip, detail=f"user {uid}: {json.dumps(data)[:200]}")
     h.ok()
 
@@ -2489,6 +2508,7 @@ def api_unlink(h: Handler, name: str) -> None:
 
 
 host_mcp.install(sys.modules[__name__])  # the consent and connected-clients API
+compile_api.install(sys.modules[__name__])  # the account page's API tokens
 
 
 # ---------------------------------------------------------------------------

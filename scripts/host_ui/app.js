@@ -1,6 +1,8 @@
 // Hosted LaTeX Studio: sign-in, projects, workspace and site administration. Plain DOM, no libraries.
 // Every page is a function of the URL hash; the server decides what each user may see and do.
 
+import { apiTokensSection } from "./tokens.js";
+
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => {
   const node = Object.assign(document.createElement(tag), props);
@@ -386,7 +388,8 @@ async function accountPage() {
     providers,
     sect("Password", "Changing it signs out your other sessions.", password),
     sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero),
-    await aiClientsSection(sect));
+    await aiClientsSection(sect),
+    await apiTokensSection(sect, { api, el, button, form, field, input, when, announce, rerender: accountPage }));
 }
 
 // ---- AI clients (MCP): consent and connected apps ---------------------------------------------------------------

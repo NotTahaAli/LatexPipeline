@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import ai
+import compile_api
 import host
 import host_mcp
 import serve
@@ -2267,6 +2268,231 @@ class Mcp(HostCase):
         self.assertEqual(self.mcp(reader, {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
             "name": "add_comment", "arguments": {"project": self.pid, "path": "main.tex", "quote": quote,
                                                  "comment": "x"}}})[0], 403)
+
+
+
+# --- Remote compile API: API tokens and POST /api/v1/compile (compile_api.py) ----------------------------------------
+
+API_DOC = "\\documentclass{article}\n\\begin{document}\nHello from the API.\n\\end{document}\n"
+BUILT = {"ok": True, "pdf": b"%PDF-1.7 fake", "log": "the log", "seconds": 0.4, "pages": 1, "errors": [],
+         "skipped": []}
+
+
+class CompileApiOff(HostCase):
+    def test_off_unless_the_operator_enables_it(self):
+        self.user("ed@x.org")
+        ed = self.client("ed@x.org")
+        self.assertEqual(ed.call("GET", "/api/account/tokens")[0], 404)
+        self.assertEqual(ed.call("POST", "/api/account/tokens", {"name": "ci"})[0], 404)
+        self.assertEqual(Client(self).call("POST", "/api/v1/compile", raw=b"x", origin=False,
+                                           ctype="application/zip")[0], 404)
+
+    def test_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "config.toml").write_text("[api]\nenabled = true\nmax_upload_mb = 5\n")
+            self.assertEqual(host.load_config(data)["api"]["max_upload_mb"], 5)
+            for text in ('[api]\nenabled = "yes"', "[api]\nnope = 1", "[api]\nconcurrent = 0"):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+        self.assertIn("[api]", host.CONFIG_TEMPLATE)
+
+
+class CompileApiCase(HostCase):
+    LIMITS: dict = {}
+
+    def extra_config(self):
+        return {"api": {**compile_api.DEFAULTS, "enabled": True, **self.LIMITS}}
+
+    def setUp(self):
+        super().setUp()
+        compile_api.STATE["throttles"].clear()
+        self.addCleanup(compile_api.STATE["throttles"].clear)
+        self.uid = self.user("ed@x.org")
+        self.ed = self.client("ed@x.org")
+        self.worker = mock.patch.object(compile_api, "run_on_worker", side_effect=lambda *a: dict(BUILT)).start()
+
+    def token(self, client=None, **body):
+        status, data, _ = (client or self.ed).call("POST", "/api/account/tokens", {"name": "laptop", **body})
+        self.assertEqual(status, 201, data)
+        return data
+
+    def compile(self, token, data=None, query="", headers=None, origin=False, ctype="application/zip"):
+        hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+        return Client(self).call("POST", "/api/v1/compile" + query, raw=data or make_zip({"main.tex": API_DOC}),
+                                 headers={**hdrs, **(headers or {})}, origin=origin, ctype=ctype)
+
+
+class CompileApiHosted(CompileApiCase):
+    def test_tokens_are_shown_once_stored_hashed_listed_and_revoked(self):
+        made = self.token(scopes=["compile"], days=30)
+        self.assertTrue(made["token"].startswith("lpat_"))
+        row = self.app.db.one("SELECT * FROM api_tokens WHERE id = ?", made["id"])
+        self.assertEqual(row["token_hash"], host.token_hash(made["token"]))
+        self.assertNotIn(made["token"], json.dumps(row))
+        self.assertAlmostEqual(row["expires"] - row["created"], 30 * 86400, delta=5)
+        status, listed, _ = self.ed.call("GET", "/api/account/tokens")
+        self.assertEqual((status, [t["id"] for t in listed["tokens"]]), (200, [made["id"]]))
+        self.assertNotIn("token", listed["tokens"][0])
+        self.assertIn("compile", listed["scopes"])
+        for bad in ({"scopes": ["admin"]}, {"scopes": []}, {"days": 0}, {"days": True}, {"name": ""}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "x", **bad})[0], 400)
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "x"}, origin="http://evil.example")[0],
+                         403)
+        self.assertEqual(Client(self).call("GET", "/api/account/tokens")[0], 401)
+        # Somebody else's token is not there to revoke.
+        self.user("ot@x.org")
+        other = self.client("ot@x.org")
+        self.assertEqual(other.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 404)
+        self.assertEqual(self.compile(made["token"])[0], 200)
+        self.assertEqual(self.ed.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 200)
+        self.assertEqual(self.compile(made["token"])[0], 401)
+        self.assertEqual(self.ed.call("GET", "/api/account/tokens")[1]["tokens"], [])
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit")]
+        for action in ("api_token_created", "api_compile", "api_token_revoked"):
+            self.assertIn(action, actions)
+
+    def test_live_tokens_are_capped(self):
+        for _ in range(compile_api.MAX_TOKENS):
+            self.token()
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "one more"})[0], 409)
+
+    def test_the_endpoint_takes_only_a_valid_token_with_the_compile_scope(self):
+        token = self.token()["token"]
+        status, body, res = self.compile(None)
+        self.assertEqual(status, 401)
+        self.assertIn("Bearer", res.getheader("WWW-Authenticate"))
+        self.assertEqual(self.compile("lpat_" + "x" * 43)[0], 401)
+        self.assertEqual(self.compile(token, origin="http://evil.example")[0], 403)
+        self.assertEqual(Client(self).call("GET", "/api/v1/compile", headers={"Authorization": f"Bearer {token}"})[0],
+                         405)
+        self.assertEqual(Client(self).call("POST", "/api/v1/other", raw=b"x", origin=False)[0], 404)
+        # A signed-in browser without a token gets nothing: no cookies on this endpoint.
+        self.assertEqual(self.ed.call("POST", "/api/v1/compile", raw=make_zip({"main.tex": API_DOC}),
+                                      ctype="application/zip")[0], 401)
+        self.app.db.run("UPDATE api_tokens SET scopes = 'editor-sync'")
+        self.assertEqual(self.compile(token)[0], 403)
+        self.app.db.run("UPDATE api_tokens SET scopes = 'compile', expires = ?", time.time() - 1)
+        self.assertEqual(self.compile(token)[0], 401)
+        self.app.db.run("UPDATE api_tokens SET expires = NULL")
+        self.app.db.run("UPDATE users SET disabled = 1 WHERE id = ?", self.uid)
+        self.assertEqual(self.compile(token)[0], 401)
+        self.app.db.run("UPDATE users SET disabled = 0 WHERE id = ?", self.uid)
+        status, body, res = self.compile(token)
+        self.assertEqual((status, body, res.getheader("Content-Type")), (200, b"%PDF-1.7 fake", "application/pdf"))
+
+    def test_wrong_tokens_are_throttled_per_address(self):
+        for _ in range(30):
+            self.assertEqual(self.compile("lpat_wrong")[0], 401)
+        self.assertEqual(self.compile(self.token()["token"])[0], 429)
+
+    def test_a_password_change_revokes_tokens(self):
+        token = self.token()["token"]
+        self.assertEqual(self.ed.call("POST", "/api/account/password", {"current": "password-123",
+                                                                         "password": "new-password-456"})[0], 200)
+        self.assertEqual(self.compile(token)[0], 401)
+
+    def test_the_same_request_is_answered_from_the_cache_and_the_log_on_failure(self):
+        token = self.token()["token"]
+        first = self.compile(token)
+        second = self.compile(token)
+        self.assertEqual((first[0], first[2].getheader("X-Compile-Cache")), (200, "miss"))
+        self.assertEqual((second[0], second[1], second[2].getheader("X-Compile-Cache")), (200, b"%PDF-1.7 fake", "hit"))
+        self.assertEqual(self.worker.call_count, 1)
+        self.assertEqual(self.compile(token, query="?output=log")[1], b"the log")
+        other = self.compile(token, make_zip({"main.tex": API_DOC + "%"}))
+        self.assertEqual(other[2].getheader("X-Compile-Cache"), "miss")
+        self.worker.side_effect = lambda *a: {**BUILT, "ok": False, "pdf": None, "log": "! Emergency stop."}
+        status, body, res = self.compile(token, make_zip({"main.tex": "broken"}))
+        self.assertEqual((status, body), (422, b"! Emergency stop."))
+        self.assertFalse(json.loads(res.getheader("X-Compile"))["ok"])
+        usage = self.app.db.one("SELECT * FROM api_usage WHERE user_id = ?", self.uid)
+        self.assertEqual((usage["compiles"], usage["cached"]), (3, 2))
+        user, body, ctype, main = self.worker.call_args[0]
+        self.assertEqual((user["id"], ctype, main), (self.uid, "application/zip", "main.tex"))
+
+    def test_bad_parameters_and_oversized_bodies(self):
+        token = self.token()["token"]
+        self.assertEqual(self.compile(token, query="?main=../x.tex")[0], 400)
+        self.assertEqual(self.compile(token, query="?output=html")[0], 400)
+        big = b"x" * (compile_api.DEFAULTS["max_upload_mb"] * 1024 * 1024 + 1)
+        self.assertEqual(self.compile(token, big)[0], 413)
+        self.worker.assert_not_called()
+
+    def test_project_workers_never_answer_the_compile_api(self):
+        tenant = host.create_tenant(self.app, "Team")
+        self.app.db.run("INSERT INTO members VALUES (?, ?, ?)", tenant, self.uid, "editor")
+        pid = Workspaces.make_project(self, self.ed, tenant, "Doc", "article")
+        self.assertEqual(self.ed.call("POST", f"/p/{pid}/api/v1/compile", raw=b"x", ctype="application/zip")[0], 404)
+        self.assertNotIn(pid, self.app.workers.running)
+
+
+class CompileApiLimits(CompileApiCase):
+    LIMITS = {"compiles_per_hour": 4, "compiles_per_day": 2}
+
+    def test_hourly_rate_and_daily_quota(self):
+        token = self.token()["token"]
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "1"}))[0], 200)
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "2"}))[0], 200)
+        status, body, _ = self.compile(token, make_zip({"main.tex": "3"}))
+        self.assertEqual(status, 429)
+        self.assertIn("Daily limit", body["error"])
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "1"}))[2].getheader("X-Compile-Cache"), "hit")
+        status, _, res = self.compile(token, make_zip({"main.tex": "1"}))
+        self.assertEqual((status, res.getheader("Retry-After")), (429, "600"))
+        self.assertEqual(self.worker.call_count, 2)
+
+    def test_one_compile_per_person_at_a_time(self):
+        token = self.token()["token"]
+        started, finish = threading.Event(), threading.Event()
+
+        def slow(*args):
+            started.set()
+            finish.wait(10)
+            return dict(BUILT)
+
+        self.worker.side_effect = slow
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.compile(token)[0]))
+        thread.start()
+        self.assertTrue(started.wait(10))
+        status, _, res = self.compile(token, make_zip({"main.tex": "other"}))
+        finish.set()
+        thread.join(10)
+        self.assertEqual((status, res.getheader("Retry-After"), results), (429, "5", [200]))
+
+
+class CompileApiWorker(HostCase):
+    def extra_config(self):
+        return {"api": {**compile_api.DEFAULTS, "enabled": True}}
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex") and sys.platform.startswith("linux"),
+                         "needs latexmk and pdflatex to start a real worker")
+    def test_a_real_compile_worker_builds_the_upload(self):
+        compile_api.STATE["throttles"].clear()
+        uid = self.user("ed@x.org")
+        ed = self.client("ed@x.org")
+        token = ed.call("POST", "/api/account/tokens", {"name": "ci"})[1]["token"]
+        tar = io.BytesIO()
+        import tarfile
+        with tarfile.open(fileobj=tar, mode="w:gz") as archive:
+            data = API_DOC.encode()
+            info = tarfile.TarInfo("paper/main.tex")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        status, body, res = Client(self).call("POST", "/api/v1/compile", raw=tar.getvalue(), origin=False,
+                                              ctype="application/gzip", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.startswith(b"%PDF"))
+        self.assertIn(f"api{uid}", self.app.workers.running)
+        self.assertEqual(self.app.workers.running[f"api{uid}"].project["tenant_id"], compile_api.API_TENANT)
+        status, body, _ = Client(self).call("POST", "/api/v1/compile", origin=False, ctype="application/json",
+                                            raw=json.dumps({"files": {"main.tex": "\\nosuchthing"}}).encode(),
+                                            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 422)
+        self.assertIn(b"main.tex", body)
 
 
 if __name__ == "__main__":
