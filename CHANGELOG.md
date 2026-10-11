@@ -4,6 +4,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- `build.py --arxiv [DOC ...]`: `out/<name>.arxiv.zip` with exactly the files the build read from the document directory, the generated `main.bbl` (`.ind`, `.gls`, `.nls`), `%` comments stripped from `.tex` files and a `00README.json` for XeLaTeX, plus a preflight (outside files, file names, hidden files, absolute or `..` paths, shell escape, missing figures, images over 34 megapixels, biblatex `.bbl` format, LuaLaTeX) printed and written to the log; "Export for arXiv" in the editor's More menu (owner-only, off while sharing).
+- Accessibility checks for `tagged = true` documents (`scripts/a11y.py`): missing PDF title, `\includegraphics` without `alt=`, skipped heading levels and packages the LaTeX Tagging Project lists as incompatible, in the log, `build-report.json` (new optional `a11y` key), the editor's Warnings tab and `ci_report.py lint` notices.
+
+### Fixed
+
+- Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed

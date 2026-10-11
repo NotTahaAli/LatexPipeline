@@ -65,6 +65,8 @@ export const api = {
   fs: (doc, op, path, to) => call(`api/fs?${qs(to == null ? { doc, op, path, cid: api.cid || "" } : { doc, op, path, to, cid: api.cid || "" })}`, { method: "POST" }),
   docx: (doc) => call(`api/docx?${qs({ doc })}`, { method: "POST" }),
   docxUrl: (doc) => `docx/${doc.split("/").map(enc).join("/")}`,
+  arxiv: (doc) => call(`api/arxiv?${qs({ doc })}`, { method: "POST" }),
+  arxivUrl: (doc) => `arxiv/${doc.split("/").map(enc).join("/")}`,
   focus: (doc, path) => call(`api/focus?${qs({ doc, path })}`, { method: "POST" }),
   pdfUrl: (doc, v, focus) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}${focus ? "&focus=1" : ""}`,
   logUrl: (doc) => `log/${doc.split("/").map(enc).join("/")}`,

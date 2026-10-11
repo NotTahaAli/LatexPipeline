@@ -572,7 +572,7 @@ class GatewayMode(SharedState, ServerCase):
     def test_owner_only_features_are_unavailable(self):
         for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
                              ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
-                             ("GET", "/events")]:
+                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events")]:
             with self.subTest(path=path):
                 self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
         self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
@@ -1198,6 +1198,25 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("GET", "/docx/demo", "owner")[0], 200)
             self.assertEqual(self.get("GET", "/docx/demo")[0], 401)
 
+    def test_arxiv_export_is_owner_only_off_while_sharing_and_downloads_as_zip(self):
+        url = "/api/arxiv?doc=demo"
+        found = [{"level": "error", "file": None, "message": "m", "hint": "h"}]
+        with mock.patch.object(build, "export_arxiv", return_value=(found, ["x"])) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)  # sharing is on
+            export.assert_not_called()
+            serve.SHARE["on"] = False
+            self.assertEqual(self.get("POST", url, "owner"), (200, {"ok": True, "findings": found}))
+        with mock.patch.object(build, "export_arxiv", return_value=(None, ["ERROR: no recorded build (.fls)"])):
+            self.assertEqual(self.get("POST", url, "owner"), (500, {"error": "no recorded build (.fls)"}))
+        serve.SHARE["on"] = True
+        (self.root / "demo.arxiv.zip").write_bytes(b"PK")
+        with mock.patch.object(build, "arxiv_path_for", return_value=self.root / "demo.arxiv.zip"):
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/arxiv/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/arxiv/demo", "owner"), (200, b"PK"))
+
     def test_docx_download_name_has_an_ascii_fallback_and_a_utf8_name(self):
         header = serve.attachment_header("Отчёт 1.docx")
         header.encode("ascii")
@@ -1803,6 +1822,21 @@ class LogWarnings(ServerCase):
         self.log.unlink()
         self.assertEqual(self.request("GET", "/api/warnings?doc=demo")[1], {"warnings": []})
         self.assertEqual(self.request("GET", "/api/warnings?doc=nope")[0], 404)
+
+    def test_accessibility_lines_of_the_log_are_warnings_with_links(self):
+        self.write("main.tex", "\\section{A}\n\\subsubsection{B}\n")
+        self.log.write_text(
+            "Build of files/demo/main.tex: SUCCESS\n"
+            "ACCESSIBILITY: The PDF has no title (pdftitle is empty).\n  Hint: Add a title.\n"
+            "ACCESSIBILITY: files/demo/main.tex:2: \\subsubsection follows \\section: a level is skipped.\n"
+            "  Hint: Use the next level.\n"
+            "ACCESSIBILITY: files/demo/../secret.tex:1: outside\n  Hint: h\n"
+            "\n===== latexmk output =====\nACCESSIBILITY: x.tex:1: not a header line\n  Hint: h\n",
+            encoding="utf-8")
+        with mock.patch.object(build, "SOURCE_DIR", Path("/somewhere/files")):
+            rows = [w for w in self.request("GET", "/api/warnings?doc=demo")[1]["warnings"] if w["kind"] == "a11y"]
+        self.assertEqual([(w["file"], w["line"]) for w in rows], [(None, None), ("main.tex", 2), (None, None)])
+        self.assertEqual((rows[0]["source"], rows[0]["hint"]), ("Accessibility", "Add a title."))
 
     def test_remember_build_merges_into_the_report_without_dropping_other_documents(self):
         report = self.root / "report"

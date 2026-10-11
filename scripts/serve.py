@@ -448,13 +448,33 @@ def parse_warnings(log_text: str, root: Path | None = None) -> list[dict]:
     return found
 
 
+_A11Y = re.compile(r"^ACCESSIBILITY: (?:(?P<file>[^\n]+?):(?P<line>\d+): )?(?P<message>[^\n]+)\n"
+                   r"  Hint: (?P<hint>[^\n]*)$", re.MULTILINE)
+
+
+def a11y_warnings(log_text: str, root: Path, name: str) -> list[dict]:
+    """The ACCESSIBILITY lines build.py writes at the top of a tagged document's log, as Warnings rows."""
+    head = log_text.split("\n===== latexmk output", 1)[0]
+    prefix = posixpath.join(build.SOURCE_DIR.name, name, "")  # error_text's files/<doc>/
+    found = []
+    for match in _A11Y.finditer(head):
+        file = match.group("file")
+        file = doc_relative(root, file[len(prefix):] if file and file.startswith(prefix) else None)
+        found.append({
+            "kind": "a11y", "level": "warning", "message": match.group("message"), "file": file,
+            "line": int(match.group("line")) if file else None, "source": "Accessibility",
+            "hint": match.group("hint"), "excerpt": match.group("message"),
+        })
+    return found
+
+
 def doc_warnings(name: str) -> list[dict]:
     main_tex = DOCS[name]
     try:
         text = build.log_path_for(main_tex).read_text(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         return []
-    return parse_warnings(text, main_tex.parent)
+    return a11y_warnings(text, main_tex.parent, name) + parse_warnings(text, main_tex.parent)
 
 
 def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -> None:
@@ -3303,6 +3323,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             return  # zotero_info answers per role: a guest learns only whether it may sync
         if path.startswith("/docx/"):
             raise ApiError("Only the owner can download the DOCX export.", 403)
+        if path.startswith("/arxiv/"):
+            raise ApiError("Only the owner can download the arXiv export.", 403)
         if path.startswith(("/pdf/", "/log/")):
             scoped(path[1:].partition("/")[2])
         elif path in READ_API:
@@ -3346,7 +3368,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         if not rate_ok("ai", 10, 60.0):
             raise ApiError("Too many AI requests; wait a moment.", 429)
     # POST /api/docx and GET /docx/ are owner only on purpose: pandoc reads any file a \input names, so an edit
-    # link could otherwise put /etc/passwd into a download.
+    # link could otherwise put /etc/passwd into a download. POST /api/arxiv and GET /arxiv/ too: the archive is
+    # the owner's source tree, comments included in what it was made from.
     elif method == "POST" and path == "/api/bib":
         scoped(doc)  # Read-only (the sources and .bib files a view link can already read), POST to carry unsaved text.
     elif method == "POST" and path == "/api/bib/edit":
@@ -3652,6 +3675,13 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 raise ApiError(message, 500)
             self.json({"ok": True})
+        elif url.path == "/api/arxiv" and name in DOCS:
+            if SHARE["on"]:
+                raise ApiError("arXiv export is off while sharing.", 409)
+            findings, lines = build.export_arxiv(DOCS[name])  # reads the last build's cache; runs no TeX
+            if findings is None:
+                raise ApiError(lines[0].removeprefix("ERROR: "), 500)
+            self.json({"ok": True, "findings": findings})
         elif url.path == "/forward":  # Owner only (check_permission): every open viewer jumps there.
             found, box = forward(query)
             box["doc"] = found
@@ -3744,7 +3774,7 @@ class Handler(BaseHTTPRequestHandler):
             self.poll(query)
         elif path == "/events":
             self.events()
-        elif path.startswith(("/pdf/", "/log/", "/docx/")):
+        elif path.startswith(("/pdf/", "/log/", "/docx/", "/arxiv/")):
             self.file(path, "focus" in query)
         elif path == "/api/files":
             root = self.doc_root(query)
@@ -3836,6 +3866,8 @@ class Handler(BaseHTTPRequestHandler):
         main_tex = DOCS[name]
         if kind == "docx":
             target = build.docx_path_for(main_tex)
+        elif kind == "arxiv":
+            target = build.arxiv_path_for(main_tex)
         elif focus:
             target = build.focus_paths(main_tex)[0 if kind == "pdf" else 1]
         else:
@@ -3845,10 +3877,11 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.reply(404, b"Not built yet", "text/plain")
             return
-        types = {"pdf": "application/pdf", "docx": DOCX_TYPE}
+        types = {"pdf": "application/pdf", "docx": DOCX_TYPE, "arxiv": "application/zip"}
+        download = {"docx": ".docx", "arxiv": ".arxiv.zip"}.get(kind)
         self.reply(200, body, types.get(kind, "text/plain; charset=utf-8"),
-                   {"Content-Disposition": attachment_header(posixpath.basename(name) + ".docx")}
-                   if kind == "docx" else None)
+                   {"Content-Disposition": attachment_header(posixpath.basename(name) + download)}
+                   if download else None)
 
     # --- transports -------------------------------------------------------
 
