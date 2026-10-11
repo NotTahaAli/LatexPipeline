@@ -99,7 +99,7 @@ class Preflight(unittest.TestCase):
         got = self.messages(found)
         self.assertEqual([level for level, _, _ in got], ["error"] * 8)  # /abs/fig is also missing
         text = " | ".join(message for _, _, message in got)
-        for part in ("/elsewhere/defs.tex", "\\input{../shared/defs}", "\\includegraphics{/abs/fig}",
+        for part in (str(Path("/elsewhere/defs.tex")), "\\input{../shared/defs}", "\\includegraphics{/abs/fig}",
                      "\\write18", "minted", "Figure 'nowhere'", "Figure '/abs/fig'", "shell escape"):
             self.assertIn(part, text)
         self.assertNotIn("example-image", text)  # read from TeX Live, which arXiv has
