@@ -1,0 +1,74 @@
+name: Binaries
+
+# Single-file builds of scripts/build.py and scripts/serve.py (PyInstaller), so
+# people without Python can build and edit documents. They still need LaTeX.
+# A pushed v* tag attaches them to that tag's release; the CI-owned `pdfs`
+# release is never touched. A manual run on a branch keeps them as run artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x64
+          - os: macos-latest
+            suffix: macos-arm64
+          - os: windows-latest
+            suffix: windows-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller==6.22.3
+      # serve.py reads its UI and fonts next to itself (sys._MEIPASS when frozen).
+      - name: Build
+        run: |
+          python -m PyInstaller --onefile --paths scripts --name build-${{ matrix.suffix }} scripts/build.py
+          python -m PyInstaller --onefile --paths scripts --name serve-${{ matrix.suffix }} \
+            --add-data scripts/serve_ui:serve_ui --add-data scripts/fonts:fonts scripts/serve.py
+      - name: Smoke test
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          ./dist/build-${{ matrix.suffix }}$ext --help
+          ./dist/build-${{ matrix.suffix }}$ext --list
+          ./dist/serve-${{ matrix.suffix }}$ext --help
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Attach to the tag's release
+        run: |
+          gh run download "${{ github.run_id }}" --dir dist --pattern 'binaries-*'
+          gh release view "$TAG" > /dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" dist/*/* --clobber

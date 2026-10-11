@@ -28,8 +28,11 @@ import sandbox
 # Configuration
 # ---------------------------------------------------------------------------
 
+# A PyInstaller binary (see .github/workflows/binaries.yml) runs from its unpack
+# folder, so the project is the directory it is started in.
+FROZEN = getattr(sys, "frozen", False)
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT_DIR = SCRIPT_DIR.parent
+ROOT_DIR = Path.cwd().resolve() if FROZEN else SCRIPT_DIR.parent
 FILES_DIR = ROOT_DIR / "files"
 # Where documents are found. --source DIR changes it for one run.
 SOURCE_DIR = FILES_DIR
@@ -458,7 +461,8 @@ def newest_input(main_tex: Path) -> float:
     that the last build read (recorded_inputs), and build.py and accel.py.
     """
     # The scripts that decide what a build produces; editing serve.py or ci_report.py rebuilds nothing.
-    newest = max(Path(__file__).stat().st_mtime, (SCRIPT_DIR / "accel.py").stat().st_mtime)
+    scripts = [Path(sys.executable)] if FROZEN else [Path(__file__), SCRIPT_DIR / "accel.py"]
+    newest = max(path.stat().st_mtime for path in scripts)
 
     # Directories count too: deleting or renaming an input changes only its folder's time.
     try:

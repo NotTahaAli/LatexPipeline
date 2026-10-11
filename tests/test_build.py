@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -758,6 +759,28 @@ class GlobalInputsTests(unittest.TestCase):
         for name in ("build.py", "accel.py", "hints.py", "publish_release.py", "ci_report.py"):
             text = (self.ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)
+
+
+class FrozenTests(unittest.TestCase):
+    """PyInstaller binaries (binaries.yml): the project is the working directory, the binary is the build script."""
+
+    def test_root_is_the_working_directory(self):
+        scripts = Path(__file__).resolve().parent.parent / "scripts"
+        code = (f"import sys; sys.frozen = True; sys.path.insert(0, {str(scripts)!r}); "
+                "import build; print(build.ROOT_DIR)")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True, check=True)
+            self.assertEqual(Path(out.stdout.strip()), Path(tmp).resolve())
+
+    def test_binary_time_counts_as_an_input(self):
+        with fake_repo() as root:
+            main_tex = write_doc(root, "a", "x")
+            binary = root / "build-bin"
+            binary.write_text("x")
+            future = time.time() + 3600
+            os.utime(binary, (future, future))
+            with mock.patch.object(build, "FROZEN", True), mock.patch.object(build.sys, "executable", str(binary)):
+                self.assertEqual(build.newest_input(main_tex), future)
 
 
 class ReportAndFocusTests(unittest.TestCase):

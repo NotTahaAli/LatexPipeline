@@ -62,6 +62,14 @@ In a copy made from the template, CI runs only the build. The unit tests, ruff a
 
 Check that it works with `latexmk --version`. If the command isn't found, add your LaTeX installation to `PATH` and restart the terminal.
 
+### Binaries
+
+No Python? Each version release (`v*` tags, not the `pdfs` release) carries single-file builds of `build.py` and `serve.py` made with PyInstaller by `.github/workflows/binaries.yml`: `build-<platform>` and `serve-<platform>` for `linux-x64`, `macos-arm64` (Apple silicon) and `windows-x64` (`.exe`). They take the same flags as the scripts. LaTeX is still required.
+
+* Run them from the project folder (the one holding `files/`): a binary treats the directory it is started in as the repository, so `out/` and `.latex-cache/` land there.
+* On Linux and macOS, make the download executable first: `chmod +x build-linux-x64`. The binaries are not signed, so macOS and Windows may warn on the first start.
+* The editor binary loads its libraries from the CDN; `scripts/vendor_ui.py` (offline editor) needs the Python version.
+
 ---
 
 ## Building
@@ -659,6 +667,8 @@ The editor's live preview has one too: `uv run --no-project --with playwright==1
   * File names on the release are escaped. Every character other than letters, digits, `.` and `-` becomes `_` followed by its UTF-8 bytes in hex: space becomes `_20`, `_` becomes `_5F`, and `/` becomes `_2F`. For example, `FP-123 Proposal.pdf` becomes `FP-123_20Proposal.pdf`. To recover the original name, replace each `_` with `%` and URL-decode. The release page shows the original path as the file's label.
   * After a fully successful build, the `pdfs` tag moves to the commit that was built. That tag marks where the next run starts from.
 * **requirements** fails if `uv.lock` or `requirements.txt` has fallen behind `pyproject.toml`.
+
+[`.github/workflows/binaries.yml`](.github/workflows/binaries.yml) runs on pushed `v*` tags (and manually): it builds the [binaries](#binaries) on Linux, macOS and Windows, runs each with `--help` (and `build --list`), and attaches them to that tag's release, creating the release if needed. A manual run on a branch keeps them as run artifacts only.
 
 `out/` is git-ignored, so never commit it.
 

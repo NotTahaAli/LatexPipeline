@@ -4,6 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Single-file binaries of `build.py` and `serve.py` for Linux, macOS and Windows (PyInstaller), attached to each `v*` release by `.github/workflows/binaries.yml`; a binary uses the directory it is started in as the repository.
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed
