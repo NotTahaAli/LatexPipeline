@@ -49,6 +49,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: zen mode (only the editor, in a centred column; Esc leaves it).
 - Editor: the document folder's `.editorconfig` sets indentation, and on Ctrl+S trims trailing white space and adds a final newline (`/api/refs` returns its text).
 - Review markup: `build.toml` `review = "show" | "clean"` (or `build.py --review show|clean`) defines `\lpadd`, `\lpdel`, `\lpedit`, `\lpnote` and the `lpaddblock`, `lpdelblock`, `lpnoteblock` environments, shown as green highlight, red strike-through and notes, or printed as if every change were accepted; off by default, and a document's own definitions win.
+- Editor: go to definition (F12, Ctrl+click) of labels, `\cite` keys (the `.bib` entry), the document's commands and environments, and find references (Shift+F12) across the document (`POST /api/symbols`, `scripts/navigate.py`).
+- Editor: rename a label everywhere (F2: its `\label` and every `\ref`-like use; `POST /api/rename`, edit role; files open in co-editing change through their rooms, others are written with history).
+- Editor: label numbers from the last build's `.aux` next to `\label` and `\ref` (Settings toggle).
+- Editor: the Outline also lists figures and tables with captions, labels and TODOs, with a filter.
+- Editor: "File graph" of `\input`/`\include`/`\bibliography`/`\includegraphics` and local packages, drawn as SVG.
+- Editor: TODOs drawer tab for `% TODO`, `% FIXME` and `\todo{}`, click to jump.
+- Editor: bookmarks (Ctrl+Alt+K, next Ctrl+Alt+L, previous Ctrl+Alt+J, Bookmarks tab) and the cursor of each file restored, kept per browser.
+- Editor: package documentation on `\usepackage{x}` (hover or F12) opens `https://texdoc.org/pkg/x` in a new tab.
+- Editor: Symbols sidebar tab (Greek, operators, relations, arrows, accents, misc) with search, inserting at the cursor.
+- Editor: optional KaTeX preview under displayed equations in source mode (figures are not previewed).
+- Editor: "Typeset selection" sets the selected LaTeX with the document's preamble in one run through `sandbox.spawn()` and shows it in a popup (`POST /api/typeset`, edit role, `scripts/fragment.py`).
+- Editor: optional "Follow the cursor": SyncTeX forward search on a cursor pause and after each build.
+- Editor: PDF presentation mode (full screen, one page, arrow keys) and "Open the PDF in a new tab".
 - `build.py --review-pdf DOC` and the editor's More > Build with suggestions: `out/<name>.review.pdf` with the open suggestions inlined as marked changes and unresolved comments as notes, built from a copy (only plain-prose ranges; the rest is skipped with a reason); never published.
 
 ### Changed

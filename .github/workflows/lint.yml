@@ -46,7 +46,7 @@ jobs:
         run: node tests/latex_check.mjs scripts/serve_ui/latex.js
       # Pure helpers of the editor: table paste, the review export and the editing tools.
       - name: Editor helper checks
-        run: node tests/tablepaste_check.mjs && node tests/reviewexport_check.mjs && node tests/edits_check.mjs
+        run: node tests/tablepaste_check.mjs && node tests/reviewexport_check.mjs && node tests/edits_check.mjs && node tests/nav_check.mjs scripts/serve_ui
       # Visual tools: table editor, figure dialog, TikZ parser and writer, Markdown.
       - name: Visual tool checks
         run: node tests/tableedit_check.mjs && node tests/figure_check.mjs && node tests/tikz_check.mjs && node tests/markdown_check.mjs

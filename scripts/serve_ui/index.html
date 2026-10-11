@@ -78,6 +78,9 @@
     <symbol id="i-suggest" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-4-4L4 16z"/><path d="M14 20h6"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
+    <symbol id="i-present" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M12 16v4M8 20h8"/></symbol>
+    <symbol id="i-newtab" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+    <symbol id="i-omega" viewBox="0 0 24 24"><path d="M5 19h4v-2a6 6 0 1 1 6 0v2h4"/></symbol>
   </defs>
 </svg>
 
@@ -118,6 +121,7 @@
         <button role="tab" id="tab-search" aria-controls="panel-search" aria-selected="false"><svg class="ic"><use href="#i-search"/></svg>Search</button>
         <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
         <button role="tab" id="tab-refs" aria-controls="panel-refs" aria-selected="false"><svg class="ic"><use href="#i-book"/></svg>References</button>
+        <button role="tab" id="tab-symbols" aria-controls="panel-symbols" aria-selected="false"><svg class="ic"><use href="#i-omega"/></svg>Symbols</button>
         <button role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false"><svg class="ic"><use href="#i-spark"/></svg>Assistant</button>
         <button role="tab" id="tab-git" aria-controls="panel-git" aria-selected="false" hidden><svg class="ic"><use href="#i-branch"/></svg>Git</button>
       </div>
@@ -136,11 +140,13 @@
     </div>
     <div id="panel-search" role="tabpanel" aria-labelledby="tab-search" hidden></div>
     <div id="panel-refs" role="tabpanel" aria-labelledby="tab-refs" hidden></div>
+    <div id="panel-symbols" role="tabpanel" aria-labelledby="tab-symbols" hidden></div>
     <div id="panel-ai" role="tabpanel" aria-labelledby="tab-ai" hidden></div>
     <div id="panel-git" role="tabpanel" aria-labelledby="tab-git" hidden></div>
     <div id="panel-outline" role="tabpanel" aria-labelledby="tab-outline" hidden>
       <div id="outlineHead" class="outline-head"></div>
       <div id="outlineList" role="group" aria-label="Document outline"></div>
+      <div id="outlineExtra" role="group" aria-label="Figures, tables, labels and TODOs"></div>
     </div>
   </aside>
 
@@ -185,6 +191,8 @@
       <button id="zFit" class="icon" aria-label="Fit width" title="Fit width"><svg class="ic"><use href="#i-fit"/></svg></button>
       <button id="pdfDark" class="icon" aria-pressed="false" aria-label="Dark PDF pages" title="Dark PDF pages (inverts the page colours)"><svg class="ic"><use href="#i-moon"/></svg></button>
       <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
+      <button id="presentBtn" class="icon" aria-label="Present the PDF" title="Present: full screen, one page at a time, arrow keys (Esc ends)"><svg class="ic"><use href="#i-present"/></svg></button>
+      <button id="pdfTabBtn" class="icon" aria-label="Open the PDF in a new tab" title="Open the PDF in a new tab"><svg class="ic"><use href="#i-newtab"/></svg></button>
       <span id="liveState" class="live-state" hidden></span>
     </div>
     <div id="focusNote" class="focus-note" role="status" hidden></div>
@@ -202,6 +210,8 @@
       <button role="tab" id="dtab-grammar" aria-controls="dpanel-grammar" aria-selected="false">Grammar <span id="grammarCount" class="count"></span></button>
       <button role="tab" id="dtab-review" aria-controls="dpanel-review" aria-selected="false">Review <span id="reviewCount" class="count"></span></button>
       <button role="tab" id="dtab-history" aria-controls="dpanel-history" aria-selected="false">History</button>
+      <button role="tab" id="dtab-todos" aria-controls="dpanel-todos" aria-selected="false">TODOs <span id="todoCount" class="count"></span></button>
+      <button role="tab" id="dtab-bookmarks" aria-controls="dpanel-bookmarks" aria-selected="false">Bookmarks</button>
       <button role="tab" id="dtab-log" aria-controls="dpanel-log" aria-selected="false"><svg class="ic"><use href="#i-log"/></svg>Log</button>
     </div>
     <span class="spacer"></span>
@@ -219,6 +229,11 @@
   </div>
   <div id="dpanel-review" role="tabpanel" aria-labelledby="dtab-review" hidden></div>
   <div id="dpanel-history" role="tabpanel" aria-labelledby="dtab-history" hidden></div>
+  <div id="dpanel-todos" role="tabpanel" aria-labelledby="dtab-todos" hidden><ul id="todoList" class="plist"></ul></div>
+  <div id="dpanel-bookmarks" role="tabpanel" aria-labelledby="dtab-bookmarks" hidden>
+    <div class="wfilter" role="group" aria-label="Bookmarks in this file"><button type="button" class="chip" id="bmPrev">Previous (Ctrl+Alt+J)</button><button type="button" class="chip" id="bmNext">Next (Ctrl+Alt+L)</button></div>
+    <ul id="bookmarkList" class="plist"></ul>
+  </div>
   <div id="dpanel-log" tabindex="0" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
 </section>
 
@@ -259,6 +274,11 @@
   <div class="hv-foot"></div>
 </dialog>
 
+<dialog id="navDlg" aria-labelledby="navTitle">
+  <div class="dlg-head"><h2 id="navTitle"></h2><button type="button" class="icon" id="navClose" aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></div>
+  <div id="navBody" class="nav-body"></div>
+</dialog>
+
 <dialog id="palette" aria-label="Command palette">
   <div class="pal-head"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><input id="paletteInput" type="text" role="combobox" aria-expanded="true" aria-controls="paletteList" aria-autocomplete="list" placeholder="Type a command..." autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div>
   <ul id="paletteList" role="listbox"></ul>
@@ -281,6 +301,8 @@
         <label class="check wide"><input id="sSpell" type="checkbox"> Spell check: underline misspelled words in visual mode and the paragraph panel</label>
         <label class="check wide"><input id="sVisual" type="checkbox"> Visual mode on by default</label>
         <label class="check wide"><input id="sCheck" type="checkbox"> Code check: underline unmatched \begin/\end, braces, \left/\right and math delimiters as you type (<code>%%novalidate</code> turns it off for a file)</label>
+        <label class="check wide"><input id="sNums" type="checkbox"> Label numbers: show the number each \label got in the last build next to it and to every \ref</label>
+        <label class="check wide"><input id="sMathPrev" type="checkbox"> Math preview: show displayed equations typeset (KaTeX) under their source</label>
       </div>
     </details>
     <details class="set-more" id="sEditTools"></details>
@@ -307,6 +329,7 @@
         <label class="check wide"><input id="sPdfDark" type="checkbox"> Dark PDF pages: invert the page colours (this browser only)</label>
         <label class="check wide"><input id="sFocusAuto" type="checkbox"> Build the chapter preview after each save</label>
         <label class="check wide"><input id="sLive" type="checkbox"> Live preview: update the chapter you type in, in the PDF, as you pause</label>
+        <label class="check wide"><input id="sFollow" type="checkbox"> Follow the cursor: scroll the PDF to the line you are on, when you pause and after each build</label>
       </div>
     </details>
     <div class="actions"><button type="button" class="btn ghost" id="sCheat">Keyboard shortcuts</button><button class="btn primary" value="close">Done</button></div>
