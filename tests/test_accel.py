@@ -95,6 +95,26 @@ class SkipDetectionTests(unittest.TestCase):
             self.assertFalse(accel.DEFINES.search(text), text)
 
 
+class BodyDependencyTests(unittest.TestCase):
+    def test_only_definitions_pictures_use_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp)
+            main = doc / "main.tex"
+            main.write_text("\\newcommand{\\pre}{x}\\begin{document}\\input{ch}\\end{document}", encoding="utf-8")
+            ch = doc / "ch.tex"
+            ch.write_text("\\newcommand{\\used}{a}\\newcommand{\\text}{b}\n\\tikzset{s/.style={\nred}}\n"
+                          "\\definecolor{mine}{rgb}{1,0,0}\n\\begin{tikzpicture}\\node[mine]{\\used};\\end{tikzpicture}\n",
+                          encoding="utf-8")
+            before = accel.body_dependencies(main)
+            self.assertIn(b"\\newcommand{\\used}", before)
+            self.assertIn(b"red}}", before)  # the whole \\tikzset, across lines
+            self.assertIn(b"definecolor{mine}", before)
+            self.assertNotIn(b"\\text}", before)
+            self.assertNotIn(b"\\pre", before)  # the preamble is hashed on its own
+            ch.write_text(ch.read_text(encoding="utf-8").replace("{b}", "{c}") + "Words.\n", encoding="utf-8")
+            self.assertEqual(accel.body_dependencies(main), before)
+
+
 class TikzDetectionTests(unittest.TestCase):
     def test_only_documents_that_mention_tikz_are_externalized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,6 +233,20 @@ class ExternalizedBuildTests(unittest.TestCase):
         self.write("main.tex", HEAD + "\\input{styles}\n\\begin{document}\n" + pic("\\lbl") + "\\end{document}\n")
         self.assertEqual(self.render(), ["one"])
         self.write("styles.tex", "\\newcommand{\\lbl}{two}\n")
+        self.assertEqual(self.render(), ["two"])
+
+    def test_styles_and_macros_defined_in_a_chapter_invalidate_figures(self):
+        self.write("main.tex", HEAD + "\\begin{document}\n\\input{ch}\n\\end{document}\n")
+        self.write("ch.tex", "\\newcommand{\\lbl}{one}\n" + pic("\\lbl"))
+        self.assertEqual(self.render(), ["one"])
+        self.write("ch.tex", "\\newcommand{\\lbl}{two}\n" + pic("\\lbl"))
+        self.assertEqual(self.render(), ["two"])
+
+    def test_a_file_input_inside_a_picture_invalidates_figures(self):
+        self.write("main.tex", HEAD + "\\begin{document}\n\\begin{tikzpicture}\\input{node}\\end{tikzpicture}\n\\end{document}\n")
+        self.write("node.tex", "\\node{one};\n")
+        self.assertEqual(self.render(), ["one"])
+        self.write("node.tex", "\\node{two};\n")
         self.assertEqual(self.render(), ["two"])
 
     def test_unused_cached_figures_are_deleted(self):
