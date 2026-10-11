@@ -296,9 +296,25 @@ class LiveFeatureTests(unittest.TestCase):
         self.assertEqual(self.warm.compile("c", "main.tex", FULL)["status"], "same")
         moved = self.warm.compile("c", "main.tex", FULL.replace("\\input{ch/two}\n", ""))
         self.assertEqual((moved["status"], moved["saved"]), ("rebuild", False))  # the input tree is the build's
-        edited = self.warm.compile("c", "main.tex", FULL.replace("\\begin{document}", "\\usepackage{xcolor}\n"
-                                                                                       "\\begin{document}"))
-        self.assertEqual((edited["status"], edited["saved"]), ("preamble", False))
+
+    def test_an_unsaved_preamble_edit_restarts_the_process_from_the_typed_text_and_keeps_previewing(self):
+        self.compile("ch/two.tex", None, "pre")  # the chapter this tab looked at last
+        typed = FULL.replace("\\begin{document}", "\\newcommand\\fromtyped{Typed preamble}\n\\begin{document}")
+        result, words = self.compile("main.tex", typed, "pre")
+        self.assertEqual((result["status"], result["preamble"], result["target"]), ("preview", True, "ch/two"))
+        self.assertFalse(result["warm"])  # a process started from the editor's preamble
+        self.assertIn("Chapter two", words)
+        # Typing in a chapter now uses that preamble, on a process that loaded it while this one typeset.
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\fromtyped.\n", "pre")
+        self.assertIn("Typed preamble", words)
+        self.assertTrue(result["warm"])
+        self.assertFalse(result["figures"])
+        # Another tab has no such text: it previews from the file on disk.
+        result = self.warm.compile("other", "ch/one.tex", "\\clearpage\\section{One}\\fromtyped.\n")
+        self.assertFalse(result["ok"])
+        # The editor back at the saved preamble: as built.
+        self.assertEqual(self.warm.compile("pre", "main.tex", FULL)["status"], "same")
+        self.assertEqual(self.warm.overrides("pre"), {})
 
     def test_include_and_package_read_files_use_the_typed_text(self):
         result, words = self.compile("ch/three.tex", "\\section{Three}Typed into an include.\n")
@@ -325,17 +341,27 @@ class LiveFeatureTests(unittest.TestCase):
         self.assertGreaterEqual(int(fields["Line"]), 1)
         self.assertIsNone(preview.sync_files(self.main, "other-tab"))
 
-    def test_a_saved_package_edit_restarts_the_waiting_process_and_previews_wait_for_the_build(self):
+    def test_a_package_edit_restarts_the_waiting_process_and_previews_go_on(self):
         sty = self.main.parent / "mystyle.sty"
         old = self.warm.ready[0]
-        sty.write_text("\\newcommand\\mine{N}\n")
+        self.compile("ch/one.tex", None, "pkg")
+        result, words = self.compile("mystyle.sty", "\\newcommand\\mine{Unsaved package}\n", "pkg")
+        self.assertEqual((result["target"], result["preamble"]), ("ch/one", True))
+        self.assertIn("Chapter one", words)
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\mine.\n", "pkg")
+        self.assertIn("Unsaved package", words)  # the package's unsaved text, read in place of the file
+        sty.write_text("\\newcommand\\mine{Saved package}\n")
         self.addCleanup(sty.write_text, "\\newcommand\\mine{M}\n")
         os.utime(sty, ns=(5, 5))
-        self.assertEqual(self.warm.compile("c", "mystyle.sty", "unsaved"), preview.status("preamble", saved=False))
-        result = self.warm.compile("c", "mystyle.sty", None)
-        self.assertEqual((result["status"], result["saved"]), ("preamble", True))
+        self.compile("mystyle.sty", None, "pkg")
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\mine.\n", "pkg")
+        self.assertIn("Saved package", words)
+        self.assertEqual(self.warm.overrides("pkg"), {})
         self.assertNotIn(old, self.warm.ready)  # Restarted from the new preamble.
         self.assertIsNotNone(old.popen.poll())
+        with mock.patch.object(self.warm, "targets", {}), \
+                mock.patch.object(preview.accel, "read_focusmap", return_value=[]):
+            self.assertEqual(self.warm.compile("none", "mystyle.sty", None), preview.status("preamble", saved=True))
 
     def test_previews_put_full_builds_below_normal_priority(self):
         with mock.patch.object(preview.sandbox, "LOW_UNTIL", 0.0):

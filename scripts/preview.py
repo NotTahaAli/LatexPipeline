@@ -189,18 +189,27 @@ def preamble_of(text: str) -> str:
     return text.split(r"\begin{document}")[0]
 
 
-def preamble_key(main_tex: Path, settings: dict) -> str:
-    """What a waiting process depends on. A different key means it must be replaced."""
+def preamble_key(main_tex: Path, settings: dict, overrides: dict[str, str] | None = None) -> str:
+    """
+    What a waiting process depends on. A different key means it must be replaced. overrides: unsaved text of
+    preamble files (relative name -> text) that the process reads in place of the file on disk.
+    """
+    overrides = overrides or {}
     digest = hashlib.sha1(repr((
         settings["engine"], bool(settings["shell_escape"]), [os.environ.get(k) for k in ENV_KEYS], settings["review"],
+        sorted(overrides),
     )).encode())
-    digest.update(preamble_of(main_tex.read_text(encoding="utf-8", errors="replace")).encode())
+    main_text = overrides.get(main_tex.name) or main_tex.read_text(encoding="utf-8", errors="replace")
+    digest.update(preamble_of(main_text).encode())
     for path in accel.preamble_files(main_tex):
-        digest.update(path.read_bytes())
+        rel = path.relative_to(main_tex.parent).as_posix()
+        digest.update(overrides[rel].encode() if rel in overrides else path.read_bytes())
     for path in sorted(main_tex.parent.rglob("*")):
         if path.suffix in PREAMBLE_DEPS and path.is_file():
-            stat = path.stat()
-            digest.update(f"{path.relative_to(main_tex.parent).as_posix()}:{stat.st_mtime_ns}:{stat.st_size}".encode())
+            rel, stat = path.relative_to(main_tex.parent).as_posix(), path.stat()
+            mark = hashlib.sha1(overrides[rel].encode()).hexdigest() if rel in overrides \
+                else f"{stat.st_mtime_ns}:{stat.st_size}"
+            digest.update(f"{rel}:{mark}".encode())
     return digest.hexdigest()
 
 
@@ -275,7 +284,7 @@ class Proc:
 
     ids = itertools.count()
 
-    def __init__(self, main_tex: Path, settings: dict, key: str) -> None:
+    def __init__(self, main_tex: Path, settings: dict, key: str, overrides: dict[str, str] | None = None) -> None:
         self.key, self.main_tex = key, main_tex
         self.root = root_for(main_tex)
         self.dir = self.root / f"p{os.getpid()}-{next(Proc.ids)}"
@@ -283,12 +292,18 @@ class Proc:
         self.dir.mkdir(parents=True)
         build.mirror_dirs(main_tex.parent, self.dir)  # \include{dir/x} writes dir/x.aux here.
         self.cancelled = False
+        # Unsaved preamble text (main.tex, a class, a package, a file the preamble reads), read in place of the file.
+        swap = ""
+        for i, (rel, text) in enumerate(sorted((overrides or {}).items())):
+            path = self.dir / f"pgfwarm-pre{i}{Path(rel).suffix}"
+            path.write_text(text, encoding="utf-8")
+            swap += (SUBSTITUTE % (rel, tex_ref(path, main_tex.parent))).strip()  # one command line: no newline
         command = [
             settings["engine"], "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-synctex=1",
             f"-output-directory={self.dir}", f"-jobname={main_tex.stem}",
             *(["-shell-escape"] if settings["shell_escape"] else []),
             build.review_pretex(settings) + accel.write_inject(self.dir, main_tex.parent, "pgfwarm-wait.tex", WAIT)
-            + f"\\input{{{main_tex.name}}}",
+            + swap + f"\\input{{{main_tex.name}}}",
         ]
         self.out = open(self.dir / "console.txt", "w+", encoding="utf-8", errors="replace")
         try:
@@ -387,11 +402,14 @@ class Warm:
         self.targets: dict[str, str] = {}  # client -> chapter it previewed last (for files a package reads)
         self.timer: threading.Timer | None = None
         self.labels: tuple = (None, {})  # (snapshot .aux times, labels)
+        # client -> its unsaved preamble text: main.tex's preamble, or a whole class, package or file the preamble
+        # reads. Previews of that client use a process started from it until the file on disk says the same.
+        self.unsaved: dict[str, dict[str, str]] = {}
 
-    def _spare(self, settings: dict, key: str) -> None:
+    def _spare(self, settings: dict, key: str, overrides: dict[str, str] | None = None) -> None:
         """(lock held) Start waiting processes up to the pool size, stopped again after IDLE seconds unused."""
         while len(self.ready) < self.pool:
-            self.ready.append(Proc(self.main_tex, settings, key))
+            self.ready.append(Proc(self.main_tex, settings, key, overrides))
         if self.timer:
             self.timer.cancel()
         self.timer = threading.Timer(IDLE, self.stop_ready)
@@ -419,33 +437,50 @@ class Warm:
 
     # --- what to typeset ---------------------------------------------------------------------------------------
 
-    def preamble_edit(self, rel: str, text: str | None) -> dict | None:
+    def preamble_edit(self, client: str, rel: str, text: str | None) -> bool | None:
         """
-        A status reply if rel is (or the edit touches) the preamble: main.tex up to \\begin{document}, a file it
-        reads there, a class or package. The waiting process is restarted from what is on disk, and the full build
-        that follows the save brings references and the input tree up to date; previews resume after it.
+        None if rel is not part of the preamble: main.tex up to \\begin{document}, a file it reads there, a class or
+        package. Else whether the preamble differs from the one the full build used, after keeping the client's
+        unsaved preamble text (see overrides()), so its previews start a process from that text meanwhile.
         """
         main_tex, doc = self.main_tex, self.main_tex.parent
         path = doc / rel
+        mine = self.unsaved.setdefault(client, {})
         if rel == main_tex.name:
             disk = main_tex.read_text(encoding="utf-8", errors="replace")
-            new = disk if text is None else text
+            new = preamble_of(disk if text is None else text)
             try:
                 built = (root_for(main_tex) / "aux" / SOURCE).read_text(encoding="utf-8", errors="replace")
             except OSError:
                 built = disk
-            if preamble_of(new) == preamble_of(built):
-                return None
-            saved = preamble_of(new) == preamble_of(disk)
-        elif path.suffix in PREAMBLE_DEPS or path in accel.preamble_files(main_tex):
-            saved = text is None or text == path.read_text(encoding="utf-8", errors="replace")
-        else:
-            return None
-        if saved:
-            self.warm_up()  # A new waiting process if the key moved (the old one is stopped).
-        return status("preamble", saved=saved)
+            mine[rel] = new  # main.tex: only its preamble; the body stays the file's (or the region's overlay)
+            return new != preamble_of(built)
+        if path.suffix in PREAMBLE_DEPS or path in accel.preamble_files(main_tex):
+            if text is not None:
+                mine[rel] = text
+            else:
+                mine.pop(rel, None)
+            return True
+        return None
 
-    def chapter_job(self, entries: list[dict], rel: str, text: str | None, client: str) -> dict:
+    def overrides(self, client: str) -> dict[str, str]:
+        """The client's unsaved preamble files that still differ from the disk, as the text a process reads."""
+        doc, kept = self.main_tex.parent, {}
+        for rel, text in list(self.unsaved.get(client, {}).items()):
+            try:
+                disk = (doc / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                disk = None
+            if rel == self.main_tex.name and disk is not None:
+                if text != preamble_of(disk):
+                    kept[rel] = text + disk[len(preamble_of(disk)):]
+            elif disk is not None and text != disk:
+                kept[rel] = text
+        self.unsaved[client] = {rel: self.unsaved[client][rel] for rel in kept}
+        return kept
+
+    def chapter_job(self, entries: list[dict], rel: str, text: str | None, client: str, reuse: bool = True) -> dict:
+        """The --focus job for the chapter holding rel; reuse: the full build's figures may stand in (same preamble)."""
         target = accel.top_unit(entries, rel)
         inputs = []
         if target is None:
@@ -465,7 +500,7 @@ class Warm:
         names = {("include:" if e["kind"] == "i" else "") + tex_name(e["raw"]) for e in mine}
         names = names or ({rel} if inputs else set())
         overlays = [(name, rel, text) for name in sorted(names)] if text is not None else []
-        figures = self.figures_unchanged(entries, keep, first, rel, text if overlays else None)
+        figures = reuse and self.figures_unchanged(entries, keep, first, rel, text if overlays else None)
         if figures:
             tex += FIGURES_TEX % entries[first]["figs"]
         files = [doc / tex_name(entries[i]["raw"]) for i in sorted(keep)]
@@ -496,6 +531,8 @@ class Warm:
             built = (root_for(self.main_tex) / "aux" / SOURCE).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return status("rebuild")
+        typed = text
+        text = preamble_of(built) + text[len(preamble_of(text)):]  # the preamble is the process's (compile())
         new, old = text.splitlines(), built.splitlines()
         a = 0
         while a < min(len(new), len(old)) and new[a] == old[a]:
@@ -530,8 +567,8 @@ class Warm:
             "only": r"\AddToHook{begindocument/before}{\includeonly{}}" + "\n"
             if any(e["kind"] == "i" for e in entries) else "",
         }
-        start = text.find(r"\begin{document}")
-        body = "\n" * text.count("\n", 0, start) + text[start + len(r"\begin{document}"):] + "\n\\end{document}\n"
+        start = typed.find(r"\begin{document}")
+        body = "\n" * typed.count("\n", 0, start) + typed[start + len(r"\begin{document}"):] + "\n\\end{document}\n"
         return {
             "tex": tex, "overlays": [(None, self.main_tex.name, body)], "target": self.main_tex.name,
             "figures": False, "files": [],
@@ -555,22 +592,30 @@ class Warm:
         sandbox.LOW_UNTIL = time.monotonic() + ACTIVE  # Full builds and figure jobs step back meanwhile.
         if not has_snapshot(main_tex):
             raise PreviewError("No full build with a recorded input tree yet.")
-        edit = self.preamble_edit(rel, text)
-        if edit:
-            return edit
+        edit = self.preamble_edit(client, rel, text)
+        overrides = self.overrides(client)
         entries = accel.read_focusmap(root_for(main_tex) / "aux" / f"{main_tex.stem}.focusmap")
+        job = None
         if rel == main_tex.name:
             job = self.region_job(entries, main_tex.read_text(encoding="utf-8", errors="replace")
                                   if text is None else text)
-            if job is None:
-                return status("same")
-            if "status" in job:
+            if job is not None and "status" in job:
                 job["saved"] = text is None or text == main_tex.read_text(encoding="utf-8", errors="replace")
                 return job
-        else:
-            job = self.chapter_job(entries, rel, text, client)
+            if job is None and not edit:
+                return status("same")
+        elif not edit:
+            job = self.chapter_job(entries, rel, text, client, not overrides)
             self.targets[client] = job["target"]
-        key = preamble_key(main_tex, settings)
+        if job is None:
+            # The preamble changed: typeset the chapter the client looked at last (else the first one) again, on a
+            # process started from the new preamble; its pages replace the old ones when they arrive.
+            target = self.targets.get(client) or next((e["path"] for e in entries if e["depth"] == 1), None)
+            if target is None:
+                return status("preamble", saved=not overrides)
+            job = self.chapter_job(entries, target, None, client, False)
+        job["preamble"] = overrides
+        key = preamble_key(main_tex, settings, overrides)
         began, started = time.monotonic(), time.time()
         with self.lock:
             number = self.latest[client] = self.latest.get(client, 0) + 1
@@ -611,12 +656,12 @@ class Warm:
             with self.lock:
                 self.pool = 2
                 try:
-                    self._spare(settings, key)
+                    self._spare(settings, key, overrides)
                 except OSError:
                     pass
         result.update(warm=warm_first, passes=passes, seconds=round(time.monotonic() - began, 3), t=started,
                       target=job["target"], pages=job["pages"], overlay=bool(job["overlays"]),
-                      figures=job["figures"], status="preview")
+                      figures=job["figures"], status="preview", preamble=bool(edit or overrides))
         return result
 
     def _pass(self, client: str, number: int, settings: dict, key: str, job: dict, bbls: dict, labels_tex: str,
@@ -632,14 +677,15 @@ class Warm:
                 raise PreviewError("Too many previews of this document at once; try again in a moment.")
             while self.ready and (self.ready[0].key != key or not self.ready[0].alive()):
                 self.ready.pop(0).stop()
-            proc, warm = (self.ready.pop(0), True) if self.ready else (Proc(self.main_tex, settings, key), False)
+            proc, warm = (self.ready.pop(0), True) if self.ready \
+                else (Proc(self.main_tex, settings, key, job["preamble"]), False)
             self.running[client] = proc
             try:
                 proc.trigger(job, bbls, labels_tex)
             except OSError:  # Died before the trigger (a preamble error; its log says why), or a file is missing.
                 proc.popen.kill()
             try:
-                self._spare(settings, key)  # The next one loads its preamble while this one typesets.
+                self._spare(settings, key, job["preamble"])  # The next one loads its preamble while this one typesets.
             except OSError:
                 pass  # The next compile starts one itself and reports why it cannot.
 
@@ -676,6 +722,7 @@ class Warm:
             proc.cleanup()
             raise
         names = {f"{OVERLAY}{i}": rel for i, (_, rel, _) in enumerate(job["overlays"])}
+        names.update({f"pgfwarm-pre{i}": rel for i, rel in enumerate(sorted(job["preamble"]))})
         errors = build.parse_latex_errors(console)
         for item in errors:  # An overlay stands for the file being typed.
             item["file"] = names.get(Path(item["file"]).stem, item["file"])
