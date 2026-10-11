@@ -637,3 +637,22 @@ html.zen #editorPane{display:flex!important;flex:1 1 100%}
 html.zen .cm-content{max-width:46em;margin:0 auto}
 #zenExit{position:fixed;top:10px;right:16px;z-index:20;opacity:.7}
 #zenExit:hover,#zenExit:focus-visible{opacity:1}
+
+/* Git panel (git.js) */
+#panel-git{flex:1;min-height:0;overflow:auto;padding:6px 8px}
+.git-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0}
+.git-row .spacer{flex:1}
+.git-where{font:12px var(--mono);word-break:break-all}
+.git-file{display:flex;align-items:center;gap:8px;padding:4px 0}
+.git-path{flex:1;min-width:0;text-align:left;font:12px var(--mono);word-break:break-all}
+.git-code{font-size:11px}
+.git-merge{border:1px solid var(--ox);border-radius:var(--r);padding:8px;margin:8px 0}
+.git-commit{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.git-commit textarea,.git-field input{width:100%;box-sizing:border-box;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:6px 8px;font:inherit}
+.git-field{display:flex;flex-direction:column;gap:4px;margin:8px 0;font-size:13px}
+.git-pre{margin:0;padding:8px;background:var(--code);border:1px solid var(--rule);border-radius:6px;overflow:auto;max-height:50vh;font:12px/1.5 var(--mono)}
+.git-pre .dl-add{color:var(--moss)}
+.git-pre .dl-del{color:var(--ox)}
+.git-pre .dl-hunk,.git-pre .dl-meta{color:var(--muted)}
+.git-log li{padding:6px 0;font-size:13px}
+.git-subject{font-weight:600}

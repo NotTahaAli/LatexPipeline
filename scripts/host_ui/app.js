@@ -386,7 +386,58 @@ async function accountPage() {
     providers,
     sect("Password", "Changing it signs out your other sessions.", password),
     sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero),
+    await gitSection(sect), await tokensSection(sect),
     await aiClientsSection(sect));
+}
+
+// ---- Git token and personal API tokens ----------------------------------------------------------------------------
+// The Git token is used by this server for your pulls and pushes in a project's Git tab; it is never shown again and
+// never given to a project's editor process.
+async function gitSection(sect) {
+  const g = await api("/api/account/git");
+  const git = form([
+    field("User name on the Git host", input("username", "text", { value: g.username, required: true, maxLength: 100, autocomplete: "off" })),
+    field("Access token", input("token", "password", { required: true, autocomplete: "off", placeholder: g.has_key ? "Stored; paste a new one to replace it" : "Paste a token" }),
+      "A personal access token with read and write access to the repositories you sync (repository contents only)."),
+  ], "Save Git token", async (v, f) => {
+    await api("/api/account/git", "POST", v);
+    f.querySelector("[name=token]").value = "";
+    return "Saved. Pull and Push are in each project's Git tab.";
+  });
+  const clear = g.has_key ? button("Remove the stored token", async () => { await api("/api/account/git", "POST", { clear_token: true }); accountPage(); }, "btn ghost danger") : null;
+  return sect("Git", "Your token for syncing projects with a Git repository over https. It is kept on this server and never shown again.", git, clear);
+}
+
+// Personal API tokens: for the VS Code extension and scripts. Shown once; each opens only the projects picked here,
+// with your role in them.
+async function tokensSection(sect) {
+  const data = await api("/api/account/tokens");
+  const projects = [];
+  for (const t of me?.tenants || []) {
+    try { for (const p of (await api(`/api/tenants/${t.id}`)).projects) projects.push({ ...p, tenant: t.name }); } catch { /* not readable */ }
+  }
+  const out = el("div", { className: "msg ok", role: "status", hidden: true });
+  const list = data.tokens.length ? el("ul", { className: "list" }, data.tokens.map((t) => el("li", {},
+    el("span", { className: "grow" }, el("span", { className: "who", textContent: t.name }),
+      el("span", { className: "hint block", textContent: `${t.projects.map((p) => p.name).join(", ")} · made ${when(t.created)} · ${t.used ? `last used ${when(t.used)}` : "not used yet"}` })),
+    button("Revoke", async () => {
+      if (!confirm(`Revoke the token ${t.name}? Anything using it stops working at once.`)) return;
+      await api(`/api/account/tokens/${t.id}`, "DELETE"); announce(`${t.name} revoked.`); accountPage();
+    }, "btn ghost danger", { ariaLabel: `Revoke ${t.name}` }))))
+    : el("p", { className: "empty", textContent: "No API tokens." });
+  const boxes = el("fieldset", { className: "card" }, el("legend", { className: "eyebrow", textContent: "Projects it may open" }),
+    projects.length ? projects.map((p) => el("label", { className: "check" }, input("project", "checkbox", { value: p.id }), `${p.name} (${p.tenant})`))
+      : el("p", { className: "empty", textContent: "No projects yet." }));
+  const make = form([field("Name", input("name", "text", { required: true, maxLength: 80, placeholder: "VS Code on my laptop", autocomplete: "off" })), boxes],
+    "Make token", async (v, f) => {
+      const picked = [...f.querySelectorAll("[name=project]:checked")].map((b) => b.value);
+      if (!picked.length) throw new Error("Pick at least one project.");
+      const r = await api("/api/account/tokens", "POST", { name: v.name, projects: picked });
+      out.replaceChildren(el("p", { textContent: "Copy this token now; it is not shown again:" }), el("code", { className: "key", textContent: r.token }));
+      out.hidden = false; f.reset();
+      return "Token made.";
+    });
+  return sect("API tokens", "For the VS Code extension and scripts: each token opens only the projects you pick, with your role in them. Changing your password ends all of them.", list, out, make);
 }
 
 // ---- AI clients (MCP): consent and connected apps ---------------------------------------------------------------

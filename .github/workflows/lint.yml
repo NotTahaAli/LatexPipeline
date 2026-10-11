@@ -8,6 +8,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "vscode/**"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -16,6 +17,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "vscode/**"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -48,6 +50,9 @@ jobs:
       # Visual tools: table editor, figure dialog, TikZ parser and writer, Markdown.
       - name: Visual tool checks
         run: node tests/tableedit_check.mjs && node tests/figure_check.mjs && node tests/tikz_check.mjs && node tests/markdown_check.mjs
+      # The VS Code extension's pure helpers (vscode/lib.js, no npm install) and the Git panel's.
+      - name: VS Code extension check
+        run: node tests/vscode_check.mjs
 
   unittest:
     # Maintainer check: skipped in copies made from the template.

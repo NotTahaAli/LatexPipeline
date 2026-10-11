@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import ai
 import host
+import host_git
 import host_mcp
 import serve
 import zotero
@@ -2267,6 +2269,331 @@ class Mcp(HostCase):
         self.assertEqual(self.mcp(reader, {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
             "name": "add_comment", "arguments": {"project": self.pid, "path": "main.tex", "quote": quote,
                                                  "comment": "x"}}})[0], 403)
+
+
+GIT_IDENTITY = {"GIT_AUTHOR_NAME": "Seed", "GIT_AUTHOR_EMAIL": "seed@example.org", "GIT_COMMITTER_NAME": "Seed",
+                "GIT_COMMITTER_EMAIL": "seed@example.org", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def run_git(cwd, *args, check=True):
+    return subprocess.run(["git", *args], cwd=str(cwd), check=check, capture_output=True, text=True,
+                          env={**os.environ, **GIT_IDENTITY})
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class GitSync(HostCase):
+    """Hosted Git sync: the gateway runs git with the person's own token; workers never take part. The network is a
+    local bare repository behind a fake host_git.transfer; the host name resolves to whatever the test says."""
+
+    URL = "https://git.example.org/team/thesis.git"
+    TOKEN = "ghp_SecretTokenOfEd123"
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("rv@x.org", "reviewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.editor = self.client("ed@x.org")
+        self.pid = Workspaces.make_project(self, self.editor, self.tenant, "Doc", "article")
+        self.project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
+        self.source = self.app.project_source(self.project)
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Git")).start()
+        self.addresses = ["8.8.8.8"]
+        mock.patch.object(host_git, "resolve", side_effect=lambda h, p: list(self.addresses)).start()
+        self.transfers = []
+        mock.patch.object(host_git, "transfer", side_effect=self.fake_transfer).start()
+        self.remote = self.data / "remote.git"
+        run_git(self.data, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        self.seed = self.data / "seed"
+        run_git(self.data, "clone", "-q", str(self.remote), str(self.seed))
+
+    def fake_transfer(self, project, args, url, auth):
+        """The real transfer pins the host and runs git with the token in its environment; here the same git runs
+        against a local bare repository instead of the URL."""
+        self.transfers.append((args[0], url, auth))
+        env = host_git.repo_env(project, [("protocol.file.allow", "always")])
+        return subprocess.run(["git", *[str(self.remote) if a == url else a for a in args]],
+                              cwd=str(self.source), env=env, capture_output=True, text=True)
+
+    def upstream(self, files, message="upstream"):
+        run_git(self.seed, "pull", "-q", "--no-rebase", "origin", "main", check=False)
+        for name, text in files.items():
+            (self.seed / name).write_text(text, encoding="utf-8")
+        run_git(self.seed, "add", "-A")
+        run_git(self.seed, "commit", "-q", "-m", message)
+        run_git(self.seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    def sync(self, client, op, **extra):
+        return client.call("POST", f"/p/{self.pid}/api/git/remote?doc=Doc", {"op": op, **extra})
+
+    def connect(self, client=None):
+        return self.sync(client or self.editor, "connect", url=self.URL, branch="main")
+
+    def set_token(self, client=None):
+        return (client or self.editor).call("POST", "/api/account/git", {"token": self.TOKEN, "username": "ed"})
+
+    def test_token_is_kept_server_side(self):
+        status, info, _ = self.editor.call("GET", "/api/account/git")
+        self.assertEqual((status, info["has_key"]), (200, False))
+        status, info, _ = self.set_token()
+        self.assertEqual((status, info), (200, {"has_key": True, "username": "ed"}))
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.assertEqual(self.app.db.one("SELECT token FROM git_tokens WHERE user_id = ?", uid)["token"], self.TOKEN)
+        for bad in ({"token": "short", "username": "ed"}, {"token": "has space inside", "username": "ed"},
+                    {"token": self.TOKEN}, {"token": self.TOKEN, "username": "a b"}):
+            self.assertEqual(self.editor.call("POST", "/api/account/git", bad)[0], 400, bad)
+        no_csrf = self.client("ed@x.org")
+        no_csrf.csrf = None
+        self.assertEqual(self.set_token(no_csrf)[0], 403)
+        self.assertEqual(Client(self).call("GET", "/api/account/git")[0], 401)
+        self.assertEqual(self.editor.call("POST", "/api/account/git", {"clear_token": True})[1]["has_key"], False)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git_token%'")]
+        self.assertEqual(actions, ["git_token_set", "git_token_removed"])
+
+    def test_who_may_connect_and_where_to(self):
+        for email in ("vi@x.org", "rv@x.org"):
+            client = self.client(email)
+            self.assertEqual(client.call("GET", f"/p/{self.pid}/api/git/remote")[0], 200)
+            self.assertEqual(self.connect(client)[0], 403, email)
+        self.assertEqual(self.connect(self.client("out@x.org"))[0], 404)
+        self.assertEqual(self.editor.call("GET", f"/p/{self.pid}/api/git")[0], 404)  # the local panel: not hosted
+        for url in ("http://git.example.org/a.git", "ssh://git.example.org/a.git", "file:///etc", "https://u:p@h.org/a",
+                    "https://h.org/a?x=1", "https://h.org", "ext::sh -c touch% /tmp/x", "https://h.org/a b"):
+            with self.subTest(url=url):
+                self.assertEqual(self.sync(self.editor, "connect", url=url, branch="main")[0], 400)
+        for branch in ("-f", "a..b", "x/", "a b", ".hidden", "x" * 200):
+            with self.subTest(branch=branch):
+                self.assertEqual(self.sync(self.editor, "connect", url=self.URL, branch=branch)[0], 400)
+        for addresses in (["127.0.0.1"], ["10.1.2.3"], ["::1"], ["169.254.169.254"], ["192.168.0.2"], ["fd00::1"],
+                          ["8.8.8.8", "172.16.0.1"], ["::ffff:127.0.0.1"], ["100.64.0.1"], ["0.0.0.0"]):
+            self.addresses = addresses
+            with self.subTest(addresses=addresses):
+                self.assertEqual(self.connect()[0], 400)  # SSRF: a private address after DNS resolution
+        self.addresses = ["8.8.8.8"]
+        status, data, _ = self.connect()
+        self.assertEqual(status, 200, data)
+        info = self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1]
+        self.assertEqual((info["connected"], info["url"], info["branch"], info["has_token"]),
+                         (True, self.URL, "main", False))
+        audit = self.app.db.one("SELECT * FROM audit WHERE action = 'git_connected'")
+        self.assertIn(self.URL, audit["detail"])
+        cross = self.editor.call("POST", f"/p/{self.pid}/api/git/remote", {"op": "pull"}, origin="https://evil.example")
+        self.assertEqual(cross[0], 403)
+
+    def test_first_pull_never_overwrites_a_different_file(self):
+        self.upstream({"main.tex": "\\documentclass{article}\\begin{document}Remote\\end{document}\n",
+                       "ch1.tex": "Chapter\n"})
+        self.connect()
+        mine = (self.source / "main.tex").read_text(encoding="utf-8")
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), mine)
+        self.assertFalse((self.source / "ch1.tex").exists())
+        (self.source / "main.tex").unlink()  # the person clears the way in the editor
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        self.assertIn("Remote", (self.source / "main.tex").read_text(encoding="utf-8"))
+        self.assertEqual((self.source / "ch1.tex").read_text(encoding="utf-8"), "Chapter\n")
+        self.assertIsNone(self.transfers[0][2])  # no token saved: a public repository is pulled without one
+        info = self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1]
+        self.assertTrue(info["synced"] and info["commit"])
+
+    def pulled(self):
+        self.upstream({"main.tex": "one\ntwo\nthree\nfour\nfive\n"})
+        (self.source / "main.tex").unlink()
+        self.connect()
+        self.assertTrue(self.sync(self.editor, "pull")[1]["ok"])
+
+    def test_pull_merges_and_conflicts_are_listed_never_resolved(self):
+        self.pulled()
+        (self.source / "main.tex").write_text("ONE\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+        self.upstream({"main.tex": "one\ntwo\nthree\nfour\nFIVE\n"})
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\ntwo\nthree\nfour\nFIVE\n")
+        (self.source / "main.tex").write_text("ONE\nmine\nthree\nfour\nFIVE\n", encoding="utf-8")
+        self.upstream({"main.tex": "ONE\ntheirs\nthree\nfour\nFIVE\n"})
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\nmine\nthree\nfour\nFIVE\n")
+        self.assertIn("conflicts: main.tex", self.app.db.all("SELECT detail FROM audit WHERE action = 'git_pull'")[-1]
+                      ["detail"])
+
+    def test_push_needs_the_persons_token_and_never_shows_it(self):
+        self.pulled()
+        (self.source / "ch2.tex").write_text("New chapter\n", encoding="utf-8")
+        self.assertEqual(self.sync(self.editor, "push")[0], 400)  # no token yet
+        self.set_token()
+        status, result, _ = self.sync(self.editor, "push")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        op, url, auth = self.transfers[-1]
+        self.assertEqual((op, url), ("push", self.URL))
+        self.assertEqual(base64.b64decode(auth).decode(), f"ed:{self.TOKEN}")
+        log = run_git(self.remote, "log", "-1", "--format=%an <%ae>%n%s", "main").stdout
+        self.assertTrue(log.startswith("Ed <ed@x.org>"), log)
+        self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
+        self.upstream({"other.tex": "x\n"})
+        (self.source / "ch2.tex").write_text("Changed again\n", encoding="utf-8")
+        status, data, _ = self.sync(self.editor, "push")
+        self.assertEqual(status, 409, data)  # the repository moved on: pull first
+        replies = json.dumps([self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1], data, result])
+        self.assertNotIn(self.TOKEN, replies)
+        self.assertNotIn(self.TOKEN, "".join(p.read_text(errors="ignore") for p in self.source.rglob("*")
+                                             if p.is_file()))
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git_p%'")]
+        self.assertIn("git_push", actions)
+
+    def test_repository_outside_the_project_and_removed_with_it(self):
+        self.pulled()
+        gitdir = host_git.repo_dir(self.project)
+        self.assertTrue((gitdir / "HEAD").is_file())
+        self.assertNotIn(self.app.project_root(self.project), gitdir.parents)
+        self.assertFalse((self.source / ".git").exists())
+        self.assertEqual(self.editor.call("DELETE", f"/api/projects/{self.pid}")[0], 200)
+        self.assertFalse(gitdir.exists())
+
+    def test_quota_is_checked_before_files_are_written(self):
+        self.app.save_settings({"max_project_mb": 1})
+        self.upstream({"big.tex": "x" * (2 * 1024 * 1024)})
+        self.connect()
+        status, data, _ = self.sync(self.editor, "pull")
+        self.assertEqual(status, 507, data)
+        self.assertFalse((self.source / "big.tex").exists())
+
+    def test_symlinks_arrive_as_plain_files(self):
+        if os.name != "posix":
+            self.skipTest("needs symlinks")
+        os.symlink("/etc/passwd", self.seed / "link.tex")
+        self.upstream({"main.tex": "x\n"})
+        (self.source / "main.tex").unlink()
+        self.connect()
+        self.assertTrue(self.sync(self.editor, "pull")[1]["ok"])
+        self.assertFalse((self.source / "link.tex").is_symlink())
+        self.assertEqual((self.source / "link.tex").read_text(), "/etc/passwd")
+
+    def test_real_transfer_pins_the_checked_address_and_keeps_the_token_off_the_command_line(self):
+        mock.patch.stopall()
+        mock.patch.object(host_git, "resolve", return_value=["8.8.8.8"]).start()
+        seen = {}
+
+        class Proc:
+            returncode = 0
+
+            def __init__(self, args, **kw):
+                seen.update(args=args, env=kw["env"])
+
+            def communicate(self):
+                return b"", b""
+
+        host_git.ensure_repo(self.project, "main")
+        with mock.patch.object(host_git.subprocess, "Popen", Proc):
+            host_git.transfer(self.project, ["fetch", self.URL], self.URL, "QUJD")
+        env = seen["env"]
+        pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+        self.assertEqual(pairs["http.curloptResolve"], "git.example.org:443:8.8.8.8")
+        self.assertEqual(pairs["http.extraHeader"], "Authorization: Basic QUJD")
+        for key, value in (("protocol.allow", "never"), ("protocol.https.allow", "always"),
+                           ("http.followRedirects", "false"), ("core.symlinks", "false"),
+                           ("submodule.recurse", "false"), ("core.fsmonitor", "false")):
+            self.assertEqual(pairs[key], value)
+        self.assertNotIn("QUJD", " ".join(seen["args"]))
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertNotIn("HTTPS_PROXY", env)
+        mock.patch.object(host_git, "resolve", return_value=["127.0.0.1"]).start()
+        with mock.patch.object(host_git.subprocess, "Popen", side_effect=AssertionError("git must not run")), \
+                self.assertRaises(host.HttpError):
+            host_git.transfer(self.project, ["fetch", self.URL], self.URL, None)
+
+
+class ApiTokens(HostCase):
+    """Personal API tokens (VS Code, scripts): hashed, scoped to projects, revocable, the person's current role."""
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.editor = self.client("ed@x.org")
+        self.pid = Workspaces.make_project(self, self.editor, self.tenant, "Doc", "article")
+        self.pid2 = Workspaces.make_project(self, self.editor, self.tenant, "Other", "article")
+        self.upstream = Upstream()
+        self.upstream.start()
+        self.addCleanup(self.upstream.sock.close)
+        Proxy.fake_worker(self, self.upstream.port)
+
+    def bearer(self, token, method, path, body=None, headers=None):
+        client = Client(self)
+        return client.call(method, path, body, origin=False, headers={"Authorization": f"Bearer {token}",
+                                                                       **(headers or {})})
+
+    def make(self, client=None, projects=None):
+        status, data, _ = (client or self.editor).call("POST", "/api/account/tokens",
+                                                       {"name": "VS Code", "projects": projects or [self.pid]})
+        self.assertEqual(status, 200, data)
+        return data
+
+    def test_tokens_open_only_their_projects_with_the_current_role(self):
+        made = self.make()
+        token = made["token"]
+        self.assertTrue(token.startswith("lpat_"))
+        row = self.app.db.one("SELECT * FROM api_tokens WHERE id = ?", made["id"])
+        self.assertEqual(row["token_hash"], host.token_hash(token))
+        self.assertNotIn(token, json.dumps(self.editor.call("GET", "/api/account/tokens")[1]))
+        status, data, _ = self.bearer(token, "PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex", {"text": "hi"})
+        self.assertEqual(status, 200, data)  # no Origin and no cookie: a bearer token is not a browser's
+        self.assertIn("X-Host-Role: edit", data["headers"])
+        self.assertTrue(any(h.startswith("X-Host-User: ") and h.endswith(";Ed") for h in data["headers"]))
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid2}/api/files?doc=Other")[0], 404)  # not in scope
+        for rest in ("/api/ai", "/api/zotero"):
+            self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}{rest}")[0], 403)
+        upgrade = {"Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Key": "x" * 24,
+                   "Sec-WebSocket-Version": "13"}
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/ws", headers=upgrade)[0], 403)
+        self.assertEqual(self.bearer(token, "POST", f"/p/{self.pid}/api/mcp", {})[0], 404)
+        status, who, _ = self.bearer(token, "GET", "/api/token")
+        self.assertEqual((status, who["name"], [p["id"] for p in who["projects"]]), (200, "Ed", [self.pid]))
+        self.assertEqual(who["projects"][0]["role"], "edit")
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.app.db.run("UPDATE members SET role = 'viewer' WHERE user_id = ?", uid)  # demoted: the token follows
+        status, data, _ = self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")
+        self.assertIn("X-Host-Role: view", data["headers"])
+        self.app.db.run("DELETE FROM members WHERE user_id = ?", uid)  # removed: gone at once
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 404)
+        for bad in ("lpat_wrong", "not-a-token", "lpat_" + "x" * 200):
+            self.assertEqual(self.bearer(bad, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        self.assertEqual(self.bearer(token, "GET", "/api/me")[1].get("user"), None)  # never a session elsewhere
+
+    def test_create_list_revoke_and_end_with_the_password(self):
+        viewer = self.client("vi@x.org")
+        made = self.make(viewer)
+        listed = viewer.call("GET", "/api/account/tokens")[1]["tokens"]
+        self.assertEqual([(t["id"], t["projects"][0]["name"]) for t in listed], [(made["id"], "Doc")])
+        status, data, _ = self.bearer(made["token"], "GET", f"/p/{self.pid}/api/files?doc=Doc")
+        self.assertIn("X-Host-Role: view", data["headers"])  # a viewer's token can only view
+        self.assertEqual(self.editor.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 404)  # not theirs
+        self.assertEqual(viewer.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 200)
+        self.assertEqual(self.bearer(made["token"], "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        outsider_tenant = host.create_tenant(self.app, "Elsewhere")
+        self.user("out@x.org", "editor", outsider_tenant)
+        outsider = self.client("out@x.org")
+        status, _, _ = outsider.call("POST", "/api/account/tokens", {"name": "x", "projects": [self.pid]})
+        self.assertEqual(status, 404)  # only projects the person can open
+        for bad in ({"name": "x", "projects": []}, {"name": "x", "projects": ["../x"]},
+                    {"name": "", "projects": [self.pid]}):
+            self.assertEqual(self.editor.call("POST", "/api/account/tokens", bad)[0], 400, bad)
+        no_csrf = self.client("ed@x.org")
+        no_csrf.csrf = None
+        self.assertEqual(no_csrf.call("POST", "/api/account/tokens", {"name": "x", "projects": [self.pid]})[0], 403)
+        token = self.make()["token"]
+        status, _, _ = self.editor.call("POST", "/api/account/password",
+                                        {"current": "password-123", "password": "another-password-456"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'api_token%'")]
+        self.assertEqual(actions, ["api_token_created", "api_token_revoked", "api_token_created"])
 
 
 if __name__ == "__main__":
