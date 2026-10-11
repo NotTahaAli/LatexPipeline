@@ -244,6 +244,22 @@ class Outline(TempDoc):
         self.assertFalse({"hidden", "my"} & set(found["macros"]))
         self.assertLessEqual({"box*", "myproof"}, set(found["envs"]))
 
+    def test_references_collects_glossary_entries_and_editorconfig(self):
+        self.write("gloss.tex", "\\newglossaryentry{latex}{name={LaTeX}, description={a system}}\n"
+                                "\\newglossaryentry{cpu}\n  {name=processor,description={x}}\n"
+                                "\\newacronym[longplural={frames}]{fps}{FPS}{frames per second}\n"
+                                "% \\newacronym{hidden}{H}{hidden}\n\\newacronym{bad key}{B}{b}\n")
+        found = serve.references(self.root)
+        self.assertEqual(found["glossary"]["latex"], {"text": "LaTeX", "kind": "entry", "file": "gloss.tex"})
+        self.assertEqual(found["glossary"]["cpu"]["text"], "processor")
+        self.assertEqual(found["glossary"]["fps"],
+                         {"text": "FPS: frames per second", "kind": "acronym", "file": "gloss.tex"})
+        self.assertNotIn("hidden", found["glossary"])
+        self.assertNotIn("bad key", found["glossary"])
+        self.assertEqual(found["editorconfig"], "")
+        self.write(".editorconfig", "[*.tex]\nindent_style = tab\n")
+        self.assertEqual(serve.references(self.root)["editorconfig"], "[*.tex]\nindent_style = tab\n")
+
     def test_log_excerpt_starts_at_the_tex_error(self):
         log = ("summary\nfiles/x/main.tex:3: Undefined control sequence.\n\n! Undefined control sequence.\n"
                "<recently read> \\foo\n\nl.3 \\foo\n         \nmore\nextra\n")
