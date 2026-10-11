@@ -126,6 +126,22 @@ class ParseLatexErrorsTests(unittest.TestCase):
         console = "./main.tex:3: Something vague\nl.3 \\foo\n! Undefined control sequence.\n"
         self.assertIn("Check the spelling", build.parse_latex_errors(console)[0]["hint"])
 
+    def test_emergency_stop_names_the_missing_file(self):
+        console = (
+            "! LaTeX Error: File `placeins.sty' not found.\n\n"
+            "Type X to quit or <RETURN> to proceed,\n"
+            "or enter new name. (Default extension: sty)\n\n"
+            "Enter file name: \n"
+            "./main.tex:5: Emergency stop.\n"
+            "<read *> \n"
+            "l.5 \\makeatletter\n"
+        )
+        found = build.parse_latex_errors(console)
+        self.assertEqual([(e["file"], e["line"], e["message"]) for e in found], [
+            ("main.tex", 5, "LaTeX Error: File `placeins.sty' not found."),
+        ])
+        self.assertIn("placeins.sty", found[0]["hint"])
+
     def test_unknown_error_has_no_hint(self):
         found = build.parse_latex_errors("./main.tex:3: Something vague\nl.3 text\n")
         self.assertIsNone(found[0]["hint"])

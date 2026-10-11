@@ -818,6 +818,11 @@ def parse_latex_errors(console: str) -> list[dict]:
             continue
 
         message = match.group("message")
+        if message.startswith("Emergency stop"):
+            # A missing file prints "! LaTeX Error: File `x.sty' not found." without file:line, then the
+            # file prompt fails in nonstop mode; report that cause, not the stop.
+            cause = next((row[2:] for row in reversed(lines[max(0, index - 8):index]) if row.startswith("! ")), None)
+            message = cause or message
         context = "\n".join(lines[index + 1:index + 4])
         item = {
             "file": posixpath.normpath(match.group("file")),
