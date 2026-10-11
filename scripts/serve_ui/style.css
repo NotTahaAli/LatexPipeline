@@ -592,3 +592,20 @@ dialog::backdrop{background:var(--scrim)}
   .rv-bar .btn,.hv-item .btn,.rv-actions .btn,.rv-bar .chip{min-height:40px}
   .hv-controls,.hv-foot,.hv-sum{padding-left:12px;padding-right:12px}
 }
+
+/* Search and replace in all files (search.js) */
+#side[data-tab=search]{width:min(420px,100vw)}
+.sr-form{display:flex;flex-direction:column;gap:6px;padding:6px 6px 8px}
+.sr-form input[type=search],.sr-form input[type=text]{flex:1;min-width:0;height:32px;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:0 10px}
+.sr-opts,.sr-rep{display:flex;gap:12px;align-items:center}
+.sr-opts .check{align-items:center;font:12px var(--mono)}
+.sr-status{margin:0;padding:0 8px 6px;font-size:12.5px}
+.sr-file{padding:6px 8px}
+.sr-path{font:12px var(--mono);color:var(--ink-2);padding:2px 0}
+.sr-file ul{list-style:none;margin:0;padding:0}
+.sr-file li{display:flex;gap:6px;align-items:baseline;border:0}
+.sr-hit{flex:1;min-width:0;text-align:left;font:12px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:2px 0}
+.sr-hit mark{background:color-mix(in srgb,var(--accent) 25%,transparent);color:inherit}
+.sr-one{font-size:12px;flex:none}
+#toast button.tp-go{margin-left:10px;color:inherit;font-weight:600;text-decoration:underline}
+.rx-dlg{width:440px}.rx-dlg form>p,.rx-dlg form>.rv-actions{padding:0 22px 16px}

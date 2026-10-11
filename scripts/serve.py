@@ -3180,6 +3180,158 @@ def review_change(name: str, role: str, user: str | None, data: dict) -> dict:
     return result
 
 
+# --- Project-wide search and replace -------------------------------------------------------------------------
+
+SEARCH_HITS = 500  # matches listed per search; replacing is not capped by it
+SEARCH_FILE_MAX = 1024 * 1024  # bigger text files are skipped (and listed as skipped)
+SEARCH_QUERY_MAX = 1000
+
+
+def search_flag(data: dict, key: str) -> bool:
+    return data.get(key) in (True, 1, "1", "true")  # JSON bodies and query strings alike
+
+
+def search_pattern(role: str, data: dict) -> re.Pattern:
+    """The pattern a search or replace asks for: literal by default; regular expressions only for the owner (a
+    guest's pattern could backtrack for minutes, ReDoS)."""
+    q = data.get("q")
+    if not isinstance(q, str) or not q or len(q) > SEARCH_QUERY_MAX or "\0" in q:
+        raise ApiError("Type something to search for.", 400)
+    regex = search_flag(data, "regex")
+    if regex and role != "owner":
+        raise ApiError("Regular expressions are for the owner only.", 403)
+    pattern = q if regex else re.escape(q)
+    if search_flag(data, "word"):
+        pattern = r"(?<!\w)(?:" + pattern + r")(?!\w)"
+    try:
+        return re.compile(pattern, re.MULTILINE | (0 if search_flag(data, "case") else re.IGNORECASE))
+    except re.error as exc:
+        raise ApiError(f"Bad regular expression: {exc}", 400)
+
+
+def search_files(name: str, role: str, rel=None) -> tuple[list[dict], list[str]]:
+    """Text files to search (one, or all), read through read_text_file; build-config files only for the owner."""
+    root = DOCS[name].parent
+    paths = [rel] if isinstance(rel, str) and rel else text_files(name)
+    found, skipped = [], []
+    for path in paths:
+        if role != "owner" and is_rc(path):
+            if rel:
+                raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
+            continue
+        try:
+            if resolve_in_doc(root, path).stat().st_size > SEARCH_FILE_MAX:
+                raise ApiError("too large", 413)
+            found.append(read_text_file(root, path))
+        except (ApiError, OSError):
+            if rel:
+                raise ApiError(f"{path} cannot be searched (missing, too large or not UTF-8 text).", 400)
+            skipped.append(path)
+    return found, skipped
+
+
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def search_project(name: str, role: str, data: dict) -> dict:
+    """Every match in the document's text files, grouped by file, with a one-line preview (columns in UTF-16, as the
+    editor counts them). Reads the files on disk, so text typed in the last autosave interval is not seen yet."""
+    pattern = search_pattern(role, data)
+    found, skipped = search_files(name, role)
+    out, total = [], 0
+    for f in found:
+        text, matches = f["text"], []
+        for m in pattern.finditer(text):
+            if m.end() == m.start():
+                continue
+            total += 1
+            if total > SEARCH_HITS:
+                break
+            start = text.rfind("\n", 0, m.start()) + 1
+            end = text.find("\n", m.start())
+            line = text[start:len(text) if end < 0 else end]
+            col = m.start() - start
+            matches.append({"line": text.count("\n", 0, m.start()) + 1, "col": utf16_len(line[:col]),
+                            "len": utf16_len(m.group(0)), "before": line[max(0, col - 60):col],
+                            "match": m.group(0)[:200].replace("\n", " "), "after": line[col + len(m.group(0)):][:120]})
+        if matches:
+            out.append({"path": f["path"], "matches": matches})
+        if total > SEARCH_HITS:
+            break
+    return {"files": out, "total": min(total, SEARCH_HITS), "truncated": total > SEARCH_HITS, "skipped": skipped}
+
+
+def replace_text(text: str, pattern: re.Pattern, data: dict) -> tuple[str, int]:
+    """text with every match replaced, or only match number `nth` (0-based, empty matches not counted) when given;
+    then `line` must still be where that match starts, else 409: the file moved on since the search."""
+    repl = data.get("replace", "")
+    if not isinstance(repl, str) or len(repl) > SEARCH_QUERY_MAX * 10:
+        raise ApiError("Bad replacement.", 400)
+    nth, line = data.get("nth"), data.get("line")
+    if nth is not None and (not isinstance(nth, int) or isinstance(nth, bool) or nth < 0):
+        raise ApiError("Bad match number.", 400)
+    seen = [0]
+
+    def one(m):
+        if m.end() == m.start():
+            return ""
+        index, seen[0] = seen[0], seen[0] + 1
+        if nth is not None and index != nth:
+            return m.group(0)
+        if nth is not None and line is not None and text.count("\n", 0, m.start()) + 1 != line:
+            raise ApiError("The file changed since the search; search again.", 409)
+        try:
+            return m.expand(repl) if search_flag(data, "regex") else repl
+        except (re.error, IndexError) as exc:
+            raise ApiError(f"Bad replacement: {exc}", 400)
+
+    new = pattern.sub(one, text)
+    if nth is not None and seen[0] <= nth:
+        raise ApiError("The file changed since the search; search again.", 409)
+    count = 1 if nth is not None else seen[0]
+    if len(new) > MAX_TEXT:
+        raise ApiError("The result would be too large.", 413)
+    return new, count
+
+
+def replace_project(name: str, role: str, data: dict, author: str) -> dict:
+    """
+    Replace in one file or all of them. With `text` (a file open in a co-editing room, as the editor has it): only
+    compute; the editor applies the result to the room's shared text. Otherwise the server writes every file that has
+    no open room, like an editor save (history before and after, base version), and returns the room files, which the
+    editor changes through their rooms: the server never writes a file that has an open co-editing room.
+    """
+    pattern = search_pattern(role, data)
+    rel = data.get("path")
+    if "text" in data:
+        text = data["text"]
+        if not isinstance(rel, str) or not isinstance(text, str) or len(text) > MAX_TEXT:
+            raise ApiError("Bad file content.", 400)
+        if role != "owner" and is_rc(rel):
+            raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
+        new, count = replace_text(text.replace("\r\n", "\n"), pattern, data)
+        return {"path": rel, "text": new, "count": count}
+    if data.get("nth") is not None and not rel:
+        raise ApiError("Replacing one match needs its file.", 400)
+    found, _ = search_files(name, role, rel)
+    planned, rooms = [], []
+    for f in found:
+        new, count = replace_text(f["text"], pattern, data)
+        if new == f["text"]:
+            continue
+        (rooms if room_open(name, f["path"]) else planned).append((f, new, count))
+    written = []
+    for f, new, count in planned:  # computed first, so a bad replacement fails before anything is written
+        remember_disk(name, f["path"])
+        write_text_file(DOCS[name].parent, f["path"], new, f["version"], f["eol"])
+        remember(name, f["path"], new, [author])
+        written.append({"path": f["path"], "count": count})
+    if written:
+        broadcast("fs", {"doc": name, "changed": [w["path"] for w in written], "removed": []})
+    return {"files": written, "count": sum(w["count"] for w in written), "rooms": [f["path"] for f, _, _ in rooms]}
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -3197,7 +3349,7 @@ DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
     "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
-    "/api/review",
+    "/api/review", "/api/search",
 }
 
 
@@ -3312,6 +3464,8 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
                     raise ApiError("Too many history requests; wait a moment.", 429)
             elif path.startswith("/api/history") and not rate_ok("history-read", *HISTORY_READ_LIMIT):
                 raise ApiError("Too many history requests; wait a moment.", 429)  # diffs cost CPU
+            elif path == "/api/search" and not rate_ok("search", 60, 60.0):  # reads every file of the document
+                raise ApiError("Too many searches; wait a moment.", 429)
         elif path == "/forward" and "quiet" in query:
             return  # Checked again once the target document is known.
         else:
@@ -3330,6 +3484,11 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
             raise ApiError("Too many file changes; wait a moment.", 429)
         if any(is_rc((query.get(key) or [""])[0]) for key in ("path", "to")):
             raise ApiError("This file configures the build and cannot be changed through a shared link.", 403)
+    elif method == "POST" and path == "/api/replace":
+        need_edit()  # replace_project writes no build-config file for guests and no file that has an open room.
+        scoped(doc)
+        if not rate_ok("replace", 60, 60.0):  # each written file is a version; a room file is one request each
+            raise ApiError("Too many replacements; wait a moment.", 429)
     elif method == "POST" and path == "/api/upload":
         need_edit()
         scoped(doc)
@@ -3617,6 +3776,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json(history_clean(name, self.body()))
         elif url.path == "/api/review" and name in DOCS:
             self.json(review_change(name, self.role, self.user, self.body()))
+        elif url.path == "/api/replace" and name in DOCS:
+            self.json(replace_project(name, self.role, self.body(), self.author(query)))
         elif url.path == "/api/grammar" and name in DOCS:
             self.json(grammar_check(name, self.body().get("text")))
         elif url.path == "/api/bib/lookup" and name in DOCS:
@@ -3772,6 +3933,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/warnings":
             self.doc_root(query)
             self.json({"warnings": doc_warnings(query["doc"][0])})
+        elif path == "/api/search":
+            self.doc_root(query)
+            self.json(search_project(query["doc"][0], self.role, {k: v[0] for k, v in query.items()}))
         elif path in ("/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
                       "/api/review"):
             self.doc_root(query)  # 404 for an unknown document

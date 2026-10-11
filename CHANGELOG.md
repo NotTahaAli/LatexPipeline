@@ -4,6 +4,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Editor: search and replace in all files of a document (sidebar Search tab, Ctrl+Shift+F; `GET /api/search`, `POST /api/replace`): match case, whole word, regular expressions for the owner only; files open in live co-editing are changed through the shared document, others written with history; build-config files stay owner-only.
+- Editor: pasting a table from a spreadsheet, Word or a web page offers "Paste as table", a `table`/`tabular` with LaTeX special characters escaped (booktabs rules when the document loads booktabs).
+- Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed

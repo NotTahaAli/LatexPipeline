@@ -13,6 +13,8 @@ import { reviewSupport } from "./review.js";
 import { namedLinks } from "./links.js";
 import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
+import { searchPanel } from "./search.js";
+import { tablePaste } from "./tablepaste.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -79,6 +81,7 @@ const REV = reviewSupport(S, V, {
   hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
 });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
+const TP = tablePaste(V, { el, toast, preamble: async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => "")) });
 function toggleSuggest() {
   if (readOnly) return;
   REV.setSuggest(!REV.suggesting);
@@ -115,6 +118,7 @@ function extensionsFor(tab) {
     }),
     errField,
     readOnly ? [] : GR.extension,
+    readOnly ? [] : TP,
     REV.extension,
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
@@ -953,6 +957,17 @@ const historyUi = historyPanel($("dpanel-history"), {
   send: (message) => channel.send(message),
 });
 $("diffClose").onclick = () => $("diffDlg").close();
+// Search and replace in all files (search.js): a file open in a co-editing room is changed through its room.
+const searchUi = searchPanel($("panel-search"), {
+  api, el, role, readOnly, doc: () => cur, toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  async open(path, line, col, len) {
+    if (narrow()) setSide(false);
+    await openFile(path, line);
+    const at = view.state.doc.line(Math.min(line, view.state.doc.lines)).from + col;
+    if (active?.path === path && at + len <= view.state.doc.length) view.dispatch({ selection: { anchor: at, head: at + len } });
+  },
+  async room(path) { if (!tabs.has(path)) await openFile(path, 0, { noFocus: true }); const r = tabs.get(path)?.collab; return r?.ready && r.canEdit ? r : null; },
+});
 REV.mount($("dpanel-review"));
 $("commentBtn").onclick = () => REV.startComment();
 $("suggestBtn").onclick = () => toggleSuggest();
@@ -1093,7 +1108,7 @@ $("drawerClose").onclick = () => setDrawer(false);
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
   $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
-  for (const n of ["files", "outline", "refs", "ai"]) {
+  for (const n of ["files", "search", "outline", "refs", "ai"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
@@ -1103,6 +1118,8 @@ $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
 $("tab-files").onclick = () => setSide(true, "files");
 $("tab-outline").onclick = () => setSide(true, "outline");
+$("tab-search").onclick = () => setSide(true, "search");
+const showSearch = () => { setSide(true, "search"); searchUi.focus(active?.kind === "text" ? view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to) : ""); };
 $("tab-refs").onclick = () => setSide(true, "refs");
 $("tab-ai").onclick = () => setSide(true, "ai");
 
@@ -1191,6 +1208,7 @@ const COMMANDS = [
   { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveTab(active) },
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
+  { id: "search", title: "Search and replace in all files", keys: `${mod}+Shift+F`, run: () => showSearch() },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
   { id: "assistant", title: "Toggle AI assistant", run: () => (ui.side && ui.sideTab === "ai") ? setSide(false) : setSide(true, "ai") },
@@ -1333,6 +1351,7 @@ document.addEventListener("keydown", (e) => {
   if (m && !e.altKey && !e.shiftKey && k === "k") { e.preventDefault(); openPalette(); }
   else if (m && e.shiftKey && k === "p") { e.preventDefault(); openPalette(); }
   else if (m && !e.shiftKey && !e.altKey && k === "b") { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
+  else if (m && e.shiftKey && k === "f") { e.preventDefault(); showSearch(); }
   else if (m && e.shiftKey && k === "o") { e.preventDefault(); COMMANDS.find((c) => c.id === "outline").run(); }
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
   else if (m && e.altKey && k === "v") { e.preventDefault(); setVisual(!settings.visual); }
