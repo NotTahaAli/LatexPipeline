@@ -13,8 +13,8 @@ MCP (Model Context Protocol) for LaTeX projects: the protocol and the tools, sha
   worker (POST /api/mcp, gateway only).
 
 Threat model: the client, the model and the document text are untrusted input. A tool can do only what the
-caller's role allows (owner locally; edit or view behind the gateway, narrowed by the OAuth grant there), never
-touches build-config files (RC_NAMES) except as the local owner, never writes a file that has an open co-editing
+caller's role allows (owner locally; edit, review or view behind the gateway, narrowed by the OAuth grant there),
+never touches build-config files (RC_NAMES) except as the local owner, never writes a file that has an open co-editing
 room, records every change in the version history with the client's name, and caps what it returns. Accepting or
 rejecting suggestions is not a tool: that stays with people.
 """
@@ -582,8 +582,9 @@ REF = re.compile(r"\\(?:[cC]|auto|eq|page|name|v|Vref|labelc)?ref\*?\s*\{([^}]*)
 
 class Doc:
     """
-    One document as one caller sees it. role: owner (local), edit or view (hosted worker). user: "id;name" behind the
-    gateway. author: the name history and review show for changes ("Alice via Claude", or "Claude (MCP)" locally).
+    One document as one caller sees it. role: owner (local), edit, review or view (hosted worker). user: "id;name"
+    behind the gateway. author: the name history and review show for changes ("Alice via Claude", or "Claude (MCP)"
+    locally).
     """
 
     def __init__(self, serve, name: str, role: str, user: str | None, author: str,
@@ -607,9 +608,18 @@ class Doc:
 
     def need_edit(self, limit: str | None = None) -> None:
         if self.role not in ("owner", "edit"):
-            raise ToolError("Your role in this project is view-only: you cannot change it.")
+            raise ToolError("Your role in this project is reviewer: you can comment and suggest, not change it."
+                            if self.role == "review" else
+                            "Your role in this project is view-only: you cannot change it.")
         if limit and self.role != "owner":
             self.need_rate(limit)
+
+    def need_review(self) -> None:
+        """Comments and suggestions: the edit and review roles (serve.review_change keeps a reviewer to its own)."""
+        if self.role not in ("owner", "edit", "review"):
+            raise ToolError("Your role in this project is view-only: you cannot comment on it.")
+        if self.role != "owner":
+            self.need_rate("review")
 
     LIMITS = {"put": "PUT_LIMIT", "fs": "FS_LIMIT", "review": "REVIEW_LIMIT", "rebuild": "REBUILD_LIMIT",
               "history": "HISTORY_LIMIT", "history-read": "HISTORY_READ_LIMIT"}
@@ -913,7 +923,7 @@ class Doc:
 
     def anchor(self, path: str, quote: str, occurrence: int | None, text: str | None = None, after: int = 0) -> dict:
         if text is None:
-            self.need_edit("review")
+            self.need_review()
             self.need_text_path(path)
             text = self.s.read_text_file(self.root, path)["text"]
         quote = quote.replace("\r\n", "\n")
@@ -977,14 +987,14 @@ class Doc:
         return found
 
     def t_reply_comment(self, thread: str, comment: str) -> dict:
-        self.need_edit("review")
+        self.need_review()
         self.thread(thread)
         done = self.s.review_change(self.name, self.role, self.user,
                                     {"op": "reply", "thread": thread, "text": comment, "name": self.author})
         return result({"thread": thread, "comments": len(done["item"]["comments"])})
 
     def t_resolve_thread(self, thread: str, reopen: bool = False) -> dict:
-        self.need_edit("review")
+        self.need_review()
         self.thread(thread)
         self.s.review_change(self.name, self.role, self.user,
                              {"op": "resolve", "thread": thread, "resolved": not reopen, "name": self.author})
@@ -1001,7 +1011,7 @@ class Doc:
         return self.user is not None or item.get("name") == who["name"]
 
     def t_delete_comment(self, thread: str, comment: str) -> dict:
-        self.need_edit("review")
+        self.need_review()
         found = self.thread(thread)
         target = next((c for c in found["comments"] if c.get("id") == comment), None)
         if target is None:
@@ -1013,7 +1023,7 @@ class Doc:
         return result({"thread": thread, "deleted": comment})
 
     def t_withdraw_suggestion(self, id: str) -> dict:  # noqa: A002 - the schema's name
-        self.need_edit("review")
+        self.need_review()
         found = next((x for x in self.s.review_store(self.name).load()["suggestions"] if x.get("id") == id), None)
         if found is None:
             raise ToolError("No such open suggestion (list_reviews shows them).")

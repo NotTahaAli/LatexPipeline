@@ -1705,6 +1705,7 @@ class Mcp(HostCase):
         self.other = host.create_tenant(self.app, "Other")
         self.user("ed@x.org", "editor", self.tenant)
         self.user("vi@x.org", "viewer", self.tenant)
+        self.user("re@x.org", "reviewer", self.tenant)
         self.user("ot@x.org", "admin", self.other)
         self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
         self.opid = Workspaces.make_project(self, self.client("ot@x.org"), self.other, "Secret", "article")
@@ -2149,6 +2150,123 @@ class Mcp(HostCase):
         host_mcp.THROTTLES.clear()
         self.app.config["mcp"]["calls_per_minute"] = 2
         self.assertEqual([self.mcp(token, listing)[0] for _ in range(3)], [200, 200, 429])
+
+    # --- the reviewer workspace role: comments and suggestions in the editor and over MCP, no file changes ---
+
+    def test_the_migration_keeps_members_and_invites_and_allows_reviewers(self):
+        import sqlite3
+        path = self.data / "old.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("".join(host.MIGRATIONS[:4]) + "CREATE TABLE schema_version(version INTEGER NOT NULL);"
+                           "INSERT INTO schema_version VALUES (4);"
+                           "INSERT INTO tenants VALUES ('t', 'T', 0);"
+                           "INSERT INTO users(id, email, name, created) VALUES (1, 'a@x.org', 'A', 0);"
+                           "INSERT INTO members VALUES ('t', 1, 'viewer');"
+                           "INSERT INTO invites(token_hash, tenant_id, role, created, expires) "
+                           "VALUES ('h', 't', 'editor', 0, 1);")
+        with self.assertRaises(sqlite3.IntegrityError):  # the old CHECK
+            conn.execute("UPDATE members SET role = 'reviewer'")
+        conn.close()
+        db = host.DB(path)
+        self.addCleanup(db.conn.close)
+        self.assertEqual(db.version(), len(host.MIGRATIONS))
+        self.assertEqual([(r["tenant_id"], r["user_id"], r["role"]) for r in db.all("SELECT * FROM members")],
+                         [("t", 1, "viewer")])
+        self.assertEqual(db.one("SELECT role, token_hash FROM invites")["role"], "editor")
+        db.run("UPDATE members SET role = 'reviewer'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.run("UPDATE members SET role = 'owner'")
+        db.run("DELETE FROM tenants")  # the foreign keys still cascade
+        self.assertEqual(db.all("SELECT * FROM members"), [])
+
+    def test_workspace_admins_assign_the_role_and_reviewers_make_no_projects(self):
+        self.user("ad@x.org", "admin", self.tenant)
+        admin, reviewer = self.client("ad@x.org"), self.client("re@x.org")
+        self.assertEqual(admin.call("POST", f"/api/tenants/{self.tenant}/invites", {"role": "reviewer"})[0], 200)
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'vi@x.org'")["id"]
+        self.assertEqual(admin.call("POST", f"/api/tenants/{self.tenant}/members/{uid}", {"role": "reviewer"})[0],
+                         200)
+        self.assertEqual(self.client("vi@x.org").call("GET", f"/api/tenants/{self.tenant}")[1]["role"], "reviewer")
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/projects", {"name": "X"})[0], 403)
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/upload?name=X", {})[0], 403)
+        self.assertEqual(reviewer.call("DELETE", f"/api/projects/{self.pid}")[0], 403)
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/invites", {"role": "viewer"})[0], 403)
+        self.assertEqual(reviewer.call("GET", f"/api/projects/{self.pid}/zip")[0], 200)  # reads like a viewer
+
+    def test_the_worker_gets_the_review_role(self):
+        upstream = Upstream()
+        upstream.start()
+        self.addCleanup(upstream.sock.close)
+        self.fake_worker(upstream.port)
+        forged = {"X-Host-Role": "edit", "X-Host-Admin": "1"}
+        status, data, _ = self.client("re@x.org").call("GET", f"/p/{self.pid}/api/config", headers=forged)
+        self.assertEqual(status, 200)
+        self.assertEqual([h for h in data["headers"] if h.startswith("X-Host-")][:2],
+                         [f"X-Host-Secret: {'w' * 43}", "X-Host-Role: review"])
+        self.assertFalse([h for h in data["headers"] if h.startswith("X-Host-Admin")])
+
+    def test_reviewers_comment_and_suggest_in_the_editor_but_change_nothing(self):
+        self.real_worker()
+        reviewer, editor = self.client("re@x.org"), self.client("ed@x.org")
+        base = f"/p/{self.pid}"
+        self.assertEqual(reviewer.call("GET", f"{base}/api/config")[1]["role"], "review")
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        before = (source / "main.tex").read_text()
+        for method, path, body in (("PUT", "/api/file?doc=Doc&path=main.tex", {"text": "x"}),
+                                   ("PUT", "/api/file?doc=Doc&path=build.toml", {"text": "x"}),
+                                   ("POST", "/api/fs?doc=Doc&op=newfile&path=x.tex", {}),
+                                   ("POST", "/rebuild?doc=Doc", {}),
+                                   ("POST", "/api/history/label?doc=Doc", {"label": "v"})):
+            with self.subTest(path=path):
+                self.assertEqual(reviewer.call(method, base + path, body)[0], 403)
+        self.assertEqual((source / "main.tex").read_text(), before)
+        quote = "\\begin{document}"
+        at = before.index(quote)
+        anchor = {"from": at, "to": at + len(quote), "quote": quote, "prefix": "", "suffix": ""}
+        status, made, _ = reviewer.call("POST", f"{base}/api/review?doc=Doc",
+                                        {"op": "suggest", "path": "main.tex", "anchor": anchor, "insert": "x"})
+        self.assertEqual(status, 200)
+        accept = {"op": "accept", "ids": [made["item"]["id"]]}
+        self.assertEqual(reviewer.call("POST", f"{base}/api/review?doc=Doc", accept)[0], 403)
+        self.assertEqual(editor.call("POST", f"{base}/api/review?doc=Doc", accept)[0], 200)
+        self.assertFalse(reviewer.call("GET", f"{base}/api/ai")[1]["enabled"])
+        self.assertFalse(reviewer.call("GET", f"{base}/api/zotero")[1]["can_sync"])
+
+    def test_reviewers_over_mcp_get_the_review_tools_only(self):
+        self.worker()
+        token = self.connect(email="re@x.org")[1]["access_token"]
+        projects = self.tool(token, "list_projects")["structuredContent"]["projects"]
+        self.assertEqual([p["access"] for p in projects], [["read", "review"]])
+        quote = "\\begin{document}"
+        made = self.tool(token, "add_comment", project=self.pid, path="main.tex", quote=quote, comment="Hm")
+        self.assertFalse(made["isError"], made)
+        tid = made["structuredContent"]["id"]
+        self.assertFalse(self.tool(token, "reply_comment", project=self.pid, thread=tid, comment="More")["isError"])
+        self.assertFalse(self.tool(token, "resolve_thread", project=self.pid, thread=tid)["isError"])
+        sug = self.tool(token, "add_suggestion", project=self.pid, path="main.tex", quote=quote, replacement="x")
+        self.assertFalse(sug["isError"], sug)
+        sid = sug["structuredContent"]["id"]
+        self.assertFalse(self.tool(token, "withdraw_suggestion", project=self.pid, id=sid)["isError"])
+        refused = (("edit_file", {"path": "main.tex", "old_text": "document", "new_text": "x"}),
+                   ("write_file", {"path": "new.tex", "content": "x"}),
+                   ("delete_file", {"path": "main.tex"}),
+                   ("build", {}),
+                   ("label_version", {"label": "x"}),
+                   ("grammar_check", {"path": "main.tex"}),
+                   ("add_comment", {"path": "build.toml", "quote": "x", "comment": "x"}))
+        for name, args in refused:
+            with self.subTest(tool=name):
+                self.assertTrue(self.tool(token, name, project=self.pid, **args)["isError"])
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        self.assertFalse((source / "new.tex").exists())
+        self.assertTrue((source / "main.tex").is_file())
+        self.assertIn("reviewer", self.tool(token, "edit_file", project=self.pid, path="main.tex",
+                                            old_text="document", new_text="x")["content"][0]["text"])
+        # The grant narrows the role too: a reviewer's read-only connection cannot comment.
+        reader = self.connect(email="re@x.org", scopes=())[1]["access_token"]
+        self.assertEqual(self.mcp(reader, {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+            "name": "add_comment", "arguments": {"project": self.pid, "path": "main.tex", "quote": quote,
+                                                 "comment": "x"}}})[0], 403)
 
 
 if __name__ == "__main__":

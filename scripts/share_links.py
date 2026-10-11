@@ -30,7 +30,7 @@ FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "lat
 VERSION = 2
 MAX_LINKS = 200
 MAX_NAME = 40
-ROLES = ("edit", "view")
+ROLES = ("edit", "review", "view")  # review: comment and suggest, never change the text
 _CACHE: dict = {"key": None, "links": []}
 _LOCK = threading.Lock()
 
@@ -95,7 +95,7 @@ def save(links: list, path: Path | None = None) -> None:
 def create(links: list, name, role, doc: str, root: str, now: float | None = None) -> dict:
     """A new link record (appended to links; the caller saves)."""
     if role not in ROLES:
-        raise LinkError("A link is for editing or for viewing.")
+        raise LinkError("A link is for editing, reviewing or viewing.")
     if len(links) >= MAX_LINKS:
         raise LinkError(f"There are {MAX_LINKS} named links; revoke some first.")
     link = {"id": secrets.token_hex(6), "token": secrets.token_urlsafe(32), "name": clean_name(name), "role": role,

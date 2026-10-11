@@ -16,7 +16,8 @@ const MAX_HOLD = 5000;      // ms an IME composition may hold the co-editing roo
 const clip = (s, n = 280) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 /**
- * ctx = {api, el, icon, doc(), canEdit, me() -> {name, key}, view(), activePath(), openFile(path, line, opts),
+ * ctx = {api, el, icon, doc(), canEdit (comment and suggest), reviewer (suggest mode locked on; withdraws only its own
+ *        suggestions, never accepts, rejects or moves anchors), me() -> {name, key}, view(), activePath(), openFile(path, line, opts),
  *        showPanel(), toast(msg), live(msg), onCount(n),
  *        fromYjs() -> true while the co-editing binding applies a change that already happened to the shared text,
  *        hold(on) -> keep the editor's text from co-editors and the disk while an IME composition is in progress}
@@ -88,7 +89,7 @@ export function reviewSupport(S, V, ctx) {
   function reanchorSoon() { clearTimeout(anchorTimer); anchorTimer = setTimeout(reanchor, 1500); }
   function reanchor() {
     const view = ctx.view();
-    if (!ctx.canEdit || !view) return;
+    if (!ctx.canEdit || ctx.reviewer || !view) return;   // the server refuses a reviewer's reanchor
     const text = view.state.doc.toString(), path = ctx.activePath(), now = places(view.state, true), items = [];
     for (const item of [...data.threads, ...data.suggestions]) {
       if (item.path !== path || String(item.id).startsWith("tmp")) continue;
@@ -356,7 +357,7 @@ export function reviewSupport(S, V, ctx) {
   ]));
 
   function setSuggest(on) {
-    if (!ctx.canEdit) return;
+    if (!ctx.canEdit || (ctx.reviewer && !on)) return;
     if (!on) flush();
     suggesting = !!on;
     render();
@@ -506,7 +507,11 @@ export function reviewSupport(S, V, ctx) {
     const pending = String(s.id).startsWith("tmp");
     li.append(el("div", { className: "rv-head" }, where(s), el("span", { className: "rv-who" }, el("b", { textContent: s.name }), stamp(s.time))),
       ...(parts.length > 1 ? [el("p", { className: "mute rv-group", textContent: `One edit in ${parts.length} places, accepted or rejected together:` })] : []), ...changes);
-    if (ctx.canEdit) {
+    if (ctx.reviewer && s.mine) {   // a reviewer withdraws its own suggestions; accepting and rejecting is for editors
+      const no = btn("Withdraw", () => decide([s.id], false));
+      no.disabled = pending;
+      li.append(el("div", { className: "rv-actions" }, no, ...(pending ? [el("span", { className: "mute", textContent: "Saving..." })] : [])));
+    } else if (ctx.canEdit && !ctx.reviewer) {
       const yes = btn("Accept", () => decide([s.id], true)), no = btn(s.mine ? "Withdraw" : "Reject", () => decide([s.id], false));
       yes.disabled = no.disabled = pending;
       li.append(el("div", { className: "rv-actions" }, yes, no, ...(pending ? [el("span", { className: "mute", textContent: "Saving..." })] : [])));
@@ -531,8 +536,9 @@ export function reviewSupport(S, V, ctx) {
     if (ctx.canEdit) {
       const sw = btn("Suggest", () => ctx.toggleSuggest(), "chip rv-switch", "Suggest mode: your edits become suggestions that others accept or reject");
       sw.setAttribute("role", "switch"); sw.setAttribute("aria-checked", String(suggesting));
+      if (ctx.reviewer) { sw.disabled = true; sw.title = "Reviewers always suggest: what you type becomes a suggestion"; }
       tools.push(btn("Comment", startComment, "btn", "Comment on the selected text (Ctrl+Alt+M)"), sw);
-      if (filter === "suggestions" && sugg.length) {
+      if (filter === "suggestions" && sugg.length && !ctx.reviewer) {
         tools.push(btn("Accept all", () => { if (confirm(`Accept ${sugg.length} ${sugg.length === 1 ? "suggestion" : "suggestions"}${fileOnly ? " in this file" : ""}?`)) decide(sugg.map((s) => s.id), true); }),
           btn("Reject all", () => { if (confirm(`Reject ${sugg.length} ${sugg.length === 1 ? "suggestion" : "suggestions"}${fileOnly ? " in this file" : ""}?`)) decide(sugg.map((s) => s.id), false); }));
       }

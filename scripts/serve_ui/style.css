@@ -88,6 +88,7 @@ kbd{font:11px var(--mono);color:var(--ink-2);background:var(--surface);border:1p
 /* Role chip, first-run tips */
 .role{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ochre-soft);color:var(--ochre);white-space:nowrap}
 .role.edit{background:var(--accent-soft);color:var(--accent)}
+.role.review{background:var(--moss-soft);color:var(--moss)}
 .btn:disabled,button.icon:disabled,.mini:disabled{opacity:.45;cursor:not-allowed}
 #tips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 14px;background:var(--accent-soft);color:var(--accent);border-bottom:1px solid var(--rule)}
 #tips .btn{height:28px}

@@ -4,6 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Reviewer role: a "can review" named share link and a hosted `reviewer` workspace role (between viewer and editor; new `host.db` migration) comment, reply, resolve and suggest (Suggest mode locked on, "Reviewer" chip) and withdraw their own suggestions, but cannot save, change files, rebuild, accept or reject; the server refuses their co-editing updates, and over MCP they get the review tools only.
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed
