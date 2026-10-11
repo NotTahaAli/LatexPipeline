@@ -130,8 +130,13 @@ SETTING_RANGES = {
     "max_workers": (1, 500), "max_workers_per_tenant": (1, 500), "worker_idle_minutes": (1, 1440),
     "build_timeout": (10, 3600),
 }
-ROLES = ("admin", "editor", "viewer")
+ROLES = ("admin", "editor", "reviewer", "viewer")
 EDIT_ROLES = ("admin", "editor")
+
+
+def worker_role(tenant_role: str) -> str:
+    """The role a project's worker (serve.py --gateway) gets in X-Host-Role for a workspace role."""
+    return "edit" if tenant_role in EDIT_ROLES else "review" if tenant_role == "reviewer" else "view"
 
 
 class ConfigError(Exception):
@@ -274,6 +279,25 @@ MIGRATIONS = [
         kind TEXT NOT NULL CHECK(kind IN ('access', 'refresh')), resource TEXT NOT NULL, expires REAL NOT NULL,
         used REAL);
     CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
+    """,
+    # The reviewer role (comments and suggestions, no direct edits): SQLite changes a CHECK only by a new table.
+    """
+    CREATE TABLE members_new(
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'editor', 'reviewer', 'viewer')), PRIMARY KEY(tenant_id, user_id));
+    INSERT INTO members_new(tenant_id, user_id, role) SELECT tenant_id, user_id, role FROM members;
+    DROP TABLE members;
+    ALTER TABLE members_new RENAME TO members;
+    CREATE TABLE invites_new(
+        id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'editor', 'reviewer', 'viewer')), email TEXT, created_by INTEGER,
+        created REAL NOT NULL, expires REAL NOT NULL, used_by INTEGER, used REAL);
+    INSERT INTO invites_new(id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used)
+        SELECT id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used FROM invites;
+    DROP TABLE invites;
+    ALTER TABLE invites_new RENAME TO invites;
     """,
 ]
 
@@ -1309,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
         if rest is None:
             self.redirect(f"/p/{pid}/")
             return
-        role = "edit" if tenant_role_ in EDIT_ROLES else "view"
+        role = worker_role(tenant_role_)
         if self.command not in ("GET", "POST", "PUT"):
             raise HttpError(405, "Method not allowed.")
         if (self.command != "GET" or upgrade) and not self.origin_ok():
@@ -1373,7 +1397,7 @@ class Handler(BaseHTTPRequestHandler):
                        0 if billed else 1, usage.get("input", 0), usage.get("output", 0) - ai.MAX_TOKENS,
                        day, uid, tid)
 
-        reason = ("View-only members cannot use the assistant." if role != "edit"
+        reason = ("Only editors can use the assistant." if role != "edit"
                   else "The AI assistant is off on this server." if not on
                   else "The daily AI limit is reached; try again tomorrow." if not left() else None)
         if self.command == "GET":
@@ -1419,7 +1443,7 @@ class Handler(BaseHTTPRequestHandler):
         project's worker (/api/zotero/compare and /apply, no network), never in this shared process."""
         cfg = zotero_settings(self.session["id"])
         allowed = role == "edit" and zotero.configured(cfg)
-        reason = ("View-only members cannot sync from Zotero." if role != "edit" else None if allowed
+        reason = ("Only editors can sync from Zotero." if role != "edit" else None if allowed
                   else "Add your Zotero library and API key on the Account page first.")
         if self.command == "GET" and rest == "/api/zotero":
             self.send_json({**zotero_public(cfg), "hosted": True, "can_sync": allowed, "reason": reason})
@@ -1554,7 +1578,7 @@ class Handler(BaseHTTPRequestHandler):
                 checked = now
                 current = session_for(session)
                 found = project_access(APP, current, pid) if current and current["stage"] == "full" else None
-                if not found or ("edit" if found[1] in EDIT_ROLES else "view") != role:
+                if not found or worker_role(found[1]) != role:
                     return
             if not ready:
                 if now - traffic > WS_IDLE:
@@ -1936,7 +1960,7 @@ def api_invite_create(h: Handler, tid: str) -> None:
     data = h.json_body()
     role = data.get("role")
     if role not in ROLES:
-        raise HttpError(400, "Pick a role: admin, editor or viewer.")
+        raise HttpError(400, "Pick a role: admin, editor, reviewer or viewer.")
     email = norm_email(data.get("email")) if data.get("email") else None
     days = data.get("days", 7)
     if not (isinstance(days, int) and 1 <= days <= 30):
@@ -1967,7 +1991,7 @@ def api_member_role(h: Handler, tid: str, uid: str) -> None:
     need_role(h, tid, ("admin",))
     role = h.json_body().get("role")
     if role not in ROLES:
-        raise HttpError(400, "Pick a role: admin, editor or viewer.")
+        raise HttpError(400, "Pick a role: admin, editor, reviewer or viewer.")
     with APP.db.tx():
         member = APP.db.one("SELECT role FROM members WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
         if not member:
@@ -2089,7 +2113,7 @@ def api_project_delete(h: Handler, pid: str) -> None:
         raise HttpError(404, "No such project.")
     project, role = found
     if role not in EDIT_ROLES:
-        raise HttpError(403, "Viewers cannot delete projects.")
+        raise HttpError(403, "Only editors can delete projects.")
     delete_project(project)
     audit_log(APP, "project_deleted", h.user["id"], h.ip, project["tenant_id"], f"{pid} {project['name']}")
     h.ok()

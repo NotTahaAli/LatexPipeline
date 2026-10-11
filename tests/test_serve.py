@@ -3771,5 +3771,147 @@ class HistoryAndReviewLimits(SharedState, ServerCase):
         self.assertEqual(status, 413)
 
 
+class ReviewerRole(SharedState, ServerCase):
+    """The review role (a "can review" named link, or a hosted reviewer): comments and suggestions, nothing else."""
+
+    as_ = GatewayMode.as_
+    SECRET = GatewayMode.SECRET
+    ANCHOR = {"from": 12, "to": 17, "quote": "hello", "prefix": "\\section{A}\n", "suffix": "\n"}
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("build.toml", "engine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        serve.SHARE["port"] = self.port
+        self.tokens = dict(self.share_on())
+        for who, name, role in (("bea", "Bea", "review"), ("ed", "Ed", "edit")):
+            status, info = self.request("POST", "/api/share/links", {"name": name, "role": role},
+                                        {"Cookie": f"{serve.cookie_name()}={self.tokens['owner']}"})
+            self.assertEqual(status, 200)
+            link = next(x for x in info["named"] if x["name"] == name)
+            self.assertEqual(link["role"], role)
+            self.tokens[who] = link["url"].split("token=")[1].split("#")[0]
+
+    def get(self, method, path, who, body=None):
+        return self.request(method, path, body, {"Cookie": f"{serve.cookie_name()}={self.tokens[who]}"})
+
+    def review(self, who, body):
+        return self.get("POST", "/api/review?doc=demo", who, {"key": "k" * 32, **body})
+
+    def test_a_review_link_is_the_review_role(self):
+        self.assertEqual(serve.identity_for_token(self.tokens["bea"])[0], "review")
+        self.assertEqual(self.get("GET", "/api/config", "bea")[1]["role"], "review")
+        self.assertEqual(self.get("GET", "/api/review?doc=demo", "bea")[0], 200)
+        self.assertEqual(self.get("GET", "/api/file?doc=demo&path=main.tex", "bea")[0], 200)
+        self.assertEqual(set(serve.share_links()), {"view", "edit"})  # the anonymous pair stays as it was
+        with self.assertRaises(serve.named.LinkError):
+            serve.named.create([], "Eve", "owner", "demo", serve.link_root("demo"))
+
+    def test_reviewers_comment_reply_resolve_suggest_and_take_back_their_own(self):
+        status, made = self.review("bea", {"op": "comment", "path": "main.tex", "anchor": self.ANCHOR, "text": "Why?"})
+        self.assertEqual((status, made["item"]["comments"][0]["name"]), (200, "Bea"))
+        tid = made["item"]["id"]
+        self.assertEqual(self.review("bea", {"op": "reply", "thread": tid, "text": "Also."})[0], 200)
+        _, ed = self.review("ed", {"op": "reply", "thread": tid, "text": "Because."})
+        eds = ed["item"]["comments"][-1]["id"]
+        self.assertEqual(self.review("bea", {"op": "delete", "thread": tid, "comment": eds})[0], 403)  # not hers
+        self.assertEqual(self.review("bea", {"op": "delete", "thread": tid,
+                                             "comment": made["item"]["comments"][0]["id"]})[0], 200)
+        self.assertEqual(self.review("bea", {"op": "resolve", "thread": tid, "resolved": True})[0], 200)
+        status, mine = self.review("bea", {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "hi"})
+        self.assertEqual(status, 200)
+        _, theirs = self.review("ed", {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "yo"})
+        both = [mine["item"]["id"], theirs["item"]["id"]]
+        for body in ({"op": "accept", "ids": [mine["item"]["id"]]}, {"op": "reject", "ids": both},
+                     {"op": "reject", "ids": [theirs["item"]["id"]]}, {"op": "release", "ids": both},
+                     {"op": "reject", "ids": []}, {"op": "reject", "ids": "x"},
+                     {"op": "reanchor", "items": [{"id": tid, "anchor": self.ANCHOR}]}):
+            with self.subTest(body=body):
+                self.assertEqual(self.review("bea", body)[0], 403)
+        self.assertEqual(len(self.get("GET", "/api/review?doc=demo", "ed")[1]["suggestions"]), 2)
+        self.assertEqual(self.review("bea", {"op": "reject", "ids": [mine["item"]["id"]]})[0], 200)  # withdraw
+        self.assertEqual(self.review("ed", {"op": "accept", "ids": [theirs["item"]["id"]]})[0], 200)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")  # the editor applies it
+
+    def test_reviewers_change_no_files_and_run_nothing(self):
+        refused = [
+            ("PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"}),
+            ("PUT", "/api/file?doc=demo&path=new.tex", {"text": "x"}),
+            ("PUT", "/api/file?doc=demo&path=build.toml", {"text": "x"}),
+            ("POST", "/api/fs?doc=demo&op=newfile&path=x.tex", None),
+            ("POST", "/api/fs?doc=demo&op=rename&path=main.tex&to=b.tex", None),
+            ("POST", "/api/fs?doc=demo&op=delete&path=fig.png", None),
+            ("POST", "/api/upload?doc=demo&name=a.png", None),
+            ("POST", "/rebuild?doc=demo", None),
+            ("POST", "/api/focus?doc=demo&path=main.tex", None),
+            ("POST", "/api/preview?doc=demo&cid=c1", {"path": "main.tex", "text": "x"}),
+            ("POST", "/api/history/label?doc=demo", {"label": "v"}),
+            ("POST", "/api/history/restore?doc=demo", {"id": 1}),
+            ("POST", "/api/history/pending?doc=demo&cid=c1", {"op": "claim", "path": "main.tex"}),
+            ("POST", "/api/grammar?doc=demo", {"text": "x"}),
+            ("POST", "/api/ai?doc=demo", {"question": "x"}),
+            ("POST", "/api/bib/edit?doc=demo", {}),
+            ("POST", "/api/bib/lookup?doc=demo", {}),
+            ("POST", "/api/zotero/apply?doc=demo", {}),
+            ("POST", "/api/share/links", {"name": "Eve", "role": "edit"}),
+        ]
+        for method, path, body in refused:
+            with self.subTest(path=path):
+                self.assertEqual(self.get(method, path, "bea", body)[0], 403)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["build.toml", "fig.png", "main.tex"])
+        status, _ = self.review("bea", {"op": "comment", "path": "build.toml", "text": "x",
+                                        "anchor": {"from": 0, "to": 0, "quote": "", "prefix": "", "suffix": ""}})
+        self.assertEqual(status, 403)  # build configuration stays the owner's, for comments too
+        self.assertEqual(serve.ai_info("review")["enabled"], False)
+        self.assertFalse(serve.zotero_info("review")["can_sync"])
+
+    def test_reviewers_see_live_edits_but_cannot_push_their_own(self):
+        def send(cid, who, *messages):
+            return self.get("POST", f"/api/send?cid={cid}", who, {"messages": list(messages)})[1]["replies"]
+
+        room = "demo\nmain.tex"
+        send("c-ed", "ed", {"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}})
+        self.assertEqual(send("c-ed", "ed", {"type": "y-update", "data": {"room": room, "u": "EDIT1"}}), [])
+        (joined,) = send("c-bea", "bea", {"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 2,
+                                                                       "epoch": "made-up"}})
+        self.assertEqual((joined["type"], joined["data"]["updates"]), ("y-state", ["EDIT1"]))
+        self.assertNotEqual(joined["data"]["epoch"], "made-up")  # no lineage claims either
+        self.assertEqual(joined["data"]["leader"], "c-ed")
+        replies = send("c-bea", "bea", {"type": "y-update", "data": {"room": room, "u": "BEA1"}},
+                       {"type": "restore-done", "data": {"doc": "demo", "path": "main.tex", "token": "t"}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "build.toml", "aid": 2}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "new.tex", "aid": 2}})
+        self.assertEqual([r["data"]["status"] for r in replies], [403, 403, 403, 404])
+        self.assertEqual(serve.ROOMS[room]["log"], ["EDIT1"])
+        send("c-ed", "ed", {"type": "y-update", "data": {"room": room, "u": "EDIT2"}})
+        seen = serve.visible(serve.BUS.since(0), "review")
+        self.assertIn("EDIT2", [m["data"].get("u") for m in seen if m["type"] == "y-update"])
+        send("c-bea", "bea", {"type": "hello", "data": {"name": "x", "doc": "demo", "path": "main.tex"}})
+        users = {u["name"]: u["role"] for u in serve.presence("review")["users"]}
+        self.assertEqual(users["Bea"], "review")
+        serve.client_gone("c-ed")
+        self.assertIsNone(serve.ROOMS[room]["leader"])  # a reviewer never leads (and so never saves) a room
+
+    def test_hosted_reviewers_are_the_review_role(self):
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable(self.SECRET, "demo")
+        self.assertEqual(self.as_("review", "GET", "/api/config")[1]["role"], "review")
+        self.assertEqual(self.as_("review", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 403)
+        self.assertEqual(self.as_("review", "POST", "/rebuild?doc=demo")[0], 403)
+        status, made = self.as_("review", "POST", "/api/review?doc=demo",
+                                {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "hi"})
+        self.assertEqual(status, 200)
+        accept = {"op": "accept", "ids": [made["item"]["id"]]}
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", accept)[0], 403)
+        withdraw = {"op": "reject", "ids": [made["item"]["id"]]}
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", withdraw, user="8;Bob")[0], 403)
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", withdraw)[0], 200)
+        clean = {"X-Host-Admin": "1"}
+        self.assertEqual(self.as_("review", "POST", "/api/history/clean?doc=demo", {}, headers=clean)[0], 403)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,8 @@ let view;
 
 // ---- who am I, what may I do ---------------------------------------------------------------------
 const config = await api.config().catch(() => ({ role: "owner" }));
-const role = config.role, readOnly = role === "view";
+// A reviewer (role "review") cannot change anything either (readOnly), but comments and types in suggest mode, locked on.
+const role = config.role, reviewer = role === "review", readOnly = role === "view" || reviewer;
 const me = store.json("user", null) || (() => { const u = { name: "Guest " + (100 + Math.floor(Math.random() * 900)), color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }; store.set("user", u); return u; })();
 if (!me.key) { me.key = Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join(""); store.set("user", me); }   // marks your own review comments on link shares
 if (config.name) me.name = config.name;   // a named link or an account: the server's name is the one others see
@@ -70,7 +71,7 @@ const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLin
 const GR = grammarSupport(S, V);
 // Review comments and suggest mode (review.js); the panel lives in the drawer's Review tab.
 const REV = reviewSupport(S, V, {
-  api, el, icon, canEdit: !readOnly, doc: () => cur, me: () => me, view: () => view,
+  api, el, icon, canEdit: !readOnly || reviewer, reviewer, doc: () => cur, me: () => me, view: () => view,
   activePath: () => (active?.kind === "text" ? active.path : null), openFile: (p, line, opts) => openFile(p, line, opts),
   showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
@@ -80,7 +81,7 @@ const REV = reviewSupport(S, V, {
 });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
 function toggleSuggest() {
-  if (readOnly) return;
+  if (readOnly && !reviewer) return;
   REV.setSuggest(!REV.suggesting);
   $("suggestBtn").setAttribute("aria-checked", String(REV.suggesting));
   $("cm").classList.toggle("suggesting", REV.suggesting);
@@ -108,7 +109,7 @@ function extensionsFor(tab) {
     keysC.of([]),
     lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
     room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
-    readOnly ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
+    readOnly && !reviewer ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
     readOnly ? [] : EditorView.domEventHandlers({
       paste: (e, v) => dropImages(e.clipboardData?.files, e, v.state.selection.main.head),
       drop: (e, v) => dropImages(e.dataTransfer?.files, e, v.posAtCoords({ x: e.clientX, y: e.clientY }) ?? v.state.selection.main.head),
@@ -392,7 +393,7 @@ function scheduleAutosave() {
 }
 
 async function saveTab(tab, opts) {
-  if (!tab || tab.kind !== "text" || tab.saving) return;
+  if (!tab || tab.kind !== "text" || tab.saving || readOnly) return;
   if (tab.collab) return tab.collab.save(opts);
   clearTimeout(autosaveTimer);
   if (imeHold && tab === active) { scheduleAutosave(); return; }   // text being composed in suggest mode is not saved
@@ -1200,7 +1201,7 @@ const COMMANDS = [
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "grammar", title: "Show grammar findings", run: () => setDrawer(true, "grammar") },
-  { id: "comment", edit: true, title: "Comment on the selection", keys: `${mod}+Alt+M`, run: () => REV.startComment() },
+  { id: "comment", edit: !reviewer, title: "Comment on the selection", keys: `${mod}+Alt+M`, run: () => REV.startComment() },
   { id: "suggest", edit: true, title: "Toggle suggest mode (track changes)", keys: `${mod}+Alt+S`, run: () => toggleSuggest() },
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
@@ -1296,7 +1297,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? [] : ["comment", "suggest"]), "review", "history"]],
+  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history"]],
     ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
@@ -1337,7 +1338,7 @@ document.addEventListener("keydown", (e) => {
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
   else if (m && e.altKey && k === "v") { e.preventDefault(); setVisual(!settings.visual); }
   else if (m && e.altKey && k === "p") { e.preventDefault(); setProse(!ui.prose); }
-  else if (m && e.altKey && k === "m" && !readOnly) { e.preventDefault(); REV.startComment(); }
+  else if (m && e.altKey && k === "m" && (!readOnly || reviewer)) { e.preventDefault(); REV.startComment(); }
   else if (m && e.altKey && k === "s" && !readOnly) { e.preventDefault(); toggleSuggest(); }
   else if (m && k === ",") { e.preventDefault(); openSettings(); }
   else if (m && k === "enter" && active?.kind === "text") { e.preventDefault(); toCursor(); }
@@ -1348,7 +1349,7 @@ document.addEventListener("keydown", (e) => {
 
 // ---- people and sharing ---------------------------------------------------------------------------------
 const avatar = (u) => { const a = el("span", { className: "av", textContent: (u.name || "?").trim().slice(0, 1).toUpperCase(), title: u.name }); a.style.background = u.color; return a; };
-const roleLabel = (r) => ({ owner: "host", edit: "can edit", view: "view only" }[r] || r);
+const roleLabel = (r) => ({ owner: "host", edit: "can edit", review: "reviewer", view: "view only" }[r] || r);
 function renderUsers(users) {
   const everyone = users || [], others = everyone.filter((u) => u.cid !== channel.cid);
   $("usersWrap").hidden = everyone.length < 2;
@@ -1427,8 +1428,9 @@ else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSh
 if (role !== "owner") {
   const chip = $("roleChip");
   chip.hidden = false; chip.className = "role " + role;
-  chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: (readOnly ? "View only" : "Can edit") + (config.name && !config.hosted ? ` as ${config.name}` : "") }));
-  chip.title = config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
+  chip.replaceChildren(icon(reviewer ? "comment" : readOnly ? "eye" : "share"), el("span", { textContent: (reviewer ? "Reviewer" : readOnly ? "View only" : "Can edit") + (config.name && !config.hosted ? ` as ${config.name}` : "") }));
+  chip.title = reviewer ? "You are a reviewer: you can comment, and what you type becomes suggestions that editors accept or reject. You cannot change the text directly."
+    : config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
     : readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
   chip.tabIndex = 0;
 }
@@ -1437,8 +1439,12 @@ if (config.hosted) {   // Behind scripts/host.py the editor lives at /p/<id>/: t
   home.setAttribute("aria-label", "All projects");
   home.append(...logo.childNodes); logo.replaceWith(home);
 }
+if (reviewer) {   // Suggest mode on for good: the server refuses a reviewer's edits to the text and its saves anyway.
+  toggleSuggest();
+  $("suggestBtn").disabled = true; $("suggestBtn").title = "Reviewers always suggest: what you type becomes a suggestion";
+}
 if (readOnly) {
-  $("commentBtn").hidden = $("suggestBtn").hidden = true;   // Comments and suggestions need the edit role; the Review tab still lists them.
+  if (!reviewer) $("commentBtn").hidden = $("suggestBtn").hidden = true;   // Comments and suggestions need the edit or review role; the Review tab still lists them.
   for (const [id, why] of [["rebuildBtn", "Only people with the edit link can rebuild"], ["proseBtn", "Paragraph editing needs the edit link"]]) {
     $(id).disabled = true; $(id).title = why;
   }

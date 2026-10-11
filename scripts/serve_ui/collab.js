@@ -88,7 +88,7 @@ export class Room {
     this.collab = collab; this.doc = doc; this.path = path; this.rid = `${doc}\n${path}`;
     this.epoch = null; this.leader = null; this.ready = false; this.buffer = [];
     this.version = null; this.eol = "\n"; this.savedText = null; this.saving = false; this.error = null;
-    this.canEdit = collab.role !== "view";
+    this.canEdit = collab.role !== "view" && collab.role !== "review";   // the server refuses their updates too (on_update)
     this.fresh();
   }
 

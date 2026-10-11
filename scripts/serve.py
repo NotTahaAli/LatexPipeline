@@ -1569,7 +1569,8 @@ def zotero_info(role: str) -> dict:
         return {**info, "local_ok": not SHARE["on"], "can_sync": True, "can_configure": True, "sandboxed": sandboxed}
     allowed = role == "edit" and info["share_editors"] and sandboxed and info["configured"]
     return {"guest": True, "can_sync": allowed, "configured": allowed, "mode": info["mode"], "local_ok": False,
-            "reason": None if allowed else "View-only links cannot sync." if role != "edit"
+            "reason": None if allowed else "View-only links cannot sync." if role == "view"
+            else "Reviewers cannot sync from Zotero." if role != "edit"
             else "Zotero sync for shared links needs sandboxed builds." if info["share_editors"] and not sandboxed
             else "The owner has not let shared editors sync from Zotero."}
 
@@ -1633,6 +1634,7 @@ def ai_info(role: str = "owner") -> dict:
     allowed = on and (role == "owner" or (role == "edit" and share))
     info = {"enabled": allowed, "model": saved["model"], "notice": ai.NOTICE,
             "reason": None if allowed else "View-only links cannot use the assistant." if role == "view"
+            else "Reviewers cannot use the assistant." if role == "review"
             else "The owner has not allowed the assistant for shared links." if on
             else "The AI assistant is off. The owner can turn it on in the Assistant panel."}
     if role == "owner":
@@ -1808,12 +1810,12 @@ SHARE: dict = {
 # the resolved path of its main.tex (link_root). Read through named.current(), which follows the file, so a revoke
 # made by another serve.py of this user holds here too.
 SHARE_LOCK = threading.Lock()
-ROLES = ("owner", "edit", "view")
+ROLES = ("owner", "edit", "review", "view")  # review: comments and suggestions only, no direct edits
 # --gateway (scripts/host.py): one worker per project, reached only through the gateway, which authenticates the
 # user and says who they are in X-Host-* headers signed with a per-worker secret. Every request is a shared
-# non-owner (edit or view): cookies, share tokens and owner features do not exist here.
+# non-owner (edit, review or view): cookies, share tokens and owner features do not exist here.
 GATEWAY: dict = {"secret": b""}
-GATEWAY_ROLES = ("edit", "view")
+GATEWAY_ROLES = ("edit", "review", "view")
 SHELL_TOKENS = ("shell-escape", "enable-write18", "shell-restricted")
 COMMAND_KEYS = {
     "pdflatex", "xelatex", "lualatex", "latex", "bibtex", "biber", "makeindex", "makeglossaries", "dvips", "dvipdf",
@@ -2397,7 +2399,7 @@ def check_room(doc, path, role: str) -> tuple[str, Path]:
     if not isinstance(path, str) or file_kind(path) != "text":
         raise ApiError("Not a text file.", 415)
     target = resolve_in_doc(DOCS[doc].parent, path)
-    if role == "view" and not target.is_file():
+    if role in ("view", "review") and not target.is_file():
         raise ApiError("No such file.", 404)
     return room_id(doc, path), target
 
@@ -2429,7 +2431,7 @@ def on_join(message: dict, client: str, role: str) -> dict:
     except ApiError as exc:
         return reply_error(exc)
     seen = data.get("epoch") if isinstance(data.get("epoch"), str) else None
-    epoch = seen if role != "view" else None
+    epoch = seen if role in ("owner", "edit") else None
     with COLLAB_LOCK:
         room = ROOMS.get(rid)
         conflict = False
@@ -2476,8 +2478,9 @@ def on_join(message: dict, client: str, role: str) -> dict:
 def on_update(message: dict, client: str, role: str) -> dict | None:
     data = message.get("data") or {}
     rid, update = data.get("room"), data.get("u")
-    if role == "view":
-        return reply_error(ApiError("This link is view-only.", 403))
+    if role not in ("owner", "edit"):  # a reviewer's typing becomes suggestions (POST /api/review), never text
+        why = "A review link cannot change the text." if role == "review" else "This link is view-only."
+        return reply_error(ApiError(why, 403))
     if not isinstance(update, str) or len(update) > MAX_UPDATE:
         return reply_error(ApiError("Bad update.", 413))
     if role != "owner":
@@ -2638,7 +2641,7 @@ HANDLERS.update({
 # References panel's edits. The bus only says "something changed in <doc>" ("history", "review"); clients refetch.
 
 HISTORY: dict = {"dir": None}  # None: .latex-history beside build.CACHE_DIR
-ROLE_NAMES = {"owner": "Owner", "edit": "Editor", "view": "Viewer"}
+ROLE_NAMES = {"owner": "Owner", "edit": "Editor", "review": "Reviewer", "view": "Viewer"}
 HISTORY_LIMIT = (20, 60.0)  # labels and restores a shared role may make per window
 REVIEW_LIMIT = (120, 60.0)  # comments, suggestions and decisions per window
 HISTORY_READ_LIMIT = (120, 60.0)  # history lists, versions and diffs a shared role may read per window
@@ -3015,7 +3018,7 @@ def on_restore_done(message: dict, client: str, role: str) -> dict | None:
     """Bus message "restore-done" {doc, path, token}: the claimer's edit went into the room (sent after it)."""
     data = message.get("data") or {}
     doc, path, token = data.get("doc"), data.get("path"), data.get("token")
-    if role == "view" or doc not in DOCS or (role != "owner" and doc != SHARE["doc"]):
+    if role not in ("owner", "edit") or doc not in DOCS or (role != "owner" and doc != SHARE["doc"]):
         return reply_error(ApiError("Not allowed.", 403))
     if not isinstance(path, str) or not isinstance(token, str):
         return reply_error(ApiError("Bad message.", 400))
@@ -3157,9 +3160,25 @@ def review_list(name: str, role: str, user: str | None, key) -> dict:
             "moderator": role == "owner"}
 
 
+# What the review role may do: comment, reply, resolve, delete its own comments, suggest, withdraw its own
+# suggestions (reject them). Accepting, releasing and re-anchoring follow edits to the text: the edit role's.
+REVIEWER_OPS = ("comment", "reply", "resolve", "delete", "suggest", "reject")
+
+
 def review_change(name: str, role: str, user: str | None, data: dict) -> dict:
     who = reviewer(role, user, data)
     op = data.get("op")
+    if role == "review":
+        if op not in REVIEWER_OPS:
+            raise ApiError("Reviewers can comment and suggest; accepting suggestions needs the edit role.", 403)
+        if op == "reject":
+            try:
+                mine = {s.get("id") for s in review_store(name).load()["suggestions"] if s.get("author") == who["key"]}
+            except review.ReviewError as exc:
+                raise ApiError(str(exc), exc.status)
+            ids = data.get("ids")
+            if not isinstance(ids, list) or not ids or any(i not in mine for i in ids):
+                raise ApiError("Reviewers can withdraw only their own suggestions.", 403)
     if op in ("comment", "suggest"):
         path = data.get("path")
         if not isinstance(path, str) or file_kind(path) != "text":
@@ -3293,6 +3312,11 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
 
     def need_edit() -> None:
         if role != "edit":
+            raise ApiError("A review link cannot change the document." if role == "review"
+                           else "This link is view-only.", 403)
+
+    def need_review() -> None:  # comments and suggestions: the edit and review roles
+        if role not in ("edit", "review"):
             raise ApiError("This link is view-only.", 403)
 
     if method == "GET":
@@ -3386,10 +3410,15 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)
         if not rate_ok(path, *REVIEW_LIMIT):
             raise ApiError("Too many changes; wait a moment.", 429)
-    elif method == "POST" and path in ("/api/history/label", "/api/history/restore", "/api/review"):
-        need_edit()  # Viewers browse history and read comments (READ_API); changing either needs the edit role.
+    elif method == "POST" and path == "/api/review":
+        need_review()  # Viewers read comments (READ_API); review_change keeps reviewers to their own part.
         scoped(doc)
-        if not rate_ok(path, *(REVIEW_LIMIT if path == "/api/review" else HISTORY_LIMIT)):
+        if not rate_ok(path, *REVIEW_LIMIT):
+            raise ApiError("Too many changes; wait a moment.", 429)
+    elif method == "POST" and path in ("/api/history/label", "/api/history/restore"):
+        need_edit()  # Viewers browse history (READ_API); changing it needs the edit role.
+        scoped(doc)
+        if not rate_ok(path, *HISTORY_LIMIT):
             raise ApiError("Too many changes; wait a moment.", 429)
     elif method == "POST" and path == "/api/preview":
         need_edit()  # Runs LaTeX on text the client sends, like a save and a chapter preview together.

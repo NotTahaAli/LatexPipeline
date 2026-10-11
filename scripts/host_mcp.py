@@ -593,7 +593,7 @@ class Hosted:
                                     f'error_description="This needs the {scope} permission"'}
 
     def projects(self) -> dict:
-        """project id -> (project, effective role edit/view): granted, and reachable with the person's role now."""
+        """project id -> (project, worker role edit/review/view): granted, and reachable with the person's role now."""
         tenants, projects = json.loads(self.grant["tenants"]), json.loads(self.grant["projects"])
         marks = ",".join("?" * len(tenants)) or "NULL"
         rows = H.APP.db.all(f"SELECT id FROM projects WHERE tenant_id IN ({marks}) ORDER BY name", *tenants)
@@ -601,11 +601,12 @@ class Hosted:
         for pid in [r["id"] for r in rows] + projects:
             access = H.project_access(H.APP, self.user, pid)
             if access:
-                found[pid] = (access[0], "edit" if access[1] in H.EDIT_ROLES else "view")
+                found[pid] = (access[0], H.worker_role(access[1]))
         return found
 
     def access(self, role: str) -> list[str]:
-        return ["read"] + [s for s in ("write", "review") if s in self.scopes and role == "edit"]
+        return ["read"] + [s for s in ("write", "review") if s in self.scopes
+                           and (role == "edit" or (role == "review" and s == "review"))]
 
     def call(self, name: str, args: dict) -> dict:
         reachable = self.projects()
@@ -651,12 +652,15 @@ class Hosted:
                                       "can use.")
         project, role = reachable[pid]
         if name in WRITE_TOOLS:
-            if role != "edit":
+            if role == "review" and mcp_tools.TOOL_BY_NAME[name]["_scope"] != "review":
+                raise mcp_tools.ToolError("Your role in this workspace is reviewer: you can comment and suggest, but "
+                                          "not change it.")
+            if role not in ("edit", "review"):
                 raise mcp_tools.ToolError("Your role in this workspace is viewer: you can read but not change it.")
             H.audit_log(H.APP, "mcp_tool", self.user["id"], self.h.ip, project["tenant_id"],
                         f"{self.grant['client_name']}: {name} {pid}")
         remote = self.zotero_library() if name in ("zotero_sync_preview", "zotero_apply") else None
-        return self.worker(project, "edit" if name in WRITE_TOOLS else "view", name, args, remote)
+        return self.worker(project, role if name in WRITE_TOOLS else "view", name, args, remote)
 
     def zotero_library(self) -> str:
         """The person's own Zotero library (their key from the Account page, never sent on), fetched like the

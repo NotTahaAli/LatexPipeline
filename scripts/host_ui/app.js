@@ -86,7 +86,7 @@ function page(opts, ...all) {
 }
 
 const when = (t) => new Date(t * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
-const roleName = { admin: "Admin", editor: "Editor", viewer: "Viewer" };
+const roleName = { admin: "Admin", editor: "Editor", reviewer: "Reviewer", viewer: "Viewer" };
 const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
 const params = () => new URLSearchParams(location.hash.slice(1));
 
@@ -218,7 +218,7 @@ async function homePage() {
 
 async function tenantCard(tid) {
   const t = await api(`/api/tenants/${tid}`);
-  const canEdit = t.role !== "viewer";
+  const canEdit = t.role === "admin" || t.role === "editor";
   const box = msgBox();
   const refresh = async () => card.replaceWith(await tenantCard(tid));
   const projects = t.projects.map((p) => el("article", { className: "card project", ariaLabel: p.name },
@@ -268,7 +268,7 @@ async function tenantPage(tid) {
   const box = msgBox();
   const reload = () => tenantPage(tid);
   const roleSelect = (m) => {
-    const s = el("select", { ariaLabel: `Role of ${m.name}` }, ["admin", "editor", "viewer"].map((r) => el("option", { value: r, textContent: roleName[r], selected: r === m.role })));
+    const s = el("select", { ariaLabel: `Role of ${m.name}` }, ["admin", "editor", "reviewer", "viewer"].map((r) => el("option", { value: r, textContent: roleName[r], selected: r === m.role })));
     s.onchange = async () => { try { await api(`/api/tenants/${tid}/members/${m.id}`, "POST", { role: s.value }); announce(`${m.name} is now ${s.value}.`); } catch (err) { show(box, err.message); s.value = m.role; } };
     return s;
   };
@@ -283,10 +283,10 @@ async function tenantPage(tid) {
       }, "btn ghost danger", { ariaLabel: `Remove ${m.name}` })))),
       t.members.length ? null : el("tr", {}, el("td", { colSpan: 3, className: "empty", textContent: "No members yet. Invite people with a link." })))));
   const linkOut = el("div", { hidden: true });
-  const roleHelp = { editor: "edit and build", viewer: "read only", admin: "manage members" };
+  const roleHelp = { editor: "edit and build", reviewer: "comment and suggest", viewer: "read only", admin: "manage members" };
   const invite = form([
     field("Email (optional)", input("email", "email"), "Only this address can use the link."),
-    field("Role", el("select", { name: "role" }, ["editor", "viewer", "admin"].map((r) => el("option", { value: r, textContent: `${roleName[r]} \u2014 ${roleHelp[r]}` })))),
+    field("Role", el("select", { name: "role" }, ["editor", "reviewer", "viewer", "admin"].map((r) => el("option", { value: r, textContent: `${roleName[r]} \u2014 ${roleHelp[r]}` })))),
   ], "Create invite link", async (v) => {
     const r = await api(`/api/tenants/${tid}/invites`, "POST", { role: v.role, email: v.email || undefined });
     const out = input("link", "text", { readOnly: true, value: r.link, ariaLabel: "Invite link" });
@@ -421,7 +421,8 @@ async function consentPage(id) {
       all.onchange = () => { for (const b of kids.map((li) => li.querySelector("input"))) { b.disabled = all.checked; if (all.checked) b.checked = true; } };
       return el("div", { className: "consent-ws" }, el("label", { className: "check" }, all,
         el("span", {}, el("b", { textContent: ws.name }), " · all its projects, also new ones",
-          ws.role === "viewer" ? el("span", { className: "tag warn", textContent: "Viewer: read only" }) : null)),
+          ws.role === "viewer" ? el("span", { className: "tag warn", textContent: "Viewer: read only" })
+            : ws.role === "reviewer" ? el("span", { className: "tag warn", textContent: "Reviewer: comments and suggestions only" }) : null)),
         kids.length ? el("ul", { className: "consent-projects" }, kids) : el("p", { className: "hint", textContent: "No projects yet." }));
     }) : el("p", { className: "empty", textContent: "You are not a member of any workspace yet." }));
   const decide = async (allow) => {
