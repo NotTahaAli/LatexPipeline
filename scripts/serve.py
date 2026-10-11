@@ -2634,7 +2634,18 @@ MAX_CLEAN_DAYS = 36500
 
 def history_folder(name: str) -> Path:
     key = build.cache_dir_for(DOCS[name]).name  # the build cache's key, so bench/x, files/x and /elsewhere/x stay apart
-    return Path(HISTORY["dir"] or build.CACHE_DIR.parent / ".latex-history") / key
+    base = Path(HISTORY["dir"] or build.CACHE_DIR.parent / ".latex-history")
+    folder = base / key
+    # Sources outside the repository used to keep their history in <base>/<escaped name>, shared with
+    # files/<name>. Adopt it once, unless a files/ document of that name may own it.
+    old = base / build.escape_name(name)
+    if (key.startswith("_x") and name != "." and not folder.exists() and old.is_dir()
+            and not (build.FILES_DIR / name / "main.tex").exists()):
+        try:
+            os.replace(old, folder)
+        except OSError:
+            pass
+    return folder
 
 
 def store_allows(size: int) -> bool:

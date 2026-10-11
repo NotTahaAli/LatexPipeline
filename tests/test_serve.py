@@ -240,10 +240,34 @@ class Outline(TempDoc):
         self.assertIn("l.3 \\foo", out)
 
 
-@unittest.skipUnless(shutil.which("pdflatex") and shutil.which("synctex"), "needs pdflatex and synctex")
 class OutsideSource(TempDoc):
     """--source outside the repository: the cache (SyncTeX data) is keyed by the source's path."""
 
+    def test_history_from_before_the_path_key_is_adopted_unless_files_has_that_document(self):
+        main = self.write("main.tex", "x").resolve()
+        with tempfile.TemporaryDirectory() as repo:
+            repo = Path(repo).resolve()
+            history = repo / ".latex-history"
+            with mock.patch.object(build, "ROOT_DIR", repo), \
+                    mock.patch.object(build, "CACHE_DIR", repo / ".latex-cache"), \
+                    mock.patch.object(build, "FILES_DIR", repo / "files"), \
+                    mock.patch.object(build, "SOURCE_DIR", self.base.resolve()), \
+                    mock.patch.dict(serve.HISTORY, {"dir": None}), \
+                    mock.patch.dict(serve.DOCS, {"doc": main}, clear=True):
+                (repo / "files" / "doc").mkdir(parents=True)
+                (repo / "files" / "doc" / "main.tex").write_text("x")
+                (history / "doc").mkdir(parents=True)
+                (history / "doc" / "index.sqlite3").write_text("old")
+                folder = serve.history_folder("doc")
+                self.assertTrue(folder.name.startswith("_x"))
+                self.assertFalse(folder.exists())  # files/doc may own .latex-history/doc: left alone
+                self.assertTrue((history / "doc").is_dir())
+                (repo / "files" / "doc" / "main.tex").unlink()
+                self.assertEqual(serve.history_folder("doc"), folder)
+                self.assertEqual((folder / "index.sqlite3").read_text(), "old")
+                self.assertFalse((history / "doc").exists())
+
+    @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("synctex"), "needs pdflatex and synctex")
     def test_forward_search_finds_the_line(self):
         self.write("main.tex", "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n")
         main = (self.root / "main.tex").resolve()

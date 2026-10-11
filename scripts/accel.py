@@ -135,8 +135,10 @@ FIGURE_DEPS = {".cls", ".sty", ".def", ".cfg", ".clo", ".pgf", ".tikz", ".csv", 
 NOSKIP = r"\expandafter\def\csname pgfx@noskip\endcsname{}"
 # Code that loads or draws with TikZ (checked with comments removed); a word in the text is not enough.
 TIKZ_WORDS = re.compile(
-    r"\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{[^}]*(?:tikz|pgfplots)"
-    r"|\\use(?:tikz|pgfplots)library|\\begin\s*\{tikzpicture\}"
+    r"\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{[^}]*(?:tikz|pgfplots"
+    # Packages that load TikZ under another name.
+    r"|(?<![\w-])(?:pgf|forest|pgfgantt|chemfig|smartdiagram|tkz-[\w-]+)(?![\w-]))"
+    r"|\\documentclass\s*\[[^\]]*tikz|\\use(?:tikz|pgfplots)library|\\begin\s*\{tikzpicture\}|\\tikz(?![a-zA-Z@])"
 )
 # The part of a .tex file that can change a figure: its tikzpicture environments and
 # every other line that mentions tikz, pgf or axis (\tikzset, \pgfplotsset, \tikz ...;).

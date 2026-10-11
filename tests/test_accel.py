@@ -105,11 +105,14 @@ class TikzDetectionTests(unittest.TestCase):
             self.assertTrue(accel.uses_tikz(root))
 
     def test_words_and_comments_do_not_count_only_code_that_loads_or_draws(self):
-        for text in ("Text that names pgfplots and tikz.", "% \\usepackage{tikz}", "\\verb|x| 50\\% tikz"):
+        for text in ("Text that names pgfplots and tikz.", "% \\usepackage{tikz}", "\\verb|x| 50\\% tikz",
+                     "\\usepackage{pgfopts}", "\\documentclass[a4paper]{article}"):
             self.assertFalse(accel.TIKZ_WORDS.search(accel.COMMENT.sub("", text)), text)
         for text in ("\\usepackage{tikz}", "\\usepackage[compat=1.18]{amsmath, pgfplots}", "\\usepackage{tikz-cd}",
                      "\\RequirePackage{circuitikz}", "\\usetikzlibrary{arrows}", "\\usepgfplotslibrary{fillbetween}",
-                     "\\begin{tikzpicture}"):
+                     "\\begin{tikzpicture}", "\\documentclass[tikz,border=2pt]{standalone}", "\\usepackage{pgf}",
+                     "\\tikz \\draw (0,0) -- (1,1);", "\\usepackage{forest}", "\\usepackage{amsmath,tkz-euclide}",
+                     "\\usepackage{chemfig}", "\\usepackage{pgfgantt}", "\\usepackage{smartdiagram}"):
             self.assertTrue(accel.TIKZ_WORDS.search(accel.COMMENT.sub("", text)), text)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

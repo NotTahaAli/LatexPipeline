@@ -171,6 +171,21 @@ def escape_name(text: str) -> str:
     )
 
 
+def path_key(path: Path) -> str:
+    """
+    The resolved path, casefolded on a case-insensitive file system (macOS, Windows), so
+    `--source ~/Thesis` and `--source ~/thesis` give one cache and history key there.
+    """
+    text = str(path.resolve())
+    flipped = text.swapcase()
+    try:
+        if flipped != text and os.path.samefile(text, flipped):
+            return text.casefold()
+    except OSError:  # the other casing does not exist: a case-sensitive file system
+        pass
+    return text
+
+
 def cache_dir_for(main_tex: Path) -> Path:
     """
     One flat directory per document, so no document's cache lies inside
@@ -186,7 +201,7 @@ def cache_dir_for(main_tex: Path) -> Path:
         except ValueError:
             # A --source outside the repository: keyed by its resolved path. "_x" never comes out of
             # escape_name ("_" is always followed by two hex digits), so no in-repo name collides.
-            digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+            digest = hashlib.sha256(path_key(root).encode()).hexdigest()[:16]
             return CACHE_DIR / (f"_x{digest}" + ("" if name == "." else "_2F" + escape_name(name)))
         name = prefix if name == "." else f"{prefix}/{name}"
     return CACHE_DIR / ("_root" if name == "." else escape_name(name))
@@ -1947,7 +1962,9 @@ def main() -> int:
 
     documents = select_documents(documents, args.docs)
 
-    if args.changed_since:
+    if args.changed_since and ROOT_DIR not in SOURCE_DIR.parents and SOURCE_DIR != ROOT_DIR:
+        info(f"--changed-since ignored: {display(SOURCE_DIR)} is outside the repository, so git cannot diff it.")
+    elif args.changed_since:
         documents = filter_changed(documents, args.changed_since)
 
         if not documents:

@@ -523,6 +523,32 @@ class SourceDirTests(unittest.TestCase):
         self.assertEqual(build.cache_dir_for(self.bench_doc), self.root / ".latex-cache" / "bench_2Fshared")
         self.assertEqual(build.cache_dir_for(self.files_doc), self.root / ".latex-cache" / "shared")
 
+    def test_outside_cache_key_ignores_casing_only_where_the_file_system_does(self):
+        upper, lower = Path("/elsewhere/Thesis/a/main.tex"), Path("/elsewhere/thesis/a/main.tex")
+
+        def key(main):
+            with mock.patch.object(build, "SOURCE_DIR", main.parent.parent):
+                return build.cache_dir_for(main)
+
+        with mock.patch.object(build.os.path, "samefile", return_value=True):  # case-insensitive (macOS, Windows)
+            self.assertEqual(key(upper), key(lower))
+        with mock.patch.object(build.os.path, "samefile", side_effect=FileNotFoundError):  # case-sensitive
+            self.assertNotEqual(key(upper), key(lower))
+
+    def test_changed_since_is_ignored_for_a_source_outside_the_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp).resolve()
+            (outside / "a").mkdir()
+            (outside / "a" / "main.tex").write_text("x", encoding="utf-8")
+            argv = ["build.py", "--source", str(outside), "--changed-since", "HEAD", "--list"]
+            out = io.StringIO()
+            with mock.patch.object(build.sys, "argv", argv), mock.patch.object(build, "SOURCE_DIR", build.SOURCE_DIR), \
+                    mock.patch.object(build, "filter_changed") as filtered, contextlib.redirect_stdout(out):
+                self.assertEqual(build.main(), 0)
+            filtered.assert_not_called()
+            self.assertIn("--changed-since ignored", out.getvalue())
+            self.assertIn("a/main.tex", out.getvalue())
+
     def test_prune_keeps_outputs_of_every_known_source(self):
         out = self.root / "out"
         out.mkdir()
