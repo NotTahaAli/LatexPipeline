@@ -34,9 +34,11 @@ INJECT = r"""\makeatletter
 % reads the whole document), with it 1 to 6 s.
 \def\pgfx@skipinput{\@ifnextchar\bgroup\@gobble\@gobble}
 \def\pgfx@skip{\global\let\input\pgfx@skipinput\global\let\include\@gobble}
-\AddToHook{begindocument/end}{\ifcsname pgf@externalend\endcsname\ifpgf@external@grabshipout
-\ifcsname pgfx@noskip\endcsname\else
-\let\pgfx@end\pgf@externalend\def\pgf@externalend{\pgfx@end\pgfx@skip}\fi\fi\fi}
+% \pgfx@hook holds \ifpgf@external@grabshipout, which is undefined without TikZ: written
+% straight into a skipped branch it would not count as an \if, and its \fi would be extra.
+\def\pgfx@hook{\ifpgf@external@grabshipout\ifcsname pgfx@noskip\endcsname\else
+\let\pgfx@end\pgf@externalend\def\pgf@externalend{\pgfx@end\pgfx@skip}\fi\fi}
+\AddToHook{begindocument/end}{\ifcsname pgf@externalend\endcsname\expandafter\pgfx@hook\fi}
 \makeatother
 """
 
@@ -131,7 +133,11 @@ DRAFT = {"pdflatex": "-draftmode", "lualatex": "--draftmode", "xelatex": "-no-pd
 # Files that change what a figure looks like without changing its source text.
 FIGURE_DEPS = {".cls", ".sty", ".def", ".cfg", ".clo", ".pgf", ".tikz", ".csv", ".dat", ".tsv", ".table"}
 NOSKIP = r"\expandafter\def\csname pgfx@noskip\endcsname{}"
-TIKZ_WORDS = re.compile(r"tikz|pgfplots")
+# Code that loads or draws with TikZ (checked with comments removed); a word in the text is not enough.
+TIKZ_WORDS = re.compile(
+    r"\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{[^}]*(?:tikz|pgfplots)"
+    r"|\\use(?:tikz|pgfplots)library|\\begin\s*\{tikzpicture\}"
+)
 # The part of a .tex file that can change a figure: its tikzpicture environments and
 # every other line that mentions tikz, pgf or axis (\tikzset, \pgfplotsset, \tikz ...;).
 FIGURE_TEXT = re.compile(r"(?s:\\begin\{tikzpicture\}.*?\\end\{tikzpicture\})|^.*(?:tikz|pgf|axis).*$", re.M)
@@ -149,7 +155,8 @@ LOCAL_INPUT = re.compile(r"\\(?:input|InputIfFileExists)\s*\{([^}]+)\}")
 def uses_tikz(doc_dir: Path) -> bool:
     """
     True if the document draws with tikz/pgfplots and every picture can be
-    externalized: any .tex/.cls/.sty file mentions tikz or pgfplots, and none
+    externalized: any .tex/.cls/.sty file loads tikz or pgfplots (or a package named
+    after them), a TikZ library, or has a tikzpicture outside comments, and none
     uses remember picture, overlay or tikzmark.
     """
     found = False
@@ -161,7 +168,7 @@ def uses_tikz(doc_dir: Path) -> bool:
                 continue
             if UNSAFE.search(text):
                 return False
-            found = found or bool(TIKZ_WORDS.search(text))
+            found = found or bool(TIKZ_WORDS.search(COMMENT.sub("", text)))
     return found
 
 

@@ -104,6 +104,18 @@ class TikzDetectionTests(unittest.TestCase):
             (root / "my.cls").write_text(r"\RequirePackage{tikz}", encoding="utf-8")
             self.assertTrue(accel.uses_tikz(root))
 
+    def test_words_and_comments_do_not_count_only_code_that_loads_or_draws(self):
+        for text in ("Text that names pgfplots and tikz.", "% \\usepackage{tikz}", "\\verb|x| 50\\% tikz"):
+            self.assertFalse(accel.TIKZ_WORDS.search(accel.COMMENT.sub("", text)), text)
+        for text in ("\\usepackage{tikz}", "\\usepackage[compat=1.18]{amsmath, pgfplots}", "\\usepackage{tikz-cd}",
+                     "\\RequirePackage{circuitikz}", "\\usetikzlibrary{arrows}", "\\usepgfplotslibrary{fillbetween}",
+                     "\\begin{tikzpicture}"):
+            self.assertTrue(accel.TIKZ_WORDS.search(accel.COMMENT.sub("", text)), text)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.tex").write_text("A sentence that names pgfplots.\n% \\usepackage{tikz}\n", encoding="utf-8")
+            self.assertFalse(accel.uses_tikz(root))
+
 
 class TouchedTests(unittest.TestCase):
     def test_only_figure_text_counts_as_a_figure_edit(self):
@@ -164,6 +176,19 @@ class ExternalizedBuildTests(unittest.TestCase):
         return subprocess.run(
             ["pdftotext", str(self.build / "main.pdf"), "-"], capture_output=True, text=True,
         ).stdout.split()
+
+    def test_injected_hooks_leave_a_document_without_tikz_alone(self):
+        # The externalization hooks run even when TikZ is not loaded: an undefined \\if in a
+        # skipped branch used to give "Extra \\fi" at \\begin{document}.
+        self.write("main.tex", "\\documentclass{article}\n\\begin{document}\n"
+                   "A sentence that names pgfplots.\n\\end{document}\n")
+        figures = accel.Figures(self.doc / "main.tex", self.build, "pdflatex", False, 2)
+        run = subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", f"-output-directory={self.build}",
+             "-jobname=main", figures.main_pretex + r"\input{main.tex}"],
+            cwd=self.doc, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout[-2000:])
 
     def test_cache_hit_after_reordering_chapters(self):
         self.write("a.tex", pic("AAA"))
