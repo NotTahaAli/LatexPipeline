@@ -1,0 +1,87 @@
+\section{Overview and Motivation (Numerical Methods)}\label{sec:c5s1}
+\lipsum[138-138]
+
+This section builds on the material in \cref{ch:5}, \cref{ch:6} and the prior work of \citet{ch5-4}; see also \citep{ch5-14,ch5-8}.
+
+\begin{equation}\label{eq:c5s1-a}
+  I = \int_{0}^{1}\!\!\int_{0}^{1} \frac{\sin(\pi x)\sin(\pi y)}{1+x^2+y^2}\,\mathrm{d}x\,\mathrm{d}y \approx \frac{1}{M}\sum_{m=1}^{M} h(\xi_m),
+\end{equation}
+with variance decreasing as
+\begin{equation}\label{eq:c5s1-b}
+  \operatorname{Var}\bigl[\hat I_M\bigr] = \frac{1}{M}\Bigl(\int h^2\,\mathrm{d}\mu - I^2\Bigr) = \mathcal{O}(M^{-1}).
+\end{equation}
+
+Equations~\eqref{eq:c5s1-a} and~\eqref{eq:c5s1-b} are used throughout the remainder of this section.
+
+\kant[2-10]
+
+\subsection{Quantitative behaviour}\label{sec:c5s1-q}
+Results are collected in \cref{tab:c5s1} and visualised in \cref{fig:c5s1-f1}. Similar trends were reported in~\citep{ch5-6,ch5-10}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c5s1}.}\label{tab:c5s1}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{70.9} & \SI{5.61}{\milli\second} & \num{4.447e-5} \\
+Beta & \num{70.9} & \SI{4.53}{\milli\second} & \num{8.386e-2} \\
+Gamma & \num{67.1} & \SI{8.61}{\milli\second} & \num{2.016e-1} \\
+Delta & \num{36.8} & \SI{9.37}{\milli\second} & \num{1.091e-5} \\
+Epsilon & \num{15.7} & \SI{5.01}{\milli\second} & \num{8.377e-5} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=9mm and 8mm,>=Stealth,blk/.style={draw,rounded corners,fill=orange!12,minimum width=2.1cm,minimum height=8mm,align=center}]
+\node[blk](a){Data\\acquisition};\node[blk,right=of a](b){Pre-\\processing};\node[blk,right=of b](c){Model\\fitting};\node[blk,right=of c](d){Validation};
+\node[blk,below=of b](e){Feature\\store};\node[blk,below=of c](f){Parameter\\search};
+\draw[->](a)--(b);\draw[->](b)--(c);\draw[->](c)--(d);\draw[->](b)--(e);\draw[->](e)--(f);\draw[->](f)--(c);\draw[->,dashed](d.north)--++(0,.8)-|(a.north);
+\begin{scope}[on background layer]\node[draw,dashed,fit=(a)(b)(c)(d)(e)(f),inner sep=6pt,fill=gray!5]{};\end{scope}
+\end{tikzpicture}
+\caption{Generated figure for \texttt{c5s1-f1} (parameters $a=3$, $b=3$).}\label{fig:c5s1-f1}
+\end{figure}
+
+\kant[3-10]
+
+\subsection{Implementation notes}\label{sec:c5s1-i}
+The core routine is shown in \cref{lst:c5s1}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{ch5-13}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for c5s1.},label={lst:c5s1}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\lipsum[68-68]
+\begin{theorem}\label{thm:c5s1}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c5s1} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.45\linewidth]{diag.png}
+\caption{Raster/vector asset \texttt{diag.png} included from the figures directory.}\label{fig:c5s1-i0}
+\end{figure}
+
+\kant[6-11]

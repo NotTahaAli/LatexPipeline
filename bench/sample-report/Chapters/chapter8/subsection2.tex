@@ -1,0 +1,82 @@
+\section{Mathematical Framework (Results)}\label{sec:c8s2}
+\lipsum[23-23]
+
+This section builds on the material in \cref{sec:c8s1}, \cref{ch:9} and the prior work of \citet{main-22}; see also \citep{main-38,main-37}.
+
+\begin{equation}\label{eq:c8s2-a}
+  I = \int_{0}^{1}\!\!\int_{0}^{1} \frac{\sin(\pi x)\sin(\pi y)}{1+x^2+y^2}\,\mathrm{d}x\,\mathrm{d}y \approx \frac{1}{M}\sum_{m=1}^{M} h(\xi_m),
+\end{equation}
+with variance decreasing as
+\begin{equation}\label{eq:c8s2-b}
+  \operatorname{Var}\bigl[\hat I_M\bigr] = \frac{1}{M}\Bigl(\int h^2\,\mathrm{d}\mu - I^2\Bigr) = \mathcal{O}(M^{-1}).
+\end{equation}
+
+Equations~\eqref{eq:c8s2-a} and~\eqref{eq:c8s2-b} are used throughout the remainder of this section.
+
+\lipsum[91-92]
+
+\subsection{Quantitative behaviour}\label{sec:c8s2-q}
+Results are collected in \cref{tab:c8s2} and visualised in \cref{fig:c8s2-f1}. Similar trends were reported in~\citep{main-10,main-33}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c8s2}.}\label{tab:c8s2}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{65.6} & \SI{4.34}{\milli\second} & \num{4.330e-4} \\
+Beta & \num{48.7} & \SI{6.89}{\milli\second} & \num{4.421e-4} \\
+Gamma & \num{32.1} & \SI{1.98}{\milli\second} & \num{3.732e-4} \\
+Delta & \num{96.8} & \SI{4.96}{\milli\second} & \num{8.046e-2} \\
+Epsilon & \num{49.2} & \SI{0.67}{\milli\second} & \num{4.594e-3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=9mm and 8mm,>=Stealth,blk/.style={draw,rounded corners,fill=teal!12,minimum width=2.1cm,minimum height=8mm,align=center}]
+\node[blk](a){Data\\acquisition};\node[blk,right=of a](b){Pre-\\processing};\node[blk,right=of b](c){Model\\fitting};\node[blk,right=of c](d){Validation};
+\node[blk,below=of b](e){Feature\\store};\node[blk,below=of c](f){Parameter\\search};
+\draw[->](a)--(b);\draw[->](b)--(c);\draw[->](c)--(d);\draw[->](b)--(e);\draw[->](e)--(f);\draw[->](f)--(c);\draw[->,dashed](d.north)--++(0,.8)-|(a.north);
+\begin{scope}[on background layer]\node[draw,dashed,fit=(a)(b)(c)(d)(e)(f),inner sep=6pt,fill=gray!5]{};\end{scope}
+\end{tikzpicture}
+\caption{Generated figure for \texttt{c8s2-f1} (parameters $a=5$, $b=3$).}\label{fig:c8s2-f1}
+\end{figure}
+
+\kant[6-11]
+
+\subsection{Implementation notes}\label{sec:c8s2-i}
+The core routine is shown in \cref{lst:c8s2}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{main-1}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c8s2.},label={lst:c8s2}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\kant[5-12]
+\begin{theorem}\label{thm:c8s2}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c8s2} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.45\linewidth]{rings.png}
+\caption{Raster/vector asset \texttt{rings.png} included from the figures directory.}\label{fig:c8s2-i0}
+\end{figure}
+
+\lipsum[21-21]

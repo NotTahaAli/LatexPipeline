@@ -1,0 +1,71 @@
+\section{Analysis and Validation (Experimental Setup)}\label{sec:c7s3}
+\kant[8-10]
+
+This section builds on the material in \cref{sec:c7s2}, \cref{ch:8} and the prior work of \citet{main-34}; see also \citep{main-14,main-5}.
+
+\begin{equation}\label{eq:c7s3-a}
+  \hat{\theta} = \arg\min_{\theta\in\Theta}\; \frac{1}{n}\sum_{i=1}^{n}\ell\bigl(y_i, g_\theta(x_i)\bigr) + \lambda\lVert\theta\rVert_2^2 .
+\end{equation}
+Under standard regularity conditions the estimator is consistent, and its error satisfies
+\begin{equation}\label{eq:c7s3-b}
+  \mathbb{E}\lVert\hat\theta-\theta^\star\rVert^2 \le \frac{C\,\sigma^2 d}{n} + \lambda^2\lVert\theta^\star\rVert^2 .
+\end{equation}
+
+Equations~\eqref{eq:c7s3-a} and~\eqref{eq:c7s3-b} are used throughout the remainder of this section.
+
+\kant[4-12]
+
+\subsection{Quantitative behaviour}\label{sec:c7s3-q}
+Results are collected in \cref{tab:c7s3}. Similar trends were reported in~\citep{main-10,main-9}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c7s3}.}\label{tab:c7s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{20.1} & \SI{4.42}{\milli\second} & \num{2.842e-5} \\
+Beta & \num{22.9} & \SI{1.08}{\milli\second} & \num{7.991e-1} \\
+Gamma & \num{3.0} & \SI{4.91}{\milli\second} & \num{1.274e-4} \\
+Delta & \num{83.2} & \SI{9.08}{\milli\second} & \num{6.049e-2} \\
+Epsilon & \num{31.3} & \SI{1.19}{\milli\second} & \num{8.506e-1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[136-137]
+
+\subsection{Implementation notes}\label{sec:c7s3-i}
+The core routine is shown in \cref{lst:c7s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{main-8}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c7s3.},label={lst:c7s3}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\kant[6-12]
+\begin{theorem}\label{thm:c7s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c7s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.45\linewidth]{grad1.png}
+\caption{Raster/vector asset \texttt{grad1.png} included from the figures directory.}\label{fig:c7s3-i0}
+\end{figure}
+
+\lipsum[16-16]

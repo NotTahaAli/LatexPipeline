@@ -1,0 +1,76 @@
+\section{Mathematical Framework (Experimental Setup)}\label{sec:c7s2}
+\lipsum[1-1]
+
+This section builds on the material in \cref{sec:c7s1}, \cref{ch:8} and the prior work of \citet{main-36}; see also \citep{main-15,main-16}.
+
+\begin{align}\label{eq:c7s2-a}
+  \mathbf{x}_{k+1} &= \mathbf{A}\mathbf{x}_k + \mathbf{B}\mathbf{u}_k + \mathbf{w}_k, & \mathbf{w}_k&\sim\mathcal{N}(0,\mathbf{Q}),\\
+  \mathbf{y}_k &= \mathbf{C}\mathbf{x}_k + \mathbf{v}_k, & \mathbf{v}_k&\sim\mathcal{N}(0,\mathbf{R}).\label{eq:c7s2-b}
+\end{align}
+
+Equations~\eqref{eq:c7s2-a} and~\eqref{eq:c7s2-b} are used throughout the remainder of this section.
+
+\kant[1-10]
+
+\subsection{Quantitative behaviour}\label{sec:c7s2-q}
+Results are collected in \cref{tab:c7s2} and visualised in \cref{fig:c7s2-f1}. Similar trends were reported in~\citep{main-27,main-10}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c7s2}.}\label{tab:c7s2}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{28.5} & \SI{6.15}{\milli\second} & \num{7.797e-5} \\
+Beta & \num{96.2} & \SI{8.17}{\milli\second} & \num{1.926e-5} \\
+Gamma & \num{18.2} & \SI{3.31}{\milli\second} & \num{4.068e-2} \\
+Delta & \num{36.7} & \SI{8.45}{\milli\second} & \num{2.231e-4} \\
+Epsilon & \num{66.4} & \SI{8.01}{\milli\second} & \num{8.637e-5} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=0.43\linewidth,height=5cm]
+\nextgroupplot[title={(a)},domain=-3:3]\addplot[teal,thick,samples=200]{x^3-4*x};
+\nextgroupplot[title={(b)},domain=-3:3]\addplot[black,thick,samples=200]{4*exp(-x^2)*cos(deg(4*x))};
+\end{groupplot}\end{tikzpicture}
+\caption{Generated figure for \texttt{c7s2-f1} (parameters $a=4$, $b=4$).}\label{fig:c7s2-f1}
+\end{figure}
+
+\lipsum[48-49]
+
+\subsection{Implementation notes}\label{sec:c7s2-i}
+The core routine is shown in \cref{lst:c7s2}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{main-25}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for c7s2.},label={lst:c7s2}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\kant[1-11]
+\begin{theorem}\label{thm:c7s2}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c7s2} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\kant[4-12]

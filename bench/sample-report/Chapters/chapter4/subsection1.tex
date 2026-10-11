@@ -1,0 +1,71 @@
+\section{Overview and Motivation (System Design)}\label{sec:c4s1}
+\lipsum[93-93]
+
+This section builds on the material in \cref{ch:4}, \cref{ch:5} and the prior work of \citet{ch4-10}; see also \citep{ch4-14,ch4-4}.
+
+\begin{align}\label{eq:c4s1-a}
+  \mathbf{x}_{k+1} &= \mathbf{A}\mathbf{x}_k + \mathbf{B}\mathbf{u}_k + \mathbf{w}_k, & \mathbf{w}_k&\sim\mathcal{N}(0,\mathbf{Q}),\\
+  \mathbf{y}_k &= \mathbf{C}\mathbf{x}_k + \mathbf{v}_k, & \mathbf{v}_k&\sim\mathcal{N}(0,\mathbf{R}).\label{eq:c4s1-b}
+\end{align}
+
+Equations~\eqref{eq:c4s1-a} and~\eqref{eq:c4s1-b} are used throughout the remainder of this section.
+
+\lipsum[32-33]
+
+\subsection{Quantitative behaviour}\label{sec:c4s1-q}
+Results are collected in \cref{tab:c4s1} and visualised in \cref{fig:c4s1-f1}. Similar trends were reported in~\citep{ch4-7,ch4-8}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c4s1}.}\label{tab:c4s1}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{76.1} & \SI{4.82}{\milli\second} & \num{7.938e-1} \\
+Beta & \num{10.5} & \SI{7.87}{\milli\second} & \num{2.433e-2} \\
+Gamma & \num{1.4} & \SI{5.28}{\milli\second} & \num{4.393e-5} \\
+Delta & \num{39.4} & \SI{5.23}{\milli\second} & \num{6.610e-5} \\
+Epsilon & \num{3.5} & \SI{5.88}{\milli\second} & \num{6.007e-5} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=0.43\linewidth,height=5cm]
+\nextgroupplot[title={(a)},domain=-3:3]\addplot[blue,thick,samples=200]{x^3-4*x};
+\nextgroupplot[title={(b)},domain=-3:3]\addplot[black,thick,samples=200]{4*exp(-x^2)*cos(deg(4*x))};
+\end{groupplot}\end{tikzpicture}
+\caption{Generated figure for \texttt{c4s1-f1} (parameters $a=4$, $b=4$).}\label{fig:c4s1-f1}
+\end{figure}
+
+\kant[8-11]
+
+\subsection{Implementation notes}\label{sec:c4s1-i}
+The core routine is shown in \cref{lst:c4s1}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{ch4-5}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c4s1.},label={lst:c4s1}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\lipsum[74-74]
+\begin{theorem}\label{thm:c4s1}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c4s1} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[109-109]

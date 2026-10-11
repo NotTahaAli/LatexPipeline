@@ -1,0 +1,71 @@
+\section{Analysis and Validation}\label{sec:aBs3}
+\lipsum[112-112]
+
+This section builds on the material in \cref{app:B}, \cref{ch:8} and the prior work of \citet{appx-6}; see also \citep{appx-8,appx-1}.
+
+\begin{equation}\label{eq:aBs3-a}
+  \frac{\partial u}{\partial t} = \nabla\cdot\bigl(D(\mathbf{x})\nabla u\bigr) + f(u),\qquad u(\mathbf{x},0)=u_0(\mathbf{x}).
+\end{equation}
+Discretising in space with $N$ degrees of freedom yields the semi-discrete system
+\begin{align}\label{eq:aBs3-b}
+  \mathbf{M}\dot{\mathbf{u}} &= -\mathbf{K}\mathbf{u} + \mathbf{F}(\mathbf{u}),\\
+  \mathbf{u}(0) &= \mathbf{u}_0 \in \mathbb{R}^{N}.
+\end{align}
+
+Equations~\eqref{eq:aBs3-a} and~\eqref{eq:aBs3-b} are used throughout the remainder of this section.
+
+\lipsum[73-74]
+
+\subsection{Quantitative behaviour}\label{sec:aBs3-q}
+Results are collected in \cref{tab:aBs3}. Similar trends were reported in~\citep{appx-9,appx-14}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{aBs3}.}\label{tab:aBs3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{32.7} & \SI{6.38}{\milli\second} & \num{4.546e-5} \\
+Beta & \num{21.4} & \SI{0.16}{\milli\second} & \num{2.686e-5} \\
+Gamma & \num{21.8} & \SI{6.89}{\milli\second} & \num{7.260e-2} \\
+Delta & \num{28.2} & \SI{5.34}{\milli\second} & \num{2.944e-4} \\
+Epsilon & \num{91.4} & \SI{8.35}{\milli\second} & \num{6.408e-1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[82-83]
+
+\subsection{Implementation notes}\label{sec:aBs3-i}
+The core routine is shown in \cref{lst:aBs3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{appx-3}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for aBs3.},label={lst:aBs3}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\kant[9-11]
+\begin{theorem}\label{thm:aBs3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:aBs3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[104-104]

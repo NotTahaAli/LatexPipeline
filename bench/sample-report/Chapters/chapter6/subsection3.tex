@@ -1,0 +1,65 @@
+\section{Analysis and Validation (Implementation)}\label{sec:c6s3}
+\lipsum[71-71]
+
+This section builds on the material in \cref{sec:c6s2}, \cref{ch:7} and the prior work of \citet{ch6-10}; see also \citep{ch6-8,ch6-9}.
+
+\begin{equation}\label{eq:c6s3-a}
+  \hat{\theta} = \arg\min_{\theta\in\Theta}\; \frac{1}{n}\sum_{i=1}^{n}\ell\bigl(y_i, g_\theta(x_i)\bigr) + \lambda\lVert\theta\rVert_2^2 .
+\end{equation}
+Under standard regularity conditions the estimator is consistent, and its error satisfies
+\begin{equation}\label{eq:c6s3-b}
+  \mathbb{E}\lVert\hat\theta-\theta^\star\rVert^2 \le \frac{C\,\sigma^2 d}{n} + \lambda^2\lVert\theta^\star\rVert^2 .
+\end{equation}
+
+Equations~\eqref{eq:c6s3-a} and~\eqref{eq:c6s3-b} are used throughout the remainder of this section.
+
+\kant[1-11]
+
+\subsection{Quantitative behaviour}\label{sec:c6s3-q}
+Results are collected in \cref{tab:c6s3}. Similar trends were reported in~\citep{ch6-4,ch6-1}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c6s3}.}\label{tab:c6s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{29.0} & \SI{3.21}{\milli\second} & \num{6.826e-4} \\
+Beta & \num{77.0} & \SI{2.48}{\milli\second} & \num{2.504e-3} \\
+Gamma & \num{86.3} & \SI{7.38}{\milli\second} & \num{2.612e-4} \\
+Delta & \num{20.2} & \SI{8.01}{\milli\second} & \num{7.638e-4} \\
+Epsilon & \num{59.5} & \SI{8.36}{\milli\second} & \num{6.139e-2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\lipsum[67-68]
+
+\subsection{Implementation notes}\label{sec:c6s3-i}
+The core routine is shown in \cref{lst:c6s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{ch6-2}.
+
+\begin{lstlisting}[language=c,caption={Reference implementation for c6s3.},label={lst:c6s3}]
+#include <stdio.h>
+
+/* Compute a dot product of two vectors. */
+double dot(const double *a, const double *b, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+\end{lstlisting}
+
+\kant[7-12]
+\begin{theorem}\label{thm:c6s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c6s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\lipsum[121-121]

@@ -1,0 +1,76 @@
+\section{Analysis and Validation (Numerical Methods)}\label{sec:c5s3}
+\kant[8-11]
+
+This section builds on the material in \cref{sec:c5s2}, \cref{ch:6} and the prior work of \citet{ch5-12}; see also \citep{ch5-11,ch5-7}.
+
+\begin{equation}\label{eq:c5s3-a}
+  \hat{\theta} = \arg\min_{\theta\in\Theta}\; \frac{1}{n}\sum_{i=1}^{n}\ell\bigl(y_i, g_\theta(x_i)\bigr) + \lambda\lVert\theta\rVert_2^2 .
+\end{equation}
+Under standard regularity conditions the estimator is consistent, and its error satisfies
+\begin{equation}\label{eq:c5s3-b}
+  \mathbb{E}\lVert\hat\theta-\theta^\star\rVert^2 \le \frac{C\,\sigma^2 d}{n} + \lambda^2\lVert\theta^\star\rVert^2 .
+\end{equation}
+
+Equations~\eqref{eq:c5s3-a} and~\eqref{eq:c5s3-b} are used throughout the remainder of this section.
+
+\lipsum[64-65]
+
+\subsection{Quantitative behaviour}\label{sec:c5s3-q}
+Results are collected in \cref{tab:c5s3}. Similar trends were reported in~\citep{ch5-8,ch5-6}.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of measured quantities for experiment set \texttt{c5s3}.}\label{tab:c5s3}
+\begin{tabular}{lrrr}
+\toprule
+Method & Score & Latency & Error \\
+\midrule
+Alpha & \num{70.6} & \SI{8.52}{\milli\second} & \num{8.189e-4} \\
+Beta & \num{15.5} & \SI{4.71}{\milli\second} & \num{3.053e-2} \\
+Gamma & \num{17.6} & \SI{2.01}{\milli\second} & \num{3.625e-3} \\
+Delta & \num{8.0} & \SI{8.62}{\milli\second} & \num{5.824e-5} \\
+Epsilon & \num{33.4} & \SI{1.32}{\milli\second} & \num{5.835e-1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\kant[7-10]
+
+\subsection{Implementation notes}\label{sec:c5s3-i}
+The core routine is shown in \cref{lst:c5s3}; its complexity is $\mathcal{O}(N\log N)$ per iteration~\cite{ch5-4}.
+
+\begin{lstlisting}[language=python,caption={Reference implementation for c5s3.},label={lst:c5s3}]
+def conjugate_gradient(A, b, tol=1e-8, maxit=500):
+    x = b * 0
+    r = b - A @ x
+    p = r.copy()
+    for k in range(maxit):
+        Ap = A @ p
+        alpha = (r @ r) / (p @ Ap)
+        x += alpha * p
+        r_new = r - alpha * Ap
+        if (r_new @ r_new) ** 0.5 < tol:
+            break
+        p = r_new + ((r_new @ r_new) / (r @ r)) * p
+        r = r_new
+    return x
+\end{lstlisting}
+
+\lipsum[16-16]
+\begin{theorem}\label{thm:c5s3}
+Let $A\in\mathbb{R}^{n\times n}$ be symmetric positive definite with condition number $\kappa$. Then the iteration converges and
+$\lVert e_k\rVert_A \le 2\bigl(\tfrac{\sqrt\kappa-1}{\sqrt\kappa+1}\bigr)^k\lVert e_0\rVert_A$.
+\end{theorem}
+\begin{enumerate}[label=(\roman*)]
+\item the bound in \cref{thm:c5s3} is sharp for some initial errors;
+\item the constant $2$ cannot be improved in general;
+\item preconditioning reduces the effective $\kappa$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.45\linewidth]{dots.png}
+\caption{Raster/vector asset \texttt{dots.png} included from the figures directory.}\label{fig:c5s3-i0}
+\end{figure}
+
+\lipsum[101-101]

@@ -1,0 +1,14 @@
+{
+  "latex-workshop.latex.recipe.default": "build.py",
+  "latex-workshop.latex.recipes": [
+    { "name": "build.py", "tools": ["build.py"] }
+  ],
+  "latex-workshop.latex.tools": [
+    {
+      "name": "build.py",
+      "command": "python3",
+      "args": ["%WORKSPACE_FOLDER%/scripts/build.py"]
+    }
+  ],
+  "latex-workshop.latex.autoBuild.run": "never"
+}

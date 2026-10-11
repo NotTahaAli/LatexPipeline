@@ -1,19 +1,38 @@
 name: Build PDFs
 
 on:
+  # Feature branches build through their pull request, so a push to them
+  # doesn't run the same job twice with separate caches.
   push:
+    branches: [main]
     paths:
       - "files/**"
-      - "scripts/**"
+      - "scripts/build.py"
+      - "scripts/accel.py"
+      - "scripts/sandbox.py"
+      - "scripts/hints.py"
+      - "scripts/publish_release.py"
+      - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
+      - ".github/texlive-packages.txt"
+      - "tests/fixtures/tagged/**"
+      - "tests/tagged_check.py"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
   pull_request:
     paths:
       - "files/**"
-      - "scripts/**"
+      - "scripts/build.py"
+      - "scripts/accel.py"
+      - "scripts/sandbox.py"
+      - "scripts/hints.py"
+      - "scripts/publish_release.py"
+      - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
+      - ".github/texlive-packages.txt"
+      - "tests/fixtures/tagged/**"
+      - "tests/tagged_check.py"
       - "pyproject.toml"
       - "uv.lock"
       - "requirements.txt"
@@ -34,10 +53,87 @@ jobs:
           uv export --quiet --no-hashes --no-emit-project -o requirements.txt
           git diff --exit-code requirements.txt
 
+  # Runs beside `build`, which never waits for it: on a cache miss it installs TeX Live
+  # from tug.org and saves ~/texlive for the next run (the first cold run takes minutes). Bump `v1` in both keys to refresh.
+  texlive-cache:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/texlive-packages.txt
+          sparse-checkout-cone-mode: false
+      - name: Look up the cache
+        id: tl
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          lookup-only: true
+      - name: Install TeX Live
+        if: steps.tl.outputs.cache-hit != 'true'
+        uses: zauguin/install-texlive@6671d0c62046c7e349fe154d5208fe746b07e037 # v4.4.0
+        with:
+          package_file: .github/texlive-packages.txt
+          cache: false
+      - name: Save the cache
+        if: steps.tl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+
+  # PDF/A, PDF/UA and tagged-PDF check: the fixtures in tests/fixtures/tagged are built on the cached tug.org
+  # TeX Live (kernel 2025-06 or newer) and validated with a pinned veraPDF (tests/tagged_check.py). It runs
+  # beside `build`, which never waits for it and publishes either way; without a TeX Live cache it is skipped.
+  tagged-pdf:
+    runs-on: ubuntu-latest
+    needs: texlive-cache
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Restore TeX Live cache
+        id: tl
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+      - name: No TeX Live cache yet
+        if: steps.tl.outputs.cache-hit != 'true'
+        run: echo "::notice::tagged-pdf skipped, the TeX Live cache is not saved yet (texlive-cache fills it)."
+      - name: Restore veraPDF
+        if: steps.tl.outputs.cache-hit == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/verapdf
+          key: verapdf-1.28.2-v1
+      - name: Tagged PDF, PDF/A and PDF/UA with veraPDF
+        if: steps.tl.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p ~/verapdf
+          jar=~/verapdf/greenfield-apps.jar
+          if [ ! -f "$jar" ]; then
+            curl -fsSL --retry 3 -o "$jar" https://repo1.maven.org/maven2/org/verapdf/apps/greenfield-apps/1.28.2/greenfield-apps-1.28.2.jar
+          fi
+          echo "687d4d8bcfec48c9f7e931cf78ed061f1eeccfba55d4cdc000ba9b4d8aa46ce6  $jar" | sha256sum -c -
+          printf '#!/bin/sh\nexec java -cp "%s" org.verapdf.apps.GreenfieldCliWrapper "$@"\n' "$jar" > ~/verapdf/verapdf
+          chmod +x ~/verapdf/verapdf
+          export PATH="$HOME/texlive/bin/x86_64-linux:$HOME/verapdf:$PATH"
+          verapdf --version | head -1
+          pdflatex --version | head -1
+          python3 tests/tagged_check.py
+      - uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: tagged-pdf-logs
+          path: out/
+          if-no-files-found: ignore
+
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Update the `pdfs` release.
+      contents: write        # Update the `pdfs` release.
+      pull-requests: write   # Sticky comment on pull requests.
     # One run per branch at a time, so two never edit the release at once.
     # A pending run may be superseded; the `pdfs` tag bookmark covers its changes.
     concurrency: build-pdf-${{ github.ref }}
@@ -48,10 +144,50 @@ jobs:
         with:
           fetch-depth: 0  # --changed-since needs history.
 
-      - name: Install LaTeX
+      # TeX Live from the cache saved by the texlive-cache job (about 12 s). On a miss,
+      # trimmed apt (about 70 s) so this run isn't held up; texlive-cache fills the cache meanwhile.
+      # Keep the apt list in step with README.md and .github/texlive-packages.txt.
+      - name: Restore TeX Live cache
+        id: tl
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/texlive
+          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+
+      - name: Use cached TeX Live
+        if: steps.tl.outputs.cache-hit == 'true'
         run: |
+          echo "$HOME/texlive/bin/x86_64-linux" >> "$GITHUB_PATH"
+          echo "TeX Live: cache hit (\`${{ steps.tl.outputs.cache-matched-key }}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install LaTeX with apt (cache miss)
+        if: steps.tl.outputs.cache-hit != 'true'
+        run: |
+          echo "TeX Live: cache miss, installed with apt" >> "$GITHUB_STEP_SUMMARY"
+          sudo tee /etc/dpkg/dpkg.cfg.d/01-nodoc >/dev/null <<'CFG'
+          path-exclude /usr/share/doc/*
+          path-include /usr/share/doc/*/copyright
+          path-exclude /usr/share/man/*
+          path-exclude /usr/share/info/*
+          path-exclude /usr/share/locale/*
+          CFG
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          # Skip tex-common's "build every format" trigger; build the four we use below.
+          for f in fmtutil fmtutil-sys; do
+            sudo dpkg-divert --local --rename --add /usr/bin/$f
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/bin/$f >/dev/null
+            sudo chmod +x /usr/bin/$f
+          done
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science
+          sudo apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
+            latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science \
+            texlive-xetex texlive-luatex texlive-extra-utils texlive-bibtex-extra biber chktex latexdiff
+          for f in fmtutil fmtutil-sys; do
+            sudo rm -f /usr/bin/$f
+            sudo dpkg-divert --remove --rename /usr/bin/$f
+          done
+          for f in pdflatex xelatex lualatex latex; do sudo fmtutil-sys --byfmt $f; done
 
       # latexmk's working files from the previous run, so an edit reruns only
       # the LaTeX passes it needs. A new key per run keeps the newest cache.
@@ -82,12 +218,51 @@ jobs:
             python3 scripts/build.py
           fi
 
+      # Structural findings (annotations, never fail the job), chktex and word counts go into out/lint-report.json (in the artifact).
+      - name: Lint and word counts
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 scripts/ci_report.py lint
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 scripts/ci_report.py summary >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pdfs
           path: out/
           if-no-files-found: ignore
+
+      # Pull requests: latexdiff of each changed document against the base.
+      # The PDFs go to their own artifact, outside out/, so they are never published.
+      - name: latexdiff changed documents
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/ci_report.py diff --base "$BASE_SHA" --out "$RUNNER_TEMP/diff-pdfs"
+
+      - name: Upload latexdiff PDFs
+        id: diff-artifact
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: diff-pdfs
+          path: ${{ runner.temp }}/diff-pdfs
+          if-no-files-found: ignore
+
+      # Skipped for fork pull requests: their token cannot comment.
+      - name: Comment on the pull request
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIFF_ARTIFACT_URL: ${{ steps.diff-artifact.outputs.artifact-url }}
+        run: python3 scripts/ci_report.py pr-comment --diff-dir "$RUNNER_TEMP/diff-pdfs"
 
       # Keep the `pdfs` release holding the latest PDF of every document.
       # Runs even if some documents failed, so the rest still publish.

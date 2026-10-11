@@ -1,12 +1,19 @@
 .claude/*.local.json
 .env
-.vscode
+.vscode/*
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 
 out/
 .latex-cache/
+# Editor version history and review comments (scripts/serve.py)
+.latex-history/
 
 .DS_Store
 *.pem
 
 .venv/
 __pycache__/
+# Offline copies of the editor libraries (python3 scripts/vendor_ui.py)
+scripts/serve_ui/vendor/
