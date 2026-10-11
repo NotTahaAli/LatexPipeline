@@ -8,7 +8,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
-- Hosted personal API tokens (Account > API tokens): hashed, scoped to chosen projects, revocable, ended by a password change; `Authorization: Bearer` on `/p/<project>/...` and `GET /api/token` (`scripts/host_tokens.py`).
+- Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
 - VS Code extension in `vscode/` (install with `vsce package`): connects to a local editor, a share link or a hosted project (API token), shows the document as a folder, saves through the editor's API, builds, shows build errors as Problems and the PDF in a tab.
 
 - Suggestion card: hover a suggestion, click its gutter mark or press Alt+Enter to see author, time, old and new text and replies, with Accept/Reject (edit role) or Withdraw (own); suggestions take replies.
@@ -86,9 +86,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `build.py --query DOC` prints title, author, pages, words, labels and sections as JSON.
 - `build.py --pages 1-3,7 DOC` writes `out/<name>.pages.pdf` with qpdf or pdftk (never published).
 - `build.py --watch --exec "cmd"` runs a command (no shell) after each successful build, with `LP_DOC` and `LP_PDF` set.
+- Remote compile API: `POST /api/v1/compile` takes a zip, a tar archive or a JSON files map and answers the PDF (or the log with `422`, or both as JSON). Locally on `serve.py` for the owner only; hosted with a personal API token of the `compile` scope (new `host.db` migration: `scopes` and `expires` on `api_tokens`, `api_usage`), built in a sandboxed per-person worker, with size caps, hourly and daily limits, a per-person result cache and audit entries (`[api]` in `config.toml`, off by default).
+- HTML export: `build.py --html [DOC ...]`, `build.toml` `html = true` (also published as `<name>.html.zip`) and the editor's "Export HTML" (owner-only) convert a document with make4ht into `out/<name>.html/` and `out/<name>.html.zip`, math as MathML, figures as SVG.
+- Live preview: editing the preamble (of `main.tex`, a local class or package, or a file the preamble reads) no longer pauses the preview until the next full build: a TeX process loads the typed preamble and the chapter is previewed again on it (about 3 s on `bench/sample-report`, see `docs/realtime.md`).
+- Live preview: the status line says "later pages +N" (with a tooltip) when the previewed chapter has more or fewer pages than in the full PDF, since page numbers after it stay those of the last full build.
+- Accessibility checks: `\documentclass{beamer}` reports the LaTeX Tagging Project's "no support" status with a pointer to `ltx-talk`, and frames without a title are flagged.
 
 ### Changed
 
+- TikZ externalization: a figure is rebuilt when a `\tikzset`/`\pgfplotsset` style outside pictures (also in chapters), a macro or colour it uses, or a file it `\input`s changes, not only the preamble. `accel.py` is a build input, so every document rebuilds once.
 - `publish_release.py` uploads only the PDFs and logs of documents, never other files in `out/` (review or chapter preview PDFs).
 - `build.py --arxiv [DOC ...]`: `out/<name>.arxiv.zip` with exactly the files the build read from the document directory, the generated `main.bbl` (`.ind`, `.gls`, `.nls`), `%` comments stripped from `.tex` files and a `00README.json` for XeLaTeX, plus a preflight (outside files, file names, hidden files, absolute or `..` paths, shell escape, missing figures, images over 34 megapixels, biblatex `.bbl` format, LuaLaTeX) printed and written to the log; "Export for arXiv" in the editor's More menu (owner-only, off while sharing).
 - Accessibility checks for `tagged = true` documents (`scripts/a11y.py`): missing PDF title, `\includegraphics` without `alt=`, skipped heading levels and packages the LaTeX Tagging Project lists as incompatible, in the log, `build-report.json` (new optional `a11y` key), the editor's Warnings tab and `ci_report.py lint` notices.

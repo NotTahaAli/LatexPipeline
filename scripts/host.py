@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import compile_api
 import host_git
 import host_mcp
 import host_tokens
@@ -74,7 +75,7 @@ CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
-    "mcp": {},
+    "mcp": {}, "api": {},
 }
 AI_DEFAULTS: dict = {"enabled": False, "provider": "anthropic", "base_url": "", "model": ai.DEFAULT_MODEL,
                      "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
@@ -126,7 +127,7 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # daily_per_workspace = 500            # requests per workspace per day
 # daily_total = 2000                   # requests for the whole server per day (the spending cap)
 # daily_tokens_per_user = 1000000      # input + output tokens per person per day
-""" + host_mcp.CONFIG_TEMPLATE
+""" + host_mcp.CONFIG_TEMPLATE + compile_api.CONFIG_TEMPLATE
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
 SETTING_DEFAULTS: dict = {
@@ -204,6 +205,7 @@ def load_config(data: Path) -> dict:
         if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
             raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
     host_mcp.check_config(config, path)
+    compile_api.check_config(config, path)
     return config
 
 
@@ -341,6 +343,16 @@ MIGRATIONS = [
     """
     CREATE TABLE library(
         user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL);
+    """,
+    # One personal API token system (host_tokens.py): space-separated scopes ("projects" for the project proxy and
+    # the VS Code extension, "compile" for /api/v1/compile) and an optional expiry; older tokens keep "projects".
+    # api_usage counts compiles per person and UTC day (compile_api.py).
+    """
+    ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT 'projects';
+    ALTER TABLE api_tokens ADD COLUMN expires REAL;
+    CREATE TABLE api_usage(
+        day TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        compiles INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day, user_id));
     """,
 ]
 
@@ -881,6 +893,7 @@ class App:
         self.zotero_syncs = Throttle(10, 600)  # Zotero previews per account (hard cap)
         self.git_syncs = Throttle(20, 600)  # Git pulls and pushes per account (hard cap)
         self.access_requests = Throttle(5, 3600)  # requests for a better role per account and hour
+        self.api_token_tries = Throttle(30, 900)  # wrong API tokens per address (hard cap, host_tokens.py)
         self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
         self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
@@ -1293,6 +1306,8 @@ class Handler(BaseHTTPRequestHandler):
             self.session = self.load_session()
             if host_mcp.endpoint(self, url.path):  # /mcp, /oauth/*, /.well-known/oauth-*: no cookies, no CSRF
                 return
+            if compile_api.endpoint(self, url.path):  # /api/v1/*: API tokens only, no cookies, no CSRF
+                return
             if url.path.startswith("/p/"):
                 self.project_proxy(url.path, url.query)
                 return
@@ -1363,7 +1378,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(404, "Not found.")
         pid, rest = match.group(1), match.group(2)
         upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
-        token = host_tokens.bearer(self)  # an API token (scripts, VS Code): never mixed with the cookie session
+        token = host_tokens.bearer(self, "projects")  # an API token (scripts, VS Code), never mixed with the session
         if token is not None:
             self.session = token
         if self.command == "GET" and not upgrade and self.headers.get("Sec-Fetch-Site") == "cross-site" and not (
@@ -1389,8 +1404,8 @@ class Handler(BaseHTTPRequestHandler):
         if token is not None and (upgrade or rest in host_tokens.NOT_WITH_TOKEN):
             raise HttpError(403, "Not with an API token: open the project in the browser.")
         size = self.body_size(MAX_PROXY_BODY)
-        if rest == "/api/mcp":  # only through /mcp (OAuth grant, audit, limits), never with a browser session
-            raise HttpError(404, "Not found.")
+        if rest == "/api/mcp" or (rest or "").startswith("/api/v1/"):
+            raise HttpError(404, "Not found.")  # only through /mcp and /api/v1 (grant or token, audit, limits)
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
@@ -2642,6 +2657,7 @@ def api_unlink(h: Handler, name: str) -> None:
 host_mcp.install(sys.modules[__name__])  # the consent and connected-clients API
 host_git.install(sys.modules[__name__])  # each person's Git token (Account page)
 host_tokens.install(sys.modules[__name__])  # personal API tokens (Account page)
+compile_api.install(sys.modules[__name__])  # /api/v1/compile with a token of the compile scope
 
 
 # ---------------------------------------------------------------------------

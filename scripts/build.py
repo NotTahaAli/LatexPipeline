@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -591,6 +592,13 @@ def cited_bib_path_for(main_tex: Path) -> Path:
     """files/reports/final/main.tex -> out/reports/final.cited.bib (--cited-bib, never published)."""
     pdf = output_path_for(main_tex)
     return pdf.with_name(f"{pdf.stem}.cited.bib")
+def html_paths(main_tex: Path) -> tuple[Path, Path]:
+    """
+    files/reports/final/main.tex -> (out/reports/final.html/, out/reports/final.html.zip): --html. A folder of its
+    own, not out/reports/final/, which is where the outputs of a document in files/reports/final/x/ go.
+    """
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.html"), pdf.with_name(f"{pdf.stem}.html.zip")
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +608,7 @@ def cited_bib_path_for(main_tex: Path) -> Path:
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
 CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout", "review",
-               "draft", "strict", "anonymous", "output",
+               "draft", "strict", "anonymous", "output", "html",
                "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
 # An [[output]] table: an extra PDF of the same document, out/<name>-<output name>.pdf (README, "build.toml keys").
 OUTPUT_KEYS = {"name", "define", "engine", "review", "draft", "anonymous"}
@@ -668,7 +676,7 @@ def read_settings(main_tex: Path) -> dict:
     """
     settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
                 "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT, "review": "off",
-                "draft": False, "strict": False, "anonymous": False, "output": [], "define": []}
+                "draft": False, "strict": False, "anonymous": False, "output": [], "define": [], "html": False}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -730,7 +738,7 @@ def check_settings(settings: dict, main_tex: Path) -> None:
         )
     settings["engine"] = engine.lower()
 
-    for key in ("shell_escape", "externalize", "tagged", "draft", "strict", "anonymous"):
+    for key in ("shell_escape", "externalize", "tagged", "draft", "strict", "anonymous", "html"):
         if not isinstance(settings[key], bool):
             raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: {key} must be true or false")
 
@@ -2049,12 +2057,17 @@ def prune(documents: list[Path]) -> None:
     for document in documents:
         for _name, _work, pdf in output_targets(document):
             expected |= {pdf, pdf.with_suffix(".log")}
+    html = {path for document in documents for path in html_paths(document)}
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx"),
-                 *OUT_DIR.rglob("*.arxiv.zip"), *OUT_DIR.rglob("*.cited.bib")]:
-        if path not in expected:
+                 *OUT_DIR.rglob("*.arxiv.zip"), *OUT_DIR.rglob("*.cited.bib"), *OUT_DIR.rglob("*.html.zip")]:
+        if path not in expected | html and not any(folder in path.parents for folder in html):
             info(f"Removing stale: {display(path)}")
             path.unlink()
+    for path in [*OUT_DIR.rglob("*.html")] if OUT_DIR.exists() else []:
+        if path.is_dir() and path not in html and not any(folder in path.parents for folder in html):
+            info(f"Removing stale: {display(path)}")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def clean() -> None:
@@ -2120,6 +2133,107 @@ def export_docx_all(documents: list[Path]) -> int:
     for document in documents:
         ok, message = export_docx(document)
         (info if ok else error)(f"DOCX {doc_name(document)}: {message}")
+        failed += not ok
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# HTML export (make4ht / TeX4ht, part of TeX Live: collection-binextra and collection-plaingeneric)
+# ---------------------------------------------------------------------------
+
+# tex4ht configuration: MathML for math (no MathJax, nothing loaded from a CDN), PDF figures converted to SVG with
+# pdftocairo (poppler-utils) instead of tex4ht's default Ghostscript PNGs (only once graphics is loaded: tex4ht
+# defines PdfConvert with it). Pictures (TikZ) go through dvisvgm.
+HTML_CFG = r"""\Preamble{xhtml,mathml}
+\makeatletter
+\ifcsname a:PdfConvert\endcsname
+\def\lp@page{\ifx\Gin@page\@empty1\else\Gin@page\fi}\def\lp@pages{-f \lp@page\space -l \lp@page\space}
+\Configure{PdfConvert}{svg}{"pdftocairo -svg \lp@pages "\Gin@base.pdf" "\Gin@base-\Gin@page.svg""}
+\fi
+\makeatother
+\begin{document}
+\EndPreamble
+"""
+HTML_ENGINE = {"pdflatex": [], "xelatex": ["-x"], "lualatex": ["-l"]}
+HTML_WORK = "lp-html"  # make4ht's output folder inside the work copy (it has no build-directory option before 0.4)
+
+
+def export_html(main_tex: Path) -> tuple[bool, str]:
+    """
+    make4ht main.tex -> out/<name>.html/index.html (+ .css, images) and out/<name>.html.zip. TeX4ht runs LaTeX,
+    so the whole conversion runs through sandbox.spawn() on a copy of the document in the cache (make4ht writes its
+    auxiliary files next to the source), with the last build's .bbl. Returns (ok, message).
+    """
+    make4ht = shutil.which("make4ht")
+    if not make4ht:
+        return False, "make4ht was not found on your PATH (TeX Live: tlmgr install make4ht tex4ht; " \
+                      "Debian/Ubuntu: texlive-extra-utils)."
+    try:
+        settings = read_settings(main_tex)
+    except ConfigError as exc:
+        return False, str(exc)
+    folder, archive = html_paths(main_tex)
+    work = cache_dir_for(main_tex) / "html"
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(main_tex.parent, work, symlinks=True, ignore=shutil.ignore_patterns(".*"))
+    for bbl in cache_dir_for(main_tex).glob("*.bbl"):  # citations without running BibTeX or biber again
+        shutil.copy2(bbl, work / bbl.name)
+    (work / "lp-html.cfg").write_text(HTML_CFG, encoding="utf-8")
+    command = [make4ht, *HTML_ENGINE[settings["engine"]], *(["-s"] if settings["shell_escape"] else []),
+               "-c", "lp-html.cfg", "-d", HTML_WORK, "-f", "html5", main_tex.name]
+    timeout = settings["timeout"]
+    try:
+        result = subprocess.run(**sandbox.spawn(command, work, work, {**os.environ, **LATEX_LOG_ENV}, cpu=timeout),
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"make4ht failed: {exc}"
+    finally:
+        sandbox.scrub(work)
+    page = work / HTML_WORK / f"{main_tex.stem}.html"
+    if not page.is_file():
+        lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+        errors = [line for line in lines if "error" in line.lower()]
+        return False, (errors or lines or [f"make4ht exited with {result.returncode}"])[-1].strip()
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    for path in sorted((work / HTML_WORK).rglob("*")):
+        if path.is_file() and not path.is_symlink():  # scrub() removed other kinds; links stay behind too
+            target = folder / path.relative_to(work / HTML_WORK)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+    old = f"{main_tex.stem}.html"
+    for path in folder.rglob("*.html"):  # main.html -> index.html, and the links to it
+        text = path.read_text(encoding="utf-8", errors="replace")
+        path.write_text(text.replace(f"'{old}", "'index.html").replace(f'"{old}', '"index.html'), encoding="utf-8")
+    (folder / old).replace(folder / "index.html")
+    archive.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                bundle.write(path, path.relative_to(folder.parent).as_posix())
+    missing = sorted({name for page in folder.rglob("*.html")
+                      for name in re.findall(r"<img[^>]*\ssrc=['\"]([^'\"]+)", page.read_text(encoding="utf-8"))
+                      if "://" not in name and not (folder / name).is_file()})
+    note = f" (images not converted: {', '.join(missing[:5])}; PDF figures need pdftocairo, pictures dvisvgm)" \
+        if missing else ""
+    return True, display(folder / "index.html") + note
+
+
+def wants_html(main_tex: Path) -> bool:
+    """build.toml html = true: CI exports the HTML and publish_release.py uploads its .html.zip."""
+    try:
+        return read_settings(main_tex)["html"]
+    except ConfigError:
+        return False
+
+
+def export_html_all(documents: list[Path]) -> int:
+    """The --html step (and build.toml html = true): export each document, one line each; 1 if any failed."""
+    failed = 0
+    for document in documents:
+        ok, message = export_html(document)
+        (info if ok else error)(f"HTML {doc_name(document)}: {message}")
         failed += not ok
     return 1 if failed else 0
 
@@ -2542,6 +2656,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--html",
+        action="store_true",
+        help="After building, also export each selected document to out/<name>.html/index.html (and .html.zip) with "
+             "make4ht/TeX4ht: MathML math, figures as SVG; sandboxed like a build. Published only with html = true "
+             "in build.toml.",
+    )
+
+    parser.add_argument(
         "--format",
         action="store_true",
         help="Rewrite the .tex files of each selected document with tex-fmt (must be installed; reads a "
@@ -2755,6 +2877,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.docx and (args.watch or args.focus):
         parser.error("--docx cannot be combined with --watch or --focus")
+    if args.html and (args.watch or args.focus or args.review_pdf or args.format):
+        parser.error("--html cannot be combined with --watch, --focus, --review-pdf or --format")
 
     if args.format and (args.watch or args.focus or args.docx):
         parser.error("--format cannot be combined with --watch, --focus or --docx")
@@ -2950,10 +3074,18 @@ def main() -> int:
     exported = documents
 
     def extras(failed: bool, results: list[dict]) -> int:
-        """--docx, --arxiv, --cited-bib, --preflight and --pages after the build; all but --docx skip failed builds."""
+        """
+        --docx, --html, --arxiv, --cited-bib, --preflight and --pages after the build; all but --docx and --html skip
+        failed builds. Documents with html = true in build.toml that built in this run get their HTML too (so CI can
+        publish it).
+        """
         if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
             failed = bool(export_docx_all(exported)) or failed
         broken = {entry["name"] for entry in results if not entry["ok"]}
+        built = {entry["name"] for entry in results if entry["ok"]}
+        html = [doc for doc in exported if args.html or doc_name(doc) in built and wants_html(doc)]
+        if html:
+            failed = bool(export_html_all(html)) or failed
         if args.arxiv:
             failed = bool(export_arxiv_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
         if args.cited_bib:

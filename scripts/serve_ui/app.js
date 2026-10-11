@@ -13,6 +13,7 @@ import { reviewSupport } from "./review.js";
 import { namedLinks } from "./links.js";
 import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
+import { exportHtml } from "./exporthtml.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { gitPanel } from "./git.js";
@@ -749,11 +750,12 @@ const live = new LivePreview(pdfView, {
     // wait: the preamble (or main.tex's \input list) changed, so previews pause until the full build after the save.
     const what = st.wait === "preamble" ? "preamble" : "document";
     node.textContent = st.busy ? "Live: typesetting" : st.error ? "Live: error" : st.wait ? (st.saved ? `Live: rebuilding ${what}` : `Live: ${what} changed, rebuilds on save`)
-      : st.same ? "Live: as built" : `Live: ${st.seconds.toFixed(1)} s`;
+      : st.same ? "Live: as built" : `Live: ${st.seconds.toFixed(1)} s${st.shift ? ` · later pages ${st.shift > 0 ? "+" : ""}${st.shift}` : ""}`;
     node.title = st.error || (st.busy ? "Typesetting the part you are editing"
       : st.wait ? `${st.wait === "preamble" ? "The preamble, a class or a package" : "The chapters main.tex reads"} changed: the live preview pauses until the full build${st.saved ? " now running" : " that follows the save"} has finished`
       : st.same ? "main.tex is as the full PDF shows it"
-      : `Typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}${st.passes > 1 ? `, ${st.passes} passes for new labels or citations` : ""}; the full PDF follows on save`);
+      : `Typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}${st.preamble ? " with the edited preamble" : ""}${st.passes > 1 ? `, ${st.passes} passes for new labels or citations` : ""}; the full PDF follows on save`
+        + (st.shift ? `. This part now has ${Math.abs(st.shift)} page${Math.abs(st.shift) === 1 ? "" : "s"} ${st.shift > 0 ? "more" : "fewer"} than in the full PDF: page numbers after it may be off until that build` : ""));
   },
 });
 
@@ -1438,6 +1440,7 @@ const COMMANDS = [
   { id: "tidybib", edit: true, title: "Tidy .bib file (sort entries, align fields)", run: () => tidyBib() },
   { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
   { id: "arxiv", owner: true, title: "Export for arXiv", run: () => exportArxiv() },
+  { id: "html", owner: true, title: "Export HTML (make4ht)", run: () => exportHtml(api, cur, toast, el) },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
@@ -1465,7 +1468,7 @@ let paletteItems = [], paletteSel = 0;
 function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc) && !(c.id === "html" && !config.make4ht)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
   $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
     const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
@@ -1537,14 +1540,14 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 function buildMenu() {
   const m = $("moreMenu");
   const groups = [["Panels", ["files", "outline", "references", "symbols", "assistant", "todos", "bookmarks"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
-    ["Document", [...(readOnly ? [] : ["prose", "format", "typeset"]), "visual", "graph", "zen", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format", "typeset"]), "visual", "graph", "zen", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : []), ...(role === "owner" && config.make4ht ? ["html"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
       const c = COMMANDS.find((x) => x.id === id);
       const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
       if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
-      if (id === "arxiv" && sharing) { b.disabled = true; b.title = "Off while sharing."; }
+      if ((id === "arxiv" || id === "html") && sharing) { b.disabled = true; b.title = "Off while sharing."; }
       return b;
     })), "mg" + g)));
 }

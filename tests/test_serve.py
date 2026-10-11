@@ -599,7 +599,8 @@ class GatewayMode(SharedState, ServerCase):
     def test_owner_only_features_are_unavailable(self):
         for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
                              ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
-                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events")]:
+                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events"),
+                             ("POST", "/api/html?doc=demo"), ("GET", "/html/demo")]:
             with self.subTest(path=path):
                 self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
         self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
@@ -1243,6 +1244,24 @@ class ShareHttp(SharedState, ServerCase):
             for who in ("view", "edit"):
                 self.assertEqual(self.get("GET", "/arxiv/demo", who)[0], 403)
             self.assertEqual(self.get("GET", "/arxiv/demo", "owner"), (200, b"PK"))
+
+    def test_html_export_is_owner_only_off_while_sharing_and_downloads_the_zip(self):
+        url = "/api/html?doc=demo"
+        with mock.patch.object(build, "export_html", return_value=(True, "out/demo.html/index.html")) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)  # sharing is on
+            export.assert_not_called()
+            serve.SHARE["on"] = False
+            self.assertEqual(self.get("POST", url, "owner"), (200, {"ok": True, "message": "out/demo.html/index.html"}))
+        with mock.patch.object(build, "export_html", return_value=(False, "make4ht was not found")):
+            self.assertEqual(self.get("POST", url, "owner"), (500, {"error": "make4ht was not found"}))
+        serve.SHARE["on"] = True
+        (self.root / "demo.html.zip").write_bytes(b"PK")
+        with mock.patch.object(build, "html_paths", return_value=(self.root / "x", self.root / "demo.html.zip")):
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/html/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/html/demo", "owner"), (200, b"PK"))
 
     def test_docx_download_name_has_an_ascii_fallback_and_a_utf8_name(self):
         header = serve.attachment_header("Отчёт 1.docx")
@@ -4231,6 +4250,190 @@ class SearchReplace(SharedState, ServerCase):
         self.assertEqual((status, out["count"]), (200, 1))
         self.assertIn("The cat stood.", (self.root / "main.tex").read_text(encoding="utf-8"))
         self.assertEqual(self.replace({"q": "(c)", "replace": r"\2", "regex": True, "path": "main.tex"})[0], 400)
+
+
+
+# --- POST /api/v1/compile (compile_api.py) ---------------------------------------------------------------------------
+
+DOC_TEX = "\\documentclass{article}\n\\begin{document}\nHello from the API.\n\\end{document}\n"
+
+
+def archive_zip(entries: dict, link: str | None = None) -> bytes:
+    import stat
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, text in entries.items():
+            archive.writestr(name, text)
+        if link:
+            info = zipfile.ZipInfo(link)
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "/etc/passwd")
+    return buf.getvalue()
+
+
+def archive_tar(entries: dict, link: str | None = None, mode: str = "w:gz") -> bytes:
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as archive:
+        for name, text in entries.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        if link:
+            info = tarfile.TarInfo(link)
+            info.type, info.linkname = tarfile.SYMTYPE, "/etc/passwd"
+            archive.addfile(info)
+    return buf.getvalue()
+
+
+class CompileUploads(unittest.TestCase):
+    unpack = staticmethod(serve.compile_api.unpack)
+
+    def test_zip_tar_and_json_give_the_same_files_and_one_wrapping_folder_is_dropped(self):
+        files = {"P/main.tex": "x", "P/ch/a.tex": "y"}
+        want = {"main.tex": b"x", "ch/a.tex": b"y"}
+        self.assertEqual(self.unpack(archive_zip(files), "application/zip", 10 ** 6), (want, []))
+        self.assertEqual(self.unpack(archive_tar(files), "application/gzip", 10 ** 6), (want, []))
+        self.assertEqual(self.unpack(archive_tar(files, mode="w"), "application/x-tar", 10 ** 6), (want, []))
+        data = json.dumps({"files": {"main.tex": "x", "ch/a.tex": {"base64": "eQ=="}}}).encode()
+        self.assertEqual(self.unpack(data, "application/json", 10 ** 6), (want, []))
+
+    def test_build_configuration_is_left_out_unless_the_owner_sent_it(self):
+        files = {"main.tex": "x", "build.toml": "shell_escape = true", "sub/.LatexMkRc": "$x"}
+        self.assertEqual(self.unpack(archive_zip(files), "application/zip", 10 ** 6),
+                         ({"main.tex": b"x"}, ["build.toml", "sub/.LatexMkRc"]))
+        self.assertEqual(len(self.unpack(archive_zip(files), "application/zip", 10 ** 6, keep_rc=True)[0]), 3)
+
+    def test_unsafe_uploads_are_refused(self):
+        cases = {
+            "zip slip": (archive_zip({"main.tex": "x", "../evil.tex": "y"}), "application/zip"),
+            "tar slip": (archive_tar({"main.tex": "x", "a/../../evil.tex": "y"}), "application/gzip"),
+            "absolute": (archive_tar({"/etc/x.tex": "y"}), "application/gzip"),
+            "backslash": (archive_zip({"main.tex": "x", "..\\evil.tex": "y"}), "application/zip"),
+            "drive": (json.dumps({"files": {"C:/x.tex": "y"}}).encode(), "application/json"),
+            "twice": (json.dumps({"files": {"A.tex": "y", "a.tex": "z"}}).encode(), "application/json"),
+            "too big": (archive_zip({"main.tex": "x" * 2000}), "application/zip"),
+            "bad base64": (json.dumps({"files": {"a.png": {"base64": "!!"}}}).encode(), "application/json"),
+            "not an archive": (b"hello", "application/octet-stream"),
+            "empty": (archive_zip({}), "application/zip"),
+        }
+        for name, (data, kind) in cases.items():
+            with self.subTest(name=name), self.assertRaises(serve.compile_api.UploadError):
+                self.unpack(data, kind, 1000)
+        with self.assertRaises(serve.compile_api.UploadError):
+            self.unpack(archive_zip({"a.tex": "x", "b.tex": "y", "c.tex": "z"}), "application/zip", 10 ** 6,
+                        max_files=2)
+
+    def test_links_and_special_entries_are_never_written(self):
+        self.assertEqual(self.unpack(archive_zip({"main.tex": "x"}, link="leak.tex"), "application/zip", 10 ** 6),
+                         ({"main.tex": b"x"}, []))
+        self.assertEqual(self.unpack(archive_tar({"main.tex": "x"}, link="leak.tex"), "application/gzip", 10 ** 6),
+                         ({"main.tex": b"x"}, []))
+
+    def test_main_and_output_parameters(self):
+        self.assertEqual(serve.compile_api.main_name({}), "main.tex")
+        self.assertEqual(serve.compile_api.main_name({"main": ["paper/talk.tex"]}), "paper/talk.tex")
+        for bad in ("../x.tex", "x.sty", "/abs.tex", "a//b.tex"):
+            with self.subTest(bad=bad), self.assertRaises(serve.compile_api.UploadError):
+                serve.compile_api.main_name({"main": [bad]})
+        with self.assertRaises(serve.compile_api.UploadError):
+            serve.compile_api.output_kind({"output": ["html"]})
+
+
+OK_RESULT = {"ok": True, "pdf": b"%PDF-1.7 fake", "log": "the log", "seconds": 0.5, "pages": 1, "errors": []}
+
+
+class CompileApi(SharedState, ServerCase):
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        serve.SHARE["port"] = self.port
+
+    def post(self, data, kind="application/zip", query="", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+        conn.request("POST", "/api/v1/compile" + query, data,
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": kind, **(headers or {})})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        return res.status, body, res
+
+    def test_only_the_owner_compiles_and_share_links_never(self):
+        tokens = self.share_on()
+        data = archive_zip({"main.tex": DOC_TEX})
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            for role in ("view", "edit"):
+                cookie = {"Cookie": f"{serve.cookie_name()}={tokens[role]}"}
+                self.assertEqual(self.post(data, headers=cookie)[0], 403, role)
+            self.assertEqual(self.post(data)[0], 401)
+            run.assert_not_called()
+            self.assertEqual(self.post(data, headers={"Cookie": f"{serve.cookie_name()}={tokens['owner']}",
+                                                      "Origin": "http://evil.example"})[0], 403)
+            status, body, res = self.post(data, headers={"Cookie": f"{serve.cookie_name()}={tokens['owner']}"})
+            self.assertEqual((status, body, res.getheader("Content-Type")), (200, b"%PDF-1.7 fake", "application/pdf"))
+            self.assertEqual(json.loads(res.getheader("X-Compile"))["pages"], 1)
+            self.assertEqual(run.call_args[0][1], "main.tex")
+
+    def test_failures_answer_the_log_and_json_carries_both(self):
+        failed = {**OK_RESULT, "ok": False, "pdf": None, "log": "! Undefined control sequence.",
+                  "errors": [{"file": "main.tex", "line": 3, "message": "Undefined control sequence."}]}
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=failed):
+            status, body, res = self.post(archive_zip({"main.tex": DOC_TEX}))
+        self.assertEqual((status, body), (422, b"! Undefined control sequence."))
+        self.assertEqual(json.loads(res.getheader("X-Compile"))["errors"][0]["line"], 3)
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)):
+            status, body, _ = self.post(json.dumps({"files": {"main.tex": DOC_TEX}}).encode(), "application/json",
+                                        "?output=json")
+        data = json.loads(body)
+        self.assertEqual((status, data["log"], data["pdf"]), (200, "the log", "JVBERi0xLjcgZmFrZQ=="))
+        self.assertEqual(self.post(b"garbage")[0], 400)
+        self.assertEqual(self.post(archive_zip({"main.tex": DOC_TEX}), query="?main=other.tex")[0], 400)
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+    def test_a_real_build_answers_the_pdf_and_leaves_nothing_behind(self):
+        work, out = self.base / "cache", self.base / "out"
+        with mock.patch.object(build, "CACHE_DIR", work), mock.patch.object(build, "OUT_DIR", out):
+            status, body, res = self.post(archive_tar({"paper/main.tex": DOC_TEX}), "application/gzip")
+            self.assertEqual(status, 200, body[-2000:])
+            self.assertTrue(body.startswith(b"%PDF"))
+            status, body, _ = self.post(archive_zip({"main.tex": DOC_TEX.replace("Hello", "\\nosuchmacro")}),
+                                        query="?output=log")
+            self.assertEqual(status, 422)
+            self.assertIn(b"Undefined control sequence", body)
+        self.assertEqual(list((work / "api-compile").iterdir()) + list((out / ".api-compile").iterdir()), [])
+
+
+class CompileGateway(GatewayMode):
+    def post(self, role, data, user="7-api;Ada (API)"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        conn.request("POST", "/api/v1/compile?doc=demo&output=json", data,
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": "application/zip", "X-Host-Secret": self.SECRET,
+                      "X-Host-Role": role, "X-Host-User": quote(user, safe=";")})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        return res.status, body
+
+    def test_the_gateway_compile_worker_needs_the_edit_role_and_gets_no_build_configuration(self):
+        data = archive_zip({"main.tex": DOC_TEX, "build.toml": "shell_escape = true\n"})
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            for role in ("view", "review"):
+                self.assertEqual(self.post(role, data)[0], 403, role)
+            run.assert_not_called()
+            status, body = self.post("edit", data)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["skipped"], ["build.toml"])
+        self.assertEqual(list(run.call_args[0][0]), ["main.tex"])
+
+    def test_uploads_count_against_the_project_quota(self):
+        serve.QUOTA.update(bytes=50 * 1024, area=self.base)
+        self.addCleanup(serve.QUOTA.update, bytes=0, area=None)
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            status, _ = self.post("edit", archive_zip({"main.tex": DOC_TEX, "big.bin": "x" * 60000}))
+        self.assertIn(status, (413, 507))
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

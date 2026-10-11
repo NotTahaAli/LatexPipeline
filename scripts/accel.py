@@ -152,6 +152,16 @@ VISIBLE = re.compile(r"\\begin\{tikzpicture\}|\\tikz(?![a-zA-Z@])")
 # figures (they come out empty), so a document that has any is built without externalization.
 UNSAFE = re.compile(r"remember\s*picture|overlay|tikzmark|tikzpagenodes|current\s+page")
 LOCAL_INPUT = re.compile(r"\\(?:input|InputIfFileExists)\s*\{([^}]+)\}")
+# Statements in the document body that change how a picture draws without changing its
+# source text: styles and libraries always count, a macro or colour only when a picture names it.
+STYLES = re.compile(
+    r"\\(?:tikzset|tikzstyle|pgfplotsset|pgfkeys|use(?:tikz|pgfplots)library|pgfplotstableread)(?![a-zA-Z@])"
+)
+MACRO_DEF = re.compile(
+    r"\\(?:[gex]?def|let|(?:re|provide)?newcommand\*?|(?:New|Renew|Provide|Declare)DocumentCommand)"
+    r"\s*\{?\s*\\([a-zA-Z@]+)"
+)
+COLOR_DEF = re.compile(r"\\(?:definecolor|colorlet)\s*\{([^}]+)\}")
 
 
 def uses_tikz(doc_dir: Path) -> bool:
@@ -209,6 +219,58 @@ def preamble_files(main_tex: Path) -> list[Path]:
     return found
 
 
+def statement(text: str, start: int) -> str:
+    """The command at text[start] and its arguments: to the line end, or the next command once a group closed."""
+    depth, closed, i = 0, False, start + 1
+    while i < len(text):
+        char = text[i]
+        if depth == 0 and (char == "\n" or (char == "\\" and closed)):
+            break
+        if char == "\\":
+            i += 2
+            continue
+        depth += {"{": 1, "}": -1}.get(char, 0)
+        closed = closed or (char == "}" and depth == 0)
+        i += 1
+    return text[start:i]
+
+
+def body_dependencies(main_tex: Path) -> bytes:
+    """
+    What the document body adds to every figure: \\tikzset and similar statements, the
+    definitions of macros and colours its pictures use, and the files a picture \\input's.
+    Changing any of them changes the pictures without changing their source (or its md5).
+    """
+    doc_dir = main_tex.parent
+    texts = []
+    for path in sorted(doc_dir.rglob("*.tex")):
+        if path.name.startswith(".") or not path.is_file():
+            continue
+        text = COMMENT.sub("", path.read_text(encoding="utf-8", errors="replace"))
+        if path == main_tex:
+            text = text.partition(r"\begin{document}")[2]
+        texts.append(text)
+    pictures = "\n".join(text for body in texts for text in FIGURE_TEXT.findall(body))
+    parts: list[str] = []
+    for body in texts:
+        outside = PICTURE.sub("", body)
+        for match in STYLES.finditer(outside):
+            parts.append(statement(outside, match.start()))
+        for regex in (MACRO_DEF, COLOR_DEF):
+            for match in regex.finditer(outside):
+                name = re.escape(match.group(1).strip())
+                used = rf"\\{name}(?![a-zA-Z@])" if regex is MACRO_DEF else rf"(?<![\w-]){name}(?![\w-])"
+                if re.search(used, pictures):
+                    parts.append(statement(outside, match.start()))
+    for name in sorted(set(LOCAL_INPUT.findall("\n".join(PICTURE.findall(pictures))))):
+        path = (doc_dir / name.strip().strip('"'))
+        for candidate in (path, path.with_name(path.name + ".tex")):
+            if candidate.is_file() and candidate.resolve().is_relative_to(doc_dir.resolve()):
+                parts.append(f"{name}\0{candidate.read_text(encoding='utf-8', errors='replace')}")
+                break
+    return "\0".join(parts).encode()
+
+
 def environment_hash(main_tex: Path, engine: str, shell_escape: bool) -> str:
     """
     Everything besides a figure's own source that can change its PDF: the
@@ -221,6 +283,7 @@ def environment_hash(main_tex: Path, engine: str, shell_escape: bool) -> str:
 
     for path in preamble_files(main_tex):
         digest.update(path.read_bytes())
+    digest.update(body_dependencies(main_tex))
 
     for path in sorted(main_tex.parent.rglob("*")):
         if path.suffix in FIGURE_DEPS and not path.name.startswith(".") and path.is_file():

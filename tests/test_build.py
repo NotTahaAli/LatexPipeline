@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -192,7 +193,8 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertEqual(self.settings(self.PLAIN),
                          {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
                           "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
-                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": []})
+                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": [],
+                          "html": False})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -213,7 +215,8 @@ class ReadSettingsTests(unittest.TestCase):
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
                          {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
                           "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
-                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": []})
+                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": [],
+                          "html": False})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
@@ -693,6 +696,82 @@ class DocxExportTests(unittest.TestCase):
             ok, message = build.export_docx(write_doc(root, "a", "x"))
         self.assertFalse(ok)
         self.assertIn("pandoc was not found", message)
+
+
+HTML_DOC = r"""\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Intro}\label{s}
+Text $a^2+b^2=c^2$, see \ref{s} and \cite{k}.
+\includegraphics[alt={A box}]{box}
+\bibliographystyle{plain}\bibliography{refs}
+\end{document}
+"""
+
+
+class HtmlExportTests(unittest.TestCase):
+    def test_paths_key_prune_and_missing_make4ht(self):
+        with fake_repo() as root:
+            main = write_doc(root, "reports/final", "x", "html = true\n")
+            self.assertEqual(build.html_paths(main),
+                             (root / "out/reports/final.html", root / "out/reports/final.html.zip"))
+            self.assertTrue(build.wants_html(main))
+            (main.parent / "build.toml").write_text("html = 1\n", encoding="utf-8")
+            with self.assertRaises(build.ConfigError):
+                build.read_settings(main)
+            self.assertFalse(build.wants_html(main))
+            folder, archive = build.html_paths(main)
+            folder.mkdir(parents=True)
+            (folder / "index.html").write_text("x", encoding="utf-8")
+            (folder / "pic.pdf").write_bytes(b"%PDF")  # inside a kept export: never a stale document PDF
+            archive.write_bytes(b"zip")
+            (root / "out/gone.html").mkdir()
+            (root / "out/gone.html/index.html").write_text("x", encoding="utf-8")
+            (root / "out/gone.html.zip").write_bytes(b"zip")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build.prune([main])
+            self.assertTrue((folder / "pic.pdf").exists() and archive.exists())
+            self.assertFalse((root / "out/gone.html").exists() or (root / "out/gone.html.zip").exists())
+            with mock.patch.object(build.shutil, "which", return_value=None):
+                ok, message = build.export_html(main)
+            self.assertFalse(ok)
+            self.assertIn("make4ht was not found", message)
+
+    def test_html_excludes_watch_and_focus(self):
+        for extra in (["--watch"], ["--focus", "x"]):
+            with mock.patch.object(build.sys, "argv", ["build.py", "--html", *extra]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build.parse_args()
+
+    @unittest.skipUnless(shutil.which("make4ht") and shutil.which("latexmk") and shutil.which("pdflatex"),
+                         "needs make4ht, latexmk and pdflatex")
+    def test_export_runs_in_the_sandbox_runner_and_writes_mathml_and_a_zip(self):
+        with fake_repo() as root:
+            main = write_doc(root, "a", HTML_DOC)
+            (main.parent / "refs.bib").write_text("@misc{k, title={Some Work}, author={A. Author}, year=2000}\n")
+            (main.parent / "box.tex").write_text("\\documentclass{standalone}\\begin{document}Box\\end{document}\n")
+            subprocess.run(["pdflatex", "-interaction=batchmode", "box.tex"], cwd=main.parent, capture_output=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                entry, _ = build.build_safely(main, shutil.which("latexmk"), False, False)
+            self.assertTrue(entry["ok"], entry)
+            spawned = []
+            real = build.sandbox.spawn
+            record = lambda *a, **k: spawned.append(a) or real(*a, **k)  # noqa: E731
+            with mock.patch.object(build.sandbox, "spawn", side_effect=record):
+                ok, message = build.export_html(main)
+            self.assertTrue(ok, message)
+            self.assertIn("make4ht", spawned[0][0][0])
+            folder, archive = build.html_paths(main)
+            page = (folder / "index.html").read_text(encoding="utf-8")
+            self.assertIn("<math", page)  # MathML, nothing from a CDN
+            self.assertNotIn("mathjax", page.lower())
+            self.assertIn("Some work", page)  # the full build's .bbl
+            self.assertIn("alt='A box'", page)
+            if shutil.which("pdftocairo"):
+                self.assertTrue((folder / "box-.svg").is_file())
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertIn("a.html/index.html", bundle.namelist())
+            self.assertFalse(list(main.parent.glob("*.4ct")))  # make4ht ran on a copy
 
 
 if __name__ == "__main__":

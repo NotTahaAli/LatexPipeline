@@ -64,8 +64,19 @@ class SourceChecks(unittest.TestCase):
         self.write("mine.sty", "\\RequirePackage{titlesec}\n")
         found = a11y.check(self.root, None)
         self.assertEqual([(f["file"], f["message"].split()[0]) for f in found],
-                         [("main.tex", "beamer"), ("main.tex", "soul"), ("mine.sty", "titlesec")])
+                         [("main.tex", "The"), ("main.tex", "soul"), ("mine.sty", "titlesec")])
         self.assertIn(a11y.STATUS_URL, found[0]["hint"])
+
+    def test_beamer_status_and_frame_titles(self):
+        self.write("main.tex", "\\documentclass{beamer}\n\\begin{document}\n"
+                               "\\begin{frame}\\titlepage\\end{frame}\n"
+                               "\\begin{frame}<2>[fragile]{Results}\\end{frame}\n"
+                               "\\begin{frame}\n\\frametitle{Method}\n\\end{frame}\n"
+                               "\\begin{frame}[plain]\n\\includegraphics[alt=A chart]{c}\n\\end{frame}\n"
+                               "% \\begin{frame}\n\\end{document}\n")
+        found = a11y.check(self.root, None)
+        self.assertEqual(kinds(found), [("a11y-class", "main.tex", 1), ("a11y-frame-title", "main.tex", 8)])
+        self.assertIn("ltx-talk", found[0]["message"])
 
     def test_files_outside_the_document_are_not_read(self):
         (self.root.parent / "outside.tex").write_text("\\section{A}\n\\subsubsection{B}\n", encoding="utf-8")
