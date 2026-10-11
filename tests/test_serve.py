@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -736,6 +737,40 @@ class TunnelParsing(unittest.TestCase):
         self.assertIsNone(serve.ngrok_public_url("not json"))
         self.assertIsNone(serve.ngrok_public_url('{"tunnels": []}'))
 
+    def test_ngrok_api_url_works_without_a_context_manager(self):
+        class Conn:  # http.client.HTTPConnection has no __enter__/__exit__
+            closed = False
+
+            def __init__(self, *args, **kwargs):
+                Conn.made = self
+
+            def request(self, method, path):
+                self.path = path
+
+            def getresponse(self):
+                return io.BytesIO(json.dumps({"tunnels": [{"public_url": "https://x.ngrok.app"}]}).encode())
+
+            def close(self):
+                Conn.closed = True
+
+        with mock.patch("serve.http.client.HTTPConnection", Conn):
+            self.assertEqual(serve.ngrok_api_url("http://127.0.0.1:4040/api/tunnels"), "https://x.ngrok.app")
+        self.assertEqual(Conn.made.path, "/api/tunnels")
+        self.assertTrue(Conn.closed)
+
+    def test_tunnel_url_waits_until_its_host_resolves(self):
+        lookups = [socket.gaierror(8, "nodename nor servname provided"), socket.gaierror(8, "again"), []]
+        with mock.patch("serve.socket.getaddrinfo", side_effect=lookups) as dns, mock.patch("serve.time.sleep"):
+            self.assertEqual(serve.Tunnel("cloudflared", 1)._resolvable("https://a-b.trycloudflare.com"),
+                             "https://a-b.trycloudflare.com")
+        self.assertEqual(dns.call_count, 3)
+        self.assertEqual(dns.call_args[0][0], "a-b.trycloudflare.com")
+        with mock.patch("serve.socket.getaddrinfo", side_effect=socket.gaierror(8, "no")), \
+                mock.patch("serve.time.sleep"), mock.patch.object(serve.build, "error") as err:
+            self.assertEqual(serve.Tunnel("cloudflared", 1)._resolvable("https://c.trycloudflare.com", timeout=0),
+                             "https://c.trycloudflare.com")
+        err.assert_called_once()
+
     def test_auto_prefers_cloudflared_then_ngrok_then_npx_then_ssh(self):
         def with_tools(*present):
             return mock.patch("serve.shutil.which", lambda n: f"/bin/{n}" if n in present else None)
@@ -757,7 +792,7 @@ class TunnelParsing(unittest.TestCase):
     def test_tunnel_start_reads_the_url_and_stop_kills_the_process(self):
         script = "import sys,time; print('your url is: https://t.loca.lt', flush=True); time.sleep(60)"
         spec = dict(serve.TUNNELS["localtunnel"], cmd=lambda: [sys.executable, "-c", script], args=lambda p: [])
-        with mock.patch.dict(serve.TUNNELS, {"localtunnel": spec}):
+        with mock.patch.dict(serve.TUNNELS, {"localtunnel": spec}), mock.patch("serve.socket.getaddrinfo"):
             tunnel = serve.Tunnel("localtunnel", 1)
             self.assertEqual(tunnel.start(timeout=10), "https://t.loca.lt")
             self.assertIsNone(tunnel.proc.poll())

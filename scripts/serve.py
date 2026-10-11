@@ -2189,17 +2189,34 @@ class Tunnel:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not STOP.is_set():
             if self.url:
-                return self.url
+                return self._resolvable(self.url)
             if "api" in spec:
                 self.url = self.url or ngrok_api_url(spec["api"])
             if self.proc.poll() is not None and not self.url:
                 time.sleep(0.2)  # let the reader drain
                 if self.url:
-                    return self.url
+                    return self._resolvable(self.url)
                 raise RuntimeError(f"{self.provider} exited ({self.proc.returncode}): {self.tail()}")
             time.sleep(0.25)
         self.stop()
         raise RuntimeError(f"{self.provider} gave no public URL within {int(timeout)} s: {self.tail()}")
+
+    def _resolvable(self, url: str, timeout: float = 90.0) -> str:
+        """Return url once its host resolves here. A fresh quick-tunnel name (trycloudflare.com) reaches DNS some
+        seconds after the tool prints it, and an earlier lookup is cached as missing for up to 60 s, so a link
+        handed out at once fails for whoever opens it. After timeout the url is returned anyway."""
+        host = urlsplit(url).hostname or ""
+        deadline = time.monotonic() + timeout
+        while not (self.stopped or STOP.is_set()):
+            try:
+                socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    build.error(f"{host} does not resolve yet; the link may not open for a minute.")
+                    break
+                time.sleep(2)
+        return url
 
     def tail(self) -> str:
         return " | ".join(list(self.lines)[-4:])
@@ -2213,12 +2230,14 @@ class Tunnel:
 
 
 def ngrok_api_url(api: str) -> str | None:
+    conn = http.client.HTTPConnection("127.0.0.1", 4040, timeout=1)  # not a context manager
     try:
-        with http.client.HTTPConnection("127.0.0.1", 4040, timeout=1) as conn:
-            conn.request("GET", api.split("4040", 1)[1])
-            return ngrok_public_url(conn.getresponse().read().decode("utf-8", "replace"))
+        conn.request("GET", api.split("4040", 1)[1])
+        return ngrok_public_url(conn.getresponse().read().decode("utf-8", "replace"))
     except (OSError, http.client.HTTPException):
         return None
+    finally:
+        conn.close()
 
 
 def share_start(provider: str, doc: str | None, port: int, wait: bool = False) -> None:
