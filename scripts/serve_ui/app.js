@@ -16,6 +16,7 @@ import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { tablePaste } from "./tablepaste.js";
+import { buildControls } from "./buildctl.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -58,6 +59,7 @@ if (config.name) me.name = config.name;   // a named link or an account: the ser
 
 // ---- toast ------------------------------------------------------------------------------
 function toast(...kids) { const t = $("toast"); t.replaceChildren(...kids); t.hidden = false; clearTimeout(t.t); t.t = setTimeout(() => t.hidden = true, 5000); }
+const buildUi = buildControls({ api, $, el, store, toast, canEdit: !readOnly, doc: () => cur });
 
 // ---- theme / sizes -----------------------------------------------------------------------
 function applyAppearance() {
@@ -724,13 +726,29 @@ async function formatFile() {
     const out = (await api.format(cur, text)).text;
     if (active !== tab || view.state.doc.toString() !== text) { toast(el("span", { textContent: "The file changed while tex-fmt ran; format again." })); return; }
     if (out === text) { toast(el("span", { textContent: "Already formatted." })); return; }
-    let a = 0, b = 0;
-    while (a < text.length && a < out.length && text[a] === out[a]) a++;
-    while (b < text.length - a && b < out.length - a && text[text.length - 1 - b] === out[out.length - 1 - b]) b++;
-    if (a && /[\uD800-\uDBFF]/.test(text[a - 1])) a--;   // never split a surrogate pair
-    if (b && /[\uDC00-\uDFFF]/.test(text[text.length - b])) b--;
-    view.dispatch({ changes: { from: a, to: text.length - b, insert: out.slice(a, out.length - b) }, userEvent: "input.format" });
+    replaceChanged(text, out);
     toast(el("span", { textContent: `Formatted ${tab.path} with tex-fmt.` }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
+/** One edit from text (the editor's now) to out: only the part between the common start and end changes. */
+function replaceChanged(text, out) {
+  let a = 0, b = 0;
+  while (a < text.length && a < out.length && text[a] === out[a]) a++;
+  while (b < text.length - a && b < out.length - a && text[text.length - 1 - b] === out[out.length - 1 - b]) b++;
+  if (a && /[\uD800-\uDBFF]/.test(text[a - 1])) a--;   // never split a surrogate pair
+  if (b && /[\uDC00-\uDFFF]/.test(text[text.length - b])) b--;
+  view.dispatch({ changes: { from: a, to: text.length - b, insert: out.slice(a, out.length - b) }, userEvent: "input.format" });
+}
+// ---- .bib tidy: entries sorted, fields aligned (server: bibtidy.py); applied as one edit like Format ----
+async function tidyBib() {
+  if (readOnly || active?.kind !== "text" || !/\.bib$/i.test(active.path)) { toast(el("span", { textContent: "Open a .bib file to tidy it." })); return; }
+  const tab = active, text = view.state.doc.toString();
+  try {
+    const r = await api.bibTidy(cur, { text });
+    if (active !== tab || view.state.doc.toString() !== text) { toast(el("span", { textContent: "The file changed meanwhile; tidy again." })); return; }
+    if (r.text !== text) replaceChanged(text, r.text);
+    const twins = r.duplicates.length ? ` Possible duplicates: ${r.duplicates.slice(0, 3).join("; ")}${r.duplicates.length > 3 ? " ..." : ""}.` : "";
+    toast(el("span", { textContent: (r.text === text ? "Already tidy." : `Tidied ${tab.path}.`) + twins }));
   } catch (e) { toast(el("span", { textContent: e.message })); }
 }
 // ---- review PDF: the open suggestions marked as changes and the unresolved comments as notes, built from a copy ----
@@ -1137,7 +1155,7 @@ async function loadWarnings() {
 }
 
 async function loadLog() {
-  try { $("logText").textContent = await (await fetch(api.logUrl(cur))).text(); } catch { $("logText").textContent = "No log yet."; }
+  try { buildUi.showLog(await (await fetch(api.logUrl(cur))).text()); } catch { buildUi.showLog("No log yet."); }
 }
 
 const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "log"];
@@ -1275,6 +1293,7 @@ const COMMANDS = [
   ...aiUi.commands,
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
+  ...buildUi.commands,
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "grammar", title: "Show grammar findings", run: () => setDrawer(true, "grammar") },
@@ -1293,6 +1312,7 @@ const COMMANDS = [
   { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
   { id: "format", edit: true, title: "Format file (tex-fmt)", run: () => formatFile() },
+  { id: "tidybib", edit: true, title: "Tidy .bib file (sort entries, align fields)", run: () => tidyBib() },
   { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
   { id: "arxiv", owner: true, title: "Export for arXiv", run: () => exportArxiv() },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
@@ -1584,6 +1604,7 @@ channel.on("state", (data) => {
   const wasBuilding = lastStatus === "building";
   lastStatus = docs[cur].status;
   renderStatus();
+  buildUi.update(docs, cur);
   renderFocus();
   if (wantedVersion() !== pdfView.version) loadPdf();
   loadWarnings();   // Cheap: it fetches only when a build finished since the last look.

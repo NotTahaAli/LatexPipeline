@@ -34,6 +34,7 @@ from build import (
     find_documents,
     log_path_for,
     output_path_for,
+    output_targets,
 )
 from ci_report import cell, load_documents
 
@@ -161,6 +162,9 @@ def main() -> int:
     documents = find_documents()
     expected = {asset_name(output_path_for(document)) for document in documents}
     expected |= {asset_name(log_path_for(document)) for document in documents}
+    # [[output]] PDFs of build.toml (out/<name>-<output>.pdf) are published like documents, under the same rule.
+    expected |= {asset_name(path) for document in documents for _name, _work, pdf in output_targets(document)
+                 for path in (pdf, pdf.with_suffix(".log"))}
 
     with tempfile.TemporaryDirectory() as staging:
         for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]):

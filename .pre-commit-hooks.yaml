@@ -1,0 +1,28 @@
+# Hooks for pre-commit (https://pre-commit.com), for repositories made from this template: each runs the
+# repository's own scripts/ (language "unsupported", formerly "system": no virtualenv, needs python3 on PATH).
+# Use them from .pre-commit-config.yaml with `repo: https://github.com/NotTahaAli/LatexPipeline` and a `rev`,
+# or copy them under `repo: local`. See README, "Lint and CI reports".
+- id: latex-lint
+  name: LaTeX lint (labels, references, figures, .bib, style notices)
+  entry: python3 scripts/ci_report.py lint --strict
+  language: unsupported
+  files: ^files/.*\.(tex|bib|sty|cls)$
+  pass_filenames: false
+  require_serial: true
+  minimum_pre_commit_version: "4.4.0"
+- id: latex-format
+  name: LaTeX formatting (tex-fmt --check)
+  entry: python3 scripts/build.py --format --check
+  language: unsupported
+  files: ^files/.*\.tex$
+  pass_filenames: false
+  require_serial: true
+  minimum_pre_commit_version: "4.4.0"
+- id: bib-tidy
+  name: .bib files sorted and aligned (build.py --tidy-bib --check)
+  entry: python3 scripts/build.py --tidy-bib --check
+  language: unsupported
+  files: ^files/.*\.bib$
+  pass_filenames: false
+  require_serial: true
+  minimum_pre_commit_version: "4.4.0"

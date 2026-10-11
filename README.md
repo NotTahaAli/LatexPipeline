@@ -92,9 +92,31 @@ python scripts/build.py --source bench sample-report   # build from bench/ inste
 python scripts/build.py my-report --focus Chapters/chapter5   # preview one part in ~2 s, see "Large documents"
 python scripts/build.py --format my-report   # rewrite its .tex files with tex-fmt (no build)
 python scripts/build.py my-paper --arxiv  # also write out/my-paper.arxiv.zip and check it for arXiv, see "arXiv export"
+python scripts/build.py --strict         # also fail on undefined references or citations and overfull boxes over 1 pt
+python scripts/build.py --quiet-log      # print only the LaTeX lines that need action (the log keeps everything)
+python scripts/build.py my-paper --preflight      # camera-ready checks of the PDF: fonts, Type 3, page size, PDF version
+python scripts/build.py my-paper --pages 1-3,7    # also write out/my-paper.pages.pdf with those pages (qpdf or pdftk)
+python scripts/build.py --tidy-bib my-paper       # sort and align its .bib files, report duplicates (no build)
+python scripts/build.py --deps make my-paper      # the files its last build read, as a Make rule (or json)
+python scripts/build.py --query my-paper          # title, author, pages, words, labels, sections as JSON
+python scripts/build.py --watch --notify --exec "cp out/my-paper.pdf ~/Dropbox/"   # notify, then run a command
 ```
 
 `--format` runs [tex-fmt](https://github.com/WGUNDERWOOD/tex-fmt) (install it with `cargo install tex-fmt`, `brew install tex-fmt` or a binary from its releases page) on every `.tex` file of each selected document, in the document's directory, so a `tex-fmt.toml` there sets the options (wrap length, tab size, extra list or verbatim environments; see tex-fmt's README). It prints the files it changed. Without tex-fmt on `PATH` it prints a message and exits 0. tex-fmt only rewrites text and never runs LaTeX, so it is not sandboxed.
+
+`--tidy-bib` sorts the entries of every `.bib` file of each selected document (by key in natural order; `--bib-sort author` by first author and year, `year`, or `none` to keep the order), puts the fields in [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy)'s default order (title, author, year, journal, booktitle, ...; unknown fields after them in their own order) with their `=` aligned, and lists possible duplicates (the same key, DOI or title) without removing any. Values are copied byte for byte, a comment above an entry moves with it, and `@string`, `@preamble`, `@comment` and anything it cannot parse go to the top in their original order; if the result would still differ in content, the file is left alone with a message. `--check` (also for `--format`) changes nothing and exits 1 when a file would change, for pre-commit.
+
+`--quiet-log` filters the LaTeX output printed while building with [texfot](https://ctan.org/pkg/texfot)'s rules, shortened: errors and the line after them, warnings, overfull and underfull boxes, missing characters and the "Output written" line. `out/<name>.log` keeps everything; the editor's Log tab has the same filter as a checkbox.
+
+`--strict` (or `strict = true` in `build.toml`) fails a document whose last LaTeX run warned about an undefined or multiply defined reference, label or citation, or had an overfull box wider than 1 pt; the PDF is not copied to `out/`, like any failed build. A current document is not rebuilt, so add `--force` to check one.
+
+`--preflight` runs `pdffonts` and `pdfinfo` (poppler-utils) on each PDF after the build: fonts that are not embedded are an error (exit 1; usually a figure PDF from another program), Type 3 (bitmap) fonts and pages of different sizes are warnings, and the PDF version, page size and bookmarks are listed for you to compare with what the venue asks. Without poppler-utils it says so.
+
+`--pages 1-3,7` copies those pages of one document's PDF to `out/<name>.pages.pdf` with qpdf (or pdftk); without either it prints where to get qpdf and exits 1. The file is never published.
+
+`--deps make` prints a Make rule `out/<name>.pdf: <inputs>` with every file the last build read (from the `.fls`: the document's own files and files outside it, not the TeX installation or the cache), `--deps json` the same as `{"target", "inputs"}`. `--query` prints JSON per document: `title` and `author` from `main.tex` (commands dropped), `pages` from the last build's log, `words` (texcount, `null` without it), `labels` (`key`, `number`, `page` from the `.aux` files) and `sections` (`level`, `number`, `title`, `page` from the `.toc`). Neither builds; both need one earlier build.
+
+`--watch --notify` shows a desktop notification after each build (osascript on macOS, `notify-send` on Linux, a PowerShell tray balloon on Windows; nothing if none is there). `--watch --exec "command"` runs the command after each successful build, split like a shell would split it but without a shell, in the repository root, with `LP_DOC` (the document name) and `LP_PDF` (its PDF path) in the environment. Only the command line runs it; the editor and shared links never do.
 
 With uv you can use `uv run scripts/build.py ...` instead of `python`.
 
@@ -112,7 +134,7 @@ For each document, the script:
 
 Errors are printed in the summary as `files/<doc>/<file>:<line>: message`, which most editors can open directly. The same lines start the document's `.log`. Each error is followed by a plain-language hint when one of the rules in `scripts/hints.py` matches (also in `build-report.json` as `hint`).
 
-After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings), `error` (the message of a crashed build, otherwise `null`) and `phases` (seconds spent on `figures` and `latex`, `null` for a crash). A document built with `tagged = true` also gets `a11y`, a list of accessibility findings (`kind`, `file`, `line`, `message`, `hint`; see "PDF/A and tagged PDF"); other documents have no such key. CI reads this file, so keep its keys stable.
+After a build (not `--watch`) the script writes `out/build-report.json` with every document it built in that run: `ok`, `seconds`, `engine`, `pages` (`null` if unknown or failed), `errors` (`file`, `line`, `message`), `warnings` (a count of LaTeX warnings), `error` (the message of a crashed build, otherwise `null`) and `phases` (seconds spent on `figures` and `latex`, `null` for a crash). Optional keys: `steps`, one `{"rule", "seconds"}` per latexmk rule run (`pdflatex`, `bibtex main`, ...; `--profile` prints them), and `outputs`, the `[[output]]` PDFs (see "build.toml keys"). A document built with `tagged = true` also gets `a11y`, a list of accessibility findings (`kind`, `file`, `line`, `message`, `hint`; see "PDF/A and tagged PDF"); other documents have no such key. CI reads this file, so keep its keys stable.
 
 Before building, it deletes any PDF or log in `out/` whose `main.tex` no longer exists. `--watch` does this too.
 
@@ -164,6 +186,10 @@ The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex` 
 | `lang` | `"en-US"` | Document language: PDF/A metadata and the grammar checker. |
 | `timeout` | `600` | Seconds (10 to 7200) before a latexmk run is killed. `--timeout` changes the default; sharing caps it at 300. |
 | `review` | `"off"` | `"show"` or `"clean"`: the [review markup](#review-markup) macros; `"off"` defines none. `--review` overrides it. |
+| `draft` | `false` | graphicx draws a box for each image instead of the image (`--draft` for every document). See "Large documents" for what it saves. |
+| `strict` | `false` | Fail the document on undefined or multiply defined references and citations and on overfull boxes over 1 pt (`--strict`). |
+| `anonymous` | `false` | Double-blind check: the log lists `\author`, `\affiliation`, `\email` or `\thanks` text that is not "Anonymous", e-mail addresses, acknowledgements sections and phrases such as "our previous work" (notes, never failures; comments are skipped). |
+| `[[output]]` | none | An extra PDF of the document, see below. |
 | `grammar` | `"auto"` | `"auto"`, `"off"`, `"local"` or `"public"`, see [Grammar](#grammar). |
 | `grammar_url` | `http://localhost:8081` | LanguageTool server for local mode (`LANGUAGETOOL_URL` is the fallback). |
 | `disabled_rules` | `[]` | LanguageTool rule ids to ignore. |
@@ -172,6 +198,21 @@ The LaTeX engine comes from a magic comment in the first 20 lines of `main.tex` 
 engine = "lualatex"
 pdfa = "2b"
 timeout = 900
+```
+
+**Several PDFs from one document.** Each `[[output]]` table builds one more PDF after the main one, `out/<name>-<output name>.pdf` (and its `.log`), in its own cache directory. `name` (letters, digits and `_`) is required; `define` lists macro names that are defined empty before the document starts (`\def\handout{}`, so the document can test `\ifdefined\handout`), and `engine`, `review`, `draft` and `anonymous` override the document's value. CI builds and publishes them with the document under the same release naming rule, and a failed output fails the document. The editor, `--watch` and `--focus` build the main PDF only. An output whose PDF would be another document's (`files/a` with output `b` next to `files/a-b`) fails.
+
+```toml
+anonymous = true
+
+[[output]]
+name = "camera_ready"
+anonymous = false
+define = ["cameraready"]
+
+[[output]]
+name = "handout"
+define = ["handout"]
 ```
 
 ### Review markup
@@ -267,7 +308,7 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 * Code check: unmatched `\begin`/`\end`, unbalanced braces, `\left` without `\right` and unclosed `$`, `$$`, `\(` and `\[` (also math running across a blank line) are underlined 0.6 s after you stop typing; Ctrl+Shift+M lists them, F8 jumps to the next. Comments, `verbatim`, `lstlisting`, `minted`, `comment`, `\verb`, URLs and the bodies of `\newcommand`, `\def` and friends are skipped. A line `%%novalidate` turns it off for the file, and `%%begin novalidate` ... `%%end novalidate` for a region; Settings > Editor turns it off everywhere. It is a quick structural check, not a LaTeX run: the build log stays the authority.
 * Completion also offers the macros and environments the document defines (`\newcommand`, `\renewcommand`, `\DeclareMathOperator`, `\def`, `\NewDocumentCommand`, `\newenvironment`, `\NewDocumentEnvironment`, in any `.tex`, `.sty` or `.cls` of its folder), and `\cite{` and `\ref{` match any part of the key, author or title (every word you type must appear).
 
-**Build results.** "Up to date" after a restart still shows the pages, build time and warnings of the last build (read back from `out/`). The Problems panel has a Warnings tab parsed from the LaTeX log: undefined references and citations, overfull and underfull boxes, package warnings and BibTeX warnings, filterable by kind, each with a plain-language hint where `scripts/hints.py` explains it and a link to its source line.
+**Build results.** "Up to date" after a restart still shows the pages, build time and warnings of the last build (read back from `out/`). The Problems panel has a Warnings tab parsed from the LaTeX log: undefined references and citations, overfull and underfull boxes, package warnings and BibTeX warnings, filterable by kind, each with a plain-language hint where `scripts/hints.py` explains it and a link to its source line. The Log tab's "Only lines that need action" checkbox filters the log like `build.py --quiet-log` (remembered in this browser). While a build runs, **Stop** next to Rebuild (edit role) kills its latexmk and the build fails with "Build cancelled."; a TikZ figure job already running finishes first, and the next save builds again. Ctrl+K > "Desktop notification when a build ends" asks the browser for permission and then notifies you when a build finishes or fails while the window is in the background.
 
 **Chapters, files and figures.** "Preview chapter" (status bar, or the command palette) builds only the chapter you are editing with `build.build_focus`, keeping the numbering and references of the full document, and shows it with a "Chapter preview" bar and a "Back to full PDF" button; Settings can build it after each save. Jump-to-PDF is off while it is shown. The first preview of a document builds the whole thing once. The Files tab has new file, new folder, rename/move (F2) and delete (Delete key, with a confirmation); `main.tex`, dotfiles and, over a share link, build-config files cannot be touched, and open co-editing rooms of a renamed or deleted file are closed. Drop or paste a png, jpg or pdf into the editor to save it (into `Figures/` if it exists) and insert `\includegraphics`; up to 8 MB, content checked, svg refused. Spell check (the browser's own, no dictionary shipped) underlines misspelled words in visual mode and the paragraph panel only, never LaTeX commands or keys; Settings turns it off. Shared links: view cannot start previews or change files, edit can for the shared document only.
 
@@ -288,6 +329,8 @@ Errors from the build appear in the Problems panel. [`.vscode/settings.json`](.v
 **Grammar.** The Problems panel has a Grammar tab. The open `.tex` file is checked 2 s after you stop typing (the text of the buffer, saved or not); findings are wavy underlines, and hovering one shows the message and up to three replacements to click (no replacement is offered where the span holds commands or math). Settings > Grammar (owner only) picks automatic, off, local or public, the local server URL, and whether the public API may be used while sharing. See [Grammar](#grammar) for what each mode sends where. Public mode asks for confirmation when chosen.
 
 **Format file.** Ctrl+K > "Format file (tex-fmt)" (also More > Document; edit role) sends the open `.tex` file's text, saved or not, to the server, which runs `tex-fmt --stdin` in the document folder (so its `tex-fmt.toml` applies) and returns the result. The editor applies it as one edit covering only the changed part, so undo, co-editing, suggest mode and autosave treat it like typing; the server writes nothing, and if the text changed while tex-fmt ran nothing is applied. Up to 1 MB of text and 20 requests a minute on a shared link. Without tex-fmt on the server's `PATH` you get a message.
+
+**Tidy .bib file.** Ctrl+K > "Tidy .bib file (sort entries, align fields)" (edit role) does what `build.py --tidy-bib` does to the open `.bib` file's text, saved or not (`POST /api/bib/tidy`), applies it as one edit like Format file, and lists possible duplicates in the message. The server writes nothing.
 
 **AI assistant.** The sidebar's Assistant tab (or "Toggle AI assistant" and the "AI: ..." commands in Ctrl+K) uses the Anthropic Messages API (`scripts/ai.py`, default model `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` in its settings). It is **off until the owner turns it on** in the panel's settings, which asks for confirmation because **the text you ask about is sent to Anthropic** (`api.anthropic.com`): the selection and 2,000 characters around it, the open file and the outline for a question, or the build error, about 40 lines of log and the source around the error line (plus the top of `main.tex`) for Explain. Nothing else is sent, and nothing is sent until you click.
 
@@ -465,6 +508,8 @@ A no-op rebuild takes 0.12 s (plain latexmk: 0.12 s). The figure edit now lists 
 How this compares with plain latexmk, an Overleaf-style build, a naive pdflatex/bibtex script, arara and Tectonic (including where plain latexmk wins) is in [docs/benchmarks.md](docs/benchmarks.md).
 
 Not adopted, because they did not pay off: a precompiled preamble format (saves about 1.2 s of a 12 s pass, changed the page count out of the box and hides the class from `-recorder`), `-draftmode` or `\pdfcompresslevel=0` for intermediate passes and dropping SyncTeX (no gain above the 1 s noise), parallel BibTeX (the ten units take 0.2 s together), and splicing separately built chapters into the full PDF (needs a PDF library; `pdfunite` drops the outline and breaks cross-chapter links).
+
+**Draft mode is an opt-in, not a default.** `draft = true` in `build.toml` (or `--draft`) passes `draft` to graphicx, which draws a box of the right size instead of each image, so the layout and page numbers stay. It changes the PDF, so a document builds once more when it is switched on or off. Measured on `bench/sample-report` (11 small PNG and PDF images) on a shared 4-CPU machine, two runs each: `--force` 129 and 138 s without, 119 and 103 s with it; a one-line text edit 22 and 27 s without, 28 and 23 s with it. Text edits gain nothing, and the cold-build difference is within this machine's noise. It may help a document with many large images; measure yours before relying on it.
 
 ---
 
@@ -682,6 +727,19 @@ A missing `chktex`, `texcount` or `latexdiff` leaves its column blank. `--overfu
 
 `--format` runs `tex-fmt --check` on each `.tex` file (with the document's `tex-fmt.toml`) and reports the files it would change as notices, which `--strict` ignores; `build.py --format` fixes them. A missing tex-fmt is a message. The workflow does not pass `--format`, so formatting never fails CI.
 
+Besides undefined references and unused labels, `lint` reports a label defined twice (`duplicate-label`), and as notices (which `--strict` ignores), after [pre-commit-latex-hooks](https://github.com/jonasbb/pre-commit-latex-hooks): a breakable space or line break before `\cite`, `\citep`, `\parencite` or `\autocite` (`cite-space`: write `word~\cite{key}`), `\cref` starting a sentence or `\Cref` inside one (`cref-case`), and a word spelt both the US and the UK way in one document (`spelling`: color/colour, behavior, modeling, analyze, optimize, organize, center, labeled).
+
+**pre-commit.** [`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml) offers `latex-lint` (`ci_report.py lint --strict`), `latex-format` (`build.py --format --check`) and `bib-tidy` (`build.py --tidy-bib --check`). They run the repository's own `scripts/` (language `unsupported`, pre-commit 4.4 or newer, `python3` on `PATH`), so use them in a repository made from this template:
+
+```yaml
+repos:
+  - repo: https://github.com/NotTahaAli/LatexPipeline
+    rev: <a tag or commit>
+    hooks:
+      - id: latex-lint
+      - id: bib-tidy
+```
+
 ---
 
 ## Tests and lint
@@ -703,7 +761,7 @@ The editor's live preview has one too: `uv run --no-project --with playwright==1
 
 ## GitHub Actions
 
-[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when `files/`, one of the build scripts (`build.py`, `accel.py`, `hints.py`, `a11y.py`, `publish_release.py`, `ci_report.py`), the workflow, `.github/texlive-packages.txt` or the Python project files change. Editing only `serve.py`, its UI or the tests does not trigger it. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
+[`.github/workflows/build-pdf.yml`](.github/workflows/build-pdf.yml) runs on pull requests and on pushes to the default branch when `files/`, one of the build scripts (`build.py`, `accel.py`, `hints.py`, `a11y.py`, `publish_release.py`, `ci_report.py`), the workflow, `.github/texlive-packages.txt`, `.github/fonts/`, `.github/hooks/` or the Python project files change. Editing only `serve.py`, its UI or the tests does not trigger it. A push to a feature branch does not run it: its pull request does. It can also be started manually (`workflow_dispatch`).
 
 * **build** gets TeX Live from a cache (about 12 s) or, on a cache miss, from trimmed apt (about 70 s) while a parallel `texlive-cache` job installs it from tug.org via `zauguin/install-texlive` and saves the cache for the next run (packages: `.github/texlive-packages.txt`), compiles only the documents that changed, and uploads the resulting PDFs and logs as the `pdfs` run artifact. What counts as changed depends on the trigger:
   * Push to the default branch: everything changed since the last fully successful publish. Runs that were skipped or failed get caught up.
@@ -721,6 +779,8 @@ The editor's live preview has one too: `uv run --no-project --with playwright==1
   * File names on the release are escaped. Every character other than letters, digits, `.` and `-` becomes `_` followed by its UTF-8 bytes in hex: space becomes `_20`, `_` becomes `_5F`, and `/` becomes `_2F`. For example, `FP-123 Proposal.pdf` becomes `FP-123_20Proposal.pdf`. To recover the original name, replace each `_` with `%` and URL-decode. The release page shows the original path as the file's label.
   * After a fully successful build, the `pdfs` tag moves to the commit that was built. That tag marks where the next run starts from.
 * **requirements** fails if `uv.lock` or `requirements.txt` has fallen behind `pyproject.toml`.
+* **TeX Live year.** `TEXLIVE_VERSION` at the top of the workflow (empty: the latest) is passed to `zauguin/install-texlive` as `texlive_version` and is part of the cache key, so setting it to, say, `"2025"` installs that year once and keeps it. Historic years come from tug.org's archive; the apt fallback on a cache miss is always Ubuntu's own TeX Live, whatever the setting.
+* **Extra fonts and hooks.** Font files in `.github/fonts/` are copied to `~/.local/share/fonts` before building (fontconfig for XeLaTeX, `OSFONTDIR` for LuaLaTeX). `.github/hooks/pre-build` runs before the build and `.github/hooks/post-build` after it (with `BUILD_OUTCOME` set), both with `bash`. They are repository files that run in CI only: neither the editor nor a shared link ever runs them. Changing them rebuilds every document (`GLOBAL_INPUTS`).
 
 [`.github/workflows/binaries.yml`](.github/workflows/binaries.yml) runs on pushed `v*` tags (and manually): it builds the [binaries](#binaries) on Linux, macOS and Windows, runs each with `--help` (and `build --list`), and attaches them to that tag's release, creating the release if needed. A manual run on a branch keeps them as run artifacts only.
 

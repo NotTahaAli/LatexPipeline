@@ -59,6 +59,32 @@ class LintDocumentTests(unittest.TestCase):
         self.assertEqual((by_subject["eq:gone"].path, by_subject["eq:gone"].line), ("main.tex", 3))
         self.assertEqual(by_subject["sec:chap"].path, "chap.tex")
 
+    def test_duplicate_labels(self):
+        findings = self.lint({
+            "doc/main.tex": "\\label{a}\\ref{a}\n\\input{b}\n\\label{a} % \\label{a}\n",
+            "doc/b.tex": "\\label{a}\n",
+        })
+        found = [(f.path, f.line, f.message) for f in findings if f.kind == "duplicate-label"]
+        self.assertEqual(found, [("main.tex", 3, "label 'a' is already defined at main.tex:1"),
+                                 ("b.tex", 1, "label 'a' is already defined at main.tex:1")])
+
+    def test_style_notices_cite_space_cref_case_and_spelling(self):
+        findings = self.lint({"doc/main.tex": (
+            "\\usepackage{xcolor}\\definecolor{x}{rgb}{0,0,0}\n"
+            "The colour is red, as in prior work \\cite{a}. Fine work~\\cite{b}.\n"
+            "\\cref{x} shows it. As in \\Cref{y}, see. \\Cref{z} is right; see \\cref{z}.\n"
+            "Colors\n\\cite{c} and \\textcolor{red}{x}.\n"
+        )})
+        notices = [(f.kind, f.line, f.message, f.level) for f in findings
+                   if f.kind in ("cite-space", "cref-case", "spelling")]
+        self.assertEqual(notices, [
+            ("cite-space", 2, "use ~\\cite: a line break can fall before the citation", "info"),
+            ("cite-space", 5, "use ~\\cite: a line break can fall before the citation", "info"),
+            ("cref-case", 3, "\\cref starts a sentence: use \\Cref", "info"),
+            ("cref-case", 3, "\\Cref inside a sentence: use \\cref", "info"),
+            ("spelling", 4, "both US and UK spellings are used (colors and colour): pick one", "info"),
+        ])
+
     def test_unused_figure_matches_with_and_without_extension(self):
         findings = self.lint({
             "doc/main.tex": "\\includegraphics[width=2cm]{Figures/a}\n\\includegraphics{b.pdf}\n",
