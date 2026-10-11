@@ -4,6 +4,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Editor: code folding for sections, environments, the preamble and `% region` blocks (fold gutter and Ctrl+Shift+[ / ]).
+- Editor: hovering math in source mode shows it rendered (KaTeX); hovering a `\cite` key or `\ref` label shows the entry or the label's line.
+- Editor: live code check for unmatched `\begin`/`\end`, braces, `\left`/`\right` and math delimiters, with `%%novalidate`, `%%begin novalidate` / `%%end novalidate` and a Settings toggle.
+- Editor: completion of the document's own macros and environments, more built-in environments, and `\cite` / `\ref` keys matched by any part of the key, author or title.
+- Editor: dark PDF pages (PDF toolbar or Settings), remembered in the browser.
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed

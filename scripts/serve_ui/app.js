@@ -1,4 +1,4 @@
-import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
+import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, lint as LINT, highlight as HL, stex, loadVim, loadEmacs, loadKatex, collabLibs } from "./libs.js";
 import { Collab, PALETTE, hunk } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
@@ -13,6 +13,7 @@ import { reviewSupport } from "./review.js";
 import { namedLinks } from "./links.js";
 import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
+import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -25,14 +26,14 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false, check: true, pdfDark: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
 // ---- state ------------------------------------------------------------------------------
 let docs = {}, cur = decodeURIComponent(location.hash.slice(1));
 const tabs = new Map();      // path -> tab (per-file editor state)
-let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
+let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {}, macros: [], envs: [] }, outlineData = null, lastErrKey = null;
 const firstVisit = store.get("ui") === null;
 const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
@@ -62,7 +63,11 @@ function applyAppearance() {
   root.style.setProperty("--font-size", settings.font + "px");
   root.style.setProperty("--split", ui.split + "%");
   $("splitter").setAttribute("aria-valuenow", Math.round(ui.split));
+  $("pages").classList.toggle("pdf-dark", !!settings.pdfDark);
+  $("pdfDark").setAttribute("aria-pressed", String(!!settings.pdfDark));
 }
+function togglePdfDark() { settings.pdfDark = !settings.pdfDark; saveSettings(); applyAppearance(); }
+$("pdfDark").onclick = togglePdfDark;
 
 // ---- CodeMirror ---------------------------------------------------------------------------
 const { EditorState, Compartment, Prec } = S;
@@ -85,25 +90,38 @@ function toggleSuggest() {
   $("suggestBtn").setAttribute("aria-checked", String(REV.suggesting));
   $("cm").classList.toggle("suggesting", REV.suggesting);
 }
-const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment();
+const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment(), checkC = new Compartment();
 
+const CMDS = ["section", "subsection", "subsubsection", "paragraph", "chapter", "textbf", "textit", "texttt", "emph", "underline", "cite", "ref", "eqref", "label",
+  "begin", "end", "includegraphics", "caption", "footnote", "item", "frac", "sqrt", "sum", "int", "prod", "lim", "left", "right", "mathbb", "mathcal", "mathrm",
+  "input", "include", "usepackage", "newcommand", "renewcommand", "url", "href", "centering", "hline", "noindent", "vspace", "hspace", "newpage", "tableofcontents"];
+// \cite and \ref keys match any part of the key, author or title (filter: false, so CodeMirror asks again on every key).
+const keyed = (from, typed, entries, text, option) => ({ from, filter: false, options: matchEntries(entries, typed, text).slice(0, 200).map(option) });
 const latexComplete = (ctx) => {
-  const ref = ctx.matchBefore(/\\(?:ref|eqref|cref|Cref|autoref|pageref)\{[^}]*/);
-  if (ref) return { from: ref.from + ref.text.indexOf("{") + 1, options: Object.entries(refs.labels).map(([label, v]) => ({ label, detail: v.context.slice(0, 50), type: "variable" })) };
-  const cite = ctx.matchBefore(/\\cite[a-z]*\*?(?:\[[^\]]*\])*\{[^}]*/);
+  const ref = ctx.matchBefore(/\\(?:ref|eqref|cref|Cref|autoref|pageref|nameref|vref)\{[^}]*/);
+  if (ref) {
+    const from = ref.from + ref.text.indexOf("{") + 1;
+    return keyed(from, ref.text.slice(from - ref.from), refs.labels, (v) => v.context, ({ key, v }) => ({ label: key, detail: v.context.slice(0, 50), type: "variable" }));
+  }
+  const cite = ctx.matchBefore(/\\(?:cite[A-Za-z]*|[Cc]itep?|[Cc]itet|parencite|textcite|autocite|footcite)\*?(?:\[[^\]]*\])*\{[^}]*/);
   if (cite) {
     const from = Math.max(cite.text.lastIndexOf("{"), cite.text.lastIndexOf(",")) + cite.from + 1;
-    return { from, options: Object.entries(refs.bib).map(([label, v]) => ({ label, detail: [v.author, v.year].filter(Boolean).join(" ").slice(0, 50), type: "text" })) };
+    return keyed(from, cite.text.slice(from - cite.from).trimStart(), refs.bib, (v) => [v.author, v.year, v.title].join(" "),
+      ({ key, v }) => ({ label: key, detail: [v.author, v.year].filter(Boolean).join(" ").slice(0, 50), info: v.title || undefined, type: "text" }));
   }
-  const env = ctx.matchBefore(/\\begin\{[a-z*]*/);
-  if (env) return { from: env.from + 7, options: ["itemize", "enumerate", "equation", "align", "figure", "table", "tabular", "abstract", "document", "center", "verbatim", "theorem", "proof"].map((label) => ({ label, type: "keyword" })) };
+  const env = ctx.matchBefore(/\\begin\{[A-Za-z*]*/);
+  if (env) return { from: env.from + 7, options: [...new Set([...BUILTIN_ENVS, ...(refs.envs || [])])].map((label) => ({ label, type: "keyword" })) };
   const cmd = ctx.matchBefore(/\\[A-Za-z]*/);
-  if (cmd && (cmd.to - cmd.from > 1 || ctx.explicit)) return { from: cmd.from, options: ["section", "subsection", "subsubsection", "textbf", "textit", "emph", "cite", "ref", "label", "begin", "end", "includegraphics", "caption", "footnote", "item", "frac", "sum", "int", "input", "usepackage"].map((c) => ({ label: "\\" + c, type: "function" })) };
+  if (cmd && (cmd.to - cmd.from > 1 || ctx.explicit)) {
+    const own = new Set(refs.macros || []);
+    return { from: cmd.from, options: [...CMDS.filter((c) => !own.has(c)).map((c) => ({ label: "\\" + c, type: "function" })), ...[...own].map((c) => ({ label: "\\" + c, type: "function", detail: "defined in this document" }))] };
+  }
   return null;
 };
 
 function extensionsFor(tab) {
   const room = tab.collab;
+  tab.tex = latexSupport({ V, L, LINT, loadKatex }, { path: () => tab.path, refs: () => refs, visual: () => settings.visual });
   return [
     keysC.of([]),
     lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
@@ -116,6 +134,7 @@ function extensionsFor(tab) {
     errField,
     readOnly ? [] : GR.extension,
     REV.extension,
+    tab.tex.folding, tab.tex.hover, checkC.of(settings.check ? tab.tex.check : []),
     L.bracketMatching(), AC.closeBrackets(),
     AC.autocompletion({ override: [latexComplete], icons: false }),
     EditorState.allowMultipleSelections.of(true),
@@ -126,7 +145,7 @@ function extensionsFor(tab) {
     spellC.of(spellAttr()),
     keymap.of([
       { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
-      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
+      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap, ...L.foldKeymap, ...LINT.lintKeymap,
     ]),
     SR.search({ top: true }),
     visualC.of([]),
@@ -233,6 +252,7 @@ async function applyConfig() {
     keysC.reconfigure(Prec.high(keys)),
     visualC.reconfigure(settings.visual && active?.kind === "text" ? [visualField, env] : []),
     spellC.reconfigure(spellAttr()),
+    checkC.reconfigure(settings.check && active?.tex ? active.tex.check : []),
   ] });
   $("proseBody").spellcheck = !!settings.spell;
   $("cm").classList.toggle("visual", !!settings.visual);
@@ -415,6 +435,7 @@ let autoFocusTimer;
 async function onFsEvent(msg) {
   if (msg.doc !== cur) return;
   loadFiles();
+  if ([...msg.changed, ...msg.removed].some((p) => /\.(tex|bib|sty|cls)$/i.test(p))) loadRefs();   // completion and hover cards
   if (live.last?.meta.overlay === false && msg.changed.includes(active?.path)) live.edited();   // Previewed from disk: again once saved.
   if (settings.focusAuto && !readOnly && isChapter(active) && msg.changed.includes(active.path)) {   // "Build it after each save"
     clearTimeout(autoFocusTimer); autoFocusTimer = setTimeout(() => isChapter(active) && previewChapter(true), 600);
@@ -1219,6 +1240,13 @@ const COMMANDS = [
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
   { id: "zout", title: "PDF zoom out", run: () => pdfView.setZoom(pdfView.zoom / 1.2) },
   { id: "fit", title: "PDF fit width", run: () => pdfView.fit() },
+  { id: "pdfdark", title: "PDF: dark pages on/off", run: () => togglePdfDark() },
+  { id: "fold", title: "Fold section or environment", keys: mod === "Cmd" ? "Cmd+Alt+[" : "Ctrl+Shift+[", run: () => L.foldCode(view) },
+  { id: "unfold", title: "Unfold", keys: mod === "Cmd" ? "Cmd+Alt+]" : "Ctrl+Shift+]", run: () => L.unfoldCode(view) },
+  { id: "foldall", title: "Fold all", keys: "Ctrl+Alt+[", run: () => L.foldAll(view) },
+  { id: "unfoldall", title: "Unfold all", keys: "Ctrl+Alt+]", run: () => L.unfoldAll(view) },
+  { id: "check", title: "Code check: show problems", keys: `${mod}+Shift+M`, run: () => LINT.openLintPanel(view) },
+  { id: "checktoggle", get title() { return `Code check: ${settings.check ? "on" : "off"} (change)`; }, run: () => { settings.check = !settings.check; saveSettings(); applyConfig(); } },
   ...(role === "owner" ? [{ id: "share", title: "Share...", run: () => openShare() }] : []),
   { id: "settings", title: "Settings", keys: `${mod}+,`, run: () => openSettings() },
   { id: "cheat", title: "Keyboard shortcuts", keys: "?", run: () => $("cheat").showModal() },
@@ -1255,6 +1283,7 @@ function openSettings() {
   $("sAutosave").value = settings.autosave; $("sTheme").value = settings.theme; $("sKeys").value = settings.keys;
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
+  $("sCheck").checked = settings.check; $("sPdfDark").checked = settings.pdfDark;
   $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
   $("sLive").checked = settings.live; $("sLive").disabled = readOnly;
   $("sGrammarBox").hidden = role !== "owner";
@@ -1276,6 +1305,8 @@ bind("sZoom", (n) => pdfView.setZoom((+n.value || 133) / 100));
 bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
+bind("sCheck", (n) => { settings.check = n.checked; applyConfig(); });
+bind("sPdfDark", (n) => settings.pdfDark = n.checked);
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
 bind("sLive", (n) => { settings.live = n.checked; if (!n.checked) { live.stop(); $("liveState").hidden = true; } });
 function grammarSettingsNote() {
@@ -1516,7 +1547,7 @@ async function pick(name) {
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
   $("doc").value = name; $("brandDoc").textContent = $("treeDoc").textContent = name.split("/").pop();
   focusView = null; renderFocus();
-  tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {} };
+  tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {}, macros: [], envs: [] };
   pdfView.version = null;
   warnKey = warnLoaded = null; warnings = []; renderWarnings();
   REV.reset(); historyUi.reset();
@@ -1531,7 +1562,7 @@ async function restoreTabs() {
   for (const p of open) await openFile(p, 0, { noFocus: true });
   const want = tabs.get(saved?.active) || [...tabs.values()][0];
   if (want) await activate(want, 0, { noFocus: true });
-  if (settings.visual) loadRefs();
+  loadRefs();
   if (ui.side && ui.sideTab === "refs") refsUi.load();
 }
 

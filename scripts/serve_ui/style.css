@@ -350,6 +350,17 @@ dialog::backdrop{background:var(--scrim)}
 .cm-search [name=close]{position:absolute;top:6px;right:6px;width:22px;height:22px;border:0;background:none;color:var(--muted);font-size:16px;padding:0}
 .cm-tooltip{background:var(--surface)!important;border:1px solid var(--rule)!important;border-radius:8px;box-shadow:var(--shadow);color:var(--ink)}
 .cm-tooltip-autocomplete ul li[aria-selected]{background:var(--accent-soft)!important;color:var(--accent)!important}
+.cm-texHover{padding:6px 10px;max-width:min(520px,80vw);font:13px/1.4 var(--sans)}
+.cm-texHover-head{font-weight:600}
+.cm-texHover-mute{color:var(--muted);font-size:12px}
+.cm-mathHover{overflow-x:auto;font-size:15px}
+.cm-foldGutter .cm-gutterElement{color:var(--muted);cursor:pointer;padding:0 2px}
+.cm-foldPlaceholder{background:var(--sunk)!important;border-color:var(--rule)!important;color:var(--ink-2)!important}
+.cm-panel.cm-panel-lint{background:var(--surface);color:var(--ink)}
+.cm-panel.cm-panel-lint ul [aria-selected]{background:var(--accent-soft)!important;color:var(--ink)!important}
+/* Dark PDF pages: invert, then turn hues back so figures keep roughly their colours. */
+#pages.pdf-dark .page{background:#000}
+#pages.pdf-dark .page canvas{filter:invert(1) hue-rotate(180deg)}
 .cm-searchMatch{background:color-mix(in srgb,var(--ochre) 28%,transparent)!important}
 .cm-matchingBracket{background:color-mix(in srgb,var(--accent) 22%,transparent)!important;outline:none!important}
 .tok-keyword{color:var(--t-math)}.tok-string,.tok-string2{color:var(--t-math)}.tok-comment{color:var(--t-com);font-style:italic}
