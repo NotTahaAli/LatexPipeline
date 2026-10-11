@@ -1329,6 +1329,31 @@ NEW_MACRO = re.compile(r"\\(?:(?:re)?newcommand|providecommand|DeclareMathOperat
                        r"|\\[gex]?def\s*\\([A-Za-z]+)(?![A-Za-z@])")
 NEW_ENV = re.compile(r"\\(?:(?:re)?newenvironment|(?:New|Renew|Provide|Declare)DocumentEnvironment)\*?\s*"
                      r"\{([A-Za-z*]+)\}")
+# glossaries keys for \gls and \acrshort completion: \newglossaryentry{key}{name=..}, \newacronym[..]{key}{short}{long}.
+NEW_GLOSSARY = re.compile(r"\\(newglossaryentry|longnewglossaryentry|newacronym|newabbreviation)\s*"
+                          r"(?:\[[^\]]*\]\s*)?(?=\{)")
+
+
+def glossary_entries(code: str) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    for match in NEW_GLOSSARY.finditer(code):
+        args, i = [], match.end()
+        while len(args) < 3 and code[i:i + 1] == "{":
+            arg = brace_arg(code, i)
+            if not arg:
+                break
+            args.append(re.sub(r"\s+", " ", arg[0]).strip())
+            i = arg[1] + len(code[arg[1]:arg[1] + 200]) - len(code[arg[1]:arg[1] + 200].lstrip())
+        if not args or not re.fullmatch(r"[^\s{}\\]{1,100}", args[0]):
+            continue
+        acronym = match.group(1) in ("newacronym", "newabbreviation")
+        if acronym:
+            text = ": ".join(args[1:3])
+        else:
+            name = re.search(r"\bname\s*=\s*(?:\{([^{}]*)\}|([^,{}]*))", args[1] if len(args) > 1 else "")
+            text = (name.group(1) or name.group(2) or "").strip() if name else ""
+        found.setdefault(args[0], {"text": text[:200], "kind": "acronym" if acronym else "entry"})
+    return found
 
 
 def parse_bib(text: str) -> dict[str, dict]:
@@ -1357,6 +1382,7 @@ def references(root: Path) -> dict:
     bib: dict[str, dict] = {}
     macros: set[str] = set()
     envs: set[str] = set()
+    glossary: dict[str, dict] = {}
     for item in list_files(root):
         path = item["path"]
         if item["kind"] != "text" or not path.endswith((".tex", ".bib", ".sty", ".cls")):
@@ -1372,6 +1398,8 @@ def references(root: Path) -> dict:
         code = strip_comments(text)
         macros.update(a or b for a, b in NEW_MACRO.findall(code))
         envs.update(NEW_ENV.findall(code))
+        for key, entry in glossary_entries(code).items():
+            glossary.setdefault(key, {**entry, "file": path})
         if not path.endswith(".tex"):
             continue
         lines = code.split("\n")
@@ -1380,7 +1408,12 @@ def references(root: Path) -> dict:
                 near = next((lines[n].strip() for n in range(number - 1, max(number - 8, -1), -1)
                              if re.search(r"\\(?:caption|(?:sub)*section|chapter)\b", lines[n])), line.strip())
                 labels.setdefault(match.group(1), {"file": path, "line": number, "context": near[:200]})
-    return {"labels": labels, "bib": bib, "macros": sorted(macros), "envs": sorted(envs)}
+    try:  # the editor applies the document folder's .editorconfig (indent, trailing white space, final newline)
+        editorconfig = resolve_in_doc(root, ".editorconfig").read_text("utf-8", "replace")[:20000]
+    except (OSError, ApiError):
+        editorconfig = ""
+    return {"labels": labels, "bib": bib, "macros": sorted(macros), "envs": sorted(envs), "glossary": glossary,
+            "editorconfig": editorconfig}
 
 
 def lint(doc_name: str) -> list[dict]:

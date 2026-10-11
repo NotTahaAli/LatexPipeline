@@ -20,6 +20,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: search and replace in all files of a document (sidebar Search tab, Ctrl+Shift+F; `GET /api/search`, `POST /api/replace`): match case, whole word, regular expressions for the owner only; files open in live co-editing are changed through the shared document, others written with history; build-config files stay owner-only.
 - Editor: pasting a table from a spreadsheet, Word or a web page offers "Paste as table", a `table`/`tabular` with LaTeX special characters escaped (booktabs rules when the document loads booktabs).
 - Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
+- Editor: hovering `\includegraphics{...}` shows the figure's thumbnail; completion of file names in `\includegraphics`, `\input`, `\include`, `\bibliography`, `\addbibresource` and friends.
+- Editor: completion of glossary and acronym keys (`\newglossaryentry`, `\newacronym`, `\newabbreviation`) in `\gls`, `\acrshort` and the rest of their families (`/api/refs` now returns `glossary`).
+- Editor: math prefix shortcuts (`@a` gives `\alpha`, LaTeX Workshop's table), off by default in Settings > Editing.
+- Editor: Ctrl+B / Ctrl+I toggle `\textbf` / `\emph`; wrap the selection in an environment or a command.
+- Editor: structural edits: change or delete the surrounding environment, delete the surrounding command keeping its argument, toggle a starred environment, toggle `\left`/`\right`; reviewers get them as suggestions.
+- Editor: user snippets with `${1:placeholder}` tab stops (trigger word + Tab), edited in Settings and kept in the browser, with four defaults.
+- Editor: pasting Unicode offers "Convert to LaTeX" (quotes and dashes; accented letters for pdflatex documents; Greek and symbols in math).
+- Editor: relative line numbers, a soft-wrap switch and "Rewrap paragraph" (Alt+Q) to a set width.
+- Editor: zen mode (only the editor, in a centred column; Esc leaves it).
+- Editor: the document folder's `.editorconfig` sets indentation, and on Ctrl+S trims trailing white space and adds a final newline (`/api/refs` returns its text).
 - Review markup: `build.toml` `review = "show" | "clean"` (or `build.py --review show|clean`) defines `\lpadd`, `\lpdel`, `\lpedit`, `\lpnote` and the `lpaddblock`, `lpdelblock`, `lpnoteblock` environments, shown as green highlight, red strike-through and notes, or printed as if every change were accepted; off by default, and a document's own definitions win.
 - `build.py --review-pdf DOC` and the editor's More > Build with suggestions: `out/<name>.review.pdf` with the open suggestions inlined as marked changes and unresolved comments as notes, built from a copy (only plain-prose ranges; the rest is skipped with a reason); never published.
 

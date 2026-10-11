@@ -16,6 +16,7 @@ import { LivePreview } from "./preview.js";
 import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
 import { searchPanel } from "./search.js";
 import { tablePaste } from "./tablepaste.js";
+import { editTools } from "./edittools.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -74,7 +75,7 @@ $("pdfDark").onclick = togglePdfDark;
 
 // ---- CodeMirror ---------------------------------------------------------------------------
 const { EditorState, Compartment, Prec } = S;
-const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
+const { EditorView, keymap, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
 const GR = grammarSupport(S, V);
 // Review comments and suggest mode (review.js); the panel lives in the drawer's Review tab.
 const REV = reviewSupport(S, V, {
@@ -88,6 +89,13 @@ const REV = reviewSupport(S, V, {
 });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
 const TP = tablePaste(V, { el, toast, preamble: async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => "")) });
+// Editing tools (edittools.js): a reviewer's changes go through suggest mode like typing, a view link gets none.
+const ET = editTools({ S, V, L, AC }, {
+  el, toast, settings, saveSettings, applyConfig: () => applyConfig(), view: () => view, files: () => files, refs: () => refs,
+  path: () => active?.path, imageUrl: (name) => api.imageUrl(cur, name, active?.path || ""), engine: () => docs[cur]?.engine,
+  reviewer, mayChange: () => !readOnly || (reviewer && REV.suggesting), suggesting: () => REV.suggesting,
+});
+function saveNow() { if (active?.kind === "text") ET.beforeSave(view, active.path); saveTab(active); }   // an explicit save applies .editorconfig
 function toggleSuggest() {
   if (readOnly && !reviewer) return;
   REV.setSuggest(!REV.suggesting);
@@ -128,7 +136,7 @@ function extensionsFor(tab) {
   tab.tex = latexSupport({ V, L, LINT, loadKatex }, { path: () => tab.path, refs: () => refs, visual: () => settings.visual });
   return [
     keysC.of([]),
-    lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
+    ET.extension, highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
     room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
     readOnly && !reviewer ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
     readOnly ? [] : EditorView.domEventHandlers({
@@ -141,15 +149,14 @@ function extensionsFor(tab) {
     REV.extension,
     tab.tex.folding, tab.tex.hover, checkC.of(settings.check ? tab.tex.check : []),
     L.bracketMatching(), AC.closeBrackets(),
-    AC.autocompletion({ override: [latexComplete], icons: false }),
+    AC.autocompletion({ override: [latexComplete, ...ET.sources], icons: false }),
     EditorState.allowMultipleSelections.of(true),
     L.StreamLanguage.define(stex),
     L.syntaxHighlighting(HL.classHighlighter),
-    EditorView.lineWrapping,
     EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, tabindex: "0" }),
     spellC.of(spellAttr()),
     keymap.of([
-      { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
+      { key: "Mod-s", run: () => { saveNow(); return true; }, preventDefault: true },
       ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap, ...L.foldKeymap, ...LINT.lintKeymap,
     ]),
     SR.search({ top: true }),
@@ -258,6 +265,7 @@ async function applyConfig() {
     visualC.reconfigure(settings.visual && active?.kind === "text" ? [visualField, env] : []),
     spellC.reconfigure(spellAttr()),
     checkC.reconfigure(settings.check && active?.tex ? active.tex.check : []),
+    ...ET.reconfigure(active?.path),
   ] });
   $("proseBody").spellcheck = !!settings.spell;
   $("cm").classList.toggle("visual", !!settings.visual);
@@ -1189,7 +1197,7 @@ async function setVisual(on) {
   if (on) await loadRefs();
   await applyConfig();
 }
-async function loadRefs() { try { refs = await api.refs(cur); view?.dispatch({ effects: refresh.of(null) }); } catch { /* keep old */ } }
+async function loadRefs() { try { refs = await api.refs(cur); view?.dispatch({ effects: [refresh.of(null), ...ET.reconfigure(active?.path)] }); } catch { /* keep old */ } }
 $("visualBtn").onclick = () => setVisual(!settings.visual);
 
 let proseSpan = null, proseReadOnly = false, proseTimer;
@@ -1265,7 +1273,7 @@ function showTips(force) {
 // ---- command palette, menu, settings, cheat sheet ----------------------------------------------------
 const mod = /Mac/.test(navigator.platform) ? "Cmd" : "Ctrl";
 const COMMANDS = [
-  { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveTab(active) },
+  { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveNow() },
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
   { id: "search", title: "Search and replace in all files", keys: `${mod}+Shift+F`, run: () => showSearch() },
@@ -1315,6 +1323,7 @@ const COMMANDS = [
   { id: "keys-default", title: "Keybindings: default", run: () => { settings.keys = "default"; saveSettings(); applyConfig(); } },
   { id: "keys-vim", title: "Keybindings: Vim", run: () => { settings.keys = "vim"; saveSettings(); applyConfig(); } },
   { id: "keys-emacs", title: "Keybindings: Emacs", run: () => { settings.keys = "emacs"; saveSettings(); applyConfig(); } },
+  ...ET.commands,
 ];
 
 let paletteItems = [], paletteSel = 0;
@@ -1348,6 +1357,7 @@ function openSettings() {
   $("sLive").checked = settings.live; $("sLive").disabled = readOnly;
   $("sGrammarBox").hidden = role !== "owner";
   $("sGrammar").value = settings.grammar; $("sGrammarUrl").value = settings.grammarUrl; $("sGrammarShare").checked = settings.grammarShare; grammarSettingsNote();
+  ET.settingsSection($("sEditTools"));
   $("settings").showModal();
   $("sName").focus();
 }
@@ -1388,7 +1398,7 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 function buildMenu() {
   const m = $("moreMenu");
   const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
-    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format"]), "visual", "zen", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
@@ -1424,7 +1434,7 @@ document.addEventListener("keydown", (e) => {
   const typing = e.target.closest?.(".cm-editor, input, textarea, select, [contenteditable=true]");
   if (m && !e.altKey && !e.shiftKey && k === "k") { e.preventDefault(); openPalette(); }
   else if (m && e.shiftKey && k === "p") { e.preventDefault(); openPalette(); }
-  else if (m && !e.shiftKey && !e.altKey && k === "b") { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
+  else if (m && !e.shiftKey && !e.altKey && k === "b" && !e.defaultPrevented) { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
   else if (m && e.shiftKey && k === "f") { e.preventDefault(); showSearch(); }
   else if (m && e.shiftKey && k === "o") { e.preventDefault(); COMMANDS.find((c) => c.id === "outline").run(); }
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
@@ -1434,7 +1444,7 @@ document.addEventListener("keydown", (e) => {
   else if (m && e.altKey && k === "s" && !readOnly) { e.preventDefault(); toggleSuggest(); }
   else if (m && k === ",") { e.preventDefault(); openSettings(); }
   else if (m && k === "enter" && active?.kind === "text") { e.preventDefault(); toCursor(); }
-  else if (m && k === "s") { e.preventDefault(); saveTab(active); }
+  else if (m && k === "s") { if (!e.defaultPrevented) saveNow(); e.preventDefault(); }
   else if (e.key === "?" && !typing && !e.target.closest("dialog")) { e.preventDefault(); $("cheat").showModal(); }
   else if (e.key === "Escape" && !document.querySelector("dialog[open]") && !typing) { if (ui.drawer) setDrawer(false); else if (ui.side) setSide(false); }
 });

@@ -621,3 +621,19 @@ dialog::backdrop{background:var(--scrim)}
 .sr-one{font-size:12px;flex:none}
 #toast button.tp-go{margin-left:10px;color:inherit;font-weight:600;text-decoration:underline}
 .rx-dlg{width:440px}.rx-dlg form>p,.rx-dlg form>.rv-actions{padding:0 22px 16px}
+/* editing tools (edittools.js): figure thumbnail, snippet editor, zen mode */
+.et-thumb img{display:block;max-width:240px;max-height:180px;margin-bottom:4px;background:#fff}
+.et-dlg{width:min(640px,calc(100vw - 32px))}
+.et-snip-note{padding:0 22px;font-size:12.5px}
+.et-snips{display:flex;flex-direction:column;gap:14px;padding:0 22px 16px;max-height:60vh;overflow:auto}
+.et-snip{display:grid;grid-template-columns:8em 1fr auto;gap:10px;align-items:end}
+.et-snip input{height:32px;min-width:0}
+.et-snip .wide{grid-column:auto}
+.et-dlg .actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 22px;border-top:1px solid var(--rule)}
+.et-snip textarea{min-width:0;width:100%;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:6px 10px;color:var(--ink);font:12px var(--mono);resize:vertical}
+@media (max-width:560px){.et-snip{grid-template-columns:1fr}}
+html.zen #topbar,html.zen #side,html.zen #splitter,html.zen #pdfPane,html.zen #drawer,html.zen #tips,html.zen #progress,html.zen .tabbar,html.zen #editorStatus,html.zen #prose{display:none!important}
+html.zen #editorPane{display:flex!important;flex:1 1 100%}
+html.zen .cm-content{max-width:46em;margin:0 auto}
+#zenExit{position:fixed;top:10px;right:16px;z-index:20;opacity:.7}
+#zenExit:hover,#zenExit:focus-visible{opacity:1}
