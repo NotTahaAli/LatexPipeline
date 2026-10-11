@@ -33,12 +33,19 @@ INCOMPATIBLE = {
     "scrbook": "currently-incompatible",
 }
 STATUS_URL = "https://latex3.github.io/tagging-project/tagging-status/"
+# What that page says about a class, quoted where a generic "incompatible" would hide the advice (same fetch).
+NOTES = {
+    "beamer": "The Tagging Project lists beamer as no-support (entry of 2025-06-11): its internals rebox "
+              "material repeatedly in a way that is not compatible with any form of tagging support; it recommends "
+              "the ltx-talk class (listed as compatible) for new tagged presentations.",
+}
 
 LEVELS = {"part": -1, "chapter": 0, "section": 1, "subsection": 2, "subsubsection": 3, "paragraph": 4,
           "subparagraph": 5}
 COMMENT = re.compile(r"(?<!\\)((?:\\\\)*)%[^\n]*")
 OPTIONS = r"(?:\[(?P<options>(?:[^\[\]{}]|\{[^{}]*\})*)\])?"
 TOKEN = re.compile(
+    r"\\begin\s*\{frame\}(?P<frame>)|"
     r"\\(?P<heading>part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?(?=\s*[\[{])"
     r"|\\(?:input|include|subfile)\s*\{(?P<input>[^{}]+)\}"
     rf"|\\includegraphics\*?\s*{OPTIONS}\s*\{{(?P<graphic>[^{{}}]+)\}}"
@@ -46,6 +53,8 @@ TOKEN = re.compile(
 )
 ALT_KEY = re.compile(r"(?:^|,)\s*(?:alt|actualtext|artifact)\s*(?:=|,|$)")
 MAX_DEPTH = 20
+# \begin{frame}<overlay>[options]<overlay>{Title}
+FRAME_TITLE = re.compile(r"\s*(?:<[^>]*>)?\s*(?:\[[^\]]*\])?\s*(?:<[^>]*>)?\s*\{\s*[^}\s]")
 
 
 def scan(doc_dir: Path, rel: str = "main.tex", seen: set | None = None, depth: int = 0) -> list[tuple]:
@@ -60,7 +69,11 @@ def scan(doc_dir: Path, rel: str = "main.tex", seen: set | None = None, depth: i
     found: list[tuple] = []
     for match in TOKEN.finditer(text):
         line = text.count("\n", 0, match.start()) + 1
-        if match.group("heading"):
+        if match.group("frame") is not None:
+            body = text[match.end():].split("\\end{frame}", 1)[0]
+            titled = FRAME_TITLE.match(body) or "\\frametitle" in body or re.search(r"\\(?:titlepage|maketitle)\b", body)
+            found.append(("frame", rel, line, bool(titled), None))
+        elif match.group("heading"):
             found.append(("heading", rel, line, match.group("heading"), None))
         elif match.group("input"):
             target = match.group("input").strip()
@@ -97,7 +110,10 @@ def title_set(pdf_text: bytes) -> bool | None:
 
 
 def check(doc_dir: Path, pdf_text: bytes | None) -> list[dict]:
-    """Findings for a tagged document: title, alt text, heading levels, packages the tagging code cannot handle."""
+    """
+    Findings for a tagged document: title, alt text, heading levels, packages the tagging code cannot handle,
+    and for slides the Tagging Project's beamer status and frames without a title.
+    """
     findings: list[dict] = []
 
     def add(kind: str, file: str | None, line: int | None, message: str, hint: str) -> None:
@@ -120,6 +136,13 @@ def check(doc_dir: Path, pdf_text: bytes | None) -> list[dict]:
                     "a heading level is skipped.",
                     "Screen readers navigate by heading level; use the next level down, or change the earlier heading.")
             previous = (value, rel, line)
+        elif kind == "frame" and not value:
+            add("a11y-frame-title", rel, line, "A frame has no title.",
+                "Slide titles are the headings screen readers navigate by: add \\frametitle{...} or "
+                "\\begin{frame}{Title}.")
+        elif kind == "load" and value in NOTES and value not in loaded:
+            loaded.add(value)
+            add("a11y-class", rel, line, NOTES[value], f"Consider ltx-talk for a tagged presentation; see {STATUS_URL}.")
         elif kind == "load" and value in INCOMPATIBLE and value not in loaded:
             loaded.add(value)
             add("a11y-package", rel, line, f"{value} is {INCOMPATIBLE[value]} with tagging "
