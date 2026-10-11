@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-12
+
 ### Changed
 
 - Copies made from the template run only the PDF build in CI: unit tests, ruff, the requirements check and the PDF/A fixture check run only in `NotTahaAli/LatexPipeline`.
@@ -11,7 +13,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
-- A missing package (`! LaTeX Error: File `x.sty' not found.`) is reported as that error, with its install hint, instead of the `Emergency stop.` that follows it.
+- A missing package (``! LaTeX Error: File `x.sty' not found.``) is reported as that error, with its install hint, instead of the `Emergency stop.` that follows it.
+- Sharing through ngrok no longer fails with `TypeError` (`http.client.HTTPConnection` used as a context manager).
+- A cloudflared share link is shown only once its `trycloudflare.com` host resolves (at most 90 s, then it warns and shows it anyway), so the self-test and people given the link at once no longer get `gaierror`.
 
 ## [0.1.0] - 2026-10-12
 
@@ -116,5 +120,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
 
-[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/NotTahaAli/LatexPipeline/releases/tag/v0.1.0
