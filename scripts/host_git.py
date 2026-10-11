@@ -22,6 +22,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -341,7 +342,7 @@ def handle(h, project: dict, role: str) -> None:
                      "user_id = excluded.user_id, created = excluded.created, synced = NULL, commit_id = NULL",
                      project["id"], url, branch, uid, time.time())
         if row and row["branch"] != branch and (repo_dir(project) / "HEAD").is_file():
-            shutil.rmtree(repo_dir(project), ignore_errors=True)  # a fresh start for the other branch
+            remove(repo_dir(project))  # a fresh start for the other branch
         H.audit_log(H.APP, "git_connected", uid, h.ip, tid, f"{project['id']} {url} {branch}")
         h.send_json({"ok": True})
         return
@@ -350,7 +351,7 @@ def handle(h, project: dict, role: str) -> None:
     if op == "disconnect":
         H.APP.db.run("DELETE FROM git_remotes WHERE project_id = ?", project["id"])
         with project_lock(project["id"]):
-            shutil.rmtree(repo_dir(project), ignore_errors=True)
+            remove(repo_dir(project))
         H.audit_log(H.APP, "git_disconnected", uid, h.ip, tid, project["id"])
         h.send_json({"ok": True})
         return
@@ -383,9 +384,20 @@ def handle(h, project: dict, role: str) -> None:
     h.send_json(result)
 
 
+def remove(folder: Path) -> None:
+    """rmtree that also removes git's read-only object files (Windows refuses to delete those)."""
+    def retry(func, path, _exc):
+        try:
+            os.chmod(path, 0o700)
+            func(path)
+        except OSError:
+            pass
+    shutil.rmtree(folder, **({"onexc": retry} if sys.version_info >= (3, 12) else {"onerror": retry}))
+
+
 def forget(project: dict) -> None:
     """The project is deleted: its repository too."""
-    shutil.rmtree(repo_dir(project), ignore_errors=True)
+    remove(repo_dir(project))
 
 
 # --- the person's token (Account page) -----------------------------------------------------------------------------

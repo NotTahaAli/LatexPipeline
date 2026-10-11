@@ -68,7 +68,7 @@ class GitOps(unittest.TestCase):
 
     def test_status_stage_diff_commit_log(self):
         (self.doc / "main.tex").write_text("one\nTWO\nthree\n", encoding="utf-8")
-        (self.doc / "new file.tex").write_text("new\n", encoding="utf-8")
+        (self.doc / "new file.tex").write_bytes(b"new\n")  # no CRLF on Windows
         info = gitops.status(self.doc)
         self.assertEqual((info["branch"], info["upstream"], info["remotes"]), ("main", "origin/main", ["origin"]))
         self.assertEqual({f["path"]: f["worktree"] for f in info["files"]}, {"main.tex": "M", "new file.tex": "?"})
