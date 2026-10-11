@@ -563,6 +563,12 @@ def arxiv_path_for(main_tex: Path) -> Path:
     return pdf.with_name(f"{pdf.stem}.arxiv.zip")
 
 
+def cited_bib_path_for(main_tex: Path) -> Path:
+    """files/reports/final/main.tex -> out/reports/final.cited.bib (--cited-bib, never published)."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.cited.bib")
+
+
 # ---------------------------------------------------------------------------
 # Per-document settings
 # ---------------------------------------------------------------------------
@@ -1697,9 +1703,10 @@ def prune(documents: list[Path]) -> None:
     expected |= {path for document in documents for path in review_paths(document)}
     expected |= {docx_path_for(document) for document in documents}
     expected |= {arxiv_path_for(document) for document in documents}
+    expected |= {cited_bib_path_for(document) for document in documents}
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx"),
-                 *OUT_DIR.rglob("*.arxiv.zip")]:
+                 *OUT_DIR.rglob("*.arxiv.zip"), *OUT_DIR.rglob("*.cited.bib")]:
         if path not in expected:
             info(f"Removing stale: {display(path)}")
             path.unlink()
@@ -1881,6 +1888,38 @@ def export_arxiv(main_tex: Path) -> tuple[list[dict] | None, list[str]]:
     except OSError:
         pass  # The archive is written; a log that cannot be is not worth failing for.
     return findings, lines
+
+
+def export_cited_bib(main_tex: Path) -> tuple[dict | None, list[str]]:
+    """out/<name>.cited.bib: only the entries the last build cited (citedbib.py). (result, lines to print); result is
+    None when there was nothing to read."""
+    import citedbib  # only here: the export is never part of a build or of CI
+
+    try:
+        result = citedbib.export(main_tex.parent, cache_dir_for(main_tex), main_tex.stem)
+        target = cited_bib_path_for(main_tex)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(result["text"], encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return None, [f"ERROR: cited .bib export failed: {exc}"]
+    sources = ", ".join(result["files"]) or "no .bib file"
+    lines = [f"Cited .bib: {display(target)} ({len(result['keys'])} entries from {sources})"]
+    if result["missing"]:
+        lines.append(f"WARNING: cited but in no .bib file: {', '.join(result['missing'][:20])}")
+    lines += [f"NOTE: {note}" for note in result["notes"]]
+    return result, lines
+
+
+def export_cited_bib_all(documents: list[Path]) -> int:
+    """The --cited-bib step; 1 if a document had no build to read."""
+    failed = 0
+    for document in documents:
+        result, lines = export_cited_bib(document)
+        info(f"Cited .bib {doc_name(document)}:")
+        for line in lines:
+            info(f"  {line}")
+        failed += result is None
+    return 1 if failed else 0
 
 
 def export_arxiv_all(documents: list[Path]) -> int:
@@ -2098,6 +2137,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--cited-bib",
+        action="store_true",
+        help="After building, write out/<name>.cited.bib with only the entries the build cited (read from its "
+             ".aux or .bcf, with the @string definitions and crossref parents they need). Never published.",
+    )
+
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List discovered main.tex files without building them.",
@@ -2208,6 +2254,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--format cannot be combined with --watch, --focus or --docx")
     if args.arxiv and (args.watch or args.focus):
         parser.error("--arxiv cannot be combined with --watch or --focus")
+    if args.cited_bib and (args.watch or args.focus):
+        parser.error("--cited-bib cannot be combined with --watch or --focus")
 
     return args
 
@@ -2375,18 +2423,22 @@ def main() -> int:
     exported = documents
 
     def extras(failed: bool, results: list[dict]) -> int:
-        """--docx and --arxiv after the build; --arxiv skips documents whose build failed in this run."""
+        """--docx, --arxiv and --cited-bib after the build; the last two skip documents whose build failed."""
         if args.docx:  # Also after a failed build: pandoc reads the sources, not the PDF.
             failed = bool(export_docx_all(exported)) or failed
         if args.arxiv:
             broken = {entry["name"] for entry in results if not entry["ok"]}
             failed = bool(export_arxiv_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
+        if args.cited_bib:
+            broken = {entry["name"] for entry in results if not entry["ok"]}
+            failed = bool(export_cited_bib_all([doc for doc in exported if doc_name(doc) not in broken])) or failed
         return 1 if failed else 0
 
     if not args.force:
         # --arxiv needs the .fls of a finished build, which a cleaned cache lacks even when the PDF is current.
         documents = [document for document in documents if is_stale(document)
-                     or args.arxiv and not (cache_dir_for(document) / f"{document.stem}.fls").exists()]
+                     or (args.arxiv or args.cited_bib)
+                     and not (cache_dir_for(document) / f"{document.stem}.fls").exists()]
 
         if not documents:
             info("Everything is up to date.")

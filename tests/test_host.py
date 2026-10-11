@@ -1464,6 +1464,75 @@ class Assistant(HostCase):
                     host.load_config(data)
             (data / "config.toml").write_text('[ai]\nenabled = true\nmodel = "claude-haiku-5-5"')
             self.assertEqual(host.load_config(data)["ai"]["daily_per_user"], 50)
+            for text in ('[ai]\nprovider = "other"', '[ai]\nprovider = "openai"\nmodel = "m"',
+                         '[ai]\nprovider = "openai"\nmodel = "m"\nbase_url = "http://example.com/v1"'):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+            (data / "config.toml").write_text('[ai]\nprovider = "openai"\nmodel = "org/m:7b"\n'
+                                              'base_url = "http://127.0.0.1:11434/v1/"')  # the operator may
+            self.assertEqual(host.load_config(data)["ai"]["base_url"], "http://127.0.0.1:11434/v1")
+
+    def test_an_openai_compatible_endpoint_set_by_the_operator(self):
+        self.app.config["ai"] = {**self.AI, "provider": "openai", "model": "m-large",
+                                 "base_url": "https://llm.example.org/v1"}
+        payload = json.dumps({"answer": "Close the brace.", "text": "", "edits": []})
+        urls = []
+        ai.post_json.side_effect = lambda url, body, headers: urls.append((url, headers)) or {
+            "model": "m-large", "choices": [{"finish_reason": "stop", "message": {"content": payload}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        editor = self.client("ed@x.org")
+        status, out, _ = self.ask(editor)
+        self.assertEqual((status, out["answer"]), (200, "Close the brace."))
+        self.assertEqual(urls[0], ("https://llm.example.org/v1/chat/completions",
+                                   {"Authorization": "Bearer " + self.KEY}))
+        info = editor.call("GET", f"/p/{self.pid}/api/ai")[1]
+        self.assertIn("llm.example.org", info["notice"])
+        self.assertNotIn(self.KEY, json.dumps(info) + json.dumps(out))
+
+
+class Library(HostCase):
+    """/p/<id>/api/library: each account's own reference library in host.db, answered by the gateway for every
+    project the person can open; never another person's, never a worker."""
+
+    BIB = "@article{a,\n  title = {A Made Up Title},\n  doi = {10.1/a}\n}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        self.pid2 = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc2", "article")
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for the library")).start()
+
+    def test_one_library_per_account_across_projects(self):
+        editor, viewer = self.client("ed@x.org"), self.client("vi@x.org")
+        status, out, _ = editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB})
+        self.assertEqual((status, len(out["added"])), (200, 1))
+        status, out, _ = editor.call("POST", f"/p/{self.pid2}/api/library", {"op": "add", "entries": [
+            {"type": "misc", "key": "b", "fields": {"title": "Other", "doi": "10.1/A"}}]})
+        self.assertEqual(len(out["entries"]), 2)
+        self.assertEqual(out["entries"][1]["duplicates"], [out["entries"][0]["id"]])
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/library")[1]["entries"], [])  # their own
+        status, out, _ = viewer.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB})
+        self.assertEqual((status, len(out["entries"])), (200, 1))
+        self.assertEqual(len(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]), 2)
+        ids = [e["id"] for e in editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]]
+        self.assertEqual(viewer.call("POST", f"/p/{self.pid}/api/library", {"op": "delete", "ids": ids})[0], 200)
+        self.assertEqual(len(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]), 2)
+
+    def test_outsiders_csrf_and_bad_input(self):
+        self.assertEqual(self.client("out@x.org").call("GET", f"/p/{self.pid}/api/library")[0], 404)
+        self.assertIn(self.client().call("GET", f"/p/{self.pid}/api/library")[0], (401, 302, 303, 404))
+        editor = self.client("ed@x.org")
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB},
+                                     origin="https://evil.example")[0], 403)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": "none"})[0], 400)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "nope"})[0], 400)
+        self.assertEqual(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"], [])
 
 
 class Zotero(HostCase):

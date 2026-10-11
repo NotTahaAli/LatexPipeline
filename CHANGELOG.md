@@ -22,6 +22,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
 - Review markup: `build.toml` `review = "show" | "clean"` (or `build.py --review show|clean`) defines `\lpadd`, `\lpdel`, `\lpedit`, `\lpnote` and the `lpaddblock`, `lpdelblock`, `lpnoteblock` environments, shown as green highlight, red strike-through and notes, or printed as if every change were accepted; off by default, and a document's own definitions win.
 - `build.py --review-pdf DOC` and the editor's More > Build with suggestions: `out/<name>.review.pdf` with the open suggestions inlined as marked changes and unresolved comments as notes, built from a copy (only plain-prose ranges; the rest is skipped with a reason); never published.
+- References > More > "My library...": a personal reference library shared by all your documents (local: the owner's `library.json`, mode 600, in the config folder; hosted: per account in `host.db`, new migration), filled by DOI, BibTeX, RIS, a form or the panel's selection, with duplicate and missing-field badges, insertion into a document's `.bib` and `.bib` export.
+- `build.py --cited-bib` and References > More > "Download cited-only .bib" (`GET /api/cited-bib`): a `.bib` with only the entries the last build cited (from its `.aux` or `.bcf`, with `@string` definitions and crossref parents).
+- AI assistant: "Find claims needing citations" lists uncited factual sentences of the open file; "Search Crossref" shows real Crossref records for a claim as candidates to add (`POST /api/bib/search`, edit role); the model never names references.
+- AI assistant: Ask with "Whole project" answers from passages of all the document's text files (keyword retrieval, bounded).
+- AI assistant: "LaTeX from image..." (or pasting an image) turns a picture of an equation, table or diagram into LaTeX to insert at the cursor (PNG, JPEG, GIF, WebP; scaled in the browser, size and type checked on the server).
+- AI assistant: OpenAI-compatible endpoints (OpenAI, OpenRouter, Ollama and similar; base URL, model, `OPENAI_API_KEY` or a stored key) besides Anthropic, locally in the panel's settings and hosted with `[ai] provider = "openai"` and `base_url`; a local model server serves only the owner.
 
 ### Changed
 

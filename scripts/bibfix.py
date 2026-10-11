@@ -473,6 +473,28 @@ def map_item(item: dict, kind: str) -> dict[str, str]:
     return out
 
 
+SEARCH_ROWS = 5
+
+
+def search(query: str) -> list[dict]:
+    """Crossref candidates for a free-text search phrase (the AI claims scan's query): [{"type", "fields"}], at
+    most SEARCH_ROWS. Only candidates: the person reads them and picks one; nothing is matched or added here."""
+    query = re.sub(r"\s+", " ", query if isinstance(query, str) else "").strip()[:200]
+    if len(query) < 3:
+        raise BibLookupError("Search for at least three characters.")
+    url = f"{API}?{urllib.parse.urlencode({'query.bibliographic': query, 'rows': SEARCH_ROWS})}"
+    items = ((get_json(url) or {}).get("message") or {}).get("items") or []
+    out = []
+    for item in items[:SEARCH_ROWS]:
+        if not isinstance(item, dict):
+            continue
+        kind = KINDS_FROM_CROSSREF.get(item.get("type", ""), "misc")
+        fields = map_item(item, kind)
+        if fields.get("title"):
+            out.append({"type": kind, "fields": fields})
+    return out
+
+
 def title_matches(item: dict, title: str) -> bool:
     """The Crossref title (with or without its subtitle) is at least MIN_SIMILARITY like `title`."""
     titles = item.get("title") or []

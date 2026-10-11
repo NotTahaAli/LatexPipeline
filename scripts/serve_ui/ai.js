@@ -1,11 +1,19 @@
 // Assistant panel: explain a build error, rewrite / shorten / fix / translate the selection, write LaTeX from a
-// description, ask about the open file. The server (serve.py, or host.py when hosted) holds the key and sends the
-// request to Anthropic; nothing comes back into the document until the person clicks Apply, and then it goes in
-// through the editor like typing, so co-editing and autosave see a normal edit. Model output is text only (textContent).
+// description or from a picture of an equation or table, ask about the open file or the whole project, find claims
+// that need a citation. The server (serve.py, or host.py when hosted) holds the key and sends the request to the
+// provider (Anthropic or an OpenAI-compatible endpoint); nothing comes back into the document until the person
+// clicks Apply, and then it goes in through the editor like typing, so co-editing and autosave see a normal edit.
+// Model output is text only (textContent). Reference candidates for a claim come only from Crossref (api/bib/search).
+import { suggestKey } from "./refs.js";
 
-const TASKS = { rewrite: "Rewrite", shorten: "Shorten", grammar: "Fix grammar", translate: "Translate", write: "Write LaTeX", explain: "Explain error", ask: "Question" };
+const TASKS = { rewrite: "Rewrite", shorten: "Shorten", grammar: "Fix grammar", translate: "Translate", write: "Write LaTeX", explain: "Explain error", ask: "Question", claims: "Claims needing citations", image: "LaTeX from image" };
 const CONTEXT = 2000;   // characters of context before and after the selection or cursor
 const RC = /(^|[\\/])(\.?latexmkrc|build\.toml)$/i;   // ai.RC_NAMES: never sent, never edited
+const PROJECT_TEXT = /\.(tex|bib|sty|cls|bbx|cbx|txt|md)$/i;   // what "Whole project" sends for keyword retrieval
+const MAX_FILE = 120000, MAX_FILES = 200, MAX_PROJECT = 3000000;   // ai.MAX_FILE_CHARS, MAX_PROJECT_FILES, MAX_PROJECT_CHARS
+const IMAGE_EDGE = 2576, MAX_IMAGE = 4000000;   // long edge the models read at full detail; ai.MAX_IMAGE (base64)
+const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  .then(async (r) => { const d = await r.json().catch(() => null); if (!r.ok) throw new Error(d?.error || r.statusText); return d; });
 
 /**
  * ctx = {api, el, icon, doc(), role, readOnly, toast(msg), show() (open this panel), text(path) (open-tab or saved text),
@@ -28,11 +36,21 @@ export function aiPanel(root, ctx) {
     el("button", { type: "button", className: "btn", textContent: "Translate", onclick: () => onSelection("translate") }));
   const prompt = el("textarea", { id: uid("prompt"), rows: 3, maxLength: 2000, placeholder: "A question about this file, or what to write (a 3-column table of results, the Gaussian integral, a TikZ flow chart...)" });
   const promptLabel = el("label", { htmlFor: prompt.id, className: "eyebrow", textContent: "Ask or describe" });
+  const whole = el("input", { type: "checkbox", id: uid("whole") });
+  const picker = el("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp", hidden: true });
+  picker.onchange = () => { const f = picker.files[0]; picker.value = ""; if (f) onImage(f); };
   const askRow = el("div", { className: "ai-actions" },
     el("button", { type: "button", className: "btn primary", textContent: "Ask", onclick: () => onAsk() }),
+    el("label", { className: "check", title: "Also search the document's other files for passages that match the question" }, whole, " Whole project"),
     el("button", { type: "button", className: "btn", textContent: "Write LaTeX at cursor", onclick: () => onWrite() }),
+    el("button", { type: "button", className: "btn", textContent: "LaTeX from image...", title: "An equation or table from a picture (or paste one into the box above)", onclick: () => picker.click() }), picker,
+    el("button", { type: "button", className: "btn", textContent: "Find claims needing citations", onclick: () => onClaims() }),
     el("button", { type: "button", className: "btn", textContent: "Explain first error", onclick: () => explain(ctx.errors()[0]) }));
   prompt.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onAsk(); } });
+  prompt.addEventListener("paste", (e) => {   // a pasted screenshot of an equation or table: LaTeX from it
+    const f = [...(e.clipboardData?.files || [])].find((x) => /^image\//.test(x.type));
+    if (f) { e.preventDefault(); onImage(f); }
+  });
   const tools = el("div", { className: "ai-tools" }, hint, sel, tr, promptLabel, prompt, askRow);
   const log = el("ol", { className: "ai-log" });
   log.setAttribute("aria-label", "Assistant answers");
@@ -56,33 +74,49 @@ export function aiPanel(root, ctx) {
   }
 
   function renderSettings() {
-    const open = settingsBox.open;
+    const open = settingsBox.open, other = info.provider === "openai";
     const on = el("input", { type: "checkbox", id: uid("on"), checked: !!info.on });
     const share = el("input", { type: "checkbox", id: uid("share"), checked: !!info.share, disabled: !info.sandboxed });
-    const model = el("select", { id: uid("model") }, ...[...new Set([...(info.models || []), info.model])].map((m) => new Option(m, m, false, m === info.model)));
-    const key = el("input", { type: "password", id: uid("key"), autocomplete: "off", spellcheck: false, placeholder: info.key ? "(saved; type to replace)" : "sk-ant-..." });
+    const provider = el("select", { id: uid("provider") }, new Option("Anthropic (Claude)", "anthropic", false, !other), new Option("OpenAI-compatible endpoint", "openai", false, other));
+    const amodel = info.anthropic_model || info.model;
+    const model = el("select", { id: uid("model") }, ...[...new Set([...(info.models || []), amodel])].map((m) => new Option(m, m, false, m === amodel)));
+    const keyed = other ? info.openai_key : info.key;
+    const key = el("input", { type: "password", id: uid("key"), autocomplete: "off", spellcheck: false, placeholder: keyed ? "(saved; type to replace)" : other ? "Leave empty for a local server" : "sk-ant-..." });
+    const base = el("input", { type: "url", id: uid("base"), value: info.base_url || "", autocomplete: "off", spellcheck: false, placeholder: "https://api.openai.com/v1 or http://localhost:11434/v1" });
+    const omodel = el("input", { type: "text", id: uid("omodel"), value: info.openai_model || "", autocomplete: "off", spellcheck: false, placeholder: "the model id the endpoint lists" });
     const msg = el("p", { className: "mute", role: "status" });
     const save = async (body) => {
       try { info = await ctx.api.aiSettings(body); msg.textContent = "Saved."; render(); } catch (e) { msg.textContent = e.message; }
     };
     on.onchange = () => {
-      if (on.checked && !confirm("The assistant sends the text you ask about (selections, the open file, build logs) to Anthropic (api.anthropic.com), billed to your API key. Turn it on?")) { on.checked = false; return; }
+      const where = other ? `the endpoint at ${info.base_url || "the base URL you set"}` : "Anthropic (api.anthropic.com), billed to your API key";
+      if (on.checked && !confirm(`The assistant sends the text you ask about (selections, the open file or the project's files, build logs, images you add) to ${where}. Turn it on?`)) { on.checked = false; return; }
       save({ enabled: on.checked });
     };
+    provider.onchange = () => save({ provider: provider.value });
+    const saveEndpoint = () => save({ base_url: base.value.trim(), openai_model: omodel.value.trim() });
     share.onchange = () => {
       if (share.checked && !confirm("People with an edit link could then send text to Anthropic with your API key (up to 20 an hour per named link or per address on the anonymous link, 100 in all while this server runs). Allow it?")) { share.checked = false; return; }
       save({ share: share.checked });
     };
     model.onchange = () => save({ model: model.value });
-    const keyNote = info.key === "environment" ? "The key comes from ANTHROPIC_API_KEY." : info.key ? "A key is saved in your user settings folder (readable only by you)." : "No key yet. Set ANTHROPIC_API_KEY, or paste one here.";
+    const env = other ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+    const keyNote = keyed === "environment" ? `The key comes from ${env}.` : keyed ? "A key is saved in your user settings folder (readable only by you)." : `No key yet. Set ${env}, or paste one here.`;
+    const keyField = other ? "openai_key" : "key";
     settingsBox.replaceChildren(el("summary", { textContent: "Assistant settings" }),
       el("div", { className: "ai-form" },
-        el("label", { className: "check" }, on, " Use the AI assistant (Anthropic)"),
-        el("label", { htmlFor: model.id, textContent: "Model" }), model,
+        el("label", { className: "check" }, on, " Use the AI assistant"),
+        el("label", { htmlFor: provider.id, textContent: "Provider" }), provider,
+        ...(other ? [
+          el("label", { htmlFor: base.id, textContent: "Base URL (OpenAI, OpenRouter, Mistral, or Ollama, llama.cpp, LM Studio on this computer)" }), base,
+          el("label", { htmlFor: omodel.id, textContent: "Model" }),
+          el("div", { className: "ai-row" }, omodel, el("button", { type: "button", className: "btn", textContent: "Save endpoint", onclick: saveEndpoint })),
+          el("p", { className: "mute", textContent: info.local ? "A model server on this computer or network: only you can use it, never a shared link." : "Use https; http only for a server on this computer or network. The endpoint must support JSON-schema replies (response_format) and, for images, vision input." }),
+        ] : [el("label", { htmlFor: model.id, textContent: "Model" }), model]),
         el("label", { htmlFor: key.id, textContent: "API key" }),
         el("div", { className: "ai-row" }, key,
-          el("button", { type: "button", className: "btn", textContent: "Save key", onclick: () => { if (key.value.trim()) save({ key: key.value.trim() }); key.value = ""; } }),
-          ...(info.key === "settings" ? [el("button", { type: "button", className: "btn ghost", textContent: "Forget", onclick: () => save({ forget_key: true }) })] : [])),
+          el("button", { type: "button", className: "btn", textContent: "Save key", onclick: () => { if (key.value.trim()) save({ [keyField]: key.value.trim() }); key.value = ""; } }),
+          ...(keyed === "settings" ? [el("button", { type: "button", className: "btn ghost", textContent: "Forget", onclick: () => save({ [other ? "forget_openai_key" : "forget_key"]: true }) })] : [])),
         el("p", { className: "mute", textContent: keyNote + " The server never sends it to a browser." }),
         el("label", { className: "check" }, share, " Let people with an edit link use it while sharing"),
         ...(info.sandboxed ? [] : [el("p", { className: "mute", textContent: "Needs sandboxed builds (serve.py --sandbox). Without them, LuaLaTeX from an edit link can read your key on this computer." })]),
@@ -237,8 +271,129 @@ export function aiPanel(root, ctx) {
     if (!cur) { ctx.toast("Open a text file first; the assistant reads it."); return; }
     let outline = [];
     try { outline = (await ctx.api.outline(ctx.doc())).items.map((it) => `${"  ".repeat(Math.max(0, it.level - 1))}${it.title} (${it.file}:${it.line})`); } catch { /* without outline */ }
-    const r = await run(q.slice(0, 80), { task: "ask", prompt: q, outline, history, files: [{ path: cur.path, text: cur.view.state.doc.toString() }] });
+    const files = [{ path: cur.path, text: cur.view.state.doc.toString() }];
+    if (whole.checked) files.push(...await projectFiles(cur.path, files[0].text.length));
+    const label = whole.checked ? `${q.slice(0, 70)} (${files.length} files)` : q.slice(0, 80);
+    const r = await run(label, { task: "ask", prompt: q, outline, history, files, ...(whole.checked ? { project: true } : {}) });
     if (r) { history = [...history, { q, a: r.answer }].slice(-6); prompt.value = ""; }
+  }
+
+  /** The document's other text files (open-tab text where there is one) for "Whole project": the server picks the
+   *  passages that match the question (ai.passages). Build configuration and oversized files stay out. */
+  async function projectFiles(skip, used) {
+    let list = [];
+    try { list = (await ctx.api.files(ctx.doc())).files.map((f) => f.path); } catch { return []; }
+    const out = [];
+    for (const path of list) {
+      if (path === skip || RC.test(path) || !PROJECT_TEXT.test(path) || out.length >= MAX_FILES - 1) continue;
+      let text;
+      try { text = await ctx.text(path); } catch { continue; }
+      if (typeof text !== "string" || text.length > MAX_FILE || used + text.length > MAX_PROJECT) continue;
+      used += text.length;
+      out.push({ path, text });
+    }
+    return out;
+  }
+
+  /** Sentences of the open file that state facts without a citation; each can be searched on Crossref. */
+  async function onClaims() {
+    const cur = ctx.current();
+    if (!cur) { ctx.toast("Open a .tex file first; the assistant reads it."); return; }
+    if (!/\.tex$/i.test(cur.path)) { ctx.toast("Open a .tex file first."); return; }
+    ctx.show();
+    const text = cur.view.state.doc.toString();
+    if (text.length > MAX_FILE) { ctx.toast("This file is too long for the assistant; split it into chapters."); return; }
+    await run(cur.path, { task: "claims", files: [{ path: cur.path, text }] }, (item, r) => {
+      if (!(r.claims || []).length) return;
+      const list = el("ol", { className: "ai-claims" });
+      for (const c of r.claims) {
+        const where = el("a", { href: "#", className: "where", textContent: `${c.file}:${c.line}` });
+        where.onclick = async (ev) => {
+          ev.preventDefault();
+          const view = await ctx.view(c.file), at = place(view.state.doc, c.from, c.to, c.quote);
+          if (at) view.dispatch({ selection: { anchor: at.from, head: at.to }, scrollIntoView: true });
+          else ctx.toast("That text changed since the scan.");
+        };
+        const found = el("div", { className: "ai-cands" });
+        const find = el("button", { type: "button", className: "mini", textContent: "Search Crossref", title: `Search Crossref for: ${c.query}` });
+        find.onclick = () => candidates(c.query, found, find);
+        list.append(el("li", {}, el("p", {}, where, " ", el("q", { textContent: c.quote })), el("p", { className: "mute", textContent: c.reason }),
+          ...(c.query ? [el("div", { className: "ai-actions" }, find, el("span", { className: "mute", textContent: c.query }))] : []), found));
+      }
+      item.append(list, el("p", { className: "mute", textContent: "Candidates come from Crossref only; check each one before you cite it." }));
+    });
+  }
+
+  /** Crossref candidates for one search phrase, each addable to a .bib file of the document (as a normal edit). */
+  async function candidates(query, box, button) {
+    button.disabled = true;
+    box.replaceChildren(el("p", { className: "mute", textContent: "Searching Crossref..." }));
+    let r;
+    try { r = await post(`api/bib/search?doc=${encodeURIComponent(ctx.doc())}`, { query }); }
+    catch (e) { box.replaceChildren(el("p", { className: "refs-err", textContent: e.message })); button.disabled = false; return; }
+    button.disabled = false;
+    if (!r.candidates?.length) { box.replaceChildren(el("p", { className: "mute", textContent: r.error || "Crossref found nothing for this phrase." })); return; }
+    box.replaceChildren(...r.candidates.map((c) => {
+      const f = c.fields, row = el("div", { className: "ai-cand" },
+        el("p", {}, el("b", { textContent: f.title || "" }), el("span", { className: "mute", textContent: ` ${[f.author, f.journal || f.booktitle || f.publisher, f.year].filter(Boolean).join(" · ")}` })),
+        ...(f.doi ? [el("p", { className: "mute", textContent: `doi:${f.doi}` })] : []));
+      if (!ctx.readOnly) row.append(el("div", { className: "ai-actions" }, el("button", { type: "button", className: "mini", textContent: "Add to .bib", onclick: (ev) => addToBib(c, ev.target) })));
+      return row;
+    }));
+  }
+
+  async function addToBib(c, button) {
+    let bibs = [];
+    try { bibs = (await ctx.api.files(ctx.doc())).files.map((f) => f.path).filter((p) => /\.bib$/i.test(p)); } catch { /* none */ }
+    if (!bibs.length) { ctx.toast("Create a .bib file first (References panel)."); return; }
+    const path = bibs[0];
+    try {
+      const text = await ctx.text(path);
+      const taken = new Set([...text.matchAll(/@\w+\s*[({]\s*([^,\s]+)/g)].map((m) => m[1]));
+      const key = suggestKey(c.fields, taken);
+      const r = await post(`api/bib/edit?doc=${encodeURIComponent(ctx.doc())}`, { text, op: "add", entry: { type: c.type, key, fields: c.fields } });
+      const view = await ctx.view(path);
+      if (view.state.doc.toString() !== text) throw new Error("The .bib file changed meanwhile; try again.");
+      view.dispatch({ changes: { from: r.from, to: r.to, insert: r.insert }, scrollIntoView: true, userEvent: "input.complete" });
+      button.replaceWith(el("span", { className: "ok-mark", textContent: `Added ${key} to ${path}` }));
+    } catch (e) { ctx.toast(e.message); }
+  }
+
+  /** A picture of an equation or table: scaled to IMAGE_EDGE, sent as base64, LaTeX back to insert at the cursor. */
+  async function onImage(file) {
+    const s = selection();
+    if (!s) return;
+    if (!info.vision) { ctx.toast("This server's assistant does not take images."); return; }
+    ctx.show();
+    let image;
+    try { image = await encodeImage(file); } catch (e) { ctx.toast(e.message); return; }
+    const what = prompt.value.trim();
+    await run(file.name || "pasted image", { task: "image", image, prompt: what, selection: { before: s.before, after: s.after } }, (item, r) => {
+      if (!r.text) return;
+      item.append(diff("", r.text));
+      applyButton("Insert at cursor", item, async () => {
+        const view = await ctx.view(s.path), at = view.state.selection.main.head;
+        view.dispatch({ changes: { from: at, insert: r.text }, selection: { anchor: at, head: at + r.text.length }, scrollIntoView: true, userEvent: "input.complete" });
+        return true;
+      });
+    });
+  }
+
+  async function encodeImage(file) {
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) throw new Error("Use a PNG, JPEG, GIF or WebP image.");
+    if (file.size > 40e6) throw new Error("That image is over 40 MB.");
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, IMAGE_EDGE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const g = canvas.getContext("2d");
+    g.fillStyle = "#fff"; g.fillRect(0, 0, canvas.width, canvas.height);   // transparent PNGs: black text on white
+    g.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    for (const [type, quality] of [["image/png"], ["image/jpeg", 0.92], ["image/jpeg", 0.8]]) {
+      const data = canvas.toDataURL(type, quality).split(",")[1];
+      if (data.length <= MAX_IMAGE) return { media_type: type, data };
+    }
+    throw new Error("The image is too large even after scaling it down.");
   }
 
   /** Error {file, line, message, excerpt, hint} from the build: the log lines around it and the source around the line. */
