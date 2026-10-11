@@ -9,6 +9,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Copies made from the template run only the PDF build in CI: unit tests, ruff, the requirements check and the PDF/A fixture check run only in `NotTahaAli/LatexPipeline`.
 - README: a "Just compiling LaTeX" section for people who only want to build documents.
 
+### Fixed
+
+- A missing package (`! LaTeX Error: File `x.sty' not found.`) is reported as that error, with its install hint, instead of the `Emergency stop.` that follows it.
+
 ## [0.1.0] - 2026-10-12
 
 ### Fixed
