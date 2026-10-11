@@ -192,7 +192,8 @@ class ReadSettingsTests(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
                          {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
-                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off"})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
+                          "html": False})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -212,7 +213,8 @@ class ReadSettingsTests(unittest.TestCase):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
                          {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
-                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off"})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
+                          "html": False})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
