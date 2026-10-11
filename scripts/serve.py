@@ -547,6 +547,32 @@ def run_focus(name: str, rel: str, began: float | None = None) -> None:
         publish(name, focus={**result, "finished": time.time()})
 
 
+def review_pdf(name: str, data: dict) -> dict:
+    """
+    POST /api/review-pdf: out/<name>.review.pdf, the document with its open suggestions marked as changes and (unless
+    data["comments"] is false) its unresolved comments as notes, built from a copy (build.build_review_pdf).
+    """
+    main_tex = DOCS[name]
+    with BUILD_LOCK:
+        started = time.time()
+        over = quota_after_build(started)
+        if over is None:
+            try:
+                result = build.build_review_pdf(main_tex, SETTINGS["latexmk"], history_folder(name) / "review.json",
+                                                data.get("comments") is not False, live=False)
+            except Exception as exc:  # noqa: BLE001 - a failed review build must not take the server down.
+                result = {"ok": False, "applied": 0, "notes": 0, "skipped": [], "error": f"{type(exc).__name__}: {exc}"}
+            over = quota_after_build(started)
+    if over is not None:
+        raise ApiError(over, 507)
+    result["skipped"] = [s for s in result["skipped"] if not is_rc(str(s.get("path") or ""))]
+    try:
+        result["version"] = str(build.review_paths(main_tex)[0].stat().st_mtime_ns)
+    except OSError:
+        result["version"] = None
+    return result
+
+
 def start_focus(name: str, rel) -> float:
     """
     Start a chapter preview in the background; returns its start time, which the "focus" state carries so a
@@ -3649,7 +3675,7 @@ def check_permission(role: str, method: str, path: str, query: dict, admin: bool
         scoped(doc)  # One MCP tool call from host.py (hosted AI clients); each tool checks the role itself.
         if not rate_ok("mcp", 120, 60.0):
             raise ApiError("Too many tool calls; wait a moment.", 429)
-    elif method == "POST" and path == "/api/focus":
+    elif method == "POST" and path in ("/api/focus", "/api/review-pdf"):
         need_edit()  # Starts LaTeX, so it counts like a rebuild.
         scoped(doc)
         if not rate_ok("rebuild", *REBUILD_LIMIT):
@@ -3910,6 +3936,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json(mcp_tools.worker_call(sys.modules[__name__], name, self.role, self.user, self.body()))
         elif url.path == "/api/focus" and name in DOCS:
             self.json({"ok": True, "started": start_focus(name, query.get("path", [""])[0])})
+        elif url.path == "/api/review-pdf" and name in DOCS:
+            self.json(review_pdf(name, self.body()))
         elif url.path == "/api/preview" and name in DOCS:
             meta, pdf = live_preview(name, str(query.get("cid", ["?"])[0])[:64], self.body())
             if pdf is None:
@@ -3994,7 +4022,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/events":
             self.events()
         elif path.startswith(("/pdf/", "/log/", "/docx/")):
-            self.file(path, "focus" in query)
+            self.file(path, "focus" in query, "review" in query)
         elif path == "/api/files":
             root = self.doc_root(query)
             self.json({"files": list_files(root), "dirs": empty_dirs(root)})
@@ -4080,7 +4108,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("Not an image.", 415)
         self.image(path)
 
-    def file(self, path: str, focus: bool = False) -> None:
+    def file(self, path: str, focus: bool = False, review: bool = False) -> None:
         kind, _, name = path[1:].partition("/")
         if name not in DOCS:
             self.reply(404, b"Unknown document", "text/plain")
@@ -4088,8 +4116,8 @@ class Handler(BaseHTTPRequestHandler):
         main_tex = DOCS[name]
         if kind == "docx":
             target = build.docx_path_for(main_tex)
-        elif focus:
-            target = build.focus_paths(main_tex)[0 if kind == "pdf" else 1]
+        elif focus or review:
+            target = (build.focus_paths if focus else build.review_paths)(main_tex)[0 if kind == "pdf" else 1]
         else:
             target = build.output_path_for(main_tex) if kind == "pdf" else build.log_path_for(main_tex)
         try:

@@ -20,6 +20,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: search and replace in all files of a document (sidebar Search tab, Ctrl+Shift+F; `GET /api/search`, `POST /api/replace`): match case, whole word, regular expressions for the owner only; files open in live co-editing are changed through the shared document, others written with history; build-config files stay owner-only.
 - Editor: pasting a table from a spreadsheet, Word or a web page offers "Paste as table", a `table`/`tabular` with LaTeX special characters escaped (booktabs rules when the document loads booktabs).
 - Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
+- Review markup: `build.toml` `review = "show" | "clean"` (or `build.py --review show|clean`) defines `\lpadd`, `\lpdel`, `\lpedit`, `\lpnote` and the `lpaddblock`, `lpdelblock`, `lpnoteblock` environments, shown as green highlight, red strike-through and notes, or printed as if every change were accepted; off by default, and a document's own definitions win.
+- `build.py --review-pdf DOC` and the editor's More > Build with suggestions: `out/<name>.review.pdf` with the open suggestions inlined as marked changes and unresolved comments as notes, built from a copy (only plain-prose ranges; the rest is skipped with a reason); never published.
+
+### Changed
+
+- `publish_release.py` uploads only the PDFs and logs of documents, never other files in `out/` (review or chapter preview PDFs).
 
 ## [0.1.1] - 2026-10-12
 

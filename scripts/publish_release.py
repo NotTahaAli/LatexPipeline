@@ -158,9 +158,16 @@ def main() -> int:
         digests = {}  # Only saves uploads: without the digests, everything is uploaded again.
         print("Could not read the release's digests: uploading every file.", flush=True)
 
+    documents = find_documents()
+    expected = {asset_name(output_path_for(document)) for document in documents}
+    expected |= {asset_name(log_path_for(document)) for document in documents}
+
     with tempfile.TemporaryDirectory() as staging:
         for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]):
             label = path.relative_to(OUT_DIR).as_posix()
+            if asset_name(path) not in expected:  # e.g. a review or chapter preview PDF: never published
+                print(f"Not published: {label}", flush=True)
+                continue
             if not needs_upload(path, digests):
                 print(f"Unchanged: {label}", flush=True)
                 continue
@@ -168,10 +175,6 @@ def main() -> int:
             shutil.copy(path, staged)
             print(f"Uploading: {label}", flush=True)
             gh("release", "upload", TAG, f"{staged}#{label}", "--clobber")
-
-    documents = find_documents()
-    expected = {asset_name(output_path_for(document)) for document in documents}
-    expected |= {asset_name(log_path_for(document)) for document in documents}
 
     existing = gh("release", "view", TAG, "--json", "assets", "--jq", ".assets[].name").split()
 

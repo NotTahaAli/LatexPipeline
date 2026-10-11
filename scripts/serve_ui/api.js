@@ -70,6 +70,8 @@ export const api = {
   docx: (doc) => call(`api/docx?${qs({ doc })}`, { method: "POST" }),
   docxUrl: (doc) => `docx/${doc.split("/").map(enc).join("/")}`,
   focus: (doc, path) => call(`api/focus?${qs({ doc, path })}`, { method: "POST" }),
+  reviewPdf: (doc, comments) => call(`api/review-pdf?${qs({ doc })}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comments }) }),
+  reviewPdfUrl: (doc, v) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}&review=1`,
   pdfUrl: (doc, v, focus) => `pdf/${doc.split("/").map(enc).join("/")}?v=${v}${focus ? "&focus=1" : ""}`,
   logUrl: (doc) => `log/${doc.split("/").map(enc).join("/")}`,
 };

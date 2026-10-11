@@ -493,9 +493,24 @@ def is_stale(main_tex: Path) -> bool:
     output = output_path_for(main_tex)
 
     try:
-        return newest_input(main_tex) > output.stat().st_mtime
+        if newest_input(main_tex) > output.stat().st_mtime:
+            return True
     except FileNotFoundError:
         return True
+    return review_switched(main_tex)
+
+
+def review_switched(main_tex: Path) -> bool:
+    """The last build used other review markup than --review or build.toml asks for now (e.g. --review show before)."""
+    try:
+        recorded = (cache_dir_for(main_tex) / ".mode").read_text()
+        if REVIEW_MODE is None and "\\lp@" not in recorded:
+            return False  # review markup neither asked for nor used: no settings to read
+        settings = read_settings(main_tex)
+    except (OSError, ValueError, ConfigError):
+        return False
+    meta = document_metadata(settings) + review_pretex(settings)
+    return recorded not in (f"plain{meta}", f"externalized{meta}")
 
 
 def output_path_for(main_tex: Path) -> Path:
@@ -545,11 +560,12 @@ def docx_path_for(main_tex: Path) -> Path:
 
 # "% !TEX program = xelatex" (also "% !TeX TS-program = ..."), in the first lines.
 ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.IGNORECASE)
-CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout",
+CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout", "review",
                "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
 # Wall-clock limit for one latexmk run, in seconds (build.toml "timeout"; --timeout changes the default).
 DEFAULT_TIMEOUT = 600
 TIMEOUT_RANGE = (10, 7200)
+REVIEW_MODE: str | None = None  # --review show|clean: overrides build.toml's review for every document
 PDFA_LEVEL = re.compile(r"^(?:a-)?([123][abu]|4[ef]?)$")
 
 # ponytail: errors are read from the console; -file-line-error puts each on one "file:line: message" line.
@@ -600,7 +616,7 @@ def read_settings(main_tex: Path) -> dict:
     Raises ConfigError for invalid values.
     """
     settings = {"engine": DEFAULT_ENGINE, "shell_escape": False, "latexmk_args": [], "externalize": True,
-                "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT}
+                "pdfa": None, "tagged": False, "lang": "en-US", "timeout": DEFAULT_TIMEOUT, "review": "off"}
 
     text = main_tex.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines()[:20]:
@@ -618,6 +634,8 @@ def read_settings(main_tex: Path) -> dict:
             raise ConfigError(f"{display(config_path)}: unknown key(s): {', '.join(unknown)}")
 
         settings.update(data)
+    if REVIEW_MODE:
+        settings["review"] = REVIEW_MODE
 
     engine = settings["engine"]
     if not isinstance(engine, str) or engine.lower() not in ENGINES:
@@ -640,6 +658,9 @@ def read_settings(main_tex: Path) -> dict:
         settings["pdfa"] = f"a-{match.group(1)}"
     if not (isinstance(settings["lang"], str) and re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]+)*", settings["lang"])):
         raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: lang must be a language tag such as \"en-US\"")
+
+    if not (isinstance(settings["review"], str) and settings["review"] in REVIEW_PRETEX):
+        raise ConfigError(f"{display(main_tex.parent / 'build.toml')}: review must be \"show\", \"clean\" or \"off\"")
 
     low, high = TIMEOUT_RANGE
     timeout = settings["timeout"]
@@ -723,6 +744,49 @@ def document_metadata(settings: dict) -> str:
         + (NO_ATTACHED_FILES if level and (level[2] in "12" or level == "a-4") else "")
         + "".join(extras)
     )  # one -usepretex argument: no newlines
+
+
+# build.toml review = "show" | "clean" (README, "Review markup"): \lpadd{new}, \lpdel{old}, \lpedit{old}{new},
+# \lpnote{text} and the environments lpaddblock, lpdelblock and lpnoteblock, injected with -usepretex. The definitions
+# wait for \begin{document} (hook begindocument/before), and a name the document or a package already defined is
+# left alone: the document's own macro wins. "show" loads xcolor and ulem (normalem, unless the document loaded
+# ulem itself), "clean" no package. Each value is one -usepretex argument: no newlines.
+REVIEW_PROVIDE = (r"\def\lp@provide#1#2{\ifdefined#1\else\let#1#2\fi}"
+                  r"\def\lp@all{\lp@provide\lpadd\lp@add\lp@provide\lpdel\lp@del\lp@provide\lpedit\lp@edit"
+                  r"\lp@provide\lpnote\lp@note\lp@provide\lpaddblock\lp@addblock\lp@provide\endlpaddblock\lp@endblock}")
+REVIEW_PRETEX = {
+    "off": "",
+    "show": (
+        r"\makeatletter"
+        r"\protected\def\lp@add#1{\bgroup\markoverwith{\textcolor{lpaddbg}{\rule[-.5ex]{2pt}{2.5ex}}}\ULon{#1}}"
+        r"\protected\def\lp@del#1{\textcolor{lpdelfg}{\sout{#1}}}"
+        r"\protected\def\lp@edit#1#2{\lp@del{#1}\lp@add{#2}}"
+        r"\protected\def\lp@note#1{{\color{lpnotefg}\sffamily\footnotesize[#1]}}"
+        r"\def\lp@addblock{\par\color{lpaddfg}}\def\lp@delblock{\par\color{lpdelfg}}"
+        r"\def\lp@noteblock{\par\color{lpnotefg}\sffamily\small}\def\lp@endblock{\par}" + REVIEW_PROVIDE +
+        r"\AddToHook{begindocument/before}{\RequirePackage{xcolor}"
+        r"\ifcsname ver@ulem.sty\endcsname\else\RequirePackage[normalem]{ulem}\fi"
+        r"\definecolor{lpaddbg}{RGB}{198,239,206}\definecolor{lpaddfg}{RGB}{0,110,40}"
+        r"\definecolor{lpdelfg}{RGB}{192,0,0}\definecolor{lpnotefg}{RGB}{0,70,160}\lp@all"
+        r"\lp@provide\lpdelblock\lp@delblock\lp@provide\endlpdelblock\lp@endblock"
+        r"\lp@provide\lpnoteblock\lp@noteblock\lp@provide\endlpnoteblock\lp@endblock}"
+        r"\makeatother"
+    ),
+    "clean": (  # added text plain; deleted text and notes dropped (\@bsphack keeps one space, as \label does)
+        r"\makeatletter"
+        r"\protected\def\lp@add#1{#1}\protected\def\lp@del#1{\@bsphack\@esphack}\protected\def\lp@edit#1#2{#2}"
+        r"\let\lp@note\lp@del\def\lp@addblock{}\def\lp@endblock{}" + REVIEW_PROVIDE +
+        r"\AddToHook{begindocument/before}{\lp@all"
+        r"\ifdefined\lpdelblock\else\NewDocumentEnvironment{lpdelblock}{+b}{}{}\fi"
+        r"\ifdefined\lpnoteblock\else\NewDocumentEnvironment{lpnoteblock}{+b}{}{}\fi}"
+        r"\makeatother"
+    ),
+}
+
+
+def review_pretex(settings: dict) -> str:
+    """The pretex for build.toml's review ("" when off)."""
+    return REVIEW_PRETEX[settings["review"]]
 
 
 def pdf_text(pdf: Path) -> bytes:
@@ -869,7 +933,8 @@ def kill_tree(process: subprocess.Popen) -> None:
 
 def build_document(
     main_tex: Path, latexmk: str, live: bool = True, force: bool = False, fig_jobs: int = DEFAULT_JOBS,
-    record: bool = False, validate: bool = True,
+    record: bool = False, validate: bool = True, review: str | None = None,
+    target: tuple[Path, Path] | None = None,
 ) -> tuple[dict, str]:
     """
     Build one LaTeX document. Returns (report entry, console text).
@@ -887,12 +952,14 @@ def build_document(
 
     force passes latexmk -g, which rebuilds even when its cache says up to date.
     validate=False skips veraPDF (the editor's builds: validation takes seconds).
+    review overrides build.toml's review; target = (build directory, PDF) replaces the document's own (the review
+    PDF's copy of a document, build_review_pdf).
     """
     began = time.monotonic()
     relative = Path(display(main_tex))
     name = doc_name(main_tex)
-    output_pdf = output_path_for(main_tex)
-    log_path = log_path_for(main_tex)
+    output_pdf = target[1] if target else output_path_for(main_tex)
+    log_path = output_pdf.with_suffix(".log") if target else log_path_for(main_tex)
 
     shown: list[str] = []
 
@@ -922,6 +989,8 @@ def build_document(
 
     try:
         settings = read_settings(main_tex)
+        if review:
+            settings["review"] = review
     except ConfigError as exc:
         settings = None
         errors.append(str(exc))
@@ -930,7 +999,7 @@ def build_document(
     # running still count as newer than the PDF.
     started = time.time()
 
-    build_dir = cache_dir_for(main_tex)
+    build_dir = target[0] if target else cache_dir_for(main_tex)
     cached = build_dir.exists()
     build_dir.mkdir(parents=True, exist_ok=True)
     generated_pdf = build_dir / f"{main_tex.stem}.pdf"
@@ -1015,7 +1084,8 @@ def build_document(
             try:
                 figures = accel.Figures(
                     main_tex, build_dir, settings["engine"], settings["shell_escape"], fig_jobs,
-                    env={**LATEX_LOG_ENV, **epoch}, cache=figure_cache_for(main_tex),
+                    env={**LATEX_LOG_ENV, **epoch}, cache=None if target else figure_cache_for(main_tex),
+                    pretex=review_pretex(settings),
                 )
                 if force:
                     figures.wipe()
@@ -1048,7 +1118,7 @@ def build_document(
                         return 1, failures[0].splitlines()[0]
                     if attempt and not changed:
                         return 0, ""
-                    extra = [f"-usepretex={meta}{figures.main_pretex}", f"-jobname={main_tex.stem}"]
+                    extra = [f"-usepretex={pdf_meta}{figures.main_pretex}", f"-jobname={main_tex.stem}"]
                     figures.mark_recorded()
                     code = run(latexmk_command(*extra, *(["-g"] if switched else [])))
                     if code != 0:
@@ -1060,7 +1130,8 @@ def build_document(
         # Switching between plain and externalized output needs a rebuild latexmk can't see.
         mode_file = build_dir / ".mode"
         # \DocumentMetadata must precede \documentclass, which is what -usepretex gives it.
-        meta = document_metadata(settings)
+        pdf_meta = document_metadata(settings)
+        meta = pdf_meta + review_pretex(settings)  # main_pretex of the figures carries the review markup itself
         mode = "plain"
         if settings["externalize"] and accel.uses_tikz(main_tex.parent):
             mode = "externalized"
@@ -1266,7 +1337,7 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
         settings["engine"], "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
         f"-output-directory={focus_dir}", f"-jobname={main_tex.stem}",
         *(["-shell-escape"] if settings["shell_escape"] else []),
-        f"{pretex}\\input{{{main_tex.name}}}",
+        f"{review_pretex(settings)}{pretex}\\input{{{main_tex.name}}}",
     ]
     info(f"Focus:   {focus} ({len(keep)} of {len(entries)} files read)")
     began = time.monotonic()
@@ -1309,6 +1380,86 @@ def _build_focus(main_tex: Path, latexmk: str, focus: str, fig_jobs: int) -> boo
             info("  " + error_text(doc_name(main_tex), item))
         info(paint(f"FAILED:  {relative.as_posix()} (focus {focus}); log: {display(out_log)}", RED))
     return ok
+
+
+def review_paths(main_tex: Path) -> tuple[Path, Path]:
+    """out/<name>.review.pdf and out/<name>.review.log: the document with its open suggestions (never published)."""
+    pdf = output_path_for(main_tex)
+    return pdf.with_name(f"{pdf.stem}.review.pdf"), pdf.with_name(f"{pdf.stem}.review.log")
+
+
+def review_file_for(main_tex: Path) -> Path:
+    """The editor's comments and suggestions (serve.py's history_folder with the default .latex-history)."""
+    return CACHE_DIR.parent / ".latex-history" / cache_dir_for(main_tex).name / "review.json"
+
+
+def build_review_pdf(main_tex: Path, latexmk: str, review_file: Path | None = None, notes: bool = True,
+                     live: bool = True) -> dict:
+    """
+    out/<name>.review.pdf: a copy of the document in the build cache with each open suggestion of review_file inlined
+    as \\lpdel{old}\\lpadd{new} (and, with notes, each unresolved comment as \\lpnote), built through build_document
+    with review = "show". The document's own files are never written. Returns {"ok", "applied", "notes",
+    "skipped": [{"id", "kind", "path", "reason"}], "error"}.
+    """
+    import review_pdf  # only here: CI never builds a review PDF
+
+    result: dict = {"ok": False, "applied": 0, "notes": 0, "skipped": [], "error": None}
+    review_file = review_file or review_file_for(main_tex)
+    try:
+        data = json.loads(review_file.read_text("utf-8")) if review_file.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        engine = read_settings(main_tex)["engine"]
+    except (OSError, ValueError, ConfigError) as exc:
+        result["error"] = f"Could not read the review data: {exc}" if not isinstance(exc, ConfigError) else str(exc)
+        return result
+    work = CACHE_DIR / "_review" / cache_dir_for(main_tex).name  # "_r" never comes out of escape_name
+    copy = work / "src"
+    shutil.rmtree(copy, ignore_errors=True)
+    generated = {path.resolve() for path in (CACHE_DIR, OUT_DIR, CACHE_DIR.parent / ".latex-history")}
+
+    def ignore(folder: str, names: list[str]) -> list[str]:  # a document at the repository root holds these
+        return [name for name in names if name == ".git" or (Path(folder) / name).resolve() in generated]
+
+    # Symbolic links stay links: the copy reads nothing the document itself could not.
+    shutil.copytree(main_tex.parent, copy, symlinks=True, ignore=ignore)
+    root = copy.resolve()
+
+    def inside(rel: str) -> Path | None:
+        path = (copy / rel).resolve()
+        return path if root in path.parents and path.is_file() else None
+
+    def read(rel: str) -> str | None:
+        path = inside(rel)
+        try:
+            return path.read_text(encoding="utf-8") if path else None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    try:
+        found = review_pdf.plan(data, read, notes, ascii_only=engine == "pdflatex", main=main_tex.name)
+        for rel, text in found["texts"].items():
+            inside(rel).write_text(text, encoding="utf-8")
+        pdf, log = review_paths(main_tex)
+        pdf.unlink(missing_ok=True)  # never the PDF of an older review build next to this build's log
+        entry, _ = build_document(copy / main_tex.name, latexmk, live, False, validate=False, review="show",
+                                  target=(work / "build", pdf))
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+    skipped = found["skipped"]
+    summary = [f"Review PDF of {display(main_tex)}: {found['applied']} suggestion(s) and {found['notes']} comment(s) "
+               f"inlined, {len(skipped)} skipped.\n"]
+    summary += [f"SKIPPED {s['kind']} {s['id']} in {s['path']}: {s['reason']}\n" for s in skipped]
+    try:
+        log.write_text("".join(summary) + "\n" + log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    except OSError:
+        pass
+    for line in summary:
+        info(line.rstrip())
+    first = entry["error"] or next((e["message"] for e in entry["errors"]), None)
+    result.update(ok=entry["ok"], applied=found["applied"], notes=found["notes"], skipped=skipped,
+                  error=None if entry["ok"] else first or "The review PDF failed; see its log.")
+    return result
 
 
 def build_safely(
@@ -1517,6 +1668,7 @@ def prune(documents: list[Path]) -> None:
     expected = {output_path_for(document) for document in documents}
     expected |= {log_path_for(document) for document in documents}
     expected |= {path for document in documents for path in focus_paths(document)}
+    expected |= {path for document in documents for path in review_paths(document)}
     expected |= {docx_path_for(document) for document in documents}
 
     for path in [*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.docx")]:
@@ -1925,7 +2077,33 @@ def parse_args() -> argparse.Namespace:
              "With --watch, 'auto' focuses on the part holding the file saved last.",
     )
 
+    parser.add_argument(
+        "--review",
+        choices=["show", "clean"],
+        help="Review markup (\\lpadd, \\lpdel, \\lpnote ...) for every selected document, overriding build.toml: "
+             "'show' marks changes and notes, 'clean' prints the text as if every change were accepted.",
+    )
+
+    parser.add_argument(
+        "--review-pdf",
+        action="store_true",
+        help="Build out/<name>.review.pdf for one document: its open editor suggestions inlined as marked changes "
+             "and its unresolved comments as notes (the document's files are not changed).",
+    )
+
+    parser.add_argument(
+        "--no-comments",
+        action="store_true",
+        help="With --review-pdf: leave the comments out.",
+    )
+
     args = parser.parse_args()
+
+    if args.no_comments and not args.review_pdf:
+        parser.error("--no-comments needs --review-pdf")
+
+    if args.review_pdf and (args.watch or args.focus or args.docx):
+        parser.error("--review-pdf cannot be combined with --watch, --focus or --docx")
 
     if args.focus == "auto" and not args.watch:
         parser.error("--focus auto needs --watch")
@@ -2024,6 +2202,9 @@ def main() -> int:
     if args.timeout is not None:
         global DEFAULT_TIMEOUT
         DEFAULT_TIMEOUT = args.timeout
+    if args.review:
+        global REVIEW_MODE
+        REVIEW_MODE = args.review
 
     if args.source:
         source = Path(args.source) if Path(args.source).is_absolute() else ROOT_DIR / args.source
@@ -2093,6 +2274,15 @@ def main() -> int:
             error("--focus needs exactly one document; name it, e.g. build.py sample-report --focus Chapters/ch1")
             return 2
         return 0 if build_focus(documents[0], latexmk, args.focus) else 1
+
+    if args.review_pdf:
+        if len(documents) != 1:
+            error("--review-pdf needs exactly one document; name it, e.g. build.py sample-report --review-pdf")
+            return 2
+        result = build_review_pdf(documents[0], latexmk, notes=not args.no_comments)
+        if result["error"]:
+            error(result["error"])
+        return 0 if result["ok"] else 1
 
     if args.watch:
         return watch(latexmk, args.docs, args.open, args.focus)
