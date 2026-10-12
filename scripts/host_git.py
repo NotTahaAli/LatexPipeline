@@ -302,16 +302,18 @@ def push(project: dict, remote: dict, user: dict) -> dict:
     ensure_repo(project, branch)
     if not has_head(project):
         git(project, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
-    changed = snapshot(project, {"name": user["name"], "email": user["email"]})
+    snapshot(project, {"name": user["name"], "email": user["email"]})
     if not has_head(project):
         return {"ok": True, "message": "Nothing to push."}
-    done = transfer(project, ["push", "-q", "--recurse-submodules=no", "--no-verify", remote["url"],
+    done = transfer(project, ["push", "--porcelain", "--recurse-submodules=no", "--no-verify", remote["url"],
                               f"HEAD:refs/heads/{branch}"], remote["url"], auth)
     if done.returncode:
-        if re.search(r"rejected|non-fast-forward|fetch first", done.stderr):
+        if re.search(r"rejected|non-fast-forward|fetch first", done.stdout + done.stderr):
             raise H.HttpError(409, "The repository has commits this project does not have yet: pull first.")
         raise H.HttpError(502, "Could not push to the repository: " + scrub(done.stderr))
-    return {"ok": True, "message": "Pushed." if changed else "Pushed (no new changes)."}
+    # the remote's answer, not "did this push commit": an earlier failed push may have left commits to deliver
+    same = re.search(r"^=\t", done.stdout, re.M)
+    return {"ok": True, "message": "Pushed (no new changes)." if same else "Pushed."}
 
 
 def project_lock(pid: str) -> threading.Lock:

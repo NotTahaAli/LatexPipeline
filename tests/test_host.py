@@ -2520,6 +2520,20 @@ class GitSync(HostCase):
         actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git_p%'")]
         self.assertIn("git_push", actions)
 
+    def test_push_message_says_what_the_remote_received(self):
+        """A refused push leaves its snapshot commit here; the next push delivers it and must not say "no new
+        changes" just because that push itself committed nothing."""
+        self.pulled()
+        self.set_token()
+        self.upstream({"other.tex": "x\n"})
+        (self.source / "ch2.tex").write_text("Mine\n", encoding="utf-8")
+        self.assertEqual(self.sync(self.editor, "push")[0], 409)  # committed here, refused there
+        self.assertEqual(self.sync(self.editor, "pull")[1]["ok"], True)
+        status, result, _ = self.sync(self.editor, "push")
+        self.assertEqual((status, result["message"]), (200, "Pushed."), result)
+        self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
+        self.assertEqual(self.sync(self.editor, "push")[1]["message"], "Pushed (no new changes).")
+
     def test_repository_outside_the_project_and_removed_with_it(self):
         self.pulled()
         gitdir = host_git.repo_dir(self.project)
