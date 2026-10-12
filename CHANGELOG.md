@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
 - Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
+- `tests/test_cli_flags.py`: every command-line flag of the six scripts run in a real subprocess, with an inventory check against `--help`; notification tests that run osascript and PowerShell on the macOS and Windows runners; `tests/vscode_e2e.mjs --vsix` (the packaged and installed extension), hosted reconnect, malformed tokens, hosted 409 and hosted Problems.
 - VS Code extension in `vscode/` (install with `vsce package`): connects to a local editor, a share link or a hosted project (API token), shows the document as a folder, saves through the editor's API, builds, shows build errors as Problems and the PDF in a tab.
 
 - Suggestion card: hover a suggestion, click its gutter mark or press Alt+Enter to see author, time, old and new text and replies, with Accept/Reject (edit role) or Withdraw (own); suggestions take replies.
@@ -101,6 +102,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- `publish_release.py --help` (or any argument) no longer publishes: it printed nothing and ran the whole release sync; it now shows its usage and refuses unknown arguments.
 - Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
 - Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
 - Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).

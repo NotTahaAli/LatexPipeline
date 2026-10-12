@@ -3,7 +3,8 @@
 // quick picks it opens can be answered by replacing them. It is also the copy's main: activate() keeps the context
 // (secret storage, saved state) and calls the real one. Settings arrive in VSCODE_E2E (JSON): phase, base, doc,
 // dir (the document folder on disk), seed (state carried between the two windows), pdf (out/<doc>.pdf), tokens
-// (hosted: good, compile, expired API tokens).
+// (hosted: good, compile, expired API tokens). Phase "installed" runs from a separate probe extension and checks the
+// extension VS Code installed from the .vsix (`code --install-extension`), so it never loads ./extension itself.
 "use strict";
 
 const assert = require("assert/strict");
@@ -31,7 +32,19 @@ async function until(what, fn, ms = 60000) {
 const shown = { info: [], warning: [], error: [] };
 const answers = { input: [], pick: [] };
 const picksOffered = [];
-vscode.window.showInputBox = async () => answers.input.shift();
+const inputBoxes = [];  // the options of every input box, and what validateInput said about the answer
+// An answer goes through the box's own validateInput, as typing it would: VS Code does not accept a value it rejects,
+// so the person can only cancel (undefined).
+vscode.window.showInputBox = async (options = {}) => {
+  const value = answers.input.shift();
+  const box = { prompt: options.prompt, password: !!options.password, invalid: null };
+  inputBoxes.push(box);
+  if (value === undefined || !options.validateInput) return value;
+  const problem = await options.validateInput(value);
+  if (!problem) return value;
+  box.invalid = typeof problem === "string" ? problem : problem.message;
+  return undefined;
+};
 vscode.window.showQuickPick = async (items) => { picksOffered.push(await items); return answers.pick.shift(); };
 for (const kind of ["info", "warning", "error"]) {
   const name = { info: "showInformationMessage", warning: "showWarningMessage", error: "showErrorMessage" }[kind];
@@ -48,18 +61,18 @@ globalThis.fetch = async (url, init = {}) => {
 };
 
 // VS Code runs extension tests with in-memory storage, so the second window gets the first one's saved state here.
-const real = require("./extension");
+const real = cfg.phase === "installed" ? null : require("./extension");
 let context = null;
 exports.activate = async (ctx) => {
   context = ctx;
-  if (cfg.phase === "reconnect") {
+  if (cfg.phase === "reconnect" || cfg.phase === "hosted-reconnect") {
     const seed = JSON.parse(fs.readFileSync(cfg.seed, "utf8"));
     await ctx.globalState.update("latexPipeline.target", seed.target);
     await ctx.secrets.store(seed.key, seed.secret);
   }
   return real.activate(ctx);
 };
-exports.deactivate = real.deactivate;
+exports.deactivate = () => real && real.deactivate();
 
 const run = (cmd) => vscode.commands.executeCommand(cmd);
 const step = (name) => console.log(`[vscode_e2e] ${cfg.phase}: ${name}`);
@@ -276,26 +289,45 @@ async function hostedPhase() {
   const key = `latexPipeline:${cfg.base}`;
   const folderAdded = () => (vscode.workspace.workspaceFolders || []).some((f) => f.uri.scheme === "latexpipeline");
   const connectHosted = async (token) => {
-    shown.info.length = 0; shown.error.length = 0;
+    shown.info.length = 0; shown.error.length = 0; inputBoxes.length = 0;
     answers.input.push(cfg.base, token);
     await run("latexPipeline.connect");
     assert.equal(answers.input.length, 0, "the address and the token were asked for");
   };
+  const nothingKept = async () => {
+    assert.equal(await context.secrets.get(key), undefined, "no secret stored");
+    assert.equal(context.globalState.get("latexPipeline.target"), undefined, "no saved address");
+    assert.ok(!folderAdded(), "no folder added");
+  };
+
+  for (const [what, token] of [["a value that is no token", "not-a-token"], ["a token cut short", "lpat_short"],
+    ["a pasted header", `Bearer ${tokens.good}`]]) {
+    step(`malformed input (${what}) is rejected by the token box itself, before any request`);
+    const before = requests.length;
+    await connectHosted(token);
+    const tokenBox = inputBoxes[1];
+    assert.ok(tokenBox && tokenBox.password, "the token box hides what is typed");
+    assert.equal(tokenBox.invalid, "A token starts with lpat_");
+    assert.equal(requests.length, before, "no request went out");
+    assert.deepEqual(shown.error, []);
+    assert.deepEqual(shown.info, []);
+    await nothingKept();
+  }
 
   for (const [what, token, why] of [["an expired token", tokens.expired, /Unknown, expired or revoked API token/],
     ["a token without the projects scope", tokens.compile, /lacks the projects scope/]]) {
     step(`${what} is refused and not kept`);
     await connectHosted(token);
+    assert.equal(inputBoxes[1].invalid, null, "well-formed: the box accepts it");
     assert.match(shown.error.pop() || "", why);
     assert.deepEqual(shown.info, []);
-    assert.equal(await context.secrets.get(key), undefined, "no secret stored");
-    assert.equal(context.globalState.get("latexPipeline.target"), undefined, "no saved address");
-    assert.ok(!folderAdded(), "no folder added");
+    await nothingKept();
   }
 
-  step("a projects token connects");
+  step("a projects token (pasted with spaces around it) connects");
   const sent = requests.length;
-  await connectHosted(tokens.good);
+  await connectHosted(`  ${tokens.good}\n`);
+  assert.equal(inputBoxes[1].invalid, null);
   assert.deepEqual(shown.error, [], "connect shows no error");
   assert.deepEqual(shown.info, [`Connected to ${cfg.doc} as edit.`]);
   await until("workspace folder added", folderAdded);
@@ -305,7 +337,7 @@ async function hostedPhase() {
   assert.ok(mine().every((r) => r.url.startsWith(cfg.base)), "requests stay on the project");
   assert.ok(mine().every((r) => r.headers.Authorization === `Bearer ${tokens.good}` && !r.headers.Cookie), "bearer token, no cookie");
   assert.ok(mine().every((r) => !r.url.includes(tokens.good)), "never in a URL");
-  assert.equal(await context.secrets.get(key), tokens.good, "the token is in secret storage");
+  assert.equal(await context.secrets.get(key), tokens.good, "the token is in secret storage, trimmed");
   const target = context.globalState.get("latexPipeline.target");
   assert.deepEqual(target, { kind: "hosted", base: cfg.base, project: new URL(cfg.base).pathname.split("/")[2], doc: cfg.doc });
   assert.ok(!JSON.stringify(target).includes(tokens.good), "the saved state holds no token");
@@ -323,15 +355,84 @@ async function hostedPhase() {
   assert.ok(await editor.document.save(), "save succeeded");
   assert.match(disk("main.tex"), /Saved from VS Code through the gateway\./);
 
-  step("build in the sandboxed worker, then the PDF");
+  step("save conflict through the gateway: another writer saved while this editor has unsaved edits");
+  const auth = { Authorization: `Bearer ${tokens.good}` };
+  const file = "main.tex", ours = "Ours, not saved yet.\n\n";
+  const filePuts = () => requests.filter((r) => r.method === "PUT" && new URL(r.url).searchParams.get("path") === file);
+  await editor.edit((e) => e.insert(editor.document.positionAt(editor.document.getText().lastIndexOf("\\end{document}")), ours));
+  const current = await (await realFetch(`${cfg.base}api/file?doc=${cfg.doc}&path=${file}`, { headers: auth })).json();
+  const theirs = current.text.replace("\\end{document}", "Theirs, saved first.\n\n\\end{document}");
+  const put = await realFetch(`${cfg.base}api/file?doc=${cfg.doc}&path=${file}&cid=other-writer`, { method: "PUT",
+    headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ text: theirs, base: current.version, eol: "\n" }) });
+  assert.equal(put.status, 200, "the other writer saved through the gateway");
+  await until("the bus (through the gateway) told VS Code", async () => (await vscode.workspace.fs.stat(uri(file))).size === Buffer.byteLength(theirs));
+  const puts = filePuts().length;
+  assert.equal(await editor.document.save(), false, "VS Code refuses the save itself");
+  assert.equal(filePuts().length, puts, "nothing was sent");
+  const files = vscode.workspace.getConfiguration("files");
+  await files.update("saveConflictResolution", "overwriteFileOnDisk", vscode.ConfigurationTarget.Global);
+  try {
+    assert.equal(await editor.document.save(), false, "the overwrite is refused");
+    assert.equal(filePuts().length, puts + 1, "this time the save was sent");
+    assert.equal(filePuts().at(-1).status, 409, "the worker's 409 comes back through the gateway");
+    assert.ok(editor.document.isDirty && editor.document.getText().includes(ours), "the unsaved edit stays in the editor");
+    assert.equal(disk(file), theirs, "the other writer's text is not overwritten");
+  } finally {
+    await files.update("saveConflictResolution", undefined, vscode.ConfigurationTarget.Global);
+  }
+  await vscode.window.showTextDocument(editor.document);
+  await run("workbench.action.files.revert");
+  await until("reverted to the server's text", () => !editor.document.isDirty && editor.document.getText() === theirs);
+  const again = vscode.window.activeTextEditor;
+  await again.edit((e) => e.insert(again.document.positionAt(again.document.getText().lastIndexOf("\\end{document}")), ours));
+  assert.ok(await again.document.save(), "the save on top of the current text goes through");
+  assert.ok(disk(file).includes("Theirs, saved first.") && disk(file).includes(ours), "both changes are kept");
+
+  step("hosted build errors land in the Problems panel");
+  const good = again.document.getText();
+  await again.edit((e) => e.replace(new vscode.Range(0, 0, again.document.lineCount, 0), good.replace("\\end{document}", "\\undefinedmacro\n\\end{document}")));
+  await run("latexPipeline.build");  // saves the dirty file first
+  assert.ok(!again.document.isDirty, "build saved the open file");
+  const errs = await until("error diagnostic", () => {
+    const found = vscode.languages.getDiagnostics(uri("main.tex")).filter((d) => d.severity === vscode.DiagnosticSeverity.Error);
+    return found.length && found;
+  }, 180000);
+  assert.ok(errs.some((d) => /Undefined control sequence/.test(d.message)), JSON.stringify(errs.map((d) => d.message)));
+  const line = good.split("\n").length - 2;  // \undefinedmacro sits where \end{document} was (0-based)
+  assert.ok(errs.some((d) => d.range.start.line === line), `error on line ${line + 1}: ${JSON.stringify(errs.map((d) => d.range.start.line))}`);
+
+  step("a good hosted build clears them, then the PDF");
+  await again.edit((e) => e.replace(new vscode.Range(0, 0, again.document.lineCount, 0), good));
   await run("latexPipeline.build");
+  await until("errors cleared", () => !vscode.languages.getDiagnostics(uri("main.tex")).some((d) => d.severity === vscode.DiagnosticSeverity.Error), 180000);
   const pdfUrl = `${cfg.base}pdf/${encodeURIComponent(cfg.doc)}`;
-  const auth = { headers: { Authorization: `Bearer ${tokens.good}` } };
-  await until("PDF built", async () => (await realFetch(pdfUrl, auth)).ok, 180000);
+  await until("PDF built", async () => (await realFetch(pdfUrl, { headers: auth })).ok, 180000);
   const pdfRequests = () => requests.filter((r) => r.url.startsWith(pdfUrl) && r.status === 200);
   await run("latexPipeline.showPdf");
   await until("PDF fetched for the webview", () => pdfRequests().length > 0, 60000);
   assert.deepEqual(shown.error, [], "no errors");
+  // Leave connected: the next window must reconnect from the saved address and the token in secret storage.
+  fs.writeFileSync(cfg.seed, JSON.stringify({ target, key, secret: tokens.good }), { mode: 0o600 });
+}
+
+async function hostedReconnectPhase() {
+  step("the reopened window reconnects to the hosted project quietly, with the token from secret storage");
+  const { key, secret } = JSON.parse(fs.readFileSync(cfg.seed, "utf8"));
+  const folderAdded = () => (vscode.workspace.workspaceFolders || []).some((f) => f.uri.scheme === "latexpipeline");
+  assert.ok(folderAdded(), "folder kept in the workspace");
+  const names = new Map(await vscode.workspace.fs.readDirectory(uri("")));
+  assert.ok(names.has("main.tex"));
+  assert.match(Buffer.from(await vscode.workspace.fs.readFile(uri("main.tex"))).toString(), /Theirs, saved first\./);
+  const sent = requests.filter((r) => r.url.includes("/api/"));
+  assert.ok(sent.length, "requests went out");
+  assert.ok(sent.every((r) => r.url.startsWith(cfg.base) && r.headers.Authorization === `Bearer ${secret}` && !r.headers.Cookie), "bearer token from secret storage");
+  assert.deepEqual(inputBoxes, [], "nothing was asked");
+  assert.deepEqual(shown.info, [], "no message on a quiet reconnect");
+  assert.deepEqual(shown.error, []);
+
+  step("the reconnected window saves");
+  await vscode.workspace.fs.writeFile(uri("main.tex"), Buffer.from(disk("main.tex").replace("\\end{document}", "After the restart.\n\n\\end{document}")));
+  assert.match(disk("main.tex"), /After the restart\./);
 
   step("disconnect forgets the token");
   await run("latexPipeline.disconnect");
@@ -340,9 +441,31 @@ async function hostedPhase() {
   assert.equal(context.globalState.get("latexPipeline.target"), undefined, "and the saved address");
 }
 
+// The extension as VS Code installed it from the .vsix: its own files (not a development folder), activated by
+// VS Code, every command registered, the file system provider answering. A missing file in the package fails here.
+async function installedPhase() {
+  const ext = vscode.extensions.getExtension(EXT);
+  assert.ok(ext, "the packaged extension is installed");
+  assert.ok(ext.extensionPath.startsWith(cfg.extensionsDir), `installed under --extensions-dir: ${ext.extensionPath}`);
+  const listed = fs.readdirSync(ext.extensionPath).sort();
+  step("installed files " + listed.join(", "));
+  for (const f of ["extension.js", "lib.js", "package.json"]) assert.ok(listed.includes(f), `${f} in the package`);
+  assert.ok(listed.some((f) => /^readme\.md$/i.test(f)) && listed.some((f) => /^license/i.test(f)), "readme and licence (vsce renames them)");
+  await ext.activate();
+  assert.ok(ext.isActive, "activated by VS Code");
+  await assert.rejects(Promise.resolve(vscode.workspace.fs.stat(uri("main.tex"))), /Not connected/);  // its file system provider
+  const have = await vscode.commands.getCommands(true);
+  for (const c of ext.packageJSON.contributes.commands) assert.ok(have.includes(c.command), `command ${c.command} registered`);
+  // Disconnect needs no input and shows nothing (the others would wait on a real message box this runner cannot
+  // answer: the installed extension has its own API object, so the runner's replacements do not reach it).
+  await run("latexPipeline.disconnect");
+  step("commands " + ext.packageJSON.contributes.commands.map((c) => c.command).join(", "));
+}
+
 exports.run = async function run() {
   try {
-    await ({ owner: ownerPhase, reconnect: reconnectPhase, hosted: hostedPhase }[cfg.phase])();
+    await ({ owner: ownerPhase, reconnect: reconnectPhase, hosted: hostedPhase, "hosted-reconnect": hostedReconnectPhase,
+      installed: installedPhase }[cfg.phase])();
     step("ok");
   } catch (err) {
     console.error(`[vscode_e2e] ${cfg.phase} FAILED:`, err && err.stack || err);
