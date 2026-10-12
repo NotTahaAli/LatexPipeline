@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
 ### Added
 
 - Hosted editor: the Git tab is a full Git panel on the connected branch: changed files with their diffs, Stage, Unstage, Stage all (one staging area per project), Commit as the signed-in person, and the history with each commit's changes. Everyone in the project can read it; editors change. Pull and Push no longer commit everything on their own: Push sends the commits and says how many uncommitted changes stay; Pull merges into the project's commits and changes nothing when it would overwrite an uncommitted change.
@@ -15,7 +17,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - Git panel: a commit message being typed was lost when the panel re-rendered (Stage, Stage all, Refresh).
 - Hosted pages: the theme button always said "Dark theme"; it now names the theme a click switches to.
-
 - `host.py serve`: when the bubblewrap probe fails, the refusal now includes bwrap's own error. README: Ubuntu 23.10 and later need an AppArmor profile for `/usr/bin/bwrap` (the README wrongly said Ubuntu 24.04 allows it).
 
 ## [0.3.0] - 2026-10-12
@@ -286,7 +287,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
 
-[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...v0.1.1
