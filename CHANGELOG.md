@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Hosted editor: the Git tab is a full Git panel on the connected branch: changed files with their diffs, Stage, Unstage, Stage all (one staging area per project), Commit as the signed-in person, and the history with each commit's changes. Everyone in the project can read it; editors change. Pull and Push no longer commit everything on their own: Push sends the commits and says how many uncommitted changes stay; Pull merges into the project's commits and changes nothing when it would overwrite an uncommitted change.
 - Hosted Git never commits virtual environments, caches, editor and OS files or LaTeX build files (`host_git.IGNORE`), on top of the project's `.gitignore`.
 - Git panel (local too): click a commit in the history to see its changes (`GET /api/git/show`, owner only locally).
+- README "Automatic updates": a root-owned script and a nightly systemd timer that install the newest `v*` release on a hosted server and restart it, never moving to `main` or back to an older release.
 
 ### Fixed
 

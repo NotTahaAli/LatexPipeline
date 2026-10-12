@@ -867,6 +867,56 @@ sudo -u latexhost bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true
 
 Everything is in the data directory: `host.db` (sqlite, WAL), `config.toml` and `projects/<workspace>/<project>/<name>/` (the document folder; `.out/`, `.cache/` and `.home/` beside it are regenerated; `.latex-history/` beside it holds the editor's version history and review comments, counts toward the project quota (the blobs, the sqlite index and `review.json`), is capped at a quarter of it, and is not in the zip download; workspace admins may delete old versions from the History tab, which the gateway tells the worker with an `X-Host-Admin` header). `git/<project>/` holds the copy of a project's Git repository (Git sync; made again by the next pull if lost). Back up with `sqlite3 host.db ".backup host-backup.db"` (safe while running) plus the `projects/` tree, for example nightly with `restic` or `rsync`. To restore, stop the service, put both back, start it. Upgrades: `git pull` and restart; the database schema migrates itself (the version is in its `schema_version` table).
 
+### Automatic updates
+
+To install each new release on its own, give root a small script and a nightly timer. It fetches the tags, checks out the newest `v*` tag (never `main`, never an older version than the one running) and restarts the service. The script lives outside the clone and is owned by root, because the service user can write to the clone and root runs the script. `/usr/local/sbin/latex-host-update` (`sudo chmod 755` it):
+
+```sh
+#!/bin/sh
+# Install the newest LatexPipeline release (v* tag) and restart latex-host. Never moves backwards.
+set -eu
+app=/var/lib/latex-host/app
+g() { runuser -u latexhost -- env HOME=/var/lib/latex-host git -C "$app" "$@"; }
+g fetch --quiet --tags origin
+tag=$(g tag --list 'v*' --sort=-version:refname | head -n 1)
+[ -n "$tag" ] || exit 0
+rc=0; g merge-base --is-ancestor "$tag" HEAD || rc=$?
+[ "$rc" -eq 1 ] || exit "$rc"   # 0: already contains it; above 1: git failed
+g -c advice.detachedHead=false checkout --quiet "$tag"
+systemctl restart latex-host
+echo "latex-host now runs $tag"
+```
+
+`/etc/systemd/system/latex-host-update.service`:
+
+```ini
+[Unit]
+Description=Install the newest LaTeX Studio release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/latex-host-update
+```
+
+`/etc/systemd/system/latex-host-update.timer`:
+
+```ini
+[Unit]
+Description=Nightly LaTeX Studio update
+
+[Timer]
+OnCalendar=*-*-* 04:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`sudo systemctl daemon-reload && sudo systemctl enable --now latex-host-update.timer`. Run it once by hand with `sudo systemctl start latex-host-update` and read the result with `journalctl -u latex-host-update`. A clone that is ahead of the newest tag (a `git pull` of `main`) stays where it is until a newer tag is released. A failed fetch or checkout (local changes in the clone) leaves the running version alone and shows in the journal. The restart ends builds that are running at that moment.
+
 ## Lint and CI reports
 
 `scripts/ci_report.py` (standard library only; CI-only apart from local use) reads `out/build-report.json`:
