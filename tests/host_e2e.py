@@ -7,8 +7,9 @@ init -> site admin signs in, turns on two-step sign-in, signs in again with a co
 invites two editors and a viewer -> each signs up in their own browser -> an editor creates a project from the
 report template, edits and builds it, a second editor co-edits it live -> the viewer can read but not write ->
 someone from another workspace gets 404 for every URL of it -> an editor saves their own Zotero key on the Account
-page and syncs refs.bib from it (the gateway's zotero.get is replaced by a stub: no network) -> sign-out and session
-expiry end access. axe-core
+page and syncs refs.bib from it (the gateway's zotero.get is replaced by a stub: no network) -> the editor makes an
+API token with the projects and compile scopes on the Account page (`[api]` is on) -> sign-out and session expiry
+end access. axe-core
 (pinned, from cdnjs, only here) must report no violations on every host page, light and dark, desktop and phone.
 Needs LaTeX, and bubblewrap unless --insecure-no-sandbox. The editor itself loads its libraries from CDNs.
 """
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright
@@ -98,7 +100,8 @@ def main() -> int:
                "LP_ADMIN_NAME": "Root"}
         subprocess.run([sys.executable, str(ROOT / "scripts/host.py"), "init", "--data", str(data)], env=env,
                        check=True, stdout=subprocess.DEVNULL)
-        (data / "config.toml").write_text(f'public_url = "{origin}"\nport = {port}\nsession_idle_hours = 1\n')
+        (data / "config.toml").write_text(f'public_url = "{origin}"\nport = {port}\nsession_idle_hours = 1\n'
+                                           '[api]\nenabled = true\n')
         command = [sys.executable, "-c", ZOTERO_STUB, "serve", "--data", str(data)]
         if args.insecure_no_sandbox:
             command.append("--insecure-no-sandbox")
@@ -303,6 +306,24 @@ def run(browser, origin, data: Path, insecure: bool) -> None:
                              headers={"Origin": origin}).status
     assert status == 403, status
     ok("an editor saves their own Zotero key on the Account page and syncs refs.bib; a viewer cannot (403)")
+
+    # --- API tokens (Account page): the compile scope is offered because [api] is on ----------------------------
+    ed.goto("/#account")
+    tform = ed.locator("form").filter(has=ed.get_by_label("Token name"))
+    tform.get_by_label("Token name").fill("e2e laptop")
+    tform.get_by_label("Compile documents with POST /api/v1/compile").check()
+    tform.get_by_label(re.compile(r"^Thesis \(")).first.check()
+    tform.get_by_role("button", name="Create token").click()
+    expect(ed.get_by_text("Copy the token now")).to_be_visible()
+    token = ed.locator("code.key").inner_text()
+    assert token.startswith("lpat_"), token
+    axe(ed, "account page with a new API token")
+    ed.get_by_role("button", name="Done").click()
+    expect(ed.get_by_role("button", name="Revoke token e2e laptop")).to_be_visible()
+    axe(ed, "account page listing an API token")
+    bare = urllib.request.Request(origin + f"/p/{pid}/api/health", headers={"Authorization": f"Bearer {token}"})
+    assert urllib.request.urlopen(bare, timeout=20).status == 200  # no cookie: the token alone opens it
+    ok("an editor makes an API token with the projects and compile scopes; it opens the chosen project")
 
     # --- tenant isolation -------------------------------------------------------------------------------------
     for path in (project_url, f"/p/{pid}/api/file?doc=Thesis&path=main.tex", f"/api/projects/{pid}/zip",

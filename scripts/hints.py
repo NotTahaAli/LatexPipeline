@@ -149,6 +149,11 @@ RULES: list[tuple[re.Pattern, Hint]] = [
      "file is listed in \\bibliography or \\addbibresource."),
     (re.compile(r"couldn't open database file"),
      "BibTeX cannot find a .bib file. Check its name and that it sits in the document directory."),
+    # biber's own text (lib/Biber.pm): "Found biblatex control file version 3.10, expected version 3.11."
+    (re.compile(r"Found biblatex control file version \S+, expected version"),
+     "Your biber and biblatex versions do not match, often a distribution's biber with TeX Live's biblatex. "
+     "Install both from one place (in TeX Live: tlmgr update biber biblatex), checking the compatibility "
+     "matrix in the biber documentation."),
     (re.compile(r"Rerun to get|Label\(s\) may have changed"),
      "Not an error: LaTeX needs another pass to settle references. latexmk reruns it automatically."),
 ]

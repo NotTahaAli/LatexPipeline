@@ -59,6 +59,32 @@ class LintDocumentTests(unittest.TestCase):
         self.assertEqual((by_subject["eq:gone"].path, by_subject["eq:gone"].line), ("main.tex", 3))
         self.assertEqual(by_subject["sec:chap"].path, "chap.tex")
 
+    def test_duplicate_labels(self):
+        findings = self.lint({
+            "doc/main.tex": "\\label{a}\\ref{a}\n\\input{b}\n\\label{a} % \\label{a}\n",
+            "doc/b.tex": "\\label{a}\n",
+        })
+        found = [(f.path, f.line, f.message) for f in findings if f.kind == "duplicate-label"]
+        self.assertEqual(found, [("main.tex", 3, "label 'a' is already defined at main.tex:1"),
+                                 ("b.tex", 1, "label 'a' is already defined at main.tex:1")])
+
+    def test_style_notices_cite_space_cref_case_and_spelling(self):
+        findings = self.lint({"doc/main.tex": (
+            "\\usepackage{xcolor}\\definecolor{x}{rgb}{0,0,0}\n"
+            "The colour is red, as in prior work \\cite{a}. Fine work~\\cite{b}.\n"
+            "\\cref{x} shows it. As in \\Cref{y}, see. \\Cref{z} is right; see \\cref{z}.\n"
+            "Colors\n\\cite{c} and \\textcolor{red}{x}.\n"
+        )})
+        notices = [(f.kind, f.line, f.message, f.level) for f in findings
+                   if f.kind in ("cite-space", "cref-case", "spelling")]
+        self.assertEqual(notices, [
+            ("cite-space", 2, "use ~\\cite: a line break can fall before the citation", "info"),
+            ("cite-space", 5, "use ~\\cite: a line break can fall before the citation", "info"),
+            ("cref-case", 3, "\\cref starts a sentence: use \\Cref", "info"),
+            ("cref-case", 3, "\\Cref inside a sentence: use \\cref", "info"),
+            ("spelling", 4, "both US and UK spellings are used (colors and colour): pick one", "info"),
+        ])
+
     def test_unused_figure_matches_with_and_without_extension(self):
         findings = self.lint({
             "doc/main.tex": "\\includegraphics[width=2cm]{Figures/a}\n\\includegraphics{b.pdf}\n",
@@ -187,6 +213,19 @@ class LintCommandTests(unittest.TestCase):
         self.assertIn("bib-suggestion", [f["kind"] for f in report])
         self.assertEqual([f["kind"] for f in report], ["bib-suggestion"])
         self.assertEqual(code, 0, output)
+
+    def test_format_findings_are_notices_and_a_missing_tex_fmt_is_only_a_message(self):
+        self.run_lint(update_baseline=True)
+        code, output = self.run_lint(strict=True, format=True)  # shutil.which is None here: no tex-fmt
+        self.assertEqual(code, 0, output)
+        self.assertIn("format check skipped: tex-fmt was not found", output)
+        with mock.patch.object(ci_report, "format_sources", return_value=(["main.tex"], ["x.tex: boom"])) as run:
+            code, output = self.run_lint(strict=True, format=True)
+        run.assert_called_once_with(self.doc, check=True)
+        report = json.loads(ci_report.LINT_PATH.read_text(encoding="utf-8"))["documents"]["doc"]["findings"]
+        self.assertEqual([(f["kind"], f["path"], f["level"]) for f in report], [("format", "main.tex", "info")])
+        self.assertIn("tex-fmt: x.tex: boom", output)
+        self.assertEqual(code, 0, output)  # formatting never fails --strict, let alone CI
 
     def test_strict_fails_then_baseline_suppresses(self):
         code, output = self.run_lint(strict=True)

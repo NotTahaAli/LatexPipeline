@@ -1,4 +1,4 @@
-import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, highlight as HL, stex, loadVim, loadEmacs, collabLibs } from "./libs.js";
+import { state as S, view as V, language as L, commands as C, search as SR, autocomplete as AC, lint as LINT, highlight as HL, stex, loadVim, loadEmacs, loadKatex, collabLibs } from "./libs.js";
 import { Collab, PALETTE, hunk } from "./collab.js";
 import { api, Channel } from "./api.js";
 import { PdfView } from "./pdf.js";
@@ -13,6 +13,19 @@ import { reviewSupport } from "./review.js";
 import { namedLinks } from "./links.js";
 import { historyPanel } from "./history.js";
 import { LivePreview } from "./preview.js";
+import { exportHtml } from "./exporthtml.js";
+import { latexSupport, matchEntries, BUILTIN_ENVS } from "./latex.js";
+import { searchPanel } from "./search.js";
+import { gitPanel } from "./git.js";
+import { tablePaste } from "./tablepaste.js";
+import { editorTools } from "./tools.js";
+import { figureDialog, figureLatex, folderList, defaultFolder, withExtension } from "./figure.js";
+import { editTools } from "./edittools.js";
+import { teamSupport } from "./team.js";
+import { notifySupport } from "./notify.js";
+import { navSupport } from "./nav.js";
+import { navPanels } from "./navpanels.js";
+import { buildControls } from "./buildctl.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -25,14 +38,14 @@ const store = {
   set(k, v) { try { localStorage.setItem("lp." + k, typeof v === "string" ? v : JSON.stringify(v)); } catch { /* private mode */ } },
   json(k, d) { try { return JSON.parse(localStorage.getItem("lp." + k)) ?? d; } catch { return d; } },
 };
-const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false }, store.json("settings", {}));
+const settings = Object.assign({ autosave: 1000, theme: "system", keys: "default", font: 14, zoom: 0, visual: false, inverse: "app", focusAuto: false, live: true, spell: true, grammar: "auto", grammarUrl: "", grammarShare: false, check: true, pdfDark: false, labelNumbers: true, mathPreview: false, follow: false }, store.json("settings", {}));
 if (settings.fit === undefined) settings.fit = !settings.zoom;   // Fit the pane width until the person picks a zoom.
 const saveSettings = () => store.set("settings", settings);
 
 // ---- state ------------------------------------------------------------------------------
 let docs = {}, cur = decodeURIComponent(location.hash.slice(1));
 const tabs = new Map();      // path -> tab (per-file editor state)
-let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {} }, outlineData = null, lastErrKey = null;
+let active = null, lastTex = null, files = [], emptyDirs = [], treeSel = null, refs = { labels: {}, bib: {}, macros: [], envs: [] }, outlineData = null, lastErrKey = null;
 const firstVisit = store.get("ui") === null;
 const ui = Object.assign({ side: firstVisit && window.innerWidth >= 1200, sideTab: "files", drawer: false, drawerTab: "problems", split: 50, prose: false }, store.json("ui", {}));
 const saveUi = () => store.set("ui", ui);
@@ -47,13 +60,15 @@ let view;
 
 // ---- who am I, what may I do ---------------------------------------------------------------------
 const config = await api.config().catch(() => ({ role: "owner" }));
-const role = config.role, readOnly = role === "view";
+// A reviewer (role "review") cannot change anything either (readOnly), but comments and types in suggest mode, locked on.
+const role = config.role, reviewer = role === "review", readOnly = role === "view" || reviewer;
 const me = store.json("user", null) || (() => { const u = { name: "Guest " + (100 + Math.floor(Math.random() * 900)), color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }; store.set("user", u); return u; })();
 if (!me.key) { me.key = Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join(""); store.set("user", me); }   // marks your own review comments on link shares
 if (config.name) me.name = config.name;   // a named link or an account: the server's name is the one others see
 
 // ---- toast ------------------------------------------------------------------------------
 function toast(...kids) { const t = $("toast"); t.replaceChildren(...kids); t.hidden = false; clearTimeout(t.t); t.t = setTimeout(() => t.hidden = true, 5000); }
+const buildUi = buildControls({ api, $, el, store, toast, canEdit: !readOnly, doc: () => cur });
 
 // ---- theme / sizes -----------------------------------------------------------------------
 function applyAppearance() {
@@ -62,71 +77,116 @@ function applyAppearance() {
   root.style.setProperty("--font-size", settings.font + "px");
   root.style.setProperty("--split", ui.split + "%");
   $("splitter").setAttribute("aria-valuenow", Math.round(ui.split));
+  $("pages").classList.toggle("pdf-dark", !!settings.pdfDark);
+  $("pdfDark").setAttribute("aria-pressed", String(!!settings.pdfDark));
 }
+function togglePdfDark() { settings.pdfDark = !settings.pdfDark; saveSettings(); applyAppearance(); }
+$("pdfDark").onclick = togglePdfDark;
 
 // ---- CodeMirror ---------------------------------------------------------------------------
 const { EditorState, Compartment, Prec } = S;
-const { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
+const { EditorView, keymap, highlightActiveLine, highlightActiveLineGutter, drawSelection, dropCursor } = V;
 const GR = grammarSupport(S, V);
 // Review comments and suggest mode (review.js); the panel lives in the drawer's Review tab.
 const REV = reviewSupport(S, V, {
-  api, el, icon, canEdit: !readOnly, doc: () => cur, me: () => me, view: () => view,
+  api, el, icon, canEdit: !readOnly || reviewer, reviewer, doc: () => cur, me: () => me, view: () => view,
   activePath: () => (active?.kind === "text" ? active.path : null), openFile: (p, line, opts) => openFile(p, line, opts),
   showPanel: () => setDrawer(true, "review"), toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   onCount: (n) => { $("reviewCount").textContent = n || ""; }, toggleSuggest: () => toggleSuggest(),
   fromYjs: () => !!active?.collab?.yTx,
   dropHeld: (v) => { const t = heldRoom?.held?.text; if (t == null) return false; const h = hunk(v.state.doc.toString(), t); if (h.to > h.from || h.insert) v.dispatch({ changes: h, annotations: REV.bypass.of(true) }); return true; },
   hold: (on) => { if (on) heldRoom = active?.collab || null; heldRoom?.hold(on); imeHold = on; if (!on) { heldRoom = null; if (active?.dirty) scheduleAutosave(); } },
+  mention: (area) => NOTE.mention(area), onData: () => NOTE.update(),
 });
+// Locks, access requests, linked files, folder upload, PDF comments, version zips and diffs, crash recovery (team.js).
+const TEAM = teamSupport({
+  el, icon, api, S, role, config, me: () => me, doc: () => cur, view: () => view, activePath: () => (active?.kind === "text" ? active.path : null),
+  toast, live: (m) => { $("live").textContent = m; }, openFile: (p, line, opts) => openFile(p, line, opts), startComment: () => REV.startComment(),
+  fsDialog: (o) => fsDialog(o), files: () => files, loadFiles: () => loadFiles(), treeTarget: () => treeTarget(),
+  pdfPoint: (e) => { const page = e.target.closest?.(".page"), n = page && pdfView.fullPage(+page.dataset.i); if (n == null) return null; const r = page.getBoundingClientRect(); return { page: n, x: (e.clientX - r.left) / pdfView.zoom, y: (e.clientY - r.top) / pdfView.zoom }; },
+  shareOpen: () => $("share").open, refreshShare: () => refreshShare(), openShare: () => openShare(),
+});
+// The bell: mentions and replies, from the review data (notify.js).
+const NOTE = notifySupport({ el, icon, api, doc: () => cur, myName: () => config.name || me.name, data: () => REV.data, open: (id) => REV.focusItem(id), store });
 let heldRoom = null, imeHold = false;   // suggest mode: an IME composition is in the editor but not yet a suggestion
+const preamble = async () => (view?.state.doc.toString() || "") + (await api.read(cur, "main.tex").then((f) => f.text, () => ""));
+const TP = tablePaste(V, { el, toast, preamble });
+// Table grid, Align &, TikZ canvas, Markdown preview and conversion (tools.js); reviewers get them in suggest mode.
+const TOOLS = editorTools(L, V, stex, {
+  el, toast: (m) => toast(el("span", { textContent: m })), view: () => view, preamble, canEdit: !readOnly || reviewer, reviewer, status: $("editorStatus"),
+  mdPreview: () => ui.mdPreview !== false, setMdPreview: (on) => { ui.mdPreview = on; saveUi(); },
+});
+// Editing tools (edittools.js): a reviewer's changes go through suggest mode like typing, a view link gets none.
+const ET = editTools({ S, V, L, AC }, {
+  el, toast, settings, saveSettings, applyConfig: () => applyConfig(), view: () => view, files: () => files, refs: () => refs,
+  path: () => active?.path, imageUrl: (name) => api.imageUrl(cur, name, active?.path || ""), engine: () => docs[cur]?.engine,
+  reviewer, mayChange: () => !readOnly || (reviewer && REV.suggesting), suggesting: () => REV.suggesting,
+});
+function saveNow() { if (active?.kind === "text") ET.beforeSave(view, active.path); saveTab(active); }   // an explicit save applies .editorconfig
 function toggleSuggest() {
-  if (readOnly) return;
+  if (readOnly && !reviewer) return;
   REV.setSuggest(!REV.suggesting);
   $("suggestBtn").setAttribute("aria-checked", String(REV.suggesting));
   $("cm").classList.toggle("suggesting", REV.suggesting);
 }
-const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment();
+const keysC = new Compartment(), visualC = new Compartment(), spellC = new Compartment(), checkC = new Compartment();
 
+const CMDS = ["section", "subsection", "subsubsection", "paragraph", "chapter", "textbf", "textit", "texttt", "emph", "underline", "cite", "ref", "eqref", "label",
+  "begin", "end", "includegraphics", "caption", "footnote", "item", "frac", "sqrt", "sum", "int", "prod", "lim", "left", "right", "mathbb", "mathcal", "mathrm",
+  "input", "include", "usepackage", "newcommand", "renewcommand", "url", "href", "centering", "hline", "noindent", "vspace", "hspace", "newpage", "tableofcontents"];
+// \cite and \ref keys match any part of the key, author or title (filter: false, so CodeMirror asks again on every key).
+const keyed = (from, typed, entries, text, option) => ({ from, filter: false, options: matchEntries(entries, typed, text).slice(0, 200).map(option) });
 const latexComplete = (ctx) => {
-  const ref = ctx.matchBefore(/\\(?:ref|eqref|cref|Cref|autoref|pageref)\{[^}]*/);
-  if (ref) return { from: ref.from + ref.text.indexOf("{") + 1, options: Object.entries(refs.labels).map(([label, v]) => ({ label, detail: v.context.slice(0, 50), type: "variable" })) };
-  const cite = ctx.matchBefore(/\\cite[a-z]*\*?(?:\[[^\]]*\])*\{[^}]*/);
+  const ref = ctx.matchBefore(/\\(?:ref|eqref|cref|Cref|autoref|pageref|nameref|vref)\{[^}]*/);
+  if (ref) {
+    const from = ref.from + ref.text.indexOf("{") + 1;
+    return keyed(from, ref.text.slice(from - ref.from), refs.labels, (v) => v.context, ({ key, v }) => ({ label: key, detail: v.context.slice(0, 50), type: "variable" }));
+  }
+  const cite = ctx.matchBefore(/\\(?:cite[A-Za-z]*|[Cc]itep?|[Cc]itet|parencite|textcite|autocite|footcite)\*?(?:\[[^\]]*\])*\{[^}]*/);
   if (cite) {
     const from = Math.max(cite.text.lastIndexOf("{"), cite.text.lastIndexOf(",")) + cite.from + 1;
-    return { from, options: Object.entries(refs.bib).map(([label, v]) => ({ label, detail: [v.author, v.year].filter(Boolean).join(" ").slice(0, 50), type: "text" })) };
+    return keyed(from, cite.text.slice(from - cite.from).trimStart(), refs.bib, (v) => [v.author, v.year, v.title].join(" "),
+      ({ key, v }) => ({ label: key, detail: [v.author, v.year].filter(Boolean).join(" ").slice(0, 50), info: v.title || undefined, type: "text" }));
   }
-  const env = ctx.matchBefore(/\\begin\{[a-z*]*/);
-  if (env) return { from: env.from + 7, options: ["itemize", "enumerate", "equation", "align", "figure", "table", "tabular", "abstract", "document", "center", "verbatim", "theorem", "proof"].map((label) => ({ label, type: "keyword" })) };
+  const env = ctx.matchBefore(/\\begin\{[A-Za-z*]*/);
+  if (env) return { from: env.from + 7, options: [...new Set([...BUILTIN_ENVS, ...(refs.envs || [])])].map((label) => ({ label, type: "keyword" })) };
   const cmd = ctx.matchBefore(/\\[A-Za-z]*/);
-  if (cmd && (cmd.to - cmd.from > 1 || ctx.explicit)) return { from: cmd.from, options: ["section", "subsection", "subsubsection", "textbf", "textit", "emph", "cite", "ref", "label", "begin", "end", "includegraphics", "caption", "footnote", "item", "frac", "sum", "int", "input", "usepackage"].map((c) => ({ label: "\\" + c, type: "function" })) };
+  if (cmd && (cmd.to - cmd.from > 1 || ctx.explicit)) {
+    const own = new Set(refs.macros || []);
+    return { from: cmd.from, options: [...CMDS.filter((c) => !own.has(c)).map((c) => ({ label: "\\" + c, type: "function" })), ...[...own].map((c) => ({ label: "\\" + c, type: "function", detail: "defined in this document" }))] };
+  }
   return null;
 };
 
 function extensionsFor(tab) {
   const room = tab.collab;
+  tab.tex = latexSupport({ V, L, LINT, loadKatex }, { path: () => tab.path, refs: () => refs, visual: () => settings.visual });
   return [
     keysC.of([]),
-    lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
+    ET.extension, highlightActiveLineGutter(), highlightActiveLine(), drawSelection(), dropCursor(),
     room ? collabLibs.yCollab(room.ytext, room.awareness, { undoManager: room.undo }) : C.history(),
-    readOnly ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
+    readOnly && !reviewer ? [EditorState.readOnly.of(true), EditorView.domEventHandlers({ keydown: (e) => { if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) nudgeReadOnly(); }, paste: nudgeReadOnly, drop: nudgeReadOnly })] : [],
     readOnly ? [] : EditorView.domEventHandlers({
       paste: (e, v) => dropImages(e.clipboardData?.files, e, v.state.selection.main.head),
       drop: (e, v) => dropImages(e.dataTransfer?.files, e, v.posAtCoords({ x: e.clientX, y: e.clientY }) ?? v.state.selection.main.head),
     }),
     errField,
     readOnly ? [] : GR.extension,
+    readOnly ? [] : TP,
     REV.extension,
+    TEAM.extension(tab),
+    tab.tex.folding, tab.tex.hover, checkC.of(settings.check ? tab.tex.check : []),
+    nav.extension(tab),
     L.bracketMatching(), AC.closeBrackets(),
-    AC.autocompletion({ override: [latexComplete], icons: false }),
+    AC.autocompletion({ override: [latexComplete, ...ET.sources], icons: false }),
     EditorState.allowMultipleSelections.of(true),
-    L.StreamLanguage.define(stex),
+    TOOLS.extension(tab.path),
     L.syntaxHighlighting(HL.classHighlighter),
-    EditorView.lineWrapping,
     EditorView.contentAttributes.of({ "aria-label": `Editor: ${tab.path}`, tabindex: "0" }),
     spellC.of(spellAttr()),
     keymap.of([
-      { key: "Mod-s", run: () => { saveTab(active); return true; }, preventDefault: true },
-      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap,
+      { key: "Mod-s", run: () => { saveNow(); return true; }, preventDefault: true },
+      ...AC.closeBracketsKeymap, ...C.defaultKeymap, ...SR.searchKeymap, ...(room ? collabLibs.yUndoManagerKeymap : C.historyKeymap), ...AC.completionKeymap, ...L.foldKeymap, ...LINT.lintKeymap,
     ]),
     SR.search({ top: true }),
     visualC.of([]),
@@ -150,6 +210,7 @@ function onUpdate(u) {
     if (!active.fromDisk) { renderTabs(); showSaveState(); scheduleAutosave(); }
   }
   if (u.docChanged) scheduleGrammar();
+  if (u.docChanged && !readOnly) { const tab = active; TEAM.keep(tab, () => (tab === active ? view.state.doc : tab.state.doc).toString()); }   // crash recovery
   if (u.docChanged && u.transactions.some((t) => t.annotation(S.Transaction.userEvent))) live.edited();   // Own typing, not a co-editor's.
   if (u.docChanged || u.selectionSet) {
     const head = u.state.selection.main.head, line = u.state.doc.lineAt(head);
@@ -160,7 +221,7 @@ function onUpdate(u) {
 
 const proseEdit = S.Annotation.define();
 
-// ---- figures: drop or paste an image into the editor; it is saved into the document and \includegraphics is inserted ----------
+// ---- figures: drop or paste an image into the editor; after the figure dialog it is saved and a figure is inserted ----------
 const UPLOAD_OK = /^(image\/(png|jpeg)|application\/pdf)$/;
 function dropImages(list, event, pos) {
   const all = [...(list || [])];
@@ -176,10 +237,15 @@ async function uploadImages(fs, pos) {
   for (const f of fs) {
     try {
       const name = f.name && f.name !== "image.png" ? f.name : `pasted-${Date.now()}.${f.type === "image/jpeg" ? "jpg" : f.type === "application/pdf" ? "pdf" : "png"}`;
-      const { path } = await api.upload(cur, f, name);
+      // The figure dialog (figure.js) asks for name, folder, caption, label, width and placement first.
+      const folders = folderList(files.map((x) => x.path), emptyDirs);
+      const opt = await figureDialog({ el }, { name, folders, folder: defaultFolder(folders) });
+      if (!opt) continue;
+      const { path } = await api.upload(cur, f, withExtension(opt.name, name), opt.folder);
       if (active !== tab) { toast(el("span", { textContent: `Saved ${path}.` })); continue; }
-      const text = `\\includegraphics[width=0.8\\linewidth]{${path}}\n`;
       pos = Math.min(pos, view.state.doc.length);
+      const atLineStart = pos === view.state.doc.lineAt(pos).from;
+      const text = (opt.figure && !atLineStart ? "\n" : "") + figureLatex({ ...opt, path });
       view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length }, scrollIntoView: true, userEvent: "input.drop" });
       pos += text.length;
       toast(el("span", { textContent: `Saved ${path} and inserted it.` }));
@@ -218,13 +284,16 @@ function markErrors() {
   view.dispatch({ effects: setErrors.of(V.Decoration.set(marks.sort((a, b) => a.from - b.from), true)) });
 }
 
+let configRun = 0;
 async function applyConfig() {
   if (!view) return;
+  const run = ++configRun;
   let keys = [];
   try {
     if (settings.keys === "vim") keys = (await loadVim()).vim();
     else if (settings.keys === "emacs") keys = (await loadEmacs()).emacs();
   } catch (e) { console.warn("keybindings", e); toast(el("span", { textContent: "Could not load the " + settings.keys + " keybindings (offline?)." })); }
+  if (run !== configRun) return;   // a later call (Emacs, then Default before Emacs loaded) has already applied its keys
   const env = visualEnv.of({
     refs: () => refs,
     imageUrl: (name) => cur ? api.imageUrl(cur, name, active?.path || "") : null,
@@ -233,6 +302,9 @@ async function applyConfig() {
     keysC.reconfigure(Prec.high(keys)),
     visualC.reconfigure(settings.visual && active?.kind === "text" ? [visualField, env] : []),
     spellC.reconfigure(spellAttr()),
+    checkC.reconfigure(settings.check && active?.tex ? active.tex.check : []),
+    ...ET.reconfigure(active?.path),
+    ...nav.reconfigure(),
   ] });
   $("proseBody").spellcheck = !!settings.spell;
   $("cm").classList.toggle("visual", !!settings.visual);
@@ -245,7 +317,7 @@ async function openFile(path, line, opts = {}) {
   if (!tab) {
     const info = files.find((f) => f.path === path);
     const kind = info?.kind || (/\.(png|jpe?g|gif|svg|webp)$/i.test(path) ? "image" : "text");
-    tab = { path, kind, dirty: false, version: null, eol: "\n", savedDoc: null, state: null, conflict: null };
+    tab = { path, kind, dirty: false, version: null, eol: "\n", savedDoc: null, state: null, conflict: null, fresh: true };
     if (kind === "text") {
       try {
         const f = await api.read(cur, path);
@@ -260,6 +332,9 @@ async function openFile(path, line, opts = {}) {
       } catch (e) { toast(el("span", { textContent: `${path}: ${e.message}` })); return; }
     }
     tabs.set(path, tab);
+    if (kind === "text" && !readOnly) {   // unsaved text from a session that crashed: offered back
+      TEAM.offer(tab, tab.state.doc.toString(), async (text) => { await openFile(path); view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, userEvent: "input.recover" }); });
+    }
   }
   await activate(tab, line, opts);
 }
@@ -291,11 +366,13 @@ async function activate(tab, line, opts = {}) {
       tab.fromDisk = false;
       await applyConfig();
     }
+    if (tab.fresh && !line) nav.restoreCursor(tab.path, view);   // first time open in this page: where it was left
+    tab.fresh = false;
     if (line) gotoLine(line);
     if (!opts.noFocus) view.focus();
   }
   renderTabs(); renderTree(); showSaveState(); showBanner(); markErrors(); renderFocus();
-  if (tab.kind === "text") REV.refresh(view);
+  if (tab.kind === "text") { REV.refresh(view); TEAM.refresh(); }
   if (ui.drawer && ui.drawerTab === "history" && !same) historyUi.load();
   collab?.hello(tab.path);
   if (ui.prose) syncProse();
@@ -392,7 +469,7 @@ function scheduleAutosave() {
 }
 
 async function saveTab(tab, opts) {
-  if (!tab || tab.kind !== "text" || tab.saving) return;
+  if (!tab || tab.kind !== "text" || tab.saving || readOnly) return;
   if (tab.collab) return tab.collab.save(opts);
   clearTimeout(autosaveTimer);
   if (imeHold && tab === active) { scheduleAutosave(); return; }   // text being composed in suggest mode is not saved
@@ -415,6 +492,7 @@ let autoFocusTimer;
 async function onFsEvent(msg) {
   if (msg.doc !== cur) return;
   loadFiles();
+  if ([...msg.changed, ...msg.removed].some((p) => /\.(tex|bib|sty|cls)$/i.test(p))) loadRefs();   // completion and hover cards
   if (live.last?.meta.overlay === false && msg.changed.includes(active?.path)) live.edited();   // Previewed from disk: again once saved.
   if (settings.focusAuto && !readOnly && isChapter(active) && msg.changed.includes(active.path)) {   // "Build it after each save"
     clearTimeout(autoFocusTimer); autoFocusTimer = setTimeout(() => isChapter(active) && previewChapter(true), 600);
@@ -436,13 +514,14 @@ async function onFsEvent(msg) {
     void info;
   }
   if (outlineVisible()) loadOutline();
+  nav.refresh();
 }
 
 // ---- sidebar: file tree ---------------------------------------------------------------------
 const openDirs = new Set(store.json("dirs", [""]));
 async function loadFiles() {
   if (!cur) return;
-  try { const r = await api.files(cur); files = r.files; emptyDirs = r.dirs || []; } catch { return; }
+  try { const r = await api.files(cur); files = r.files; emptyDirs = r.dirs || []; TEAM.linked = r.linked; } catch { return; }
   if (ui.side) renderTree();
 }
 
@@ -479,6 +558,7 @@ function renderTree() {
   };
   walk(root, "", 0);
   out.replaceChildren(...rows);
+  TEAM.decorateTree(out);
   showTreeTools();
 }
 
@@ -615,6 +695,7 @@ async function loadOutline() {
     if (goal) wrap.style.setProperty("--p", Math.min(100, (it.words / goal) * 100) + "%");
     return wrap;
   }));
+  navUi.outline();
 }
 
 const narrow = () => window.matchMedia("(max-width: 1000px)").matches;
@@ -655,7 +736,7 @@ async function loadPdf() {
   pdfView.focused = !!f;
   if (pdfView.fitMode) pdfView.fit();
   liveOff.clear();
-  if (!f) await live.afterLoad(d.started);
+  if (!f) { await live.afterLoad(d.started); nav.afterBuild(); }
 }
 
 // ---- live preview: the chapter being typed, spliced over its pages a moment after typing stops (preview.js) ----------
@@ -672,11 +753,12 @@ const live = new LivePreview(pdfView, {
     // wait: the preamble (or main.tex's \input list) changed, so previews pause until the full build after the save.
     const what = st.wait === "preamble" ? "preamble" : "document";
     node.textContent = st.busy ? "Live: typesetting" : st.error ? "Live: error" : st.wait ? (st.saved ? `Live: rebuilding ${what}` : `Live: ${what} changed, rebuilds on save`)
-      : st.same ? "Live: as built" : `Live: ${st.seconds.toFixed(1)} s`;
+      : st.same ? "Live: as built" : `Live: ${st.seconds.toFixed(1)} s${st.shift ? ` · later pages ${st.shift > 0 ? "+" : ""}${st.shift}` : ""}`;
     node.title = st.error || (st.busy ? "Typesetting the part you are editing"
       : st.wait ? `${st.wait === "preamble" ? "The preamble, a class or a package" : "The chapters main.tex reads"} changed: the live preview pauses until the full build${st.saved ? " now running" : " that follows the save"} has finished`
       : st.same ? "main.tex is as the full PDF shows it"
-      : `Typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}${st.passes > 1 ? `, ${st.passes} passes for new labels or citations` : ""}; the full PDF follows on save`);
+      : `Typeset from your text in ${st.seconds.toFixed(2)} s${st.warm ? "" : " (cold start)"}${st.preamble ? " with the edited preamble" : ""}${st.passes > 1 ? `, ${st.passes} passes for new labels or citations` : ""}; the full PDF follows on save`
+        + (st.shift ? `. This part now has ${Math.abs(st.shift)} page${Math.abs(st.shift) === 1 ? "" : "s"} ${st.shift > 0 ? "more" : "fewer"} than in the full PDF: page numbers after it may be off until that build` : ""));
   },
 });
 
@@ -688,6 +770,60 @@ async function exportDocx() {
   toast(el("span", { textContent: "Converting to DOCX with pandoc..." }));
   try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
   catch (e) { toast(el("span", { textContent: e.message })); }
+}
+// tex-fmt runs on the server on the text in the editor; the result goes back in as one edit (only the changed middle),
+// so co-editing rooms, history and undo see an ordinary change and the normal save writes the file.
+async function formatFile() {
+  if (readOnly || active?.kind !== "text" || !/\.tex$/i.test(active.path)) { toast(el("span", { textContent: "Open a .tex file to format it." })); return; }
+  const tab = active, text = view.state.doc.toString();
+  try {
+    const out = (await api.format(cur, text)).text;
+    if (active !== tab || view.state.doc.toString() !== text) { toast(el("span", { textContent: "The file changed while tex-fmt ran; format again." })); return; }
+    if (out === text) { toast(el("span", { textContent: "Already formatted." })); return; }
+    replaceChanged(text, out);
+    toast(el("span", { textContent: `Formatted ${tab.path} with tex-fmt.` }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
+/** One edit from text (the editor's now) to out: only the part between the common start and end changes. */
+function replaceChanged(text, out) {
+  let a = 0, b = 0;
+  while (a < text.length && a < out.length && text[a] === out[a]) a++;
+  while (b < text.length - a && b < out.length - a && text[text.length - 1 - b] === out[out.length - 1 - b]) b++;
+  if (a && /[\uD800-\uDBFF]/.test(text[a - 1])) a--;   // never split a surrogate pair
+  if (b && /[\uDC00-\uDFFF]/.test(text[text.length - b])) b--;
+  view.dispatch({ changes: { from: a, to: text.length - b, insert: out.slice(a, out.length - b) }, userEvent: "input.format" });
+}
+// ---- .bib tidy: entries sorted, fields aligned (server: bibtidy.py); applied as one edit like Format ----
+async function tidyBib() {
+  if (readOnly || active?.kind !== "text" || !/\.bib$/i.test(active.path)) { toast(el("span", { textContent: "Open a .bib file to tidy it." })); return; }
+  const tab = active, text = view.state.doc.toString();
+  try {
+    const r = await api.bibTidy(cur, { text });
+    if (active !== tab || view.state.doc.toString() !== text) { toast(el("span", { textContent: "The file changed meanwhile; tidy again." })); return; }
+    if (r.text !== text) replaceChanged(text, r.text);
+    const twins = r.duplicates.length ? ` Possible duplicates: ${r.duplicates.slice(0, 3).join("; ")}${r.duplicates.length > 3 ? " ..." : ""}.` : "";
+    toast(el("span", { textContent: (r.text === text ? "Already tidy." : `Tidied ${tab.path}.`) + twins }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
+// ---- review PDF: the open suggestions marked as changes and the unresolved comments as notes, built from a copy ----
+async function buildReviewPdf() {
+  toast(el("span", { textContent: "Building the PDF with suggestions..." }));
+  try {
+    const r = await api.reviewPdf(cur, true);
+    const url = api.reviewPdfUrl(cur, r.version);
+    const skipped = r.skipped.length ? ` ${r.skipped.length} skipped (not plain text, overlapping, or no longer in the file): ${r.skipped.slice(0, 3).map((s) => s.reason).join("; ")}.` : "";
+    toast(el("span", {}, el("span", { textContent: r.ok ? `${r.applied} suggestion(s) and ${r.notes} comment(s) marked.${skipped} ` : `The PDF with suggestions failed: ${r.error}${skipped} ` }),
+      ...(r.ok ? [el("a", { href: url, target: "_blank", rel: "noopener", textContent: "Open" }), el("span", { textContent: " · " }), el("a", { href: url, download: "", textContent: "Download" })] : [])));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
+}
+// arXiv archive from the last build (build.py --arxiv); the preflight findings are also at the end of the log.
+async function exportArxiv() {
+  try {
+    const { findings } = await api.arxiv(cur);
+    el("a", { href: api.arxivUrl(cur), download: "" }).click();
+    const errors = findings.filter((f) => f.level === "error").length;
+    toast(el("span", { textContent: findings.length ? `arXiv archive downloading; preflight: ${errors} error(s), ${findings.length - errors} other finding(s), listed at the end of the log.` : "arXiv archive downloading; preflight found no problems." }));
+  } catch (e) { toast(el("span", { textContent: e.message })); }
 }
 async function previewChapter(quiet) {
   if (readOnly || !isChapter(active)) { if (!quiet) toast(el("span", { textContent: "Open a chapter file (one that main.tex includes) to preview it." })); return; }
@@ -765,6 +901,12 @@ $("zIn").onclick = () => pdfView.setZoom(pdfView.zoom * 1.2);
 $("zOut").onclick = () => pdfView.setZoom(pdfView.zoom / 1.2);
 $("zFit").onclick = () => pdfView.fit();
 $("toCursor").onclick = toCursor;
+{   // Comment on the PDF: a point or a dragged region, found in the source by inverse SyncTeX (team.js).
+  const b = el("button", { className: "icon", id: "pdfComment", title: "Comment on the PDF: click a point or drag over a region", onclick: () => TEAM.pdfComment($("viewer")) }, icon("comment"));
+  b.setAttribute("aria-label", "Comment on the PDF"); b.hidden = readOnly && !reviewer;
+  $("toCursor").after(b);
+  TEAM.pdfPicker($("viewer"));
+}
 
 // ---- build status and problems ----------------------------------------------------------------------
 let announced = null;
@@ -951,8 +1093,51 @@ const historyUi = historyPanel($("dpanel-history"), {
   inRoom: (path) => { const room = tabs.get(path)?.collab; return !!(room?.ready && room.canEdit); },
   roomApply: (path, text, base) => !!tabs.get(path)?.collab?.applyText(text, base),   // false while an IME composition holds the room
   send: (message) => channel.send(message),
+  versionActions: (v) => TEAM.versionActions(v),
 });
 $("diffClose").onclick = () => $("diffDlg").close();
+// Search and replace in all files (search.js): a file open in a co-editing room is changed through its room.
+const searchUi = searchPanel($("panel-search"), {
+  api, el, role, readOnly, doc: () => cur, toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  async open(path, line, col, len) {
+    if (narrow()) setSide(false);
+    await openFile(path, line);
+    const at = view.state.doc.line(Math.min(line, view.state.doc.lines)).from + col;
+    if (active?.path === path && at + len <= view.state.doc.length) view.dispatch({ selection: { anchor: at, head: at + len } });
+  },
+  async room(path) { if (!tabs.has(path)) await openFile(path, 0, { noFocus: true }); const r = tabs.get(path)?.collab; return r?.ready && r.canEdit ? r : null; },
+});
+// Navigation (nav.js, navpanels.js): definitions, references, label rename and numbers, bookmarks, TODOs, the file
+// graph, symbols, typeset selection, presentation. A label rename changes room files through their rooms, like search.
+async function jumpAt(path, line, col = 0, len = 0) {
+  if (narrow()) setSide(false);
+  await openFile(path, line);
+  if (active?.path !== path || active.kind !== "text") return;
+  const at = view.state.doc.line(Math.max(1, Math.min(line, view.state.doc.lines))).from + col;
+  if (at + len <= view.state.doc.length) view.dispatch({ selection: { anchor: at, head: at + len }, effects: EditorView.scrollIntoView(at, { y: "center" }) });
+}
+const nav = navSupport({ S, V, loadKatex }, {
+  api, el, doc: () => cur, view: () => (active?.kind === "text" ? view : null), activePath: () => (active?.kind === "text" ? active.path : null),
+  canEdit: !readOnly, store, settings, jump: jumpAt, toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  texts: async () => Object.fromEntries(await Promise.all([...tabs.values()].filter((t) => t.kind === "text").map(async (t) => [t.path, await bibCtx.text(t.path)]))),
+  forward: (path, line) => !shownFocus() && api.forward(cur, path, line).then((b) => pdfView.reveal(b), () => {}),
+  async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); },
+  async room(path) { if (!tabs.has(path)) await openFile(path, 0, { noFocus: true }); const r = tabs.get(path)?.collab; return r?.ready && r.canEdit ? r : null; },
+  pdf: async () => { await pdfView.ready; return pdfView.lib; },
+});
+const navUi = navPanels({
+  el, nav, open: jumpAt, view: () => (active?.kind === "text" ? view : null), pdfView, toast: (m) => toast(el("span", { textContent: m })),
+  pdfUrl: () => (docs[cur]?.version ? new URL(api.pdfUrl(cur, docs[cur].version), location.href).href : null),
+  lineText: (path, n) => { const t = tabs.get(path); const d = t === active ? view.state.doc : t?.state?.doc; return d && n <= d.lines ? d.line(n).text.trim().slice(0, 120) : null; },
+  insert: readOnly && !reviewer ? null : (text, at) => {
+    if (active?.kind !== "text") { toast(el("span", { textContent: "Open a file first: symbols go in at its cursor." })); return; }
+    const s = view.state.selection.main;
+    view.dispatch({ changes: { from: s.from, to: s.to, insert: text }, selection: { anchor: s.from + (at ?? text.length) }, scrollIntoView: true, userEvent: "input" });
+    view.focus();
+  },
+});
+$("presentBtn").onclick = () => navUi.present();
+$("pdfTabBtn").onclick = () => navUi.newTab();
 REV.mount($("dpanel-review"));
 $("commentBtn").onclick = () => REV.startComment();
 $("suggestBtn").onclick = () => toggleSuggest();
@@ -1030,8 +1215,8 @@ function grammarOnlyNote() {
 }
 
 // Warnings parsed from the LaTeX log on the server; kinds are filterable, each row jumps to its source line.
-const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"]];
-const warnGroup = (w) => w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
+const WARN_KINDS = [["all", "All"], ["undefined", "References"], ["box", "Boxes"], ["package", "Packages"], ["a11y", "Accessibility"]];
+const warnGroup = (w) => w.kind === "a11y" ? "a11y" : w.kind === "overfull" || w.kind === "underfull" ? "box" : w.kind === "undefined" ? "undefined" : ["package", "latex", "bibtex"].includes(w.kind) ? "package" : "other";
 let warnings = [], warnFilter = "all", warnKey = null, warnLoaded = null;
 function renderWarnings() {
   const real = warnings.filter((w) => w.level !== "info").length;
@@ -1062,10 +1247,10 @@ async function loadWarnings() {
 }
 
 async function loadLog() {
-  try { $("logText").textContent = await (await fetch(api.logUrl(cur))).text(); } catch { $("logText").textContent = "No log yet."; }
+  try { buildUi.showLog(await (await fetch(api.logUrl(cur))).text()); } catch { buildUi.showLog("No log yet."); }
 }
 
-const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "log"];
+const DRAWER_TABS = ["problems", "warnings", "lint", "grammar", "review", "history", "todos", "bookmarks", "log"];
 function setDrawer(open, tabName) {
   ui.drawer = open; if (tabName) ui.drawerTab = tabName; saveUi();
   $("drawer").hidden = !open; $("drawer").dataset.tab = ui.drawerTab;
@@ -1080,6 +1265,7 @@ function setDrawer(open, tabName) {
   if (open && ui.drawerTab === "log") loadLog();
   if (open && ui.drawerTab === "review") REV.load();
   if (open && ui.drawerTab === "history") historyUi.load();
+  if (open) navUi.drawer(ui.drawerTab);
 }
 for (const n of DRAWER_TABS) $("dtab-" + n).onclick = () => setDrawer(true, n);
 const toggleDrawer = () => setDrawer(!ui.drawer);
@@ -1093,18 +1279,28 @@ $("drawerClose").onclick = () => setDrawer(false);
 function setSide(open, tabName) {
   ui.side = open; if (tabName) ui.sideTab = tabName; saveUi();
   $("side").hidden = !open; $("sideBtn").setAttribute("aria-expanded", String(open)); $("side").dataset.tab = ui.sideTab;
-  for (const n of ["files", "outline", "refs", "ai"]) {
+  if (ui.sideTab === "git" && $("tab-git").hidden) ui.sideTab = "files";
+  for (const n of ["files", "search", "outline", "refs", "symbols", "ai", "git"]) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
-  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); }
+  if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); if (ui.sideTab === "git") gitUi.load(); }
 }
 $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
 $("tab-files").onclick = () => setSide(true, "files");
 $("tab-outline").onclick = () => setSide(true, "outline");
+$("tab-search").onclick = () => setSide(true, "search");
+const showSearch = () => { setSide(true, "search"); searchUi.focus(active?.kind === "text" ? view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to) : ""); };
 $("tab-refs").onclick = () => setSide(true, "refs");
+$("tab-symbols").onclick = () => setSide(true, "symbols");
 $("tab-ai").onclick = () => setSide(true, "ai");
+// Git (git.js): the owner's repository locally; hosted, editors sync the project with a remote repository.
+const gitUi = gitPanel($("panel-git"), { el, doc: () => cur, hosted: !!config.hosted, canEdit: role === "edit" || role === "owner",
+  toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
+  async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); } });
+$("tab-git").hidden = !(config.hosted ? role === "edit" : role === "owner");
+$("tab-git").onclick = () => setSide(true, "git");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------
 async function setVisual(on) {
@@ -1112,7 +1308,7 @@ async function setVisual(on) {
   if (on) await loadRefs();
   await applyConfig();
 }
-async function loadRefs() { try { refs = await api.refs(cur); view?.dispatch({ effects: refresh.of(null) }); } catch { /* keep old */ } }
+async function loadRefs() { try { refs = await api.refs(cur); view?.dispatch({ effects: [refresh.of(null), ...ET.reconfigure(active?.path)] }); } catch { /* keep old */ } }
 $("visualBtn").onclick = () => setVisual(!settings.visual);
 
 let proseSpan = null, proseReadOnly = false, proseTimer;
@@ -1188,22 +1384,52 @@ function showTips(force) {
 // ---- command palette, menu, settings, cheat sheet ----------------------------------------------------
 const mod = /Mac/.test(navigator.platform) ? "Cmd" : "Ctrl";
 const COMMANDS = [
-  { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveTab(active) },
+  { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveNow() },
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
+  { id: "search", title: "Search and replace in all files", keys: `${mod}+Shift+F`, run: () => showSearch() },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
+  { id: "symbols", title: "Symbol palette", run: () => (ui.side && ui.sideTab === "symbols") ? setSide(false) : setSide(true, "symbols") },
   { id: "assistant", title: "Toggle AI assistant", run: () => (ui.side && ui.sideTab === "ai") ? setSide(false) : setSide(true, "ai") },
   ...aiUi.commands,
+  ...TOOLS.commands,
   { id: "problems", title: "Toggle problems panel", keys: `${mod}+J`, run: () => toggleDrawer() },
   { id: "log", title: "Show build log", run: () => setDrawer(true, "log") },
+  ...buildUi.commands,
   { id: "warnings", title: "Show warnings", run: () => setDrawer(true, "warnings") },
   { id: "lint", title: "Show lint findings", run: () => setDrawer(true, "lint") },
   { id: "grammar", title: "Show grammar findings", run: () => setDrawer(true, "grammar") },
-  { id: "comment", edit: true, title: "Comment on the selection", keys: `${mod}+Alt+M`, run: () => REV.startComment() },
+  { id: "comment", edit: !reviewer, title: "Comment on the selection", keys: `${mod}+Alt+M`, run: () => REV.startComment() },
   { id: "suggest", edit: true, title: "Toggle suggest mode (track changes)", keys: `${mod}+Alt+S`, run: () => toggleSuggest() },
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
+  { id: "definition", title: "Go to definition", keys: "F12", run: () => view && nav.run.definition(view) },
+  { id: "findrefs", title: "Find references", keys: "Shift+F12", run: () => view && nav.run.references(view) },
+  { id: "renamelabel", edit: true, title: "Rename label everywhere", keys: "F2", run: () => view && nav.run.rename(view) },
+  { id: "pkgdoc", title: "Package documentation (texdoc.org)", run: () => { const s = active?.kind === "text" && nav.under(view.state, view.state.selection.main.head); if (s?.kind === "package") window.open(nav.docUrl(s.name), "_blank", "noopener"); else toast(el("span", { textContent: "Put the cursor on a package name in \\usepackage{...}." })); } },
+  { id: "bookmark", title: "Bookmark: set or clear on this line", keys: `${mod}+Alt+K`, run: () => view && nav.run.toggleMark(view) },
+  { id: "bmnext", title: "Bookmark: next", keys: `${mod}+Alt+L`, run: () => view && nav.run.next(view) },
+  { id: "bmprev", title: "Bookmark: previous", keys: `${mod}+Alt+J`, run: () => view && nav.run.prev(view) },
+  { id: "bookmarks", title: "Show bookmarks", run: () => setDrawer(true, "bookmarks") },
+  { id: "todos", title: "Show TODOs", run: () => setDrawer(true, "todos") },
+  { id: "graph", title: "File graph (inputs, figures, bibliography)", run: async () => { await nav.load().catch(() => {}); navUi.graph(); } },
+  { id: "typeset", edit: true, title: "Typeset selection", run: () => view && nav.run.typesetSelection(view) },
+  { id: "present", title: "Present the PDF (full screen)", run: () => navUi.present() },
+  { id: "pdftab", title: "Open the PDF in a new tab", run: () => navUi.newTab() },
+  { id: "numbers", get title() { return `Label numbers: ${settings.labelNumbers ? "on" : "off"} (change)`; }, run: () => { settings.labelNumbers = !settings.labelNumbers; saveSettings(); applyConfig(); } },
+  { id: "mathprev", get title() { return `Math preview under equations: ${settings.mathPreview ? "on" : "off"} (change)`; }, run: () => { settings.mathPreview = !settings.mathPreview; saveSettings(); applyConfig(); } },
+  { id: "follow", get title() { return `PDF follows the cursor: ${settings.follow ? "on" : "off"} (change)`; }, run: () => { settings.follow = !settings.follow; saveSettings(); if (settings.follow) nav.afterBuild(); } },
+  { id: "reviewpdf", edit: true, title: "Build with suggestions (PDF)", run: () => buildReviewPdf() },
+  { id: "sugcard", title: "Open the suggestion at the cursor", keys: "Alt+Enter", run: () => view && REV.openCard(view) },
+  { id: "pdfcomment", title: "Comment on the PDF...", run: () => TEAM.pdfComment($("viewer")) },
+  { id: "notifications", title: "Notifications (mentions and replies)", run: () => NOTE.node.querySelector("button").click() },
+  ...(config.lock ? [{ id: "lock", get title() { return TEAM.locked ? "Unlock the document" : "Lock the document (read-only for everyone)"; }, run: () => TEAM.toggleLock() }] : []),
+  ...(role === "view" || role === "review" ? [{ id: "access", title: "Request access...", run: () => TEAM.accessBtn.click() }] : []),
+  { id: "copy", edit: true, title: "Copy file or folder...", run: () => { setSide(true, "files"); TEAM.copyTarget(); } },
+  { id: "linkfile", owner: true, title: "Link a file from a URL or another document...", run: () => TEAM.linkFile() },
+  { id: "refreshlinked", edit: true, title: "Refresh linked file", run: () => TEAM.refreshLinked() },
+  { id: "unlink", owner: true, title: "Unlink file (make it an ordinary file)", run: () => TEAM.unlink() },
   { id: "visual", title: "Toggle visual mode", keys: `${mod}+Alt+V`, run: () => setVisual(!settings.visual) },
   { id: "prose", edit: true, title: "Paragraph editor (rich text)", keys: `${mod}+Alt+P`, run: () => setProse(!ui.prose) },
   { id: "newfile", edit: true, title: "New file...", run: () => newFile() },
@@ -1213,12 +1439,23 @@ const COMMANDS = [
   { id: "focus", edit: true, title: "Preview this chapter", run: () => previewChapter() },
   { id: "unfocus", title: "Back to the full PDF", run: () => backToFull() },
   { id: "rebuild", edit: true, title: "Rebuild from scratch", run: () => !readOnly && api.rebuild(cur) },
+  { id: "format", edit: true, title: "Format file (tex-fmt)", run: () => formatFile() },
+  { id: "tidybib", edit: true, title: "Tidy .bib file (sort entries, align fields)", run: () => tidyBib() },
   { id: "docx", owner: true, title: "Export DOCX (pandoc)", run: () => exportDocx() },
+  { id: "arxiv", owner: true, title: "Export for arXiv", run: () => exportArxiv() },
+  { id: "html", owner: true, title: "Export HTML (make4ht)", run: () => exportHtml(api, cur, toast, el) },
   { id: "closetab", title: "Close tab", run: () => active && closeTab(active) },
   { id: "cursor", title: "Show cursor position in PDF", keys: `${mod}+Enter`, run: toCursor },
   { id: "zin", title: "PDF zoom in", run: () => pdfView.setZoom(pdfView.zoom * 1.2) },
   { id: "zout", title: "PDF zoom out", run: () => pdfView.setZoom(pdfView.zoom / 1.2) },
   { id: "fit", title: "PDF fit width", run: () => pdfView.fit() },
+  { id: "pdfdark", title: "PDF: dark pages on/off", run: () => togglePdfDark() },
+  { id: "fold", title: "Fold section or environment", keys: mod === "Cmd" ? "Cmd+Alt+[" : "Ctrl+Shift+[", run: () => L.foldCode(view) },
+  { id: "unfold", title: "Unfold", keys: mod === "Cmd" ? "Cmd+Alt+]" : "Ctrl+Shift+]", run: () => L.unfoldCode(view) },
+  { id: "foldall", title: "Fold all", keys: "Ctrl+Alt+[", run: () => L.foldAll(view) },
+  { id: "unfoldall", title: "Unfold all", keys: "Ctrl+Alt+]", run: () => L.unfoldAll(view) },
+  { id: "check", title: "Code check: show problems", keys: `${mod}+Shift+M`, run: () => LINT.openLintPanel(view) },
+  { id: "checktoggle", get title() { return `Code check: ${settings.check ? "on" : "off"} (change)`; }, run: () => { settings.check = !settings.check; saveSettings(); applyConfig(); } },
   ...(role === "owner" ? [{ id: "share", title: "Share...", run: () => openShare() }] : []),
   { id: "settings", title: "Settings", keys: `${mod}+,`, run: () => openSettings() },
   { id: "cheat", title: "Keyboard shortcuts", keys: "?", run: () => $("cheat").showModal() },
@@ -1227,13 +1464,14 @@ const COMMANDS = [
   { id: "keys-default", title: "Keybindings: default", run: () => { settings.keys = "default"; saveSettings(); applyConfig(); } },
   { id: "keys-vim", title: "Keybindings: Vim", run: () => { settings.keys = "vim"; saveSettings(); applyConfig(); } },
   { id: "keys-emacs", title: "Keybindings: Emacs", run: () => { settings.keys = "emacs"; saveSettings(); applyConfig(); } },
+  ...ET.commands,
 ];
 
 let paletteItems = [], paletteSel = 0;
 function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && !(role === "owner" && config.pandoc))).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc) && !(c.id === "html" && !config.make4ht)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
   $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
     const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
@@ -1255,10 +1493,13 @@ function openSettings() {
   $("sAutosave").value = settings.autosave; $("sTheme").value = settings.theme; $("sKeys").value = settings.keys;
   $("sName").value = me.name;
   $("sFont").value = settings.font; $("sZoom").value = settings.zoom; $("sVisual").checked = settings.visual; $("sInverse").value = settings.inverse;
+  $("sCheck").checked = settings.check; $("sPdfDark").checked = settings.pdfDark;
+  $("sNums").checked = settings.labelNumbers; $("sMathPrev").checked = settings.mathPreview; $("sFollow").checked = settings.follow;
   $("sSpell").checked = settings.spell; $("sFocusAuto").checked = settings.focusAuto; $("sFocusAuto").disabled = readOnly;
   $("sLive").checked = settings.live; $("sLive").disabled = readOnly;
   $("sGrammarBox").hidden = role !== "owner";
   $("sGrammar").value = settings.grammar; $("sGrammarUrl").value = settings.grammarUrl; $("sGrammarShare").checked = settings.grammarShare; grammarSettingsNote();
+  ET.settingsSection($("sEditTools"));
   $("settings").showModal();
   $("sName").focus();
 }
@@ -1276,6 +1517,11 @@ bind("sZoom", (n) => pdfView.setZoom((+n.value || 133) / 100));
 bind("sVisual", (n) => setVisual(n.checked));
 bind("sInverse", (n) => settings.inverse = n.value);
 bind("sSpell", (n) => { settings.spell = n.checked; applySpell(); });
+bind("sCheck", (n) => { settings.check = n.checked; applyConfig(); });
+bind("sNums", (n) => { settings.labelNumbers = n.checked; applyConfig(); });
+bind("sMathPrev", (n) => { settings.mathPreview = n.checked; applyConfig(); });
+bind("sFollow", (n) => { settings.follow = n.checked; if (n.checked) nav.afterBuild(); });
+bind("sPdfDark", (n) => settings.pdfDark = n.checked);
 bind("sFocusAuto", (n) => settings.focusAuto = n.checked);
 bind("sLive", (n) => { settings.live = n.checked; if (!n.checked) { live.stop(); $("liveState").hidden = true; } });
 function grammarSettingsNote() {
@@ -1296,14 +1542,15 @@ $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnl
 
 function buildMenu() {
   const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "assistant"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? [] : ["comment", "suggest"]), "review", "history"]],
-    ["Document", [...(readOnly ? [] : ["prose"]), "visual", ...(role === "owner" && config.pandoc ? ["docx"] : [])]],
+  const groups = [["Panels", ["files", "outline", "references", "symbols", "assistant", "todos", "bookmarks"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
+    ["Document", [...(readOnly ? [] : ["prose", "format", "typeset"]), "visual", "graph", "zen", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : []), ...(role === "owner" && config.make4ht ? ["html"] : [])]],
     ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
   m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
     el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
       const c = COMMANDS.find((x) => x.id === id);
       const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
       if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
+      if ((id === "arxiv" || id === "html") && sharing) { b.disabled = true; b.title = "Off while sharing."; }
       return b;
     })), "mg" + g)));
 }
@@ -1332,23 +1579,24 @@ document.addEventListener("keydown", (e) => {
   const typing = e.target.closest?.(".cm-editor, input, textarea, select, [contenteditable=true]");
   if (m && !e.altKey && !e.shiftKey && k === "k") { e.preventDefault(); openPalette(); }
   else if (m && e.shiftKey && k === "p") { e.preventDefault(); openPalette(); }
-  else if (m && !e.shiftKey && !e.altKey && k === "b") { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
+  else if (m && !e.shiftKey && !e.altKey && k === "b" && !e.defaultPrevented) { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
+  else if (m && e.shiftKey && k === "f") { e.preventDefault(); showSearch(); }
   else if (m && e.shiftKey && k === "o") { e.preventDefault(); COMMANDS.find((c) => c.id === "outline").run(); }
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
   else if (m && e.altKey && k === "v") { e.preventDefault(); setVisual(!settings.visual); }
   else if (m && e.altKey && k === "p") { e.preventDefault(); setProse(!ui.prose); }
-  else if (m && e.altKey && k === "m" && !readOnly) { e.preventDefault(); REV.startComment(); }
+  else if (m && e.altKey && k === "m" && (!readOnly || reviewer)) { e.preventDefault(); REV.startComment(); }
   else if (m && e.altKey && k === "s" && !readOnly) { e.preventDefault(); toggleSuggest(); }
   else if (m && k === ",") { e.preventDefault(); openSettings(); }
   else if (m && k === "enter" && active?.kind === "text") { e.preventDefault(); toCursor(); }
-  else if (m && k === "s") { e.preventDefault(); saveTab(active); }
+  else if (m && k === "s") { if (!e.defaultPrevented) saveNow(); e.preventDefault(); }
   else if (e.key === "?" && !typing && !e.target.closest("dialog")) { e.preventDefault(); $("cheat").showModal(); }
   else if (e.key === "Escape" && !document.querySelector("dialog[open]") && !typing) { if (ui.drawer) setDrawer(false); else if (ui.side) setSide(false); }
 });
 
 // ---- people and sharing ---------------------------------------------------------------------------------
 const avatar = (u) => { const a = el("span", { className: "av", textContent: (u.name || "?").trim().slice(0, 1).toUpperCase(), title: u.name }); a.style.background = u.color; return a; };
-const roleLabel = (r) => ({ owner: "host", edit: "can edit", view: "view only" }[r] || r);
+const roleLabel = (r) => ({ owner: "host", edit: "can edit", review: "reviewer", view: "view only" }[r] || r);
 function renderUsers(users) {
   const everyone = users || [], others = everyone.filter((u) => u.cid !== channel.cid);
   $("usersWrap").hidden = everyone.length < 2;
@@ -1410,6 +1658,7 @@ function renderShare(info) {
       linkRow("View link", info.links.view, "Read-only: the source, the PDF and the outline. Anyone with it picks their own name, shown as unverified."),
       linkRow("Edit link", info.links.edit, "Can edit the files of this document and rebuild it. Names are unverified too."),
       namedLinks(info, { el, api, linkRow, refresh: refreshShare }),
+      TEAM.shareSection(),
       el("p", { className: "caution" }, el("b", { textContent: "Share edit links only with people you trust." }), " Shell escape stays off, but LuaLaTeX can still run code on this computer."),
       ...notes.map((t) => el("p", { className: "mute", textContent: t })),
       el("p", { className: "mute", id: "shareGrammar", textContent: grammarShareNote() }),
@@ -1422,13 +1671,18 @@ $("shareBtn").onclick = openShare;
 $("share").addEventListener("click", (e) => { if (e.target === $("share")) $("share").close(); });
 $("share").addEventListener("close", () => clearTimeout(shareTimer));
 if (readOnly || role !== "owner") $("shareBtn").hidden = true;
-else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
+$("roleChip").before(TEAM.chip, NOTE.node, TEAM.accessBtn);
+TEAM.treeTools(document.querySelector("#panel-files .tree-tools"));
+TEAM.dropFolder($("panel-files"));
+if (role === "view" || role === "review") setTimeout(() => TEAM.poll(), 1000);   // a request from an earlier visit
+else if (role === "owner") api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
 // Roles: say who you are, and keep what you cannot do visible but disabled, with the reason.
 if (role !== "owner") {
   const chip = $("roleChip");
   chip.hidden = false; chip.className = "role " + role;
-  chip.replaceChildren(icon(readOnly ? "eye" : "share"), el("span", { textContent: (readOnly ? "View only" : "Can edit") + (config.name && !config.hosted ? ` as ${config.name}` : "") }));
-  chip.title = config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
+  chip.replaceChildren(icon(reviewer ? "comment" : readOnly ? "eye" : "share"), el("span", { textContent: (reviewer ? "Reviewer" : readOnly ? "View only" : "Can edit") + (config.name && !config.hosted ? ` as ${config.name}` : "") }));
+  chip.title = reviewer ? "You are a reviewer: you can comment, and what you type becomes suggestions that editors accept or reject. You cannot change the text directly."
+    : config.hosted ? (readOnly ? "Your role in this project is viewer: you can read and download, but not change anything." : "You can edit this project: changes are shared live with everyone in it.")
     : readOnly ? "You opened a view link: you can read, scroll and jump between source and PDF, but not change anything. Ask the host for the edit link." : "You opened an edit link: changes are shared live. Only the host can share or stop sharing.";
   chip.tabIndex = 0;
 }
@@ -1437,8 +1691,12 @@ if (config.hosted) {   // Behind scripts/host.py the editor lives at /p/<id>/: t
   home.setAttribute("aria-label", "All projects");
   home.append(...logo.childNodes); logo.replaceWith(home);
 }
+if (reviewer) {   // Suggest mode on for good: the server refuses a reviewer's edits to the text and its saves anyway.
+  toggleSuggest();
+  $("suggestBtn").disabled = true; $("suggestBtn").title = "Reviewers always suggest: what you type becomes a suggestion";
+}
 if (readOnly) {
-  $("commentBtn").hidden = $("suggestBtn").hidden = true;   // Comments and suggestions need the edit role; the Review tab still lists them.
+  if (!reviewer) $("commentBtn").hidden = $("suggestBtn").hidden = true;   // Comments and suggestions need the edit or review role; the Review tab still lists them.
   for (const [id, why] of [["rebuildBtn", "Only people with the edit link can rebuild"], ["proseBtn", "Paragraph editing needs the edit link"]]) {
     $(id).disabled = true; $(id).title = why;
   }
@@ -1479,6 +1737,7 @@ const collab = collabLibs && config.collab !== false ? new Collab(channel, api, 
 channel.on("state", (data) => {
   const list = data.docs;
   docs = Object.fromEntries(list.map((d) => [d.name, d]));
+  queueMicrotask(() => TEAM.setLocked(docs[cur]?.locked));
   const names = list.map((d) => d.name);
   if ([...$("doc").options].map((o) => o.value).join("\n") !== names.join("\n")) $("doc").replaceChildren(...names.map((n) => new Option(n, n)));
   if (!docs[cur] || !booted) { booted = true; pick(docs[cur] ? cur : docs[store.get("doc")] ? store.get("doc") : names[0]); return; }
@@ -1486,14 +1745,16 @@ channel.on("state", (data) => {
   const wasBuilding = lastStatus === "building";
   lastStatus = docs[cur].status;
   renderStatus();
+  buildUi.update(docs, cur);
   renderFocus();
   if (wantedVersion() !== pdfView.version) loadPdf();
   loadWarnings();   // Cheap: it fetches only when a build finished since the last look.
-  if (wasBuilding && lastStatus !== "building") { loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
+  if (wasBuilding && lastStatus !== "building") { nav.refresh(0); loadOutline(); if (ui.drawer && ui.drawerTab === "log") loadLog(); if (ui.drawer && ui.drawerTab === "lint") loadLint(); }
 });
 let lastStatus = null, booted = false;
 channel.on("fs", onFsEvent);
 channel.on("review", (d) => { if (d.doc === cur) REV.changed(); });
+channel.on("access", () => TEAM.onAccess());
 channel.on("history", (d) => {
   if (d.doc !== cur) return;
   if (collab && !readOnly) historyUi.resume();   // a restore may wait for an editor of a file open here
@@ -1516,7 +1777,7 @@ async function pick(name) {
   cur = name; location.hash = encodeURIComponent(name); store.set("doc", name);
   $("doc").value = name; $("brandDoc").textContent = $("treeDoc").textContent = name.split("/").pop();
   focusView = null; renderFocus();
-  tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {} };
+  tabs.clear(); active = null; files = []; emptyDirs = []; treeSel = null; outlineData = null; refs = { labels: {}, bib: {}, macros: [], envs: [] };
   pdfView.version = null;
   warnKey = warnLoaded = null; warnings = []; renderWarnings();
   REV.reset(); historyUi.reset();
@@ -1531,7 +1792,7 @@ async function restoreTabs() {
   for (const p of open) await openFile(p, 0, { noFocus: true });
   const want = tabs.get(saved?.active) || [...tabs.values()][0];
   if (want) await activate(want, 0, { noFocus: true });
-  if (settings.visual) loadRefs();
+  loadRefs(); nav.refresh(0);
   if (ui.side && ui.sideTab === "refs") refsUi.load();
 }
 
@@ -1545,4 +1806,4 @@ applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); b
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
 pushGrammarSettings();
-window.__app = { REV, get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };
+window.__app = { REV, nav, navUi, applyConfig, get view() { return view; }, tabs, settings, ui, channel, pdfView, get active() { return active; }, openFile, saveTab, setVisual, get docs() { return docs; }, get cur() { return cur; } };

@@ -11,10 +11,13 @@ on:
       - "scripts/accel.py"
       - "scripts/sandbox.py"
       - "scripts/hints.py"
+      - "scripts/a11y.py"
       - "scripts/publish_release.py"
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - ".github/texlive-packages.txt"
+      - ".github/fonts/**"
+      - ".github/hooks/**"
       - "tests/fixtures/tagged/**"
       - "tests/tagged_check.py"
       - "pyproject.toml"
@@ -27,10 +30,13 @@ on:
       - "scripts/accel.py"
       - "scripts/sandbox.py"
       - "scripts/hints.py"
+      - "scripts/a11y.py"
       - "scripts/publish_release.py"
       - "scripts/ci_report.py"
       - ".github/workflows/build-pdf.yml"
       - ".github/texlive-packages.txt"
+      - ".github/fonts/**"
+      - ".github/hooks/**"
       - "tests/fixtures/tagged/**"
       - "tests/tagged_check.py"
       - "pyproject.toml"
@@ -40,6 +46,12 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # TeX Live year for the tug.org install (texlive-cache, tagged-pdf, build on a cache hit), e.g. "2025";
+  # empty means the latest. It is part of the cache key, so changing it installs that year once. The apt
+  # fallback on a cache miss is always Ubuntu's TeX Live. See README, "GitHub Actions".
+  TEXLIVE_VERSION: ""
 
 jobs:
   requirements:
@@ -70,20 +82,21 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ~/texlive
-          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          key: texlive-v1-${{ env.TEXLIVE_VERSION || 'latest' }}-${{ hashFiles('.github/texlive-packages.txt') }}
           lookup-only: true
       - name: Install TeX Live
         if: steps.tl.outputs.cache-hit != 'true'
         uses: zauguin/install-texlive@6671d0c62046c7e349fe154d5208fe746b07e037 # v4.4.0
         with:
           package_file: .github/texlive-packages.txt
+          texlive_version: ${{ env.TEXLIVE_VERSION }}
           cache: false
       - name: Save the cache
         if: steps.tl.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ~/texlive
-          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          key: texlive-v1-${{ env.TEXLIVE_VERSION || 'latest' }}-${{ hashFiles('.github/texlive-packages.txt') }}
 
   # PDF/A, PDF/UA and tagged-PDF check: the fixtures in tests/fixtures/tagged are built on the cached tug.org
   # TeX Live (kernel 2025-06 or newer) and validated with a pinned veraPDF (tests/tagged_check.py). It runs
@@ -100,7 +113,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ~/texlive
-          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          key: texlive-v1-${{ env.TEXLIVE_VERSION || 'latest' }}-${{ hashFiles('.github/texlive-packages.txt') }}
       - name: No TeX Live cache yet
         if: steps.tl.outputs.cache-hit != 'true'
         run: echo "::notice::tagged-pdf skipped, the TeX Live cache is not saved yet (texlive-cache fills it)."
@@ -155,7 +168,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ~/texlive
-          key: texlive-v1-${{ hashFiles('.github/texlive-packages.txt') }}
+          key: texlive-v1-${{ env.TEXLIVE_VERSION || 'latest' }}-${{ hashFiles('.github/texlive-packages.txt') }}
 
       - name: Use cached TeX Live
         if: steps.tl.outputs.cache-hit == 'true'
@@ -200,6 +213,20 @@ jobs:
           key: latex-${{ github.run_id }}
           restore-keys: latex-
 
+      # Repository-owned extras (README, "GitHub Actions"): fonts in .github/fonts/ for XeLaTeX and LuaLaTeX,
+      # and .github/hooks/pre-build and post-build, run here only (never by the editor or a shared link).
+      - name: Extra fonts
+        if: hashFiles('.github/fonts/**') != ''
+        run: |
+          mkdir -p ~/.local/share/fonts
+          cp -R .github/fonts/. ~/.local/share/fonts/
+          if command -v fc-cache >/dev/null; then fc-cache -f ~/.local/share/fonts; fi
+          echo "OSFONTDIR=$HOME/.local/share/fonts//" >> "$GITHUB_ENV"  # kpathsea: // searches subfolders
+
+      - name: Pre-build hook
+        if: hashFiles('.github/hooks/pre-build') != ''
+        run: bash .github/hooks/pre-build
+
       # Default branch: everything changed since the last fully successful
       # publish (the `pdfs` tag), so skipped or failed runs are caught up.
       # Other pushes: changed by the push. PR: changed since the base branch.
@@ -220,6 +247,12 @@ jobs:
           else
             python3 scripts/build.py
           fi
+
+      - name: Post-build hook
+        if: ${{ !cancelled() && hashFiles('.github/hooks/post-build') != '' }}
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: bash .github/hooks/post-build
 
       # Structural findings (annotations, never fail the job), chktex and word counts go into out/lint-report.json (in the artifact).
       - name: Lint and word counts

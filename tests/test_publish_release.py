@@ -75,3 +75,49 @@ class UploadSkipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadOnlyDocumentOutputsTests(unittest.TestCase):
+    def test_review_and_focus_pdfs_are_never_uploaded(self):
+        with fake_repo() as root:
+            write_doc(root, "a", "x")
+            out = root / "out"
+            out.mkdir()
+            for name in ("a.pdf", "a.log", "a.review.pdf", "a.review.log", "a.focus.pdf"):
+                (out / name).write_bytes(b"%PDF")
+            calls = []
+            with mock.patch.object(publish_release, "gh", side_effect=lambda *a: calls.append(a) or ""), \
+                    mock.patch.object(publish_release, "load_documents", return_value=[]):
+                self.assertEqual(publish_release.main(), 0)
+        uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
+        self.assertEqual(uploaded, ["a.log", "a.pdf"])
+
+    def test_output_pdfs_of_build_toml_are_published_and_pages_extracts_are_not(self):
+        with fake_repo() as root:
+            write_doc(root, "a", "x")
+            (root / "files" / "a" / "build.toml").write_text('[[output]]\nname = "handout"\n', encoding="utf-8")
+            out = root / "out"
+            out.mkdir()
+            for name in ("a.pdf", "a.log", "a-handout.pdf", "a-handout.log", "a.pages.pdf", "a-other.pdf"):
+                (out / name).write_bytes(b"%PDF")
+            calls = []
+            with mock.patch.object(publish_release, "gh", side_effect=lambda *a: calls.append(a) or ""), \
+                    mock.patch.object(publish_release, "load_documents", return_value=[]):
+                self.assertEqual(publish_release.main(), 0)
+        uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
+        self.assertEqual(uploaded, ["a-handout.log", "a-handout.pdf", "a.log", "a.pdf"])
+
+    def test_html_zip_is_uploaded_only_for_documents_that_opt_in(self):
+        with fake_repo() as root:
+            write_doc(root, "a", "x", "html = true\n")
+            write_doc(root, "b", "x")
+            out = root / "out"
+            out.mkdir()
+            for name in ("a.pdf", "a.html.zip", "b.pdf", "b.html.zip"):
+                (out / name).write_bytes(b"%PDF")
+            calls = []
+            with mock.patch.object(publish_release, "gh", side_effect=lambda *a: calls.append(a) or ""), \
+                    mock.patch.object(publish_release, "load_documents", return_value=[]):
+                self.assertEqual(publish_release.main(), 0)
+        uploaded = sorted(c[3].rpartition("#")[2] for c in calls if c[:2] == ("release", "upload"))
+        self.assertEqual(uploaded, ["a.html.zip", "a.pdf", "b.pdf"])

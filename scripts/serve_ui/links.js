@@ -2,7 +2,7 @@
 // the name and role the owner gives it. Comments, suggestions, saves and presence of that link carry this name,
 // set by the server; the person cannot change it. Every bit of user text is rendered with textContent.
 
-const ROLE_TEXT = { edit: "can edit", view: "view only" };
+const ROLE_TEXT = { edit: "can edit", review: "can review", view: "view only" };
 
 /** The "Named links" part of the Share dialog. ctx = {el, api, linkRow(label, url, note, id), refresh(), toast(msg)} */
 export function namedLinks(info, ctx) {
@@ -22,7 +22,7 @@ export function namedLinks(info, ctx) {
     return el("li", {}, row);
   });
   const name = el("input", { type: "text", id: "shareLinkName", maxLength: 40, placeholder: "Alice", autocomplete: "off" });
-  const role = el("select", { id: "shareLinkRole" }, new Option("Can edit", "edit"), new Option("View only", "view"));
+  const role = el("select", { id: "shareLinkRole" }, new Option("Can edit", "edit"), new Option("Can review (comment and suggest)", "review"), new Option("View only", "view"));
   const create = el("button", { type: "button", className: "btn", id: "shareLinkCreate", textContent: "Make link", onclick: async () => {
     if (!name.value.trim()) { name.focus(); return; }
     create.disabled = true;

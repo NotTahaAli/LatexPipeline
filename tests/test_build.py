@@ -5,10 +5,12 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 import urllib.parse
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -190,7 +192,9 @@ class ReadSettingsTests(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.settings(self.PLAIN),
                          {"engine": "pdflatex", "shell_escape": False, "latexmk_args": [], "externalize": True,
-                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
+                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": [],
+                          "html": False})
 
     def test_magic_comment_variants(self):
         cases = {
@@ -210,7 +214,9 @@ class ReadSettingsTests(unittest.TestCase):
         toml = 'engine = "lualatex"\nshell_escape = true\nlatexmk_args = ["-g"]\n'
         self.assertEqual(self.settings("% !TEX program = xelatex\n" + self.PLAIN, toml),
                          {"engine": "lualatex", "shell_escape": True, "latexmk_args": ["-g"], "externalize": True,
-                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600})
+                          "pdfa": None, "tagged": False, "lang": "en-US", "timeout": 600, "review": "off",
+                          "draft": False, "strict": False, "anonymous": False, "output": [], "define": [],
+                          "html": False})
 
     def test_build_toml_can_opt_out_of_externalize(self):
         self.assertFalse(self.settings(self.PLAIN, 'externalize = false\n')["externalize"])
@@ -341,7 +347,7 @@ class ReadSettingsTests(unittest.TestCase):
         with fake_repo() as root:
             pdf = root / "a.pdf"
             pdf.write_bytes(b"%PDF-1.7\n<pdfaid:part>2</pdfaid:part>\n/OutputIntents [1 0 R]\n")
-            self.assertIn("present", build.pdfa_check(pdf, "a-2b"))
+            self.assertIn("present", build.pdfa_check(pdf, "a-2b", validate=False))  # veraPDF may be installed
             pdf.write_bytes(b"%PDF-1.7\n")
             self.assertIn("no XMP pdfaid or OutputIntent", build.pdfa_check(pdf, "a-2b"))
 
@@ -692,6 +698,82 @@ class DocxExportTests(unittest.TestCase):
         self.assertIn("pandoc was not found", message)
 
 
+HTML_DOC = r"""\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Intro}\label{s}
+Text $a^2+b^2=c^2$, see \ref{s} and \cite{k}.
+\includegraphics[alt={A box}]{box}
+\bibliographystyle{plain}\bibliography{refs}
+\end{document}
+"""
+
+
+class HtmlExportTests(unittest.TestCase):
+    def test_paths_key_prune_and_missing_make4ht(self):
+        with fake_repo() as root:
+            main = write_doc(root, "reports/final", "x", "html = true\n")
+            self.assertEqual(build.html_paths(main),
+                             (root / "out/reports/final.html", root / "out/reports/final.html.zip"))
+            self.assertTrue(build.wants_html(main))
+            (main.parent / "build.toml").write_text("html = 1\n", encoding="utf-8")
+            with self.assertRaises(build.ConfigError):
+                build.read_settings(main)
+            self.assertFalse(build.wants_html(main))
+            folder, archive = build.html_paths(main)
+            folder.mkdir(parents=True)
+            (folder / "index.html").write_text("x", encoding="utf-8")
+            (folder / "pic.pdf").write_bytes(b"%PDF")  # inside a kept export: never a stale document PDF
+            archive.write_bytes(b"zip")
+            (root / "out/gone.html").mkdir()
+            (root / "out/gone.html/index.html").write_text("x", encoding="utf-8")
+            (root / "out/gone.html.zip").write_bytes(b"zip")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build.prune([main])
+            self.assertTrue((folder / "pic.pdf").exists() and archive.exists())
+            self.assertFalse((root / "out/gone.html").exists() or (root / "out/gone.html.zip").exists())
+            with mock.patch.object(build.shutil, "which", return_value=None):
+                ok, message = build.export_html(main)
+            self.assertFalse(ok)
+            self.assertIn("make4ht was not found", message)
+
+    def test_html_excludes_watch_and_focus(self):
+        for extra in (["--watch"], ["--focus", "x"]):
+            with mock.patch.object(build.sys, "argv", ["build.py", "--html", *extra]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build.parse_args()
+
+    @unittest.skipUnless(shutil.which("make4ht") and shutil.which("latexmk") and shutil.which("pdflatex"),
+                         "needs make4ht, latexmk and pdflatex")
+    def test_export_runs_in_the_sandbox_runner_and_writes_mathml_and_a_zip(self):
+        with fake_repo() as root:
+            main = write_doc(root, "a", HTML_DOC)
+            (main.parent / "refs.bib").write_text("@misc{k, title={Some Work}, author={A. Author}, year=2000}\n")
+            (main.parent / "box.tex").write_text("\\documentclass{standalone}\\begin{document}Box\\end{document}\n")
+            subprocess.run(["pdflatex", "-interaction=batchmode", "box.tex"], cwd=main.parent, capture_output=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                entry, _ = build.build_safely(main, shutil.which("latexmk"), False, False)
+            self.assertTrue(entry["ok"], entry)
+            spawned = []
+            real = build.sandbox.spawn
+            record = lambda *a, **k: spawned.append(a) or real(*a, **k)  # noqa: E731
+            with mock.patch.object(build.sandbox, "spawn", side_effect=record):
+                ok, message = build.export_html(main)
+            self.assertTrue(ok, message)
+            self.assertIn("make4ht", spawned[0][0][0])
+            folder, archive = build.html_paths(main)
+            page = (folder / "index.html").read_text(encoding="utf-8")
+            self.assertIn("<math", page)  # MathML, nothing from a CDN
+            self.assertNotIn("mathjax", page.lower())
+            self.assertIn("Some work", page)  # the full build's .bbl
+            self.assertIn("alt='A box'", page)
+            if shutil.which("pdftocairo"):
+                self.assertTrue((folder / "box-.svg").is_file())
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertIn("a.html/index.html", bundle.namelist())
+            self.assertFalse(list(main.parent.glob("*.4ct")))  # make4ht ran on a copy
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -718,6 +800,26 @@ class CleanCacheRetryTests(unittest.TestCase):
 
             (main.parent / "ch" / "a.tex").write_text("fixed\n", encoding="utf-8")
             self.assertTrue(self.build(main)["ok"])
+
+
+@unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+class FigureListingKeepsOutputsTests(unittest.TestCase):
+    def test_a_picture_in_a_file_the_document_does_not_read_keeps_synctex_and_the_log(self):
+        # The figure listing runs as the main job; latexmk then had nothing to redo, and the editor lost
+        # SyncTeX ("No SyncTeX data yet") and the page count until Rebuild from scratch.
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "fig", "\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\nText.\n"
+                             "\\begin{tikzpicture}\\draw (0,0) -- (1,1);\\end{tikzpicture}\n\\end{document}\n")
+            report, _ = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            synctex = build.cache_dir_for(main) / "main.synctex.gz"
+            self.assertTrue(synctex.is_file())
+            (main.parent / "notes.tex").write_text("\\begin{tikzpicture}\\draw (0,0) circle (1);\\end{tikzpicture}\n",
+                                                   encoding="utf-8")
+            report, _ = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertTrue(synctex.is_file(), "the figure listing removed the SyncTeX file")
+            self.assertEqual(report["pages"], 1)
 
 
 @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
@@ -755,9 +857,31 @@ class GlobalInputsTests(unittest.TestCase):
             self.assertFalse(editor_file.startswith(build.GLOBAL_INPUTS), editor_file)
 
     def test_ci_scripts_do_not_import_the_editor_server(self):
-        for name in ("build.py", "accel.py", "hints.py", "publish_release.py", "ci_report.py"):
+        for name in ("build.py", "accel.py", "hints.py", "a11y.py", "arxiv.py", "publish_release.py", "ci_report.py"):
             text = (self.ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertNotRegex(text, r"(?m)^\s*(import|from)\s+serve\b", name)
+
+
+class FrozenTests(unittest.TestCase):
+    """PyInstaller binaries (binaries.yml): the project is the working directory, the binary is the build script."""
+
+    def test_root_is_the_working_directory(self):
+        scripts = Path(__file__).resolve().parent.parent / "scripts"
+        code = (f"import sys; sys.frozen = True; sys.path.insert(0, {str(scripts)!r}); "
+                "import build; print(build.ROOT_DIR)")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True, check=True)
+            self.assertEqual(Path(out.stdout.strip()), Path(tmp).resolve())
+
+    def test_binary_time_counts_as_an_input(self):
+        with fake_repo() as root:
+            main_tex = write_doc(root, "a", "x")
+            binary = root / "build-bin"
+            binary.write_text("x")
+            future = time.time() + 3600
+            os.utime(binary, (future, future))
+            with mock.patch.object(build, "FROZEN", True), mock.patch.object(build.sys, "executable", str(binary)):
+                self.assertEqual(build.newest_input(main_tex), future)
 
 
 class ReportAndFocusTests(unittest.TestCase):
@@ -805,3 +929,42 @@ class ParanoidReadsTests(unittest.TestCase):
                 self.assertTrue(report["ok"], (name, report["errors"]))
                 self.assertNotIn("rebuilt without it", text)  # Externalization itself must work.
                 self.assertEqual(build.build_document(main, shutil.which("latexmk"), live=False)[0]["ok"], True)
+
+
+class FormatTests(unittest.TestCase):
+    """--format / tex-fmt: the real binary when installed; a missing one is a message, never a failure."""
+
+    UGLY = "\\begin{document}\n\\begin{itemize}\n\\item a\n\\end{itemize}\n\\end{document}\n"
+
+    def test_missing_tex_fmt(self):
+        with mock.patch.object(build.shutil, "which", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                build.format_sources(Path("."))
+            with self.assertRaises(FileNotFoundError):
+                build.format_text(Path("."), "x")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(build.format_all([Path("doc/main.tex")]), 0)
+        self.assertIn("tex-fmt was not found", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("tex-fmt"), "tex-fmt is not installed")
+    def test_check_rewrite_stdin_and_the_document_tex_fmt_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "main.tex").write_text(self.UGLY, encoding="utf-8")
+            (folder / "Chapters").mkdir()
+            (folder / "Chapters" / "a.tex").write_text("plain\n", encoding="utf-8")
+            (folder / ".hidden").mkdir()
+            (folder / ".hidden" / "x.tex").write_text(self.UGLY, encoding="utf-8")
+            (folder / "tex-fmt.toml").write_text("tabsize = 4\n", encoding="utf-8")
+            self.assertEqual(build.format_sources(folder, check=True), (["main.tex"], []))
+            self.assertEqual((folder / "main.tex").read_text(encoding="utf-8"), self.UGLY)  # --check writes nothing
+            self.assertIn("\n    \\item a\n", build.format_text(folder, self.UGLY))
+            self.assertEqual(build.format_sources(folder), (["main.tex"], []))
+            self.assertIn("\n    \\item a\n", (folder / "main.tex").read_text(encoding="utf-8"))
+            self.assertEqual((folder / ".hidden" / "x.tex").read_text(encoding="utf-8"), self.UGLY)
+            self.assertEqual(build.format_sources(folder, check=True), ([], []))
+            (folder / "tex-fmt.toml").write_text("wraplen = \"x\"\n", encoding="utf-8")  # tex-fmt panics on it
+            changed, problems = build.format_sources(folder, check=True)
+            self.assertEqual((changed, len(problems)), ([], 2))
+            with self.assertRaises(ValueError):
+                build.format_text(folder, self.UGLY)

@@ -13,8 +13,10 @@ both guests in separate browser contexts:
   - IME composition (Chrome DevTools Input.imeSetComposition / insertText) becomes a suggestion, and the text being
     composed never reaches the owner or the disk;
   - the owner's edits arriving in Alice's editor go through untouched while she is suggesting;
+  - the suggestion card (Alt+Enter) takes a reply with an @mention, which the suggester's bell lists;
   - presence shows the link names; revoking Alice's link ends her session at once;
-  - axe-core reports no violations (light, dark, phone; Share dialog and Review panel open).
+  - axe-core reports no violations (light, dark, phone; Share dialog, Review panel, suggestion card and
+    notifications open).
 If the CDNs are blocked, run `python3 scripts/vendor_ui.py` first (and delete scripts/serve_ui/vendor/ afterwards).
 """
 
@@ -234,6 +236,30 @@ def main() -> int:
             axe(phone, "owner, phone, share dialog")
             print("accepted the group as a whole; axe: 0 violations (light, dark, phone)")
 
+            # 5b. The suggestion card (Alt+Enter on a suggestion): the owner replies with an @mention there, and
+            # Alice's bell lists it.
+            very = next(s for s in review()["suggestions"] if s["insert"] == " very")
+            put_cursor(owner, very["anchor"]["from"])
+            owner.keyboard.press("Alt+Enter")
+            owner.wait_for_selector(".cm-sug-card textarea")
+            for theme in ("light", "dark"):
+                owner.evaluate("t => document.documentElement.dataset.theme = t", theme)
+                axe(owner, f"owner, suggestion card, {theme}")
+            owner.fill(".cm-sug-card textarea", "@Alice thanks, looks right")
+            owner.click(".cm-sug-card button:has-text('Reply')")
+            wait(lambda: any(c["text"].startswith("@Alice")
+                             for s in review()["suggestions"] for c in s.get("comments", [])), "reply saved")
+            owner.keyboard.press("Escape")
+            alice.wait_for_function("() => document.querySelector('#bellBtn .count').textContent !== ''", timeout=20000)
+            alice.click("#bellBtn")
+            alice.wait_for_selector("#bellList:not([hidden]) .row")
+            assert "mentioned you" in alice.inner_text("#bellList") or "replied" in alice.inner_text("#bellList")
+            for theme in ("light", "dark"):
+                alice.evaluate("t => document.documentElement.dataset.theme = t", theme)
+                axe(alice, f"Alice, notifications, {theme}")
+            alice.keyboard.press("Escape")
+            print("suggestion card: reply with an @mention; Alice's bell lists it; axe: 0 violations (light, dark)")
+
             # 7. A composition left open is ended after a few seconds; others' edits waited and then arrive.
             put_cursor(owner, 0)
             before = text_of(alice)
@@ -301,7 +327,12 @@ def main() -> int:
         server.terminate()
         server.wait(30)
         tmp.cleanup()
-        shutil.rmtree(ROOT / ".latex-history" / doc, ignore_errors=True)
+        # Outside the repository its cache and history are keyed _x<hash>_2F<name> (build.cache_dir_for).
+        for base in (ROOT / ".latex-cache", ROOT / ".latex-history", ROOT / ".latex-cache" / "_review"):
+            for found in base.glob(f"_x*_2F{doc}"):
+                shutil.rmtree(found, ignore_errors=True)
+        for found in (ROOT / "out").glob(f"{doc}.*"):
+            found.unlink()
     print("review e2e ok")
     return 0
 

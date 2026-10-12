@@ -88,6 +88,7 @@ kbd{font:11px var(--mono);color:var(--ink-2);background:var(--surface);border:1p
 /* Role chip, first-run tips */
 .role{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ochre-soft);color:var(--ochre);white-space:nowrap}
 .role.edit{background:var(--accent-soft);color:var(--accent)}
+.role.review{background:var(--moss-soft);color:var(--moss)}
 .btn:disabled,button.icon:disabled,.mini:disabled{opacity:.45;cursor:not-allowed}
 #tips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 14px;background:var(--accent-soft);color:var(--accent);border-bottom:1px solid var(--rule)}
 #tips .btn{height:28px}
@@ -149,7 +150,7 @@ button.tip:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
 .side-tabs button[role=tab]:hover{color:var(--ink)}
 .side-tabs button[role=tab][aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}
 .side-tabs button[role=tab] .ic{display:none}
-.side-tabs .tl{display:flex;gap:2px}
+.side-tabs .tl{display:flex;flex-wrap:wrap;gap:2px;min-width:0}
 .side-tabs .x{margin-left:auto;margin-bottom:4px}
 #panel-files,#panel-outline,#panel-refs{flex:1;min-height:0;overflow:auto;padding:6px}
 .count{display:inline-flex;align-items:center;justify-content:center;height:18px;min-width:18px;padding:0 5px;border-radius:9px;background:var(--sunk);color:var(--ink-2);font-size:11px;font-weight:700}
@@ -295,10 +296,11 @@ button.link:hover{text-decoration-color:currentColor}
 .sev::before{content:"Error"}
 .sev.warning{background:var(--ochre-soft);color:var(--ochre)}.sev.warning::before{content:"Warning"}
 .sev.info{background:var(--accent-soft);color:var(--accent)}.sev.info::before{content:"Note"}
+.logfilter{display:flex;gap:6px;align-items:center;padding:8px 16px 0;font-size:13px;color:var(--ink-2)}
 #logText{margin:0;padding:12px 16px;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word;color:var(--ink-2)}
 
 #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:44px;max-width:80vw;background:var(--ink);color:var(--paper);border-radius:8px;padding:9px 16px;box-shadow:var(--shadow);z-index:60}
-#toast a{color:inherit;font-weight:600}
+#toast a,#toast button.link{color:inherit;font-weight:600}
 
 dialog{border:1px solid var(--rule);border-radius:10px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow);padding:0;max-width:min(620px,94vw);width:620px}
 dialog::backdrop{background:var(--scrim)}
@@ -350,6 +352,17 @@ dialog::backdrop{background:var(--scrim)}
 .cm-search [name=close]{position:absolute;top:6px;right:6px;width:22px;height:22px;border:0;background:none;color:var(--muted);font-size:16px;padding:0}
 .cm-tooltip{background:var(--surface)!important;border:1px solid var(--rule)!important;border-radius:8px;box-shadow:var(--shadow);color:var(--ink)}
 .cm-tooltip-autocomplete ul li[aria-selected]{background:var(--accent-soft)!important;color:var(--accent)!important}
+.cm-texHover{padding:6px 10px;max-width:min(520px,80vw);font:13px/1.4 var(--sans)}
+.cm-texHover-head{font-weight:600}
+.cm-texHover-mute{color:var(--muted);font-size:12px}
+.cm-mathHover{overflow-x:auto;font-size:15px}
+.cm-foldGutter .cm-gutterElement{color:var(--muted);cursor:pointer;padding:0 2px}
+.cm-foldPlaceholder{background:var(--sunk)!important;border-color:var(--rule)!important;color:var(--ink-2)!important}
+.cm-panel.cm-panel-lint{background:var(--surface);color:var(--ink)}
+.cm-panel.cm-panel-lint ul [aria-selected]{background:var(--accent-soft)!important;color:var(--ink)!important}
+/* Dark PDF pages: invert, then turn hues back so figures keep roughly their colours. */
+#pages.pdf-dark .page{background:#000}
+#pages.pdf-dark .page canvas{filter:invert(1) hue-rotate(180deg)}
 .cm-searchMatch{background:color-mix(in srgb,var(--ochre) 28%,transparent)!important}
 .cm-matchingBracket{background:color-mix(in srgb,var(--accent) 22%,transparent)!important;outline:none!important}
 .tok-keyword{color:var(--t-math)}.tok-string,.tok-string2{color:var(--t-math)}.tok-comment{color:var(--t-com);font-style:italic}
@@ -509,10 +522,21 @@ dialog::backdrop{background:var(--scrim)}
 .ai-diff{margin:0;max-height:260px;overflow:auto;font:12px/1.45 var(--mono);background:var(--code);border:1px solid var(--rule);border-radius:var(--r);padding:6px 8px}
 .ai-diff div{white-space:pre-wrap;overflow-wrap:anywhere}
 .ai-diff .del{color:var(--ox)}.ai-diff .add{color:var(--moss)}
+.ai-claims{margin:0;padding-left:20px;display:grid;gap:8px;font-size:13px}
+.ai-claims p{overflow-wrap:anywhere}
+.ai-cands{display:grid;gap:6px}
+.ai-cand{border-left:2px solid var(--rule-strong);padding-left:8px;font-size:12.5px;overflow-wrap:anywhere}
+.lib-list{max-height:360px;overflow:auto}
+.lib-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid var(--rule);font-size:12.5px}
+.lib-title{flex:1;min-width:0;overflow-wrap:anywhere}
 
 /* Review: comments and suggestions (review.js) */
 .cm-cmt{background:color-mix(in srgb,var(--ochre) 18%,transparent);border-bottom:2px solid color-mix(in srgb,var(--ochre) 70%,transparent)}
 .cm-cmt.active{background:color-mix(in srgb,var(--ochre) 34%,transparent)}
+/* Overlapping comments do not stack their tints, and text under a tint is ink: syntax colours fall below 4.5:1 there. */
+.cm-cmt .cm-cmt{background:none}
+.cm-cmt .cm-cmt.active{background:color-mix(in srgb,var(--ochre) 20%,transparent)}
+.cm-cmt,.cm-cmt [class*=tok-]{color:var(--ink)}
 .cm-sug-del{text-decoration:line-through;text-decoration-color:var(--ox);text-decoration-thickness:2px;color:var(--ox);background:var(--ox-soft)}
 .cm-sug-ins{text-decoration:underline;text-decoration-color:var(--moss);text-decoration-thickness:2px;text-underline-offset:3px;color:var(--moss);background:var(--moss-soft)}
 .cm-sug-del.active,.cm-sug-ins.active{outline:1px solid currentColor;border-radius:2px}
@@ -592,3 +616,118 @@ dialog::backdrop{background:var(--scrim)}
   .rv-bar .btn,.hv-item .btn,.rv-actions .btn,.rv-bar .chip{min-height:40px}
   .hv-controls,.hv-foot,.hv-sum{padding-left:12px;padding-right:12px}
 }
+
+/* Search and replace in all files (search.js) */
+#side[data-tab=search]{width:min(420px,100vw)}
+.sr-form{display:flex;flex-direction:column;gap:6px;padding:6px 6px 8px}
+.sr-form input[type=search],.sr-form input[type=text]{flex:1;min-width:0;height:32px;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:0 10px}
+.sr-opts,.sr-rep{display:flex;gap:12px;align-items:center}
+.sr-opts .check{align-items:center;font:12px var(--mono)}
+.sr-status{margin:0;padding:0 8px 6px;font-size:12.5px}
+.sr-file{padding:6px 8px}
+.sr-path{font:12px var(--mono);color:var(--ink-2);padding:2px 0}
+.sr-file ul{list-style:none;margin:0;padding:0}
+.sr-file li{display:flex;gap:6px;align-items:baseline;border:0}
+.sr-hit{flex:1;min-width:0;text-align:left;font:12px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:2px 0}
+.sr-hit mark{background:color-mix(in srgb,var(--accent) 25%,transparent);color:inherit}
+.sr-one{font-size:12px;flex:none}
+#toast button.tp-go{margin-left:10px;color:inherit;font-weight:600;text-decoration:underline}
+.rx-dlg{width:440px}.rx-dlg form>p,.rx-dlg form>.rv-actions{padding:0 22px 16px}
+/* editing tools (edittools.js): figure thumbnail, snippet editor, zen mode */
+.et-thumb img{display:block;max-width:240px;max-height:180px;margin-bottom:4px;background:#fff}
+.et-dlg{width:min(640px,calc(100vw - 32px))}
+.et-snip-note{padding:0 22px;font-size:12.5px}
+.et-snips{display:flex;flex-direction:column;gap:14px;padding:0 22px 16px;max-height:60vh;overflow:auto}
+.et-snip{display:grid;grid-template-columns:8em 1fr auto;gap:10px;align-items:end}
+.et-snip input{height:32px;min-width:0}
+.et-snip .wide{grid-column:auto}
+.et-dlg .actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 22px;border-top:1px solid var(--rule)}
+.et-snip textarea{min-width:0;width:100%;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:6px 10px;color:var(--ink);font:12px var(--mono);resize:vertical}
+@media (max-width:560px){.et-snip{grid-template-columns:1fr}}
+html.zen #topbar,html.zen #side,html.zen #splitter,html.zen #pdfPane,html.zen #drawer,html.zen #tips,html.zen #progress,html.zen .tabbar,html.zen #editorStatus,html.zen #prose{display:none!important}
+html.zen #editorPane{display:flex!important;flex:1 1 100%}
+html.zen .cm-content{max-width:46em;margin:0 auto}
+#zenExit{position:fixed;top:10px;right:16px;z-index:20;opacity:.7}
+#zenExit:hover,#zenExit:focus-visible{opacity:1}
+
+/* Git panel (git.js) */
+#panel-git{flex:1;min-height:0;overflow:auto;padding:6px 8px}
+.git-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0}
+.git-row .spacer{flex:1}
+.git-where{font:12px var(--mono);word-break:break-all}
+.git-file{display:flex;align-items:center;gap:8px;padding:4px 0}
+.git-path{flex:1;min-width:0;text-align:left;font:12px var(--mono);word-break:break-all}
+.git-code{font-size:11px}
+.git-merge{border:1px solid var(--ox);border-radius:var(--r);padding:8px;margin:8px 0}
+.git-commit{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.git-commit textarea,.git-field input{width:100%;box-sizing:border-box;background:var(--paper);border:1px solid var(--rule-strong);border-radius:var(--r);padding:6px 8px;font:inherit}
+.git-field{display:flex;flex-direction:column;gap:4px;margin:8px 0;font-size:13px}
+.git-pre{margin:0;padding:8px;background:var(--code);border:1px solid var(--rule);border-radius:6px;overflow:auto;max-height:50vh;font:12px/1.5 var(--mono)}
+.git-pre .dl-add{color:var(--moss)}
+.git-pre .dl-del{color:var(--ox)}
+.git-pre .dl-hunk,.git-pre .dl-meta{color:var(--muted)}
+.git-log li{padding:6px 0;font-size:13px}
+.git-subject{font-weight:600}
+
+/* Team features (review.js card, notify.js, team.js) */
+.cm-sug-card{padding:8px 10px;max-width:min(420px,85vw);font:13px/1.4 var(--sans)}
+.cm-sug-card .rv-head{display:flex;align-items:center;gap:6px}
+.cm-sug-card .rv-change{margin:6px 0}
+.cm-sug-card del{color:var(--ox);background:var(--ox-soft)}
+.cm-sug-card ins{color:var(--moss);background:var(--moss-soft);text-decoration:none}
+.cm-sug-card .rv-c{border-top:1px solid var(--rule);padding-top:4px;margin-top:4px}
+.cm-sug-card .rv-body{margin:2px 0;white-space:pre-wrap}
+.cm-sug-card button.icon.ok{color:var(--moss)}
+.cm-sug-card button.icon.no{color:var(--ox)}
+.bell .count{position:absolute;margin:-14px 0 0 14px}
+.bell-list{min-width:320px;max-height:60vh;overflow:auto}
+.bell-list button.row{display:block;height:auto;white-space:normal;padding:6px 10px;line-height:1.35}
+.bell-list .bell-text{display:block;color:var(--ink-2);font-size:12px}
+.mention-list{position:relative;top:0;right:auto;min-width:200px;list-style:none;margin:2px 0;padding:4px}
+.mention-list li{padding:4px 8px;border-radius:5px;cursor:pointer}
+.mention-list li.on{background:var(--accent-soft);color:var(--accent)}
+.role.locked{background:var(--ox-soft);color:var(--ox)}
+.tag.linked{margin-left:auto;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+#panel-files.drop{outline:2px dashed var(--accent);outline-offset:-4px}
+#viewer.pick .page{cursor:crosshair}
+/* Navigation (nav.js, navpanels.js) */
+.cm-navNum{margin-left:3px;padding:0 4px;border-radius:3px;background:var(--sunk);color:var(--muted);font:11px var(--mono)}
+.cm-navMath{padding:4px 12px;margin:2px 0 6px;border-left:3px solid var(--rule);color:var(--ink-2);overflow-x:auto}
+.cm-navMarks .cm-gutterElement{width:12px;padding:0 2px;cursor:pointer}
+.cm-navMark{color:var(--accent);font-size:10px}
+.nav-filter{display:block;width:calc(100% - 20px);margin:0 10px 8px;font-size:13px}
+#outlineExtra{padding:0 0 10px}
+.nav-group{margin:6px 4px 0}
+.nav-group summary{padding:6px;font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);cursor:pointer}
+.nav-row .nav-tag{flex:none;max-width:45%;color:var(--muted);font:11px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#dpanel-todos .nav-row,#dpanel-bookmarks .nav-row{font-size:13px}
+.nav-body{padding:14px 22px 20px;max-height:70vh;overflow:auto}
+.nav-body p{margin:0 0 10px;color:var(--ink-2)}
+.nav-list .nav-hit{display:block;width:100%;text-align:left;font:12px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:3px 0}
+.nav-typeset{min-height:40px;color:var(--ink-2)}
+.nav-typeset canvas{display:block;max-width:100%;height:auto;background:#fff;border-radius:4px}
+#navDlg:has(.nav-graph){width:min(1100px,96vw);max-width:96vw}
+.nav-graph{overflow:auto;max-height:62vh}
+.nav-node rect{fill:var(--surface);stroke:var(--rule-strong)}
+.nav-node[role=button]{cursor:pointer}
+.nav-node[role=button]:hover rect,.nav-node:focus-visible rect{stroke:var(--accent);fill:var(--accent-soft)}
+.nav-node:focus{outline:none}
+.nav-node text{fill:var(--ink);font:12px var(--mono)}
+.nav-node.missing rect{stroke:var(--ox);stroke-dasharray:4 3}
+.nav-node.missing text{fill:var(--ox)}
+.nav-edge{fill:none;stroke:var(--accent);stroke-width:1.5}
+.nav-edge.e-graphics{stroke:var(--moss)}
+.nav-edge.e-bibliography{stroke:var(--ochre)}
+.nav-edge.e-package{stroke:var(--muted)}
+.nav-edge.missing{stroke:var(--ox);stroke-dasharray:4 3}
+.nav-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px}
+.nav-key::before{content:"";display:inline-block;width:18px;height:0;margin-right:5px;vertical-align:middle;border-top:2px solid var(--accent)}
+.nav-key.e-graphics::before{border-color:var(--moss)}.nav-key.e-bibliography::before{border-color:var(--ochre)}
+.nav-key.e-package::before{border-color:var(--muted)}.nav-key.missing::before{border-top-style:dashed;border-color:var(--ox)}
+.nav-present{position:fixed;inset:0;z-index:1000;background:#000;display:grid;place-items:center;outline:none}
+.nav-present-n{position:fixed;right:14px;bottom:10px;color:#bbb;font:12px var(--mono)}
+.sym-groups{padding:0 10px 12px}
+.sym-group h2{margin:10px 0 6px}
+.sym-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(36px,1fr));gap:4px}
+.sym{height:36px;border:1px solid var(--rule);border-radius:5px;background:var(--surface);font:18px var(--serif);color:var(--ink)}
+.sym:hover,.sym:focus-visible{border-color:var(--accent);background:var(--accent-soft)}

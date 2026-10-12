@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%231F3A68'/%3E%3Cpath d='M7 7h10M12 7v10' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="ui/style.css">
+<link rel="stylesheet" href="ui/tools.css">
 <!-- Single source of the pinned third-party URLs. scripts/vendor_ui.py downloads them; serve.py swaps in the local copies. -->
 <script type="importmap">
 {
@@ -17,6 +18,7 @@
   "@codemirror/commands": "https://esm.sh/@codemirror/commands@6.8.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@codemirror/search": "https://esm.sh/@codemirror/search@6.5.10?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@codemirror/autocomplete": "https://esm.sh/@codemirror/autocomplete@6.18.6?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
+  "@codemirror/lint": "https://esm.sh/@codemirror/lint@6.8.5?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@lezer/common": "https://esm.sh/@lezer/common@1.2.3?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "@lezer/highlight": "https://esm.sh/@lezer/highlight@1.2.1?external=@codemirror/state,@codemirror/view,@codemirror/language,@codemirror/commands,@codemirror/search,@codemirror/autocomplete,@lezer/common,@lezer/highlight,@lezer/lr",
   "yjs": "https://esm.sh/yjs@13.6.27?deps=lib0@0.2.99",
@@ -42,6 +44,7 @@
     <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></symbol>
     <symbol id="i-files" viewBox="0 0 24 24"><path d="M8 3h7l4 4v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M4 7v12a2 2 0 0 0 2 2h9"/></symbol>
     <symbol id="i-outline" viewBox="0 0 24 24"><path d="M4 6h16M8 12h12M12 18h8"/></symbol>
+    <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-12 3-12 8"/></symbol>
     <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17.5v.01"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4L4 9"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14 4l2-2"/><path d="M20 20v-5h-5"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
@@ -70,8 +73,14 @@
     <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
     <symbol id="i-comment" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 20a2 2 0 0 0 4 0"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
     <symbol id="i-suggest" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-4-4L4 16z"/><path d="M14 20h6"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
+    <symbol id="i-present" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M12 16v4M8 20h8"/></symbol>
+    <symbol id="i-newtab" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+    <symbol id="i-omega" viewBox="0 0 24 24"><path d="M5 19h4v-2a6 6 0 1 1 6 0v2h4"/></symbol>
   </defs>
 </svg>
 
@@ -109,9 +118,12 @@
     <div class="side-tabs">
       <div class="tl" role="tablist" aria-label="Sidebar">
         <button role="tab" id="tab-files" aria-controls="panel-files" aria-selected="true"><svg class="ic"><use href="#i-files"/></svg>Files</button>
+        <button role="tab" id="tab-search" aria-controls="panel-search" aria-selected="false"><svg class="ic"><use href="#i-search"/></svg>Search</button>
         <button role="tab" id="tab-outline" aria-controls="panel-outline" aria-selected="false"><svg class="ic"><use href="#i-outline"/></svg>Outline</button>
         <button role="tab" id="tab-refs" aria-controls="panel-refs" aria-selected="false"><svg class="ic"><use href="#i-book"/></svg>References</button>
+        <button role="tab" id="tab-symbols" aria-controls="panel-symbols" aria-selected="false"><svg class="ic"><use href="#i-omega"/></svg>Symbols</button>
         <button role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false"><svg class="ic"><use href="#i-spark"/></svg>Assistant</button>
+        <button role="tab" id="tab-git" aria-controls="panel-git" aria-selected="false" hidden><svg class="ic"><use href="#i-branch"/></svg>Git</button>
       </div>
       <button class="icon x" id="sideClose" aria-label="Close sidebar" title="Close sidebar"><svg class="ic"><use href="#i-x"/></svg></button>
     </div>
@@ -126,11 +138,15 @@
       </div>
       <div id="tree" role="tree" aria-label="Files"></div>
     </div>
+    <div id="panel-search" role="tabpanel" aria-labelledby="tab-search" hidden></div>
     <div id="panel-refs" role="tabpanel" aria-labelledby="tab-refs" hidden></div>
+    <div id="panel-symbols" role="tabpanel" aria-labelledby="tab-symbols" hidden></div>
     <div id="panel-ai" role="tabpanel" aria-labelledby="tab-ai" hidden></div>
+    <div id="panel-git" role="tabpanel" aria-labelledby="tab-git" hidden></div>
     <div id="panel-outline" role="tabpanel" aria-labelledby="tab-outline" hidden>
       <div id="outlineHead" class="outline-head"></div>
       <div id="outlineList" role="group" aria-label="Document outline"></div>
+      <div id="outlineExtra" role="group" aria-label="Figures, tables, labels and TODOs"></div>
     </div>
   </aside>
 
@@ -173,12 +189,15 @@
       <span id="zLevel" class="mute" aria-live="polite">133%</span>
       <button id="zIn" class="icon" aria-label="Zoom in" title="Zoom in"><svg class="ic"><use href="#i-plus"/></svg></button>
       <button id="zFit" class="icon" aria-label="Fit width" title="Fit width"><svg class="ic"><use href="#i-fit"/></svg></button>
+      <button id="pdfDark" class="icon" aria-pressed="false" aria-label="Dark PDF pages" title="Dark PDF pages (inverts the page colours)"><svg class="ic"><use href="#i-moon"/></svg></button>
       <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
+      <button id="presentBtn" class="icon" aria-label="Present the PDF" title="Present: full screen, one page at a time, arrow keys (Esc ends)"><svg class="ic"><use href="#i-present"/></svg></button>
+      <button id="pdfTabBtn" class="icon" aria-label="Open the PDF in a new tab" title="Open the PDF in a new tab"><svg class="ic"><use href="#i-newtab"/></svg></button>
       <span id="liveState" class="live-state" hidden></span>
     </div>
     <div id="focusNote" class="focus-note" role="status" hidden></div>
     <div id="pdfNote" class="pdf-note" hidden></div>
-    <div id="viewer" tabindex="0" aria-label="PDF pages"><div id="pages"></div><div id="empty" hidden></div></div>
+    <div id="viewer" role="region" tabindex="0" aria-label="PDF pages"><div id="pages"></div><div id="empty" hidden></div></div>
   </section>
 </main>
 
@@ -191,6 +210,8 @@
       <button role="tab" id="dtab-grammar" aria-controls="dpanel-grammar" aria-selected="false">Grammar <span id="grammarCount" class="count"></span></button>
       <button role="tab" id="dtab-review" aria-controls="dpanel-review" aria-selected="false">Review <span id="reviewCount" class="count"></span></button>
       <button role="tab" id="dtab-history" aria-controls="dpanel-history" aria-selected="false">History</button>
+      <button role="tab" id="dtab-todos" aria-controls="dpanel-todos" aria-selected="false">TODOs <span id="todoCount" class="count"></span></button>
+      <button role="tab" id="dtab-bookmarks" aria-controls="dpanel-bookmarks" aria-selected="false">Bookmarks</button>
       <button role="tab" id="dtab-log" aria-controls="dpanel-log" aria-selected="false"><svg class="ic"><use href="#i-log"/></svg>Log</button>
     </div>
     <span class="spacer"></span>
@@ -208,6 +229,11 @@
   </div>
   <div id="dpanel-review" role="tabpanel" aria-labelledby="dtab-review" hidden></div>
   <div id="dpanel-history" role="tabpanel" aria-labelledby="dtab-history" hidden></div>
+  <div id="dpanel-todos" role="tabpanel" aria-labelledby="dtab-todos" hidden><ul id="todoList" class="plist"></ul></div>
+  <div id="dpanel-bookmarks" role="tabpanel" aria-labelledby="dtab-bookmarks" hidden>
+    <div class="wfilter" role="group" aria-label="Bookmarks in this file"><button type="button" class="chip" id="bmPrev">Previous (Ctrl+Alt+J)</button><button type="button" class="chip" id="bmNext">Next (Ctrl+Alt+L)</button></div>
+    <ul id="bookmarkList" class="plist"></ul>
+  </div>
   <div id="dpanel-log" tabindex="0" role="tabpanel" aria-labelledby="dtab-log" hidden><pre id="logText"></pre></div>
 </section>
 
@@ -248,6 +274,11 @@
   <div class="hv-foot"></div>
 </dialog>
 
+<dialog id="navDlg" aria-labelledby="navTitle">
+  <div class="dlg-head"><h2 id="navTitle"></h2><button type="button" class="icon" id="navClose" aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></div>
+  <div id="navBody" class="nav-body"></div>
+</dialog>
+
 <dialog id="palette" aria-label="Command palette">
   <div class="pal-head"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><input id="paletteInput" type="text" role="combobox" aria-expanded="true" aria-controls="paletteList" aria-autocomplete="list" placeholder="Type a command..." autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div>
   <ul id="paletteList" role="listbox"></ul>
@@ -269,8 +300,12 @@
         <div class="field"><label for="sFont">Font size</label><input id="sFont" type="number" min="10" max="28" step="1"></div>
         <label class="check wide"><input id="sSpell" type="checkbox"> Spell check: underline misspelled words in visual mode and the paragraph panel</label>
         <label class="check wide"><input id="sVisual" type="checkbox"> Visual mode on by default</label>
+        <label class="check wide"><input id="sCheck" type="checkbox"> Code check: underline unmatched \begin/\end, braces, \left/\right and math delimiters as you type (<code>%%novalidate</code> turns it off for a file)</label>
+        <label class="check wide"><input id="sNums" type="checkbox"> Label numbers: show the number each \label got in the last build next to it and to every \ref</label>
+        <label class="check wide"><input id="sMathPrev" type="checkbox"> Math preview: show displayed equations typeset (KaTeX) under their source</label>
       </div>
     </details>
+    <details class="set-more" id="sEditTools"></details>
     <details class="set-more" id="sGrammarBox">
       <summary>Grammar</summary>
       <div class="fields">
@@ -291,13 +326,17 @@
       <div class="fields">
         <div class="field"><label for="sZoom">Zoom (%)</label><input id="sZoom" type="number" min="30" max="500" step="10"></div>
         <div class="field"><label for="sInverse">Double-click in PDF</label><select id="sInverse"><option value="app">Jump in this editor</option><option value="vscode">Open in VS Code</option></select></div>
+        <label class="check wide"><input id="sPdfDark" type="checkbox"> Dark PDF pages: invert the page colours (this browser only)</label>
         <label class="check wide"><input id="sFocusAuto" type="checkbox"> Build the chapter preview after each save</label>
         <label class="check wide"><input id="sLive" type="checkbox"> Live preview: update the chapter you type in, in the PDF, as you pause</label>
+        <label class="check wide"><input id="sFollow" type="checkbox"> Follow the cursor: scroll the PDF to the line you are on, when you pause and after each build</label>
       </div>
     </details>
     <div class="actions"><button type="button" class="btn ghost" id="sCheat">Keyboard shortcuts</button><button class="btn primary" value="close">Done</button></div>
   </form>
 </dialog>
+
+<dialog id="snippetsDlg" class="et-dlg" aria-labelledby="snippetsTitle"></dialog>
 
 <dialog id="cheat" aria-labelledby="cheatTitle">
   <form method="dialog">

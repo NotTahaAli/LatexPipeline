@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,7 +25,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import ai
+import compile_api
 import host
+import host_git
 import host_mcp
 import serve
 import zotero
@@ -1464,6 +1467,75 @@ class Assistant(HostCase):
                     host.load_config(data)
             (data / "config.toml").write_text('[ai]\nenabled = true\nmodel = "claude-haiku-5-5"')
             self.assertEqual(host.load_config(data)["ai"]["daily_per_user"], 50)
+            for text in ('[ai]\nprovider = "other"', '[ai]\nprovider = "openai"\nmodel = "m"',
+                         '[ai]\nprovider = "openai"\nmodel = "m"\nbase_url = "http://example.com/v1"'):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+            (data / "config.toml").write_text('[ai]\nprovider = "openai"\nmodel = "org/m:7b"\n'
+                                              'base_url = "http://127.0.0.1:11434/v1/"')  # the operator may
+            self.assertEqual(host.load_config(data)["ai"]["base_url"], "http://127.0.0.1:11434/v1")
+
+    def test_an_openai_compatible_endpoint_set_by_the_operator(self):
+        self.app.config["ai"] = {**self.AI, "provider": "openai", "model": "m-large",
+                                 "base_url": "https://llm.example.org/v1"}
+        payload = json.dumps({"answer": "Close the brace.", "text": "", "edits": []})
+        urls = []
+        ai.post_json.side_effect = lambda url, body, headers: urls.append((url, headers)) or {
+            "model": "m-large", "choices": [{"finish_reason": "stop", "message": {"content": payload}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        editor = self.client("ed@x.org")
+        status, out, _ = self.ask(editor)
+        self.assertEqual((status, out["answer"]), (200, "Close the brace."))
+        self.assertEqual(urls[0], ("https://llm.example.org/v1/chat/completions",
+                                   {"Authorization": "Bearer " + self.KEY}))
+        info = editor.call("GET", f"/p/{self.pid}/api/ai")[1]
+        self.assertIn("llm.example.org", info["notice"])
+        self.assertNotIn(self.KEY, json.dumps(info) + json.dumps(out))
+
+
+class Library(HostCase):
+    """/p/<id>/api/library: each account's own reference library in host.db, answered by the gateway for every
+    project the person can open; never another person's, never a worker."""
+
+    BIB = "@article{a,\n  title = {A Made Up Title},\n  doi = {10.1/a}\n}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        self.pid2 = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc2", "article")
+        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for the library")).start()
+
+    def test_one_library_per_account_across_projects(self):
+        editor, viewer = self.client("ed@x.org"), self.client("vi@x.org")
+        status, out, _ = editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB})
+        self.assertEqual((status, len(out["added"])), (200, 1))
+        status, out, _ = editor.call("POST", f"/p/{self.pid2}/api/library", {"op": "add", "entries": [
+            {"type": "misc", "key": "b", "fields": {"title": "Other", "doi": "10.1/A"}}]})
+        self.assertEqual(len(out["entries"]), 2)
+        self.assertEqual(out["entries"][1]["duplicates"], [out["entries"][0]["id"]])
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/library")[1]["entries"], [])  # their own
+        status, out, _ = viewer.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB})
+        self.assertEqual((status, len(out["entries"])), (200, 1))
+        self.assertEqual(len(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]), 2)
+        ids = [e["id"] for e in editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]]
+        self.assertEqual(viewer.call("POST", f"/p/{self.pid}/api/library", {"op": "delete", "ids": ids})[0], 200)
+        self.assertEqual(len(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"]), 2)
+
+    def test_outsiders_csrf_and_bad_input(self):
+        self.assertEqual(self.client("out@x.org").call("GET", f"/p/{self.pid}/api/library")[0], 404)
+        self.assertIn(self.client().call("GET", f"/p/{self.pid}/api/library")[0], (401, 302, 303, 404))
+        editor = self.client("ed@x.org")
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": self.BIB},
+                                     origin="https://evil.example")[0], 403)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "add", "text": "none"})[0], 400)
+        self.assertEqual(editor.call("POST", f"/p/{self.pid}/api/library", {"op": "nope"})[0], 400)
+        self.assertEqual(editor.call("GET", f"/p/{self.pid}/api/library")[1]["entries"], [])
 
 
 class Zotero(HostCase):
@@ -1705,6 +1777,7 @@ class Mcp(HostCase):
         self.other = host.create_tenant(self.app, "Other")
         self.user("ed@x.org", "editor", self.tenant)
         self.user("vi@x.org", "viewer", self.tenant)
+        self.user("re@x.org", "reviewer", self.tenant)
         self.user("ot@x.org", "admin", self.other)
         self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
         self.opid = Workspaces.make_project(self, self.client("ot@x.org"), self.other, "Secret", "article")
@@ -2149,6 +2222,771 @@ class Mcp(HostCase):
         host_mcp.THROTTLES.clear()
         self.app.config["mcp"]["calls_per_minute"] = 2
         self.assertEqual([self.mcp(token, listing)[0] for _ in range(3)], [200, 200, 429])
+
+    # --- the reviewer workspace role: comments and suggestions in the editor and over MCP, no file changes ---
+
+    def test_the_migration_keeps_members_and_invites_and_allows_reviewers(self):
+        import sqlite3
+        path = self.data / "old.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("".join(host.MIGRATIONS[:4]) + "CREATE TABLE schema_version(version INTEGER NOT NULL);"
+                           "INSERT INTO schema_version VALUES (4);"
+                           "INSERT INTO tenants VALUES ('t', 'T', 0);"
+                           "INSERT INTO users(id, email, name, created) VALUES (1, 'a@x.org', 'A', 0);"
+                           "INSERT INTO members VALUES ('t', 1, 'viewer');"
+                           "INSERT INTO invites(token_hash, tenant_id, role, created, expires) "
+                           "VALUES ('h', 't', 'editor', 0, 1);")
+        with self.assertRaises(sqlite3.IntegrityError):  # the old CHECK
+            conn.execute("UPDATE members SET role = 'reviewer'")
+        conn.close()
+        db = host.DB(path)
+        self.addCleanup(db.conn.close)
+        self.assertEqual(db.version(), len(host.MIGRATIONS))
+        self.assertEqual([(r["tenant_id"], r["user_id"], r["role"]) for r in db.all("SELECT * FROM members")],
+                         [("t", 1, "viewer")])
+        self.assertEqual(db.one("SELECT role, token_hash FROM invites")["role"], "editor")
+        db.run("UPDATE members SET role = 'reviewer'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.run("UPDATE members SET role = 'owner'")
+        db.run("DELETE FROM tenants")  # the foreign keys still cascade
+        self.assertEqual(db.all("SELECT * FROM members"), [])
+
+    def test_workspace_admins_assign_the_role_and_reviewers_make_no_projects(self):
+        self.user("ad@x.org", "admin", self.tenant)
+        admin, reviewer = self.client("ad@x.org"), self.client("re@x.org")
+        self.assertEqual(admin.call("POST", f"/api/tenants/{self.tenant}/invites", {"role": "reviewer"})[0], 200)
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'vi@x.org'")["id"]
+        self.assertEqual(admin.call("POST", f"/api/tenants/{self.tenant}/members/{uid}", {"role": "reviewer"})[0],
+                         200)
+        self.assertEqual(self.client("vi@x.org").call("GET", f"/api/tenants/{self.tenant}")[1]["role"], "reviewer")
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/projects", {"name": "X"})[0], 403)
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/upload?name=X", {})[0], 403)
+        self.assertEqual(reviewer.call("DELETE", f"/api/projects/{self.pid}")[0], 403)
+        self.assertEqual(reviewer.call("POST", f"/api/tenants/{self.tenant}/invites", {"role": "viewer"})[0], 403)
+        self.assertEqual(reviewer.call("GET", f"/api/projects/{self.pid}/zip")[0], 200)  # reads like a viewer
+
+    def test_the_worker_gets_the_review_role(self):
+        upstream = Upstream()
+        upstream.start()
+        self.addCleanup(upstream.sock.close)
+        self.fake_worker(upstream.port)
+        forged = {"X-Host-Role": "edit", "X-Host-Admin": "1"}
+        status, data, _ = self.client("re@x.org").call("GET", f"/p/{self.pid}/api/config", headers=forged)
+        self.assertEqual(status, 200)
+        self.assertEqual([h for h in data["headers"] if h.startswith("X-Host-")][:2],
+                         [f"X-Host-Secret: {'w' * 43}", "X-Host-Role: review"])
+        self.assertFalse([h for h in data["headers"] if h.startswith("X-Host-Admin")])
+
+    def test_reviewers_comment_and_suggest_in_the_editor_but_change_nothing(self):
+        self.real_worker()
+        reviewer, editor = self.client("re@x.org"), self.client("ed@x.org")
+        base = f"/p/{self.pid}"
+        self.assertEqual(reviewer.call("GET", f"{base}/api/config")[1]["role"], "review")
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        before = (source / "main.tex").read_text()
+        for method, path, body in (("PUT", "/api/file?doc=Doc&path=main.tex", {"text": "x"}),
+                                   ("PUT", "/api/file?doc=Doc&path=build.toml", {"text": "x"}),
+                                   ("POST", "/api/fs?doc=Doc&op=newfile&path=x.tex", {}),
+                                   ("POST", "/rebuild?doc=Doc", {}),
+                                   ("POST", "/api/history/label?doc=Doc", {"label": "v"})):
+            with self.subTest(path=path):
+                self.assertEqual(reviewer.call(method, base + path, body)[0], 403)
+        self.assertEqual((source / "main.tex").read_text(), before)
+        quote = "\\begin{document}"
+        at = before.index(quote)
+        anchor = {"from": at, "to": at + len(quote), "quote": quote, "prefix": "", "suffix": ""}
+        status, made, _ = reviewer.call("POST", f"{base}/api/review?doc=Doc",
+                                        {"op": "suggest", "path": "main.tex", "anchor": anchor, "insert": "x"})
+        self.assertEqual(status, 200)
+        accept = {"op": "accept", "ids": [made["item"]["id"]]}
+        self.assertEqual(reviewer.call("POST", f"{base}/api/review?doc=Doc", accept)[0], 403)
+        self.assertEqual(editor.call("POST", f"{base}/api/review?doc=Doc", accept)[0], 200)
+        self.assertFalse(reviewer.call("GET", f"{base}/api/ai")[1]["enabled"])
+        self.assertFalse(reviewer.call("GET", f"{base}/api/zotero")[1]["can_sync"])
+
+    def test_reviewers_over_mcp_get_the_review_tools_only(self):
+        self.worker()
+        token = self.connect(email="re@x.org")[1]["access_token"]
+        projects = self.tool(token, "list_projects")["structuredContent"]["projects"]
+        self.assertEqual([p["access"] for p in projects], [["read", "review"]])
+        quote = "\\begin{document}"
+        made = self.tool(token, "add_comment", project=self.pid, path="main.tex", quote=quote, comment="Hm")
+        self.assertFalse(made["isError"], made)
+        tid = made["structuredContent"]["id"]
+        self.assertFalse(self.tool(token, "reply_comment", project=self.pid, thread=tid, comment="More")["isError"])
+        self.assertFalse(self.tool(token, "resolve_thread", project=self.pid, thread=tid)["isError"])
+        sug = self.tool(token, "add_suggestion", project=self.pid, path="main.tex", quote=quote, replacement="x")
+        self.assertFalse(sug["isError"], sug)
+        sid = sug["structuredContent"]["id"]
+        self.assertFalse(self.tool(token, "withdraw_suggestion", project=self.pid, id=sid)["isError"])
+        refused = (("edit_file", {"path": "main.tex", "old_text": "document", "new_text": "x"}),
+                   ("write_file", {"path": "new.tex", "content": "x"}),
+                   ("delete_file", {"path": "main.tex"}),
+                   ("build", {}),
+                   ("label_version", {"label": "x"}),
+                   ("grammar_check", {"path": "main.tex"}),
+                   ("add_comment", {"path": "build.toml", "quote": "x", "comment": "x"}))
+        for name, args in refused:
+            with self.subTest(tool=name):
+                self.assertTrue(self.tool(token, name, project=self.pid, **args)["isError"])
+        source = self.app.project_source(self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid))
+        self.assertFalse((source / "new.tex").exists())
+        self.assertTrue((source / "main.tex").is_file())
+        self.assertIn("reviewer", self.tool(token, "edit_file", project=self.pid, path="main.tex",
+                                            old_text="document", new_text="x")["content"][0]["text"])
+        # The grant narrows the role too: a reviewer's read-only connection cannot comment.
+        reader = self.connect(email="re@x.org", scopes=())[1]["access_token"]
+        self.assertEqual(self.mcp(reader, {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+            "name": "add_comment", "arguments": {"project": self.pid, "path": "main.tex", "quote": quote,
+                                                 "comment": "x"}}})[0], 403)
+
+
+GIT_IDENTITY = {"GIT_AUTHOR_NAME": "Seed", "GIT_AUTHOR_EMAIL": "seed@example.org", "GIT_COMMITTER_NAME": "Seed",
+                "GIT_COMMITTER_EMAIL": "seed@example.org", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def run_git(cwd, *args, check=True):
+    return subprocess.run(["git", *args], cwd=str(cwd), check=check, capture_output=True, text=True,
+                          env={**os.environ, **GIT_IDENTITY})
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class GitSync(HostCase):
+    """Hosted Git sync: the gateway runs git with the person's own token; workers never take part. The network is a
+    local bare repository behind a fake host_git.transfer; the host name resolves to whatever the test says."""
+
+    URL = "https://git.example.org/team/thesis.git"
+    TOKEN = "ghp_SecretTokenOfEd123"
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.user("rv@x.org", "reviewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.editor = self.client("ed@x.org")
+        self.pid = Workspaces.make_project(self, self.editor, self.tenant, "Doc", "article")
+        self.project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
+        self.source = self.app.project_source(self.project)
+        acquire = mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Git"))
+        acquire = acquire.start()
+        self.addCleanup(lambda: self.assertEqual(acquire.call_count, 0, "a Git request went on to a worker"))
+        self.addresses = ["8.8.8.8"]
+        mock.patch.object(host_git, "resolve", side_effect=lambda h, p: list(self.addresses)).start()
+        self.transfers = []
+        mock.patch.object(host_git, "transfer", side_effect=self.fake_transfer).start()
+        self.remote = self.data / "remote.git"
+        run_git(self.data, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        self.seed = self.data / "seed"
+        run_git(self.data, "clone", "-q", str(self.remote), str(self.seed))
+
+    def fake_transfer(self, project, args, url, auth):
+        """The real transfer pins the host and runs git with the token in its environment; here the same git runs
+        against a local bare repository instead of the URL."""
+        self.transfers.append((args[0], url, auth))
+        env = host_git.repo_env(project, [("protocol.file.allow", "always")])
+        return subprocess.run(["git", *[str(self.remote) if a == url else a for a in args]],
+                              cwd=str(self.source), env=env, capture_output=True, text=True)
+
+    def upstream(self, files, message="upstream"):
+        run_git(self.seed, "pull", "-q", "--no-rebase", "origin", "main", check=False)
+        for name, text in files.items():
+            (self.seed / name).write_text(text, encoding="utf-8")
+        run_git(self.seed, "add", "-A")
+        run_git(self.seed, "commit", "-q", "-m", message)
+        run_git(self.seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    def sync(self, client, op, **extra):
+        return client.call("POST", f"/p/{self.pid}/api/git/remote?doc=Doc", {"op": op, **extra})
+
+    def connect(self, client=None):
+        return self.sync(client or self.editor, "connect", url=self.URL, branch="main")
+
+    def set_token(self, client=None):
+        return (client or self.editor).call("POST", "/api/account/git", {"token": self.TOKEN, "username": "ed"})
+
+    def test_token_is_kept_server_side(self):
+        status, info, _ = self.editor.call("GET", "/api/account/git")
+        self.assertEqual((status, info["has_key"]), (200, False))
+        status, info, _ = self.set_token()
+        self.assertEqual((status, info), (200, {"has_key": True, "username": "ed"}))
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.assertEqual(self.app.db.one("SELECT token FROM git_tokens WHERE user_id = ?", uid)["token"], self.TOKEN)
+        for bad in ({"token": "short", "username": "ed"}, {"token": "has space inside", "username": "ed"},
+                    {"token": self.TOKEN}, {"token": self.TOKEN, "username": "a b"}):
+            self.assertEqual(self.editor.call("POST", "/api/account/git", bad)[0], 400, bad)
+        no_csrf = self.client("ed@x.org")
+        no_csrf.csrf = None
+        self.assertEqual(self.set_token(no_csrf)[0], 403)
+        self.assertEqual(Client(self).call("GET", "/api/account/git")[0], 401)
+        self.assertEqual(self.editor.call("POST", "/api/account/git", {"clear_token": True})[1]["has_key"], False)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git_token%'")]
+        self.assertEqual(actions, ["git_token_set", "git_token_removed"])
+
+    def test_who_may_connect_and_where_to(self):
+        for email in ("vi@x.org", "rv@x.org"):
+            client = self.client(email)
+            self.assertEqual(client.call("GET", f"/p/{self.pid}/api/git/remote")[0], 200)
+            self.assertEqual(self.connect(client)[0], 403, email)
+        self.assertEqual(self.connect(self.client("out@x.org"))[0], 404)
+        self.assertEqual(self.editor.call("GET", f"/p/{self.pid}/api/git")[0], 404)  # the local panel: not hosted
+        for url in ("http://git.example.org/a.git", "ssh://git.example.org/a.git", "file:///etc", "https://u:p@h.org/a",
+                    "https://h.org/a?x=1", "https://h.org", "ext::sh -c touch% /tmp/x", "https://h.org/a b"):
+            with self.subTest(url=url):
+                self.assertEqual(self.sync(self.editor, "connect", url=url, branch="main")[0], 400)
+        for branch in ("-f", "a..b", "x/", "a b", ".hidden", "x" * 200):
+            with self.subTest(branch=branch):
+                self.assertEqual(self.sync(self.editor, "connect", url=self.URL, branch=branch)[0], 400)
+        for addresses in (["127.0.0.1"], ["10.1.2.3"], ["::1"], ["169.254.169.254"], ["192.168.0.2"], ["fd00::1"],
+                          ["8.8.8.8", "172.16.0.1"], ["::ffff:127.0.0.1"], ["100.64.0.1"], ["0.0.0.0"]):
+            self.addresses = addresses
+            with self.subTest(addresses=addresses):
+                self.assertEqual(self.connect()[0], 400)  # SSRF: a private address after DNS resolution
+        self.addresses = ["8.8.8.8"]
+        status, data, _ = self.connect()
+        self.assertEqual(status, 200, data)
+        info = self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1]
+        self.assertEqual((info["connected"], info["url"], info["branch"], info["has_token"]),
+                         (True, self.URL, "main", False))
+        audit = self.app.db.one("SELECT * FROM audit WHERE action = 'git_connected'")
+        self.assertIn(self.URL, audit["detail"])
+        cross = self.editor.call("POST", f"/p/{self.pid}/api/git/remote", {"op": "pull"}, origin="https://evil.example")
+        self.assertEqual(cross[0], 403)
+
+    def test_first_pull_never_overwrites_a_different_file(self):
+        self.upstream({"main.tex": "\\documentclass{article}\\begin{document}Remote\\end{document}\n",
+                       "ch1.tex": "Chapter\n"})
+        self.connect()
+        mine = (self.source / "main.tex").read_text(encoding="utf-8")
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), mine)
+        self.assertFalse((self.source / "ch1.tex").exists())
+        (self.source / "main.tex").unlink()  # the person clears the way in the editor
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        self.assertIn("Remote", (self.source / "main.tex").read_text(encoding="utf-8"))
+        self.assertEqual((self.source / "ch1.tex").read_text(encoding="utf-8"), "Chapter\n")
+        self.assertIsNone(self.transfers[0][2])  # no token saved: a public repository is pulled without one
+        info = self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1]
+        self.assertTrue(info["synced"] and info["commit"])
+
+    def pulled(self):
+        self.upstream({"main.tex": "one\ntwo\nthree\nfour\nfive\n"})
+        (self.source / "main.tex").unlink()
+        self.connect()
+        self.assertTrue(self.sync(self.editor, "pull")[1]["ok"])
+
+    def test_pull_merges_and_conflicts_are_listed_never_resolved(self):
+        self.pulled()
+        (self.source / "main.tex").write_text("ONE\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+        self.upstream({"main.tex": "one\ntwo\nthree\nfour\nFIVE\n"})
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\ntwo\nthree\nfour\nFIVE\n")
+        (self.source / "main.tex").write_text("ONE\nmine\nthree\nfour\nFIVE\n", encoding="utf-8")
+        self.upstream({"main.tex": "ONE\ntheirs\nthree\nfour\nFIVE\n"})
+        status, result, _ = self.sync(self.editor, "pull")
+        self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\nmine\nthree\nfour\nFIVE\n")
+        self.assertIn("conflicts: main.tex", self.app.db.all("SELECT detail FROM audit WHERE action = 'git_pull'")[-1]
+                      ["detail"])
+
+    def test_push_needs_the_persons_token_and_never_shows_it(self):
+        self.pulled()
+        (self.source / "ch2.tex").write_text("New chapter\n", encoding="utf-8")
+        self.assertEqual(self.sync(self.editor, "push")[0], 400)  # no token yet
+        self.assertEqual(self.app.db.all("SELECT detail FROM audit WHERE action = 'git_push'")[-1]["detail"],
+                         f"{self.pid} failed: 400")  # refused attempts are audited too
+        self.set_token()
+        status, result, _ = self.sync(self.editor, "push")
+        self.assertEqual((status, result["ok"]), (200, True), result)
+        op, url, auth = self.transfers[-1]
+        self.assertEqual((op, url), ("push", self.URL))
+        self.assertEqual(base64.b64decode(auth).decode(), f"ed:{self.TOKEN}")
+        log = run_git(self.remote, "log", "-1", "--format=%an <%ae>%n%s", "main").stdout
+        self.assertTrue(log.startswith("Ed <ed@x.org>"), log)
+        self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
+        self.upstream({"other.tex": "x\n"})
+        (self.source / "ch2.tex").write_text("Changed again\n", encoding="utf-8")
+        status, data, _ = self.sync(self.editor, "push")
+        self.assertEqual(status, 409, data)  # the repository moved on: pull first
+        replies = json.dumps([self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1], data, result])
+        self.assertNotIn(self.TOKEN, replies)
+        self.assertNotIn(self.TOKEN, "".join(p.read_text(errors="ignore") for p in self.source.rglob("*")
+                                             if p.is_file()))
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git_p%'")]
+        self.assertIn("git_push", actions)
+
+    def test_push_message_says_what_the_remote_received(self):
+        """A refused push leaves its snapshot commit here; the next push delivers it and must not say "no new
+        changes" just because that push itself committed nothing."""
+        self.pulled()
+        self.set_token()
+        self.upstream({"other.tex": "x\n"})
+        (self.source / "ch2.tex").write_text("Mine\n", encoding="utf-8")
+        self.assertEqual(self.sync(self.editor, "push")[0], 409)  # committed here, refused there
+        self.assertEqual(self.sync(self.editor, "pull")[1]["ok"], True)
+        status, result, _ = self.sync(self.editor, "push")
+        self.assertEqual((status, result["message"]), (200, "Pushed."), result)
+        self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
+        self.assertEqual(self.sync(self.editor, "push")[1]["message"], "Pushed (no new changes).")
+
+    def test_repository_outside_the_project_and_removed_with_it(self):
+        self.pulled()
+        gitdir = host_git.repo_dir(self.project)
+        self.assertTrue((gitdir / "HEAD").is_file())
+        self.assertNotIn(self.app.project_root(self.project), gitdir.parents)
+        self.assertFalse((self.source / ".git").exists())
+        self.assertEqual(self.editor.call("DELETE", f"/api/projects/{self.pid}")[0], 200)
+        self.assertFalse(gitdir.exists())
+
+    def test_quota_is_checked_before_files_are_written(self):
+        self.app.save_settings({"max_project_mb": 1})
+        self.upstream({"big.tex": "x" * (2 * 1024 * 1024)})
+        self.connect()
+        status, data, _ = self.sync(self.editor, "pull")
+        self.assertEqual(status, 507, data)
+        self.assertFalse((self.source / "big.tex").exists())
+
+    def test_symlinks_arrive_as_plain_files(self):
+        if os.name != "posix":
+            self.skipTest("needs symlinks")
+        os.symlink("/etc/passwd", self.seed / "link.tex")
+        self.upstream({"main.tex": "x\n"})
+        (self.source / "main.tex").unlink()
+        self.connect()
+        self.assertTrue(self.sync(self.editor, "pull")[1]["ok"])
+        self.assertFalse((self.source / "link.tex").is_symlink())
+        self.assertEqual((self.source / "link.tex").read_text(), "/etc/passwd")
+
+    def test_real_transfer_pins_the_checked_address_and_keeps_the_token_off_the_command_line(self):
+        mock.patch.stopall()
+        mock.patch.object(host_git, "resolve", return_value=["8.8.8.8"]).start()
+        seen = {}
+
+        class Proc:
+            returncode = 0
+
+            def __init__(self, args, **kw):
+                seen.update(args=args, env=kw["env"])
+
+            def communicate(self):
+                return b"", b""
+
+        host_git.ensure_repo(self.project, "main")
+        with mock.patch.object(host_git.subprocess, "Popen", Proc):
+            host_git.transfer(self.project, ["fetch", self.URL], self.URL, "QUJD")
+        env = seen["env"]
+        pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+        self.assertEqual(pairs["http.curloptResolve"], "git.example.org:443:8.8.8.8")
+        self.assertEqual(pairs["http.extraHeader"], "Authorization: Basic QUJD")
+        for key, value in (("protocol.allow", "never"), ("protocol.https.allow", "always"),
+                           ("http.followRedirects", "false"), ("core.symlinks", "false"),
+                           ("submodule.recurse", "false"), ("core.fsmonitor", "false")):
+            self.assertEqual(pairs[key], value)
+        self.assertNotIn("QUJD", " ".join(seen["args"]))
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertNotIn("HTTPS_PROXY", env)
+        mock.patch.object(host_git, "resolve", return_value=["127.0.0.1"]).start()
+        with mock.patch.object(host_git.subprocess, "Popen", side_effect=AssertionError("git must not run")), \
+                self.assertRaises(host.HttpError):
+            host_git.transfer(self.project, ["fetch", self.URL], self.URL, None)
+
+
+class ApiTokens(HostCase):
+    """Personal API tokens (VS Code, scripts): hashed, scoped to projects, revocable, the person's current role."""
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.user("ed@x.org", "editor", self.tenant)
+        self.user("vi@x.org", "viewer", self.tenant)
+        self.editor = self.client("ed@x.org")
+        self.pid = Workspaces.make_project(self, self.editor, self.tenant, "Doc", "article")
+        self.pid2 = Workspaces.make_project(self, self.editor, self.tenant, "Other", "article")
+        self.upstream = Upstream()
+        self.upstream.start()
+        self.addCleanup(self.upstream.sock.close)
+        Proxy.fake_worker(self, self.upstream.port)
+
+    def bearer(self, token, method, path, body=None, headers=None):
+        client = Client(self)
+        return client.call(method, path, body, origin=False, headers={"Authorization": f"Bearer {token}",
+                                                                       **(headers or {})})
+
+    def make(self, client=None, projects=None):
+        status, data, _ = (client or self.editor).call("POST", "/api/account/tokens",
+                                                       {"name": "VS Code", "projects": projects or [self.pid]})
+        self.assertEqual(status, 201, data)
+        return data
+
+    def test_tokens_open_only_their_projects_with_the_current_role(self):
+        made = self.make()
+        token = made["token"]
+        self.assertTrue(token.startswith("lpat_"))
+        row = self.app.db.one("SELECT * FROM api_tokens WHERE id = ?", made["id"])
+        self.assertEqual(row["token_hash"], host.token_hash(token))
+        self.assertNotIn(token, json.dumps(self.editor.call("GET", "/api/account/tokens")[1]))
+        status, data, _ = self.bearer(token, "PUT", f"/p/{self.pid}/api/file?doc=Doc&path=a.tex", {"text": "hi"})
+        self.assertEqual(status, 200, data)  # no Origin and no cookie: a bearer token is not a browser's
+        self.assertIn("X-Host-Role: edit", data["headers"])
+        self.assertTrue(any(h.startswith("X-Host-User: ") and h.endswith(";Ed") for h in data["headers"]))
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid2}/api/files?doc=Other")[0], 404)  # not in scope
+        for rest in ("/api/ai", "/api/zotero"):
+            self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}{rest}")[0], 403)
+        upgrade = {"Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Key": "x" * 24,
+                   "Sec-WebSocket-Version": "13"}
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/ws", headers=upgrade)[0], 403)
+        self.assertEqual(self.bearer(token, "POST", f"/p/{self.pid}/api/mcp", {})[0], 404)
+        status, who, _ = self.bearer(token, "GET", "/api/token")
+        self.assertEqual((status, who["name"], [p["id"] for p in who["projects"]]), (200, "Ed", [self.pid]))
+        self.assertEqual(who["projects"][0]["role"], "edit")
+        uid = self.app.db.one("SELECT id FROM users WHERE email = 'ed@x.org'")["id"]
+        self.app.db.run("UPDATE members SET role = 'viewer' WHERE user_id = ?", uid)  # demoted: the token follows
+        status, data, _ = self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")
+        self.assertIn("X-Host-Role: view", data["headers"])
+        self.app.db.run("DELETE FROM members WHERE user_id = ?", uid)  # removed: gone at once
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 404)
+        for bad in ("lpat_wrong", "not-a-token", "lpat_" + "x" * 200):
+            self.assertEqual(self.bearer(bad, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        self.assertEqual(self.bearer(token, "GET", "/api/me")[1].get("user"), None)  # never a session elsewhere
+
+    def test_create_list_revoke_and_end_with_the_password(self):
+        viewer = self.client("vi@x.org")
+        made = self.make(viewer)
+        listed = viewer.call("GET", "/api/account/tokens")[1]["tokens"]
+        self.assertEqual([(t["id"], t["projects"][0]["name"]) for t in listed], [(made["id"], "Doc")])
+        status, data, _ = self.bearer(made["token"], "GET", f"/p/{self.pid}/api/files?doc=Doc")
+        self.assertIn("X-Host-Role: view", data["headers"])  # a viewer's token can only view
+        self.assertEqual(self.editor.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 404)  # not theirs
+        self.assertEqual(viewer.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 200)
+        self.assertEqual(self.bearer(made["token"], "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        outsider_tenant = host.create_tenant(self.app, "Elsewhere")
+        self.user("out@x.org", "editor", outsider_tenant)
+        outsider = self.client("out@x.org")
+        status, _, _ = outsider.call("POST", "/api/account/tokens", {"name": "x", "projects": [self.pid]})
+        self.assertEqual(status, 404)  # only projects the person can open
+        for bad in ({"name": "x", "projects": []}, {"name": "x", "projects": ["../x"]},
+                    {"name": "", "projects": [self.pid]}):
+            self.assertEqual(self.editor.call("POST", "/api/account/tokens", bad)[0], 400, bad)
+        no_csrf = self.client("ed@x.org")
+        no_csrf.csrf = None
+        self.assertEqual(no_csrf.call("POST", "/api/account/tokens", {"name": "x", "projects": [self.pid]})[0], 403)
+        token = self.make()["token"]
+        status, _, _ = self.editor.call("POST", "/api/account/password",
+                                        {"current": "password-123", "password": "another-password-456"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.bearer(token, "GET", f"/p/{self.pid}/api/files?doc=Doc")[0], 401)
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'api_token%'")]
+        self.assertEqual(actions, ["api_token_created", "api_token_revoked", "api_token_created"])
+
+
+class TeamGateway(HostCase):
+    """/p/<id>/api/people and /api/access/*: the gateway answers (members, roles); a worker is never started."""
+
+    def setUp(self):
+        super().setUp()
+        self.tenant = host.create_tenant(self.app, "Team")
+        self.other = host.create_tenant(self.app, "Other")
+        self.user("ad@x.org", "admin", self.tenant)
+        self.user("ed@x.org", "editor", self.tenant)
+        self.vid = self.user("vi@x.org", "viewer", self.tenant)
+        self.user("out@x.org", "editor", self.other)
+        self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
+        acquire = mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker")).start()
+        self.addCleanup(lambda: self.assertEqual(acquire.call_count, 0, "the request went on to a worker"))
+
+    def test_people_are_the_workspace_members(self):
+        status, data, _ = self.client("vi@x.org").call("GET", f"/p/{self.pid}/api/people")
+        self.assertEqual((status, data["people"]), (200, ["Ad", "Ed", "Vi"]))
+        self.assertEqual(self.client("out@x.org").call("GET", f"/p/{self.pid}/api/people")[0], 404)
+
+    def test_a_viewer_asks_and_an_admin_grants(self):
+        viewer, admin, editor = self.client("vi@x.org"), self.client("ad@x.org"), self.client("ed@x.org")
+        url = f"/p/{self.pid}/api/access/request"
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1]["state"], "none")
+        self.assertEqual(viewer.call("POST", url, {"role": "admin"})[0], 400)
+        self.assertEqual(viewer.call("POST", url, {"role": "edit", "note": "x" * 301})[0], 400)
+        self.assertEqual(viewer.call("POST", url, {"role": "edit"}, origin="http://evil.example")[0], 403)
+        self.assertEqual(editor.call("POST", url, {"role": "edit"})[0], 400)  # already an editor
+        self.assertEqual(viewer.call("POST", url, {"role": "edit", "note": "Please"})[0], 200)
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1],
+                         {"state": "pending", "want": "editor"})
+        self.assertNotIn("requests", editor.call("GET", f"/api/tenants/{self.tenant}")[1])  # admins only
+        found = admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"]
+        self.assertEqual([(r["id"], r["role"], r["note"], r["project"]) for r in found],
+                         [(self.vid, "editor", "Please", "Doc")])
+        member = f"/api/tenants/{self.tenant}/members/{self.vid}"
+        self.assertEqual(admin.call("POST", member, {"role": "editor"})[0], 200)
+        self.assertEqual(admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"], [])  # answered
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/access/status")[1]["state"], "none")
+
+    def test_dismiss_is_for_admins_and_requests_are_rate_limited(self):
+        viewer, admin, editor = self.client("vi@x.org"), self.client("ad@x.org"), self.client("ed@x.org")
+        url = f"/p/{self.pid}/api/access/request"
+        for _ in range(5):
+            self.assertEqual(viewer.call("POST", url, {"role": "review"})[0], 200)
+        self.assertEqual(viewer.call("POST", url, {"role": "review"})[0], 429)
+        self.assertEqual(editor.call("DELETE", f"/api/tenants/{self.tenant}/requests/{self.vid}")[0], 403)
+        self.assertEqual(admin.call("DELETE", f"/api/tenants/{self.tenant}/requests/{self.vid}")[0], 200)
+        self.assertEqual(admin.call("GET", f"/api/tenants/{self.tenant}")[1]["requests"], [])
+
+# --- Remote compile API: API tokens and POST /api/v1/compile (compile_api.py) ----------------------------------------
+
+API_DOC = "\\documentclass{article}\n\\begin{document}\nHello from the API.\n\\end{document}\n"
+BUILT = {"ok": True, "pdf": b"%PDF-1.7 fake", "log": "the log", "seconds": 0.4, "pages": 1, "errors": [],
+         "skipped": []}
+
+
+class CompileApiOff(HostCase):
+    def test_off_unless_the_operator_enables_it(self):
+        self.user("ed@x.org")
+        ed = self.client("ed@x.org")
+        status, data, _ = ed.call("GET", "/api/account/tokens")
+        self.assertEqual((status, list(data["scopes"]), data["compile_url"]), (200, ["projects"], None))
+        self.assertEqual(ed.call("POST", "/api/account/tokens", {"name": "ci", "scopes": ["compile"]})[0], 400)
+        self.assertEqual(Client(self).call("POST", "/api/v1/compile", raw=b"x", origin=False,
+                                           ctype="application/zip")[0], 404)
+
+    def test_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "config.toml").write_text("[api]\nenabled = true\nmax_upload_mb = 5\n")
+            self.assertEqual(host.load_config(data)["api"]["max_upload_mb"], 5)
+            for text in ('[api]\nenabled = "yes"', "[api]\nnope = 1", "[api]\nconcurrent = 0"):
+                (data / "config.toml").write_text(text)
+                with self.subTest(text=text), self.assertRaises(host.ConfigError):
+                    host.load_config(data)
+        self.assertIn("[api]", host.CONFIG_TEMPLATE)
+
+
+class CompileApiCase(HostCase):
+    LIMITS: dict = {}
+
+    def extra_config(self):
+        return {"api": {**compile_api.DEFAULTS, "enabled": True, **self.LIMITS}}
+
+    def setUp(self):
+        super().setUp()
+        compile_api.STATE["throttles"].clear()
+        self.addCleanup(compile_api.STATE["throttles"].clear)
+        self.uid = self.user("ed@x.org")
+        self.ed = self.client("ed@x.org")
+        self.worker = mock.patch.object(compile_api, "run_on_worker", side_effect=lambda *a: dict(BUILT)).start()
+
+    def token(self, client=None, **body):
+        status, data, _ = (client or self.ed).call("POST", "/api/account/tokens",
+                                                   {"name": "laptop", "scopes": ["compile"], **body})
+        self.assertEqual(status, 201, data)
+        return data
+
+    def compile(self, token, data=None, query="", headers=None, origin=False, ctype="application/zip"):
+        hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+        return Client(self).call("POST", "/api/v1/compile" + query, raw=data or make_zip({"main.tex": API_DOC}),
+                                 headers={**hdrs, **(headers or {})}, origin=origin, ctype=ctype)
+
+
+class CompileApiHosted(CompileApiCase):
+    def test_tokens_are_shown_once_stored_hashed_listed_and_revoked(self):
+        made = self.token(scopes=["compile"], days=30)
+        self.assertTrue(made["token"].startswith("lpat_"))
+        row = self.app.db.one("SELECT * FROM api_tokens WHERE id = ?", made["id"])
+        self.assertEqual(row["token_hash"], host.token_hash(made["token"]))
+        self.assertNotIn(made["token"], json.dumps(row))
+        self.assertAlmostEqual(row["expires"] - row["created"], 30 * 86400, delta=5)
+        status, listed, _ = self.ed.call("GET", "/api/account/tokens")
+        self.assertEqual((status, [t["id"] for t in listed["tokens"]]), (200, [made["id"]]))
+        self.assertNotIn("token", listed["tokens"][0])
+        self.assertIn("compile", listed["scopes"])
+        for bad in ({"scopes": ["admin"]}, {"scopes": []}, {"days": 0}, {"days": True}, {"name": ""}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "x", **bad})[0], 400)
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "x"}, origin="http://evil.example")[0],
+                         403)
+        self.assertEqual(Client(self).call("GET", "/api/account/tokens")[0], 401)
+        # Somebody else's token is not there to revoke.
+        self.user("ot@x.org")
+        other = self.client("ot@x.org")
+        self.assertEqual(other.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 404)
+        self.assertEqual(self.compile(made["token"])[0], 200)
+        self.assertEqual(self.ed.call("DELETE", f"/api/account/tokens/{made['id']}")[0], 200)
+        self.assertEqual(self.compile(made["token"])[0], 401)
+        self.assertEqual(self.ed.call("GET", "/api/account/tokens")[1]["tokens"], [])
+        actions = [r["action"] for r in self.app.db.all("SELECT action FROM audit")]
+        for action in ("api_token_created", "api_compile", "api_token_revoked"):
+            self.assertIn(action, actions)
+
+    def test_live_tokens_are_capped(self):
+        for _ in range(host.host_tokens.MAX_PER_USER):
+            self.token()
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "one more", "scopes": ["compile"]})[0],
+                         403)
+
+    def test_the_endpoint_takes_only_a_valid_token_with_the_compile_scope(self):
+        token = self.token()["token"]
+        status, body, res = self.compile(None)
+        self.assertEqual(status, 401)
+        self.assertIn("Bearer", res.getheader("WWW-Authenticate"))
+        self.assertEqual(self.compile("lpat_" + "x" * 43)[0], 401)
+        self.assertEqual(self.compile(token, origin="http://evil.example")[0], 403)
+        self.assertEqual(Client(self).call("GET", "/api/v1/compile", headers={"Authorization": f"Bearer {token}"})[0],
+                         405)
+        self.assertEqual(Client(self).call("POST", "/api/v1/other", raw=b"x", origin=False)[0], 404)
+        # A signed-in browser without a token gets nothing: no cookies on this endpoint.
+        self.assertEqual(self.ed.call("POST", "/api/v1/compile", raw=make_zip({"main.tex": API_DOC}),
+                                      ctype="application/zip")[0], 401)
+        self.app.db.run("UPDATE api_tokens SET scopes = 'projects'")
+        self.assertEqual(self.compile(token)[0], 403)  # a projects token never compiles
+        self.app.db.run("UPDATE api_tokens SET scopes = 'compile', expires = ?", time.time() - 1)
+        self.assertEqual(self.compile(token)[0], 401)
+        self.app.db.run("UPDATE api_tokens SET expires = NULL")
+        self.app.db.run("UPDATE users SET disabled = 1 WHERE id = ?", self.uid)
+        self.assertEqual(self.compile(token)[0], 401)
+        self.app.db.run("UPDATE users SET disabled = 0 WHERE id = ?", self.uid)
+        status, body, res = self.compile(token)
+        self.assertEqual((status, body, res.getheader("Content-Type")), (200, b"%PDF-1.7 fake", "application/pdf"))
+
+    def test_wrong_tokens_are_throttled_per_address(self):
+        for _ in range(30):
+            self.assertEqual(self.compile("lpat_wrong")[0], 401)
+        self.assertEqual(self.compile(self.token()["token"])[0], 429)
+
+    def test_a_password_change_revokes_tokens(self):
+        token = self.token()["token"]
+        self.assertEqual(self.ed.call("POST", "/api/account/password", {"current": "password-123",
+                                                                         "password": "new-password-456"})[0], 200)
+        self.assertEqual(self.compile(token)[0], 401)
+
+    def test_the_same_request_is_answered_from_the_cache_and_the_log_on_failure(self):
+        token = self.token()["token"]
+        first = self.compile(token)
+        second = self.compile(token)
+        self.assertEqual((first[0], first[2].getheader("X-Compile-Cache")), (200, "miss"))
+        self.assertEqual((second[0], second[1], second[2].getheader("X-Compile-Cache")), (200, b"%PDF-1.7 fake", "hit"))
+        self.assertEqual(self.worker.call_count, 1)
+        self.assertEqual(self.compile(token, query="?output=log")[1], b"the log")
+        other = self.compile(token, make_zip({"main.tex": API_DOC + "%"}))
+        self.assertEqual(other[2].getheader("X-Compile-Cache"), "miss")
+        self.worker.side_effect = lambda *a: {**BUILT, "ok": False, "pdf": None, "log": "! Emergency stop."}
+        status, body, res = self.compile(token, make_zip({"main.tex": "broken"}))
+        self.assertEqual((status, body), (422, b"! Emergency stop."))
+        self.assertFalse(json.loads(res.getheader("X-Compile"))["ok"])
+        usage = self.app.db.one("SELECT * FROM api_usage WHERE user_id = ?", self.uid)
+        self.assertEqual((usage["compiles"], usage["cached"]), (3, 2))
+        user, body, ctype, main = self.worker.call_args[0]
+        self.assertEqual((user["id"], ctype, main), (self.uid, "application/zip", "main.tex"))
+
+    def test_bad_parameters_and_oversized_bodies(self):
+        token = self.token()["token"]
+        self.assertEqual(self.compile(token, query="?main=../x.tex")[0], 400)
+        self.assertEqual(self.compile(token, query="?output=html")[0], 400)
+        big = b"x" * (compile_api.DEFAULTS["max_upload_mb"] * 1024 * 1024 + 1)
+        self.assertEqual(self.compile(token, big)[0], 413)
+        self.worker.assert_not_called()
+
+    def test_project_workers_never_answer_the_compile_api(self):
+        tenant = host.create_tenant(self.app, "Team")
+        self.app.db.run("INSERT INTO members VALUES (?, ?, ?)", tenant, self.uid, "editor")
+        pid = Workspaces.make_project(self, self.ed, tenant, "Doc", "article")
+        self.assertEqual(self.ed.call("POST", f"/p/{pid}/api/v1/compile", raw=b"x", ctype="application/zip")[0], 404)
+        self.assertNotIn(pid, self.app.workers.running)
+
+    def test_one_token_system_with_separate_scopes(self):
+        tenant = host.create_tenant(self.app, "Team")
+        self.app.db.run("INSERT INTO members VALUES (?, ?, ?)", tenant, self.uid, "editor")
+        pid = Workspaces.make_project(self, self.ed, tenant, "Doc", "article")
+        compile_only = self.token()["token"]
+        projects_only = self.token(scopes=["projects"], projects=[pid])["token"]
+        both = self.token(scopes=["compile", "projects"], projects=[pid])
+        self.assertEqual(both["scopes"], ["compile", "projects"])
+        project_get = {"Authorization": f"Bearer {compile_only}"}
+        status, data, _ = Client(self).call("GET", f"/p/{pid}/api/files?doc=Doc", origin=False, headers=project_get)
+        self.assertEqual((status, data["error"]), (403, "This API token lacks the projects scope."))
+        self.assertEqual(Client(self).call("GET", "/api/token", origin=False, headers=project_get)[0], 403)
+        self.assertEqual(self.compile(projects_only)[0], 403)
+        self.assertEqual(self.compile(both["token"])[0], 200)
+        self.assertEqual(self.compile(compile_only)[0], 200)
+        # Projects go only with the projects scope; listed tokens carry their scopes.
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens", {"name": "x", "projects": [pid]})[0], 201)
+        self.assertEqual(self.ed.call("POST", "/api/account/tokens",
+                                      {"name": "x", "scopes": ["compile"], "projects": [pid]})[0], 400)
+        listed = self.ed.call("GET", "/api/account/tokens")[1]
+        self.assertEqual(listed["compile_url"], self.app.config["public_url"] + "/api/v1/compile")
+        self.assertIn(["compile"], [t["scopes"] for t in listed["tokens"]])
+        # Tokens made before scopes existed keep opening their projects.
+        self.app.db.run("INSERT INTO api_tokens(id, user_id, name, token_hash, projects, created) "
+                        "VALUES ('00aa00aa00aa00aa', ?, 'old', 'h', '[]', 0)", self.uid)
+        self.assertEqual(self.app.db.one("SELECT scopes FROM api_tokens WHERE id = '00aa00aa00aa00aa'")["scopes"],
+                         "projects")
+
+
+class CompileApiLimits(CompileApiCase):
+    LIMITS = {"compiles_per_hour": 4, "compiles_per_day": 2}
+
+    def test_hourly_rate_and_daily_quota(self):
+        token = self.token()["token"]
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "1"}))[0], 200)
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "2"}))[0], 200)
+        status, body, _ = self.compile(token, make_zip({"main.tex": "3"}))
+        self.assertEqual(status, 429)
+        self.assertIn("Daily limit", body["error"])
+        self.assertEqual(self.compile(token, make_zip({"main.tex": "1"}))[2].getheader("X-Compile-Cache"), "hit")
+        status, _, res = self.compile(token, make_zip({"main.tex": "1"}))
+        self.assertEqual((status, res.getheader("Retry-After")), (429, "600"))
+        self.assertEqual(self.worker.call_count, 2)
+
+    def test_one_compile_per_person_at_a_time(self):
+        token = self.token()["token"]
+        started, finish = threading.Event(), threading.Event()
+
+        def slow(*args):
+            started.set()
+            finish.wait(10)
+            return dict(BUILT)
+
+        self.worker.side_effect = slow
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.compile(token)[0]))
+        thread.start()
+        self.assertTrue(started.wait(10))
+        status, _, res = self.compile(token, make_zip({"main.tex": "other"}))
+        finish.set()
+        thread.join(10)
+        self.assertEqual((status, res.getheader("Retry-After"), results), (429, "5", [200]))
+
+
+class CompileApiWorker(HostCase):
+    def extra_config(self):
+        return {"api": {**compile_api.DEFAULTS, "enabled": True}}
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex") and sys.platform.startswith("linux"),
+                         "needs latexmk and pdflatex to start a real worker")
+    def test_a_real_compile_worker_builds_the_upload(self):
+        compile_api.STATE["throttles"].clear()
+        uid = self.user("ed@x.org")
+        ed = self.client("ed@x.org")
+        token = ed.call("POST", "/api/account/tokens", {"name": "ci", "scopes": ["compile"]})[1]["token"]
+        tar = io.BytesIO()
+        import tarfile
+        with tarfile.open(fileobj=tar, mode="w:gz") as archive:
+            data = API_DOC.encode()
+            info = tarfile.TarInfo("paper/main.tex")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        status, body, res = Client(self).call("POST", "/api/v1/compile", raw=tar.getvalue(), origin=False,
+                                              ctype="application/gzip", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.startswith(b"%PDF"))
+        self.assertIn(f"api{uid}", self.app.workers.running)
+        self.assertEqual(self.app.workers.running[f"api{uid}"].project["tenant_id"], compile_api.API_TENANT)
+        status, body, _ = Client(self).call("POST", "/api/v1/compile", origin=False, ctype="application/json",
+                                            raw=json.dumps({"files": {"main.tex": "\\nosuchthing"}}).encode(),
+                                            headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 422)
+        self.assertIn(b"main.tex", body)
 
 
 if __name__ == "__main__":

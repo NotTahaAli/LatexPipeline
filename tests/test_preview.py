@@ -29,7 +29,7 @@ Front.
 \end{document}
 """
 LATEX = shutil.which("latexmk") and shutil.which("pdflatex")
-SETTINGS = {"engine": "pdflatex", "shell_escape": False}
+SETTINGS = {"engine": "pdflatex", "shell_escape": False, "review": "off"}
 
 
 def text(pdf: bytes) -> str:
@@ -65,6 +65,7 @@ class KeyTests(unittest.TestCase):
             self.assertEqual(preview.preamble_key(main, SETTINGS), key)  # A chapter is read after the trigger.
             self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "engine": "xelatex"}), key)
             self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "shell_escape": True}), key)
+            self.assertNotEqual(preview.preamble_key(main, {**SETTINGS, "review": "show"}), key)
             for name, value in (("openin_any", "p"), ("LATEX_SANDBOX", "bwrap")):  # Sharing or the sandbox turned on.
                 with mock.patch.dict(os.environ, {name: value}):
                     on = preview.preamble_key(main, SETTINGS)
@@ -295,9 +296,25 @@ class LiveFeatureTests(unittest.TestCase):
         self.assertEqual(self.warm.compile("c", "main.tex", FULL)["status"], "same")
         moved = self.warm.compile("c", "main.tex", FULL.replace("\\input{ch/two}\n", ""))
         self.assertEqual((moved["status"], moved["saved"]), ("rebuild", False))  # the input tree is the build's
-        edited = self.warm.compile("c", "main.tex", FULL.replace("\\begin{document}", "\\usepackage{xcolor}\n"
-                                                                                       "\\begin{document}"))
-        self.assertEqual((edited["status"], edited["saved"]), ("preamble", False))
+
+    def test_an_unsaved_preamble_edit_restarts_the_process_from_the_typed_text_and_keeps_previewing(self):
+        self.compile("ch/two.tex", None, "pre")  # the chapter this tab looked at last
+        typed = FULL.replace("\\begin{document}", "\\newcommand\\fromtyped{Typed preamble}\n\\begin{document}")
+        result, words = self.compile("main.tex", typed, "pre")
+        self.assertEqual((result["status"], result["preamble"], result["target"]), ("preview", True, "ch/two"))
+        self.assertFalse(result["warm"])  # a process started from the editor's preamble
+        self.assertIn("Chapter two", words)
+        # Typing in a chapter now uses that preamble, on a process that loaded it while this one typeset.
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\fromtyped.\n", "pre")
+        self.assertIn("Typed preamble", words)
+        self.assertTrue(result["warm"])
+        self.assertFalse(result["figures"])
+        # Another tab has no such text: it previews from the file on disk.
+        result = self.warm.compile("other", "ch/one.tex", "\\clearpage\\section{One}\\fromtyped.\n")
+        self.assertFalse(result["ok"])
+        # The editor back at the saved preamble: as built.
+        self.assertEqual(self.warm.compile("pre", "main.tex", FULL)["status"], "same")
+        self.assertEqual(self.warm.overrides("pre"), {})
 
     def test_include_and_package_read_files_use_the_typed_text(self):
         result, words = self.compile("ch/three.tex", "\\section{Three}Typed into an include.\n")
@@ -324,17 +341,27 @@ class LiveFeatureTests(unittest.TestCase):
         self.assertGreaterEqual(int(fields["Line"]), 1)
         self.assertIsNone(preview.sync_files(self.main, "other-tab"))
 
-    def test_a_saved_package_edit_restarts_the_waiting_process_and_previews_wait_for_the_build(self):
+    def test_a_package_edit_restarts_the_waiting_process_and_previews_go_on(self):
         sty = self.main.parent / "mystyle.sty"
         old = self.warm.ready[0]
-        sty.write_text("\\newcommand\\mine{N}\n")
+        self.compile("ch/one.tex", None, "pkg")
+        result, words = self.compile("mystyle.sty", "\\newcommand\\mine{Unsaved package}\n", "pkg")
+        self.assertEqual((result["target"], result["preamble"]), ("ch/one", True))
+        self.assertIn("Chapter one", words)
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\mine.\n", "pkg")
+        self.assertIn("Unsaved package", words)  # the package's unsaved text, read in place of the file
+        sty.write_text("\\newcommand\\mine{Saved package}\n")
         self.addCleanup(sty.write_text, "\\newcommand\\mine{M}\n")
         os.utime(sty, ns=(5, 5))
-        self.assertEqual(self.warm.compile("c", "mystyle.sty", "unsaved"), preview.status("preamble", saved=False))
-        result = self.warm.compile("c", "mystyle.sty", None)
-        self.assertEqual((result["status"], result["saved"]), ("preamble", True))
+        self.compile("mystyle.sty", None, "pkg")
+        result, words = self.compile("ch/one.tex", "\\clearpage\\section{One}\\mine.\n", "pkg")
+        self.assertIn("Saved package", words)
+        self.assertEqual(self.warm.overrides("pkg"), {})
         self.assertNotIn(old, self.warm.ready)  # Restarted from the new preamble.
         self.assertIsNotNone(old.popen.poll())
+        with mock.patch.object(self.warm, "targets", {}), \
+                mock.patch.object(preview.accel, "read_focusmap", return_value=[]):
+            self.assertEqual(self.warm.compile("none", "mystyle.sty", None), preview.status("preamble", saved=True))
 
     def test_previews_put_full_builds_below_normal_priority(self):
         with mock.patch.object(preview.sandbox, "LOW_UNTIL", 0.0):
@@ -355,3 +382,93 @@ class LabelTests(unittest.TestCase):
         self.assertTrue(preview.referenced("x", "\\label{x} see \\ref{x}"))
         self.assertTrue(preview.referenced("x@cref", "\\cref{a, x}"))
         self.assertTrue(preview.referenced("key", "\\citep[p.~3]{other,key}"))
+
+
+BLX = r"""\documentclass{article}
+\ifdefined\pdfobjcompresslevel\pdfcompresslevel=0 \pdfobjcompresslevel=0 \fi
+\usepackage[backend=%s,sorting=none]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+\input{ch/one}
+\input{ch/two}
+\printbibliography
+\end{document}
+"""
+
+
+@unittest.skipUnless(LATEX and shutil.which("biber") and shutil.which("pdftotext"), "needs latexmk, biber, pdftotext")
+class BiberTests(unittest.TestCase):
+    """biblatex: a key the full build never cited resolves through biber; backend=bibtex keeps BibTeX."""
+
+    def preview(self, backend, typed):
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "doc", BLX % backend)
+            (main.parent / "ch").mkdir()
+            (main.parent / "ch" / "one.tex").write_text("\\section{One}See \\cite{known}.\n")
+            (main.parent / "ch" / "two.tex").write_text("\\section{Two}Chapter two, \\cite{other}.\n")
+            (main.parent / "refs.bib").write_text(BIB + "@misc{other, title={Other}, author={C. Author}, year=2002}\n")
+            entry, _ = build.build_safely(main, shutil.which("latexmk"), False, False, record=True)
+            self.assertTrue(entry["ok"], entry)
+            preview.snapshot(main)
+            warm = preview.Warm(main)
+            try:
+                warm.warm_up()
+                with mock.patch.object(warm, "biber", wraps=warm.biber) as biber:
+                    plain = warm.compile("c", "ch/two.tex", "\\section{Two}Edited, \\cite{other}.\n")
+                    result = warm.compile("c", "ch/two.tex", typed)
+            finally:
+                warm.shutdown()
+        self.assertTrue(plain["ok"] and result["ok"], (plain["errors"], result["errors"]))
+        self.assertEqual(plain["passes"], 1)
+        return result, text(result["pdf"]), biber
+
+    def test_new_key_resolves_through_biber_and_known_numbers_stay(self):
+        result, words, biber = self.preview("biber", "\\section{Two}Now \\cite{fresh} and \\cite{other}.\n")
+        self.assertEqual(biber.call_count, 1)  # Only for the preview with a new key.
+        self.assertNotIn("fresh", words)  # biblatex prints an undefined key as [fresh]
+        self.assertIn("[3]", words)  # fresh comes after the full build's known [1] and other [2] (sorting=none)
+        self.assertIn("[2]", words)
+        self.assertEqual(result["passes"], 2)
+
+    def test_backend_bibtex_keeps_the_bibtex_path(self):
+        result, words, biber = self.preview("bibtex", "\\section{Two}Now \\cite{fresh}.\n")
+        self.assertEqual(biber.call_count, 0)
+        self.assertNotIn("fresh", words)
+        self.assertEqual(result["passes"], 2)  # biblatex reads its labels from the .bbl: no third pass
+
+
+class BcfTests(unittest.TestCase):
+    """The .bcf biber reads: the snapshot's keys first, then this run's; only local data files of the document."""
+
+    def test_merged_control_file(self):
+        bcf = ('<bcf:controlfile>\n  <bcf:bibdata section="0">\n'
+               '    <bcf:datasource type="file" datatype="bibtex" glob="false">refs.bib</bcf:datasource>\n'
+               '    <bcf:datasource type="file" datatype="bibtex" glob="false">../out.bib</bcf:datasource>\n'
+               '    <bcf:datasource type="url" datatype="bibtex" glob="false">http://example.org/x.bib</bcf:datasource>\n'
+               '  </bcf:bibdata>\n  <bcf:section number="0">\n'
+               '    <bcf:citekey order="1" intorder="1">new</bcf:citekey>\n'
+               '    <bcf:citekey order="2" intorder="1">old</bcf:citekey>\n  </bcf:section>\n</bcf:controlfile>\n')
+        with fake_repo() as root:
+            main = write_doc(root, "doc", "x")
+            (main.parent / "refs.bib").write_text("")
+            aux = preview.root_for(main) / "aux"
+            aux.mkdir(parents=True)
+            (aux / "main.bcf").write_text(bcf.replace(">new<", ">first<"))
+            proc = mock.Mock(dir=root / "p", root=preview.root_for(main))
+            proc.dir.mkdir()
+            warm = preview.Warm(main)
+            with mock.patch.object(preview.subprocess, "run") as ran:
+                self.assertEqual(warm.biber(proc, {"new"}), {})  # No .bcf: biblatex with backend=bibtex, or none.
+                (proc.dir / "main.bcf").write_text(bcf)
+                self.assertEqual(warm.biber(proc, {"elsewhere"}), {})  # Not a key of this run's .bcf.
+                ran.assert_not_called()
+                ran.side_effect = lambda **_: (proc.dir / "pgfwarm-bib.bbl").write_text("\\entry{new}{misc}{}")
+                self.assertEqual(warm.biber(proc, {"new"}), {"main.bbl": b"\\entry{new}{misc}{}"})
+                self.assertIn("biber", ran.call_args.kwargs["args"])
+            written = (proc.dir / "pgfwarm-bib.bcf").read_text()
+            self.assertEqual(preview.BCF_KEY.findall(written), ["first", "old", "new"])
+            self.assertIn('order="3" intorder="1">new<', written)
+            self.assertIn(">refs.bib<", written)
+            self.assertNotIn("out.bib", written)
+            self.assertNotIn("example.org", written)
+            self.assertTrue((proc.dir / "refs.bib").is_file())

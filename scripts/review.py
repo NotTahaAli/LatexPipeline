@@ -9,6 +9,7 @@ document, like every other edit, so co-editing rooms stay consistent.
 
 A suggestion is one change {anchor, insert}, or a group made by one multi-cursor edit: the first range in anchor and
 insert, the others in "more" ([{anchor, insert}], in document order). A group is accepted or rejected as a whole.
+A suggestion may carry replies ("comments", like a thread's; reply and delete with "suggestion" instead of "thread").
 """
 
 from __future__ import annotations
@@ -150,6 +151,16 @@ class Review:
                     raise ReviewError("That comment is gone; someone deleted it.", 404)
                 return found
 
+            def discussion() -> dict:
+                """A comment thread, or (args["suggestion"]) the replies under a suggestion."""
+                if "suggestion" not in args:
+                    return thread(args.get("thread"))
+                found = next((s for s in suggestions if s.get("id") == args.get("suggestion")), None)
+                if found is None:
+                    raise ReviewError("That suggestion was accepted, rejected or withdrawn.", 404)
+                found.setdefault("comments", [])
+                return found
+
             def comment(text) -> dict:
                 return {"id": secrets.token_hex(6), "author": who["key"], "name": who["name"],
                         "text": _text(text, MAX_TEXT, "comment"), "time": now}
@@ -163,7 +174,7 @@ class Review:
                 threads.append(item)
                 result = {"item": item}
             elif op == "reply":
-                item = thread(args.get("thread"))
+                item = discussion()
                 if len(item["comments"]) >= MAX_COMMENTS:
                     raise ReviewError("This thread is full; start a new one.", 409)
                 item["comments"].append(comment(args.get("text")))
@@ -174,16 +185,17 @@ class Review:
                 item["resolved_by"] = who["name"] if item["resolved"] else None
                 result = {"item": item}
             elif op == "delete":
-                item = thread(args.get("thread"))
+                item = discussion()
                 target = next((c for c in item["comments"] if c.get("id") == args.get("comment")), None)
                 if target is None:
                     raise ReviewError("That comment is gone.", 404)
                 if target.get("author") != who["key"] and not moderator:
                     raise ReviewError("You can only delete your own comments.", 403)
                 item["comments"].remove(target)
-                if not item["comments"]:
+                if not item["comments"] and item in threads:  # a suggestion stays without its replies
                     threads.remove(item)
-                result = {"item": item if item["comments"] else None}
+                    item = None
+                result = {"item": item}
             elif op == "suggest":
                 if len(suggestions) >= MAX_SUGGESTIONS:
                     raise ReviewError(f"This document has {MAX_SUGGESTIONS} open suggestions; accept or reject some.",

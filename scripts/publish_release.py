@@ -3,7 +3,8 @@
 Sync out/ to the GitHub release tagged `pdfs`, which always holds the latest
 PDF of every document.
 
-- Uploads every PDF and <name>.log in out/ (replacing older ones).
+- Uploads every PDF and <name>.log in out/ (replacing older ones), and the
+  <name>.html.zip of documents with html = true in build.toml.
   out/ holds only what this run built: a failed document keeps its previous
   PDF on the release, next to the log of the failed build.
 - Deletes assets whose main.tex no longer exists.
@@ -17,6 +18,7 @@ Meant for CI after `build.py`; needs the `gh` CLI and GH_TOKEN.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -32,8 +34,11 @@ from build import (
     SOURCE_DIR,
     escape_name,
     find_documents,
+    html_paths,
     log_path_for,
     output_path_for,
+    output_targets,
+    wants_html,
 )
 from ci_report import cell, load_documents
 
@@ -158,9 +163,20 @@ def main() -> int:
         digests = {}  # Only saves uploads: without the digests, everything is uploaded again.
         print("Could not read the release's digests: uploading every file.", flush=True)
 
+    documents = find_documents()
+    expected = {asset_name(output_path_for(document)) for document in documents}
+    expected |= {asset_name(log_path_for(document)) for document in documents}
+    # [[output]] PDFs of build.toml (out/<name>-<output>.pdf) are published like documents, under the same rule.
+    expected |= {asset_name(path) for document in documents for _name, _work, pdf in output_targets(document)
+                 for path in (pdf, pdf.with_suffix(".log"))}
+    expected |= {asset_name(html_paths(document)[1]) for document in documents if wants_html(document)}
+
     with tempfile.TemporaryDirectory() as staging:
-        for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log")]):
+        for path in sorted([*OUT_DIR.rglob("*.pdf"), *OUT_DIR.rglob("*.log"), *OUT_DIR.rglob("*.html.zip")]):
             label = path.relative_to(OUT_DIR).as_posix()
+            if asset_name(path) not in expected:  # e.g. a review or chapter preview PDF: never published
+                print(f"Not published: {label}", flush=True)
+                continue
             if not needs_upload(path, digests):
                 print(f"Unchanged: {label}", flush=True)
                 continue
@@ -168,10 +184,6 @@ def main() -> int:
             shutil.copy(path, staged)
             print(f"Uploading: {label}", flush=True)
             gh("release", "upload", TAG, f"{staged}#{label}", "--clobber")
-
-    documents = find_documents()
-    expected = {asset_name(output_path_for(document)) for document in documents}
-    expected |= {asset_name(log_path_for(document)) for document in documents}
 
     existing = gh("release", "view", TAG, "--json", "assets", "--jq", ".assets[].name").split()
 
@@ -192,4 +204,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # No options, but --help (or a typo) must not publish: argparse prints the usage and exits first.
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     sys.exit(main())

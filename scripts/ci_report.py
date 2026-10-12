@@ -6,15 +6,17 @@ Subcommands:
 
 - summary     Markdown table of this run's documents, for $GITHUB_STEP_SUMMARY.
 - lint        Structural checks (labels, references, figures, bib), overfull boxes from
-              the cached log, chktex and word counts into out/lint-report.json. --grammar adds
+              the cached log, accessibility notices of tagged documents (build-report.json),
+              chktex and word counts into out/lint-report.json. --grammar adds
               LanguageTool findings (grammar.py); --bib-lookup suggests missing bib fields
-              from Crossref (bibfix.py).
+              from Crossref (bibfix.py); --verify-citations flags entries Crossref does not
+              confirm; --format lists .tex files tex-fmt would change.
               Findings are GitHub annotations in Actions; --strict fails on them.
 - diff        latexdiff of every document changed since --base, PDFs into --out
               (keep --out outside out/, so the PDFs are not published to the release).
 - pr-comment  Create or update the sticky pull request comment (needs gh and GH_TOKEN).
 
-Stdlib only. A missing chktex, texcount or latexdiff leaves its values blank
+Stdlib only. A missing chktex, texcount, tex-fmt or latexdiff leaves its values blank
 instead of failing the run.
 """
 
@@ -34,7 +36,17 @@ from typing import NamedTuple
 
 import bibfix
 import grammar
-from build import ENGINES, LATEXMK_ARGS, OUT_DIR, ROOT_DIR, SOURCE_DIR, ConfigError, read_settings, size_text
+from build import (
+    ENGINES,
+    LATEXMK_ARGS,
+    OUT_DIR,
+    ROOT_DIR,
+    SOURCE_DIR,
+    ConfigError,
+    format_sources,
+    read_settings,
+    size_text,
+)
 from hints import overfull_boxes
 
 REPORT_PATH = OUT_DIR / "build-report.json"
@@ -354,11 +366,16 @@ def visible_files(doc_dir: Path) -> list[Path]:
 def label_findings(sources: dict[str, str]) -> list[Finding]:
     defined: dict[str, tuple[str, int]] = {}
     refs: list[tuple[str, str, int]] = []
+    findings = []
     for path, text in sources.items():
         for match in LABEL.finditer(text):
             key = (match.group(1) or match.group(2)).strip()
-            if not is_macro_key(key):
-                defined.setdefault(key, (path, line_of(text, match.start())))
+            if is_macro_key(key):
+                continue
+            first = defined.setdefault(key, (path, line_of(text, match.start())))
+            if first != (path, line_of(text, match.start())):
+                findings.append(Finding("duplicate-label", path, line_of(text, match.start()),
+                                        f"label '{key}' is already defined at {first[0]}:{first[1]}", key))
         for match in REF.finditer(text):
             refs += [(key.strip(), path, line_of(text, match.start()))
                      for key in match.group(1).split(",")]
@@ -367,7 +384,7 @@ def label_findings(sources: dict[str, str]) -> list[Finding]:
                      (match.group(2).strip(), path, line_of(text, match.start()))]
 
     referenced = {key for key, _path, _line in refs}
-    findings = [
+    findings += [
         Finding("unused-label", path, line, f"label '{key}' is never referenced", key)
         for key, (path, line) in defined.items() if key not in referenced
     ]
@@ -376,6 +393,54 @@ def label_findings(sources: dict[str, str]) -> list[Finding]:
         for key, path, line in refs
         if key and not is_macro_key(key) and key not in defined
     ]
+    return findings
+
+
+# Style notices after pre-commit-latex-hooks (https://github.com/jonasbb/pre-commit-latex-hooks): tilde-cite,
+# cleveref-capitalization and consistent-spelling, for .tex files only.
+CITE_SPACE = re.compile(r"(?<=[\w})])(?=[ \t\n])[ \t]*\n?[ \t]*(?=\\(?:cite|citep|parencite|autocite)\b)")
+CREF_LOWER = re.compile(r"(?:\A|[.!?][\"')\]]*\s+|\n[ \t]*\n\s*)"
+                        r"(\\(?:cref|crefrange|cpageref|cpagerefrange|namecrefs?)\b)")
+CREF_UPPER = re.compile(r"[a-z,;:][ \t]*\n?[ \t]*~?(\\(?:Cref|Crefrange|Cpageref|Cpagerefrange|nameCrefs?)\b)")
+SPELLING = [(r"color\w*", r"colour\w*"), (r"behavior\w*", r"behaviour\w*"), (r"model(?:ing|ed)", r"model(?:ling|led)"),
+            (r"analyz\w*", r"analys(?:e|ed|es|ing)"), (r"optimiz\w*", r"optimis\w*"), (r"organiz\w*", r"organis\w*"),
+            (r"cent(?:er|ered|ers)", r"cent(?:re|red|res)"), (r"labeled|labeling", r"labelled|labelling")]
+NOT_PROSE = re.compile(r"\\(?:usepackage|RequirePackage|documentclass|begin|end|label|\w*ref|\w*cite\w*|"
+                       r"includegraphics|\w*input|include|\w*color\w*|definecolor)\*?(?:\[[^\]]*\])*(?:\{[^{}]*\})*")
+
+
+def style_findings(sources: dict[str, str]) -> list[Finding]:
+    """Notices: a breakable space before \\cite, \\cref / \\Cref against the sentence start, two spellings of a word."""
+    findings = []
+    words: dict[str, list[tuple[str, int, str, str]]] = {}
+    for path, text in sources.items():
+        if not path.endswith(".tex"):
+            continue
+        for match in CITE_SPACE.finditer(text):
+            findings.append(Finding("cite-space", path, line_of(text, match.end()),
+                                    "use ~\\cite: a line break can fall before the citation", "", level="info"))
+        for match in CREF_LOWER.finditer(text):
+            findings.append(Finding("cref-case", path, line_of(text, match.start(1)),
+                                    f"{match.group(1)} starts a sentence: use \\{match.group(1)[1].upper()}"
+                                    f"{match.group(1)[2:]}", "", level="info"))
+        for match in CREF_UPPER.finditer(text):
+            findings.append(Finding("cref-case", path, line_of(text, match.start(1)),
+                                    f"{match.group(1)} inside a sentence: use \\{match.group(1)[1].lower()}"
+                                    f"{match.group(1)[2:]}", "", level="info"))
+        prose = NOT_PROSE.sub(lambda m: "\n" * m.group().count("\n"), text)
+        for us, uk in SPELLING:
+            for variant in (us, uk):
+                for match in re.finditer(rf"(?<!\\)\b(?:{variant})\b", prose, re.IGNORECASE):
+                    words.setdefault(us + "|" + uk, []).append((path, line_of(prose, match.start()), variant,
+                                                                match.group().lower()))
+    for pair, found in words.items():
+        order = list(sources)
+        found.sort(key=lambda item: (order.index(item[0]), item[1]))
+        first = {variant: word for _path, _line, variant, word in reversed(found)}
+        if len(first) > 1:  # shown where the other spelling first appears
+            path, line = next(item[:2] for item in found if item[2] != found[0][2])
+            findings.append(Finding("spelling", path, line, f"both US and UK spellings are used "
+                                    f"({' and '.join(sorted(first.values()))}): pick one", pair, level="info"))
     return findings
 
 
@@ -512,10 +577,21 @@ def overfull_findings(log_text: str, budget: float) -> list[Finding]:
 
 def lint_document(doc_dir: Path, log_path: Path | None, budget: float) -> list[Finding]:
     sources = reachable_sources(doc_dir)
-    findings = label_findings(sources) + figure_findings(doc_dir, sources) + bib_findings(doc_dir, sources)
+    findings = (label_findings(sources) + figure_findings(doc_dir, sources) + bib_findings(doc_dir, sources)
+                + style_findings(sources))
     if log_path is not None and log_path.is_file():
         findings += overfull_findings(log_path.read_text(encoding="utf-8", errors="replace"), budget)
     return findings
+
+
+def a11y_findings(name: str) -> list[Finding]:
+    """Accessibility findings of a tagged document from build-report.json ("a11y", build.py), as notices."""
+    entry = next((doc for doc in load_documents() if doc.get("name") == name), {})
+    return [
+        Finding(found["kind"], found["file"] or "main.tex", found["line"], found["message"],
+                re.sub(r"\s*\([^()]*:\d+\)", "", found["message"]), level="info")  # subject without line numbers
+        for found in entry.get("a11y") or []
+    ]
 
 
 def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]:
@@ -536,6 +612,44 @@ def bib_lookup_findings(doc_dir: Path, findings: list[Finding]) -> list[Finding]
             out.append(Finding("bib-suggestion", finding.path, finding.line,
                                f"Crossref suggests for '{finding.subject}': {shown}", finding.subject, level="info"))
     return out
+
+
+def verify_findings(doc_dir: Path) -> list[Finding]:
+    """Entries Crossref does not know, or knows differently: possibly fabricated or wrong (sends a DOI or title)."""
+    out = []
+    bibfix.LOOKUP_WAIT = 60.0
+    for path in visible_files(doc_dir):
+        if path.suffix != ".bib":
+            continue
+        rel = path.relative_to(doc_dir).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for entry in bibfix.parse(text):
+            fields: dict[str, str] = {}
+            for field in entry.fields:
+                fields.setdefault(field.name, field.value)
+            try:
+                result = bibfix.verify(fields)
+            except bibfix.BibLookupError as error:  # Not checked is not a finding: never guess.
+                print(f"{rel}: could not verify '{entry.key}': {error}")
+                continue
+            if result["status"] in ("not-found", "mismatch"):
+                out.append(Finding("unverified-citation", rel, line_of(text, entry.start),
+                                   f"possibly fabricated or wrong reference '{entry.key}': {result['message']}",
+                                   entry.key))
+    return out
+
+
+def format_findings(name: str, doc_dir: Path) -> list[Finding]:
+    """.tex files tex-fmt would change (--check), as notices. A missing tex-fmt is a message, like chktex."""
+    try:
+        changed, problems = format_sources(doc_dir, check=True)
+    except FileNotFoundError as error:
+        print(f"{name}: format check skipped: {error}")
+        return []
+    for problem in problems:
+        print(f"{name}: tex-fmt: {problem}")
+    return [Finding("format", rel, None, f"tex-fmt would reformat {rel} (python scripts/build.py --format fixes it)",
+                    rel, level="info") for rel in changed]
 
 
 def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
@@ -613,7 +727,8 @@ def annotate(name: str, findings: list[Finding]) -> None:
 
 def lint_targets(names: list[str]) -> list[str]:
     """Documents from build-report.json, or every files/<name>/main.tex when there is no report."""
-    names_found = [doc["name"] for doc in load_documents()]
+    # A report from a --source bench build (or an old one, as the pre-commit hook may find) names other documents.
+    names_found = [doc["name"] for doc in load_documents() if (SOURCE_DIR / doc["name"] / "main.tex").is_file()]
     if not names_found:
         names_found = [main.parent.relative_to(SOURCE_DIR).as_posix()
                        for main in sorted(SOURCE_DIR.rglob("main.tex"))
@@ -631,11 +746,15 @@ def cmd_lint(args: argparse.Namespace) -> int:
     total = 0
     for name in lint_targets(args.documents):
         doc_dir = SOURCE_DIR / name
-        findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt)
+        findings = lint_document(doc_dir, OUT_DIR / f"{name}.log", args.overfull_pt) + a11y_findings(name)
         if getattr(args, "grammar", False):
             findings += grammar_findings(name, doc_dir)
         if getattr(args, "bib_lookup", False):
             findings += bib_lookup_findings(doc_dir, findings)
+        if getattr(args, "verify_citations", False):
+            findings += verify_findings(doc_dir)
+        if getattr(args, "format", False):
+            findings += format_findings(name, doc_dir)
         suppressed = 0
         if args.update_baseline:
             write_baseline(doc_dir, findings)
@@ -653,7 +772,10 @@ def cmd_lint(args: argparse.Namespace) -> int:
             "suppressed": suppressed,
             "findings": [finding.as_dict() for finding in findings],
         }
-        total += sum(finding.kind != "bib-suggestion" for finding in findings)  # Suggestions are notices, not failures.
+        # Suggestions, formatting and accessibility findings are notices, not failures.
+        total += sum(finding.kind not in ("bib-suggestion", "format", "cite-space", "cref-case", "spelling")
+                     and not finding.kind.startswith("a11y")
+                     for finding in findings)
         print(f"{name}: words={lint[name]['words']} chktex={lint[name]['chktex']} "
               f"lint={len(findings)} suppressed={lint[name]['suppressed']}")
         annotate(name, findings)
@@ -787,6 +909,11 @@ def main() -> int:
 
     lint.add_argument("--bib-lookup", action="store_true",
                       help="suggest missing bib fields from Crossref (sends DOIs and titles; off by default)")
+    lint.add_argument("--verify-citations", action="store_true",
+                      help="flag bib entries Crossref does not know or knows differently (sends DOIs and titles; "
+                           "off by default)")
+    lint.add_argument("--format", action="store_true",
+                      help="report .tex files tex-fmt would change (a missing tex-fmt is only a message)")
 
     diff = commands.add_parser("diff", help="latexdiff of changed documents")
     diff.add_argument("--base", required=True, help="git ref to compare against")

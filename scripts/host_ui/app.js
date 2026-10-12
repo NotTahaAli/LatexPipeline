@@ -1,6 +1,8 @@
 // Hosted LaTeX Studio: sign-in, projects, workspace and site administration. Plain DOM, no libraries.
 // Every page is a function of the URL hash; the server decides what each user may see and do.
 
+import { apiTokensSection } from "./tokens.js";
+
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => {
   const node = Object.assign(document.createElement(tag), props);
@@ -86,7 +88,7 @@ function page(opts, ...all) {
 }
 
 const when = (t) => new Date(t * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
-const roleName = { admin: "Admin", editor: "Editor", viewer: "Viewer" };
+const roleName = { admin: "Admin", editor: "Editor", reviewer: "Reviewer", viewer: "Viewer" };
 const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
 const params = () => new URLSearchParams(location.hash.slice(1));
 
@@ -218,7 +220,7 @@ async function homePage() {
 
 async function tenantCard(tid) {
   const t = await api(`/api/tenants/${tid}`);
-  const canEdit = t.role !== "viewer";
+  const canEdit = t.role === "admin" || t.role === "editor";
   const box = msgBox();
   const refresh = async () => card.replaceWith(await tenantCard(tid));
   const projects = t.projects.map((p) => el("article", { className: "card project", ariaLabel: p.name },
@@ -268,7 +270,7 @@ async function tenantPage(tid) {
   const box = msgBox();
   const reload = () => tenantPage(tid);
   const roleSelect = (m) => {
-    const s = el("select", { ariaLabel: `Role of ${m.name}` }, ["admin", "editor", "viewer"].map((r) => el("option", { value: r, textContent: roleName[r], selected: r === m.role })));
+    const s = el("select", { ariaLabel: `Role of ${m.name}` }, ["admin", "editor", "reviewer", "viewer"].map((r) => el("option", { value: r, textContent: roleName[r], selected: r === m.role })));
     s.onchange = async () => { try { await api(`/api/tenants/${tid}/members/${m.id}`, "POST", { role: s.value }); announce(`${m.name} is now ${s.value}.`); } catch (err) { show(box, err.message); s.value = m.role; } };
     return s;
   };
@@ -283,10 +285,10 @@ async function tenantPage(tid) {
       }, "btn ghost danger", { ariaLabel: `Remove ${m.name}` })))),
       t.members.length ? null : el("tr", {}, el("td", { colSpan: 3, className: "empty", textContent: "No members yet. Invite people with a link." })))));
   const linkOut = el("div", { hidden: true });
-  const roleHelp = { editor: "edit and build", viewer: "read only", admin: "manage members" };
+  const roleHelp = { editor: "edit and build", reviewer: "comment and suggest", viewer: "read only", admin: "manage members" };
   const invite = form([
     field("Email (optional)", input("email", "email"), "Only this address can use the link."),
-    field("Role", el("select", { name: "role" }, ["editor", "viewer", "admin"].map((r) => el("option", { value: r, textContent: `${roleName[r]} \u2014 ${roleHelp[r]}` })))),
+    field("Role", el("select", { name: "role" }, ["editor", "reviewer", "viewer", "admin"].map((r) => el("option", { value: r, textContent: `${roleName[r]} \u2014 ${roleHelp[r]}` })))),
   ], "Create invite link", async (v) => {
     const r = await api(`/api/tenants/${tid}/invites`, "POST", { role: v.role, email: v.email || undefined });
     const out = input("link", "text", { readOnly: true, value: r.link, ariaLabel: "Invite link" });
@@ -302,8 +304,15 @@ async function tenantPage(tid) {
     button("Revoke", async () => { await api(`/api/tenants/${tid}/invites/${i.id}`, "DELETE"); renderInvites(await api(`/api/tenants/${tid}`)); }, "btn ghost", { ariaLabel: `Revoke invite for ${i.email || i.role}` }))))
     : el("p", { className: "empty", textContent: "No open invites." }));
   renderInvites(t);
+  // Requests for a better role, sent from the editor (host.py Handler.team); granting changes the member's role.
+  const requests = (t.requests || []).length ? el("section", { ariaLabel: "Access requests" }, el("h2", { textContent: "Access requests" }),
+    el("ul", { className: "list card" }, t.requests.map((r) => el("li", {},
+      el("span", { className: "tag", textContent: roleName[r.role] }),
+      el("span", { className: "grow", textContent: `${r.name} (${r.email})${r.project ? " in " + r.project : ""} · ${when(r.created)}${r.note ? ": " + r.note : ""}` }),
+      button("Grant", async () => { try { await api(`/api/tenants/${tid}/members/${r.id}`, "POST", { role: r.role }); await reload(); announce(`${r.name} is now ${r.role}.`); } catch (err) { show(box, err.message); } }, "btn", { ariaLabel: `Make ${r.name} ${roleName[r.role].toLowerCase()}` }),
+      button("Dismiss", async () => { try { await api(`/api/tenants/${tid}/requests/${r.id}`, "DELETE"); await reload(); } catch (err) { show(box, err.message); } }, "btn ghost", { ariaLabel: `Dismiss the request from ${r.name}` }))))) : null;
   page({ title: t.name, eyebrow: "Workspace · members and invites", layout: "split" },
-    el("div", { className: "content" }, box,
+    el("div", { className: "content" }, box, requests,
       el("section", { ariaLabel: "Members" }, el("h2", { className: "sr", textContent: "Members" }), members),
       el("section", { ariaLabel: "Open invites" }, el("h2", { textContent: "Open invites" }), pending)),
     el("aside", { ariaLabel: "Invites" }, el("section", { className: "card" }, el("h2", { textContent: "Invite people" }), invite, linkOut,
@@ -386,7 +395,36 @@ async function accountPage() {
     providers,
     sect("Password", "Changing it signs out your other sessions.", password),
     sect("Zotero", "Your own Zotero library for Sync from Zotero in the References panel. The key is kept on this server and never shown again.", zotero),
+    await gitSection(sect),
+    await apiTokensSection(sect, { api, el, button, form, field, input, when, announce, rerender: accountPage, tenants: me?.tenants || [] }),
     await aiClientsSection(sect));
+}
+
+// ---- Git token ----------------------------------------------------------------------------------------------------
+// The Git token is used by this server for your pulls and pushes in a project's Git tab; it is never shown again and
+// never given to a project's editor process.
+async function gitSection(sect) {
+  const g = await api("/api/account/git");
+  const hint = (has) => has ? "Stored; paste a new one to replace it" : "Paste a token";
+  let clear;
+  const stored = (has, f) => { clear.hidden = !has; f.querySelector("[name=token]").placeholder = hint(has); };
+  const git = form([
+    field("User name on the Git host", input("username", "text", { value: g.username, required: true, maxLength: 100, autocomplete: "off" })),
+    field("Access token", input("token", "password", { required: true, autocomplete: "off", placeholder: hint(g.has_key) }),
+      "A personal access token with read and write access to the repositories you sync (repository contents only)."),
+  ], "Save Git token", async (v, f) => {
+    const r = await api("/api/account/git", "POST", v);
+    f.querySelector("[name=token]").value = "";
+    stored(r.has_key, f);
+    return "Saved. Pull and Push are in each project's Git tab.";
+  });
+  clear = button("Remove the stored token", async () => {
+    await api("/api/account/git", "POST", { clear_token: true });
+    stored(false, git);
+    git.querySelector("[name=token]").focus();  // the button just hid itself
+    announce("The Git token was removed.");
+  }, "btn ghost danger", { hidden: !g.has_key });
+  return sect("Git", "Your token for syncing projects with a Git repository over https. It is kept on this server and never shown again.", git, clear);
 }
 
 // ---- AI clients (MCP): consent and connected apps ---------------------------------------------------------------
@@ -421,7 +459,8 @@ async function consentPage(id) {
       all.onchange = () => { for (const b of kids.map((li) => li.querySelector("input"))) { b.disabled = all.checked; if (all.checked) b.checked = true; } };
       return el("div", { className: "consent-ws" }, el("label", { className: "check" }, all,
         el("span", {}, el("b", { textContent: ws.name }), " · all its projects, also new ones",
-          ws.role === "viewer" ? el("span", { className: "tag warn", textContent: "Viewer: read only" }) : null)),
+          ws.role === "viewer" ? el("span", { className: "tag warn", textContent: "Viewer: read only" })
+            : ws.role === "reviewer" ? el("span", { className: "tag warn", textContent: "Reviewer: comments and suggestions only" }) : null)),
         kids.length ? el("ul", { className: "consent-projects" }, kids) : el("p", { className: "hint", textContent: "No projects yet." }));
     }) : el("p", { className: "empty", textContent: "You are not a member of any workspace yet." }));
   const decide = async (allow) => {

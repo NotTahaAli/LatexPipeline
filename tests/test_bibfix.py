@@ -1,7 +1,9 @@
 # ruff: noqa: E501
 """bibfix: parsing, inserting fields byte-for-byte, and the Crossref mapping. The network is always mocked."""
 
+import contextlib
 import importlib
+import io
 import json
 import tempfile
 import unittest
@@ -211,7 +213,80 @@ class EntryEditTests(unittest.TestCase):
             bibfix.entry_for_doi("not a doi")
 
 
+class VerifyTests(unittest.TestCase):
+    GOOD = {"doi": "10.1000/xyz_123", "title": "Deep Learning & Beyond: A 100% Study", "year": "2019",
+            "author": "Ada Lovelace and Alan Turing"}
+
+    def setUp(self):
+        bibfix.CACHE.clear()
+
+    def check(self, fields, reply=WORK, **kwargs):
+        with mock.patch.object(bibfix, "get_json", return_value=reply, **kwargs) as fetch:
+            return bibfix.verify(fields), fetch
+
+    def test_doi_agreeing_on_title_year_and_first_author_is_verified(self):
+        got, fetch = self.check(self.GOOD)
+        self.assertEqual(got["status"], "verified")
+        self.assertEqual(fetch.call_args[0][0], "https://api.crossref.org/works/10.1000/xyz_123")
+        # Year within one (online-first vs print), accents and LaTeX accent commands are not disagreements.
+        self.assertEqual(self.check({**self.GOOD, "year": "2020", "author": "Lov{\\'e}lace, A."})[0]["status"], "verified")
+
+    def test_mismatches_name_what_differs(self):
+        for change, needle in (({"year": "2015"}, "year 2019"), ({"author": "Hopper, Grace"}, "Lovelace"),
+                               ({"title": "A survey of something else entirely"}, "Crossref's title")):
+            with self.subTest(change=change):
+                got = self.check({**self.GOOD, **change})[0]
+                self.assertEqual(got["status"], "mismatch")
+                self.assertIn(needle, got["message"])
+
+    def test_doi_that_does_not_resolve_or_is_malformed_is_not_found(self):
+        got, _ = self.check(self.GOOD, side_effect=bibfix.NotFound("404"))
+        self.assertEqual(got["status"], "not-found")
+        self.assertEqual(self.check({**self.GOOD, "doi": "nonsense"})[0]["status"], "not-found")
+
+    def test_title_search_picks_a_close_match_among_the_results(self):
+        other = {**WORK["message"], "title": ["Something unrelated"]}
+        fields = {k: v for k, v in self.GOOD.items() if k != "doi"}
+        got, fetch = self.check(fields, {"message": {"items": [other, WORK["message"]]}})
+        self.assertEqual((got["status"], got["doi"]), ("verified", "10.1000/xyz_123"))
+        self.assertIn("query.author=lovelace", fetch.call_args[0][0])
+        self.assertEqual(self.check(fields, {"message": {"items": [other]}})[0]["status"], "not-found")
+
+    def test_errors_raise_instead_of_guessing_and_empty_entries_are_unchecked(self):
+        with self.assertRaises(bibfix.BibLookupError):
+            self.check(self.GOOD, side_effect=bibfix.BibLookupError("Crossref is not reachable"))
+        self.assertEqual(self.check({"year": "2020"})[0]["status"], "unchecked")
+
+    def test_first_surname(self):
+        for author, want in (("Lovelace, Ada and B", "lovelace"), ("Ada  Lovelace AND Bo", "lovelace"),
+                             ("{The Example Consortium} and X", "theexampleconsortium"), ("M{\\\"u}ller, K", "muller"),
+                             ("", "")):
+            with self.subTest(author=author):
+                self.assertEqual(bibfix.first_surname(author), want)
+
+
 class LintTests(unittest.TestCase):
+    def test_verify_citations_flags_unknown_and_mismatched_entries_and_skips_errors(self):
+        bib = ("@article{good, doi={10.1000/xyz_123}, title={Deep Learning and Beyond: A 100\\% Study}, year={2019}}\n"
+               "@article{fake, doi={10.9999/nothing}, title={T}}\n"
+               "@article{late, doi={10.1000/xyz_123}, year={2001}}\n"
+               "@article{down, title={Offline}}\n")
+        def reply(url):
+            if "nothing" in url:
+                raise bibfix.NotFound("404")
+            if "Offline" in url:
+                raise bibfix.BibLookupError("Crossref is not reachable")
+            return WORK
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "refs.bib").write_text(bib, encoding="utf-8")
+            with mock.patch.object(bibfix, "get_json", side_effect=reply), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                got = ci_report.verify_findings(Path(tmp))
+        self.assertEqual([(f.kind, f.subject, f.line) for f in got],
+                         [("unverified-citation", "fake", 2), ("unverified-citation", "late", 3)])
+        self.assertIn("possibly fabricated or wrong reference 'fake'", got[0].message)
+        self.assertIn("could not verify 'down'", out.getvalue())
+
     def test_bib_lookup_adds_an_info_finding_and_is_quiet_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "refs.bib").write_text("@article{k, doi={10.1000/xyz_123}, title={T}}\n@article{z, title={Q}}\n", encoding="utf-8")

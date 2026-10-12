@@ -152,6 +152,38 @@ class SandboxedProcessTests(unittest.TestCase):
         self.assertEqual(self.run_py(code), "1 1 0 0 0 0 0 None True")
 
 
+@unittest.skipUnless(shutil.which("latexdiff") and SYS_OK, "needs bwrap and latexdiff")
+class SandboxedLatexdiffTests(unittest.TestCase):
+    """build.build_diff_pdf: latexdiff (Perl) runs through sandbox.spawn and --flatten reads only the copy."""
+
+    def test_flatten_cannot_read_outside_the_copy(self):
+        secret = Path.home() / f".latexdiff-probe-{os.getpid()}.tex"
+        secret.write_text("TOPSECRETWORDS\n", encoding="utf-8")
+        self.addCleanup(secret.unlink)
+        tex = "\\documentclass{article}\\begin{document}\n%s\n\\input{%s}\n\\input{part}\n\\end{document}\n"
+        seen = {}
+
+        def fake_build(main, *args, **kwargs):  # the diff text latexdiff wrote, before LaTeX would run
+            seen["text"] = main.read_text(encoding="utf-8")
+            return {"ok": True, "error": None, "errors": []}, ""
+
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, ON), \
+                mock.patch.object(build, "build_document", side_effect=fake_build), \
+                mock.patch.object(sandbox, "spawn", wraps=sandbox.spawn) as spawn:
+            main = write_doc(root, "d", "")
+            # Relative to the copy latexdiff reads (old/ and src/ are side by side), like a document's ../x.
+            rel = os.path.relpath(secret, build.CACHE_DIR / "_diff" / build.cache_dir_for(main).name / "src")
+            main.write_text(tex % ("New words.", rel), encoding="utf-8")
+            (main.parent / "part.tex").write_text("Part now.\n", encoding="utf-8")
+            result = build.build_diff_pdf(main, "latexmk", {"main.tex": tex % ("Old words.", rel),
+                                                            "part.tex": "Part then.\n"})
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(spawn.call_args[0][0][0] == "latexdiff" and spawn.call_args[0][1] == spawn.call_args[0][2])
+        self.assertIn("\\DIFadd", seen["text"])
+        self.assertIn("Part", seen["text"])  # \input inside the copy: flattened
+        self.assertNotIn("TOPSECRETWORDS", seen["text"])  # \input of a file outside: not readable in the sandbox
+
+
 @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and SYS_OK, "needs bwrap, latexmk, lualatex")
 class SandboxedBuildTests(unittest.TestCase):
     """build.py with LATEX_SANDBOX=bwrap, end to end."""

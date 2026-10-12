@@ -7,7 +7,8 @@ const DELAY = 700;   // ms of quiet before a preview starts
 export class LivePreview {
   /**
    * view: the PdfView. opts: doc() current document, tab() {path, text} of the file being typed or null,
-   * enabled() whether to run now, onState({busy, error, seconds, wait, saved, done}) for the status line.
+   * enabled() whether to run now, onState({busy, error, seconds, wait, saved, done, shift, preamble}) for the status
+   * line.
    */
   constructor(view, opts) {
     this.view = view; this.opts = opts;
@@ -54,8 +55,8 @@ export class LivePreview {
       const pdf = await this.view.lib.getDocument({ data }).promise;
       if (ctl.signal.aborted || doc !== this.opts.doc()) return;
       this.last = { doc, pdf, meta };
-      await this.apply();
-      this.opts.onState({ busy: false, seconds: meta.seconds, warm: meta.warm, passes: meta.passes });
+      const shift = await this.apply();
+      this.opts.onState({ busy: false, seconds: meta.seconds, warm: meta.warm, passes: meta.passes, shift, preamble: meta.preamble });
     } catch (e) {
       if (e.name !== "AbortError") this.opts.onState({ busy: false, error: e.message });
     } finally { if (this.ctl === ctl) this.ctl = null; }
@@ -73,7 +74,8 @@ export class LivePreview {
    * Splice the last preview over its pages of the full PDF: the pages the full build had shipped when the chapter
    * started and ended (meta.pages.first/last, 0-based; last = first - 1 inserts), else the preview's first page
    * label (hyperref) looked up in the full PDF up to the page the build recorded at its end. Failing both, the
-   * preview is shown on its own.
+   * preview is shown on its own. Returns how many pages more (or fewer) the part has than in the full PDF: the
+   * pages after it keep the full build's numbers until the next full build.
    */
   async apply() {
     const last = this.last, view = this.view;
@@ -91,6 +93,7 @@ export class LivePreview {
     }
     if (from < 0 || to < from - 1) { from = 0; to = total - 1; }
     view.setSplice({ doc: last.pdf, from, count: to - from + 1 });
+    return to < total - 1 ? last.pdf.numPages - (to - from + 1) : 0;
   }
 
   /** A new full PDF was loaded: keep showing the preview only if it was typeset after that build started. */

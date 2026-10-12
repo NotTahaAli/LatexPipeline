@@ -4,6 +4,131 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Integration tests that run the external tools for real when installed (`tests/test_integration_tools.py`: dvisvgm, qpdf, pdftoppm, mutool, latexdiff, texcount, chktex, tex-fmt, veraPDF) and the AI, Zotero, Crossref and LanguageTool HTTP code against loopback stub servers (`tests/test_integration_net.py`, `tests/netstubs.py`), with opt-in live checks (`LP_LIVE_NET=1`, `LANGUAGETOOL_URL`).
+- Coverage-driven tests (`tests/test_cov_*.py`, `node tests/cov_check.mjs`): every `serve.check_permission` route by role, document scope and rate limit (a new endpoint fails the test until it has a row), every hosted route's sign-in, site-admin and workspace guard, OAuth/MCP refusals, the fail-closed document lock, sandbox resource limits in a child process, release publishing against a fake `gh`, latexdiff in CI, and the editor API's relative, encoded URLs. Report: `releases/v0.2.0-coverage.md` in the project files.
+- `tests/ui_e2e.py`: a browser check of every palette command, shortcut and More menu entry of the editor, its features one by one (sharing with a link per role in separate browsers included) and every page of the hosted gateway, failing on console errors, failed requests and axe-core violations.
+- Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
+- Tests: `tests/test_git_live.py` runs hosted Git sync and the local Git panel against a real https Git server on loopback (git http-backend, self-signed certificate, token checked), including hostile remotes (symlinks, submodules, hooks, an oversize pack, redirects, a remote that never answers); `tests/git_e2e.py` checks the hosted Git tab, Account > Git and every button of the local Git panel in a browser with axe-core.
+- Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
+- Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
+- `tests/test_cli_flags.py`: every command-line flag of the six scripts run in a real subprocess, with an inventory check against `--help`; notification tests that run osascript and PowerShell on the macOS and Windows runners; `tests/vscode_e2e.mjs --vsix` (the packaged and installed extension), hosted reconnect, malformed tokens, hosted 409 and hosted Problems.
+- VS Code extension in `vscode/` (install with `vsce package`): connects to a local editor, a share link or a hosted project (API token), shows the document as a folder, saves through the editor's API, builds, shows build errors as Problems and the PDF in a tab.
+- Suggestion card: hover a suggestion, click its gutter mark or press Alt+Enter to see author, time, old and new text and replies, with Accept/Reject (edit role) or Withdraw (own); suggestions take replies.
+- @mentions in comments with autocomplete from the document's people, and a bell listing mentions and replies on your threads (no e-mail).
+- Comment on the PDF: click a point or drag a region; SyncTeX turns it into a review thread.
+- History: download a version as a zip, and "Compare with now (PDF)" builds a sandboxed latexdiff PDF.
+- Lock a document (owner, hosted workspace admin): read-only for everyone until unlocked, enforced by the server.
+- Files tab: copy files and folders, and upload a folder by dropping it or with the folder button.
+- Linked files: a read-only file fetched from an https URL or copied from another document, with Refresh.
+- Crash recovery: unsaved text is kept in IndexedDB and offered back when it differs from the file.
+- Request access: view and review links ask for more access; the owner grants a named link, hosted admins a role.
+- Single-file binaries of `build.py` and `serve.py` for Linux, macOS and Windows (PyInstaller), attached to each `v*` release by `.github/workflows/binaries.yml`; a binary uses the directory it is started in as the repository.
+- Live preview: citations of keys the full build never cited now resolve with biblatex and biber too (biber runs in the sandbox on the preview's `.bcf` plus the full build's keys, only when there are new keys).
+- Reviewer role: a "can review" named share link and a hosted `reviewer` workspace role (between viewer and editor; new `host.db` migration) comment, reply, resolve and suggest (Suggest mode locked on, "Reviewer" chip) and withdraw their own suggestions, but cannot save, change files, rebuild, accept or reject; the server refuses their co-editing updates, and over MCP they get the review tools only.
+- `build.py --format [DOC ...]` rewrites a document's `.tex` files with tex-fmt (its `tex-fmt.toml` applies), `ci_report.py lint --format` lists files tex-fmt would change as notices, and the editor's "Format file (tex-fmt)" command formats the open file as one edit (`POST /api/format`, edit role). A missing tex-fmt is a message, never a failure.
+- `ci_report.py lint --verify-citations` (opt-in) flags `.bib` entries whose DOI does not resolve on Crossref, whose title has no close Crossref match, or whose record disagrees on title, year or first author, as possibly fabricated or wrong references; the References panel's "Verify with Crossref" shows a verified / mismatch / not found badge per entry (`POST /api/bib/verify`, edit role, Look up's rate limits).
+- A plain-language hint for biber's "Found biblatex control file version X, expected version Y" (mismatched biber and biblatex).
+- Editor: code folding for sections, environments, the preamble and `% region` blocks (fold gutter and Ctrl+Shift+[ / ]).
+- Editor: hovering math in source mode shows it rendered (KaTeX); hovering a `\cite` key or `\ref` label shows the entry or the label's line.
+- Editor: live code check for unmatched `\begin`/`\end`, braces, `\left`/`\right` and math delimiters, with `%%novalidate`, `%%begin novalidate` / `%%end novalidate` and a Settings toggle.
+- Editor: completion of the document's own macros and environments, more built-in environments, and `\cite` / `\ref` keys matched by any part of the key, author or title.
+- Editor: dark PDF pages (PDF toolbar or Settings), remembered in the browser.
+- Editor: search and replace in all files of a document (sidebar Search tab, Ctrl+Shift+F; `GET /api/search`, `POST /api/replace`): match case, whole word, regular expressions for the owner only; files open in live co-editing are changed through the shared document, others written with history; build-config files stay owner-only.
+- Editor: pasting a table from a spreadsheet, Word or a web page offers "Paste as table", a `table`/`tabular` with LaTeX special characters escaped (booktabs rules when the document loads booktabs).
+- Editor: Review tab "Export..." downloads all comment threads and open suggestions as Markdown or JSON.
+- Editor: table editor for the `tabular`, `tabularx` or `longtable` under the cursor (grid with add, remove and move rows and columns, column alignment and spec, booktabs or `\hline` rules, written back as one edit) and "Align &", which pads the columns in the source.
+- Editor: pasting or dropping an image opens a figure dialog (file name, folder, caption, label, width, placement) and inserts a whole `figure` environment; `POST /api/upload` takes an optional `folder` inside the document.
+- Editor: "Edit picture" for TikZ: the `tikzpicture` under the cursor on a canvas (nodes, coordinates, lines and arrows), with dragging, snap to grid, adding and deleting nodes and edges, and editing names, labels and options; only changed statements are rewritten, the rest is kept verbatim and in order.
+- Editor: `.md` files get Markdown highlighting and a rendered preview (built from text nodes, never HTML), and "Insert Markdown selection as LaTeX" converts headings, emphasis, lists, links and code.
+- Editor: hovering `\includegraphics{...}` shows the figure's thumbnail; completion of file names in `\includegraphics`, `\input`, `\include`, `\bibliography`, `\addbibresource` and friends.
+- Editor: completion of glossary and acronym keys (`\newglossaryentry`, `\newacronym`, `\newabbreviation`) in `\gls`, `\acrshort` and the rest of their families (`/api/refs` now returns `glossary`).
+- Editor: math prefix shortcuts (`@a` gives `\alpha`, LaTeX Workshop's table), off by default in Settings > Editing.
+- Editor: Ctrl+B / Ctrl+I toggle `\textbf` / `\emph`; wrap the selection in an environment or a command.
+- Editor: structural edits: change or delete the surrounding environment, delete the surrounding command keeping its argument, toggle a starred environment, toggle `\left`/`\right`; reviewers get them as suggestions.
+- Editor: user snippets with `${1:placeholder}` tab stops (trigger word + Tab), edited in Settings and kept in the browser, with four defaults.
+- Editor: pasting Unicode offers "Convert to LaTeX" (quotes and dashes; accented letters for pdflatex documents; Greek and symbols in math).
+- Editor: relative line numbers, a soft-wrap switch and "Rewrap paragraph" (Alt+Q) to a set width.
+- Editor: zen mode (only the editor, in a centred column; Esc leaves it).
+- Editor: the document folder's `.editorconfig` sets indentation, and on Ctrl+S trims trailing white space and adds a final newline (`/api/refs` returns its text).
+- Review markup: `build.toml` `review = "show" | "clean"` (or `build.py --review show|clean`) defines `\lpadd`, `\lpdel`, `\lpedit`, `\lpnote` and the `lpaddblock`, `lpdelblock`, `lpnoteblock` environments, shown as green highlight, red strike-through and notes, or printed as if every change were accepted; off by default, and a document's own definitions win.
+- Editor: go to definition (F12, Ctrl+click) of labels, `\cite` keys (the `.bib` entry), the document's commands and environments, and find references (Shift+F12) across the document (`POST /api/symbols`, `scripts/navigate.py`).
+- Editor: rename a label everywhere (F2: its `\label` and every `\ref`-like use; `POST /api/rename`, edit role; files open in co-editing change through their rooms, others are written with history).
+- Editor: label numbers from the last build's `.aux` next to `\label` and `\ref` (Settings toggle).
+- Editor: the Outline also lists figures and tables with captions, labels and TODOs, with a filter.
+- Editor: "File graph" of `\input`/`\include`/`\bibliography`/`\includegraphics` and local packages, drawn as SVG.
+- Editor: TODOs drawer tab for `% TODO`, `% FIXME` and `\todo{}`, click to jump.
+- Editor: bookmarks (Ctrl+Alt+K, next Ctrl+Alt+L, previous Ctrl+Alt+J, Bookmarks tab) and the cursor of each file restored, kept per browser.
+- Editor: package documentation on `\usepackage{x}` (hover or F12) opens `https://texdoc.org/pkg/x` in a new tab.
+- Editor: Symbols sidebar tab (Greek, operators, relations, arrows, accents, misc) with search, inserting at the cursor.
+- Editor: optional KaTeX preview under displayed equations in source mode (figures are not previewed).
+- Editor: "Typeset selection" sets the selected LaTeX with the document's preamble in one run through `sandbox.spawn()` and shows it in a popup (`POST /api/typeset`, edit role, `scripts/fragment.py`).
+- Editor: optional "Follow the cursor": SyncTeX forward search on a cursor pause and after each build.
+- Editor: PDF presentation mode (full screen, one page, arrow keys) and "Open the PDF in a new tab".
+- `build.py --review-pdf DOC` and the editor's More > Build with suggestions: `out/<name>.review.pdf` with the open suggestions inlined as marked changes and unresolved comments as notes, built from a copy (only plain-prose ranges; the rest is skipped with a reason); never published.
+- References > More > "My library...": a personal reference library shared by all your documents (local: the owner's `library.json`, mode 600, in the config folder; hosted: per account in `host.db`, new migration), filled by DOI, BibTeX, RIS, a form or the panel's selection, with duplicate and missing-field badges, insertion into a document's `.bib` and `.bib` export.
+- `build.py --cited-bib` and References > More > "Download cited-only .bib" (`GET /api/cited-bib`): a `.bib` with only the entries the last build cited (from its `.aux` or `.bcf`, with `@string` definitions and crossref parents).
+- AI assistant: "Find claims needing citations" lists uncited factual sentences of the open file; "Search Crossref" shows real Crossref records for a claim as candidates to add (`POST /api/bib/search`, edit role); the model never names references.
+- AI assistant: Ask with "Whole project" answers from passages of all the document's text files (keyword retrieval, bounded).
+- AI assistant: "LaTeX from image..." (or pasting an image) turns a picture of an equation, table or diagram into LaTeX to insert at the cursor (PNG, JPEG, GIF, WebP; scaled in the browser, size and type checked on the server).
+- AI assistant: OpenAI-compatible endpoints (OpenAI, OpenRouter, Ollama and similar; base URL, model, `OPENAI_API_KEY` or a stored key) besides Anthropic, locally in the panel's settings and hosted with `[ai] provider = "openai"` and `base_url`; a local model server serves only the owner.
+- `build.py --tidy-bib [--bib-sort key|author|year|none] [--check]` sorts `.bib` entries, puts fields in bibtex-tidy's order with the `=` aligned and reports possible duplicates (same key, DOI or title) without dropping anything; the editor's "Tidy .bib file" command applies the same as one edit (`POST /api/bib/tidy`, edit role).
+- Editor: a Stop button while a build runs (`POST /api/build/cancel`, edit role) kills latexmk's process group; the build fails with "Build cancelled."
+- Editor: opt-in desktop notifications when a build ends while the window is in the background (Ctrl+K > "Desktop notification when a build ends"); `build.py --watch --notify` uses osascript, notify-send or PowerShell when one is there.
+- `build.toml` `draft = true` / `build.py --draft`: graphicx draws boxes instead of images (opt-in; no speed gain measured on `bench/sample-report`, see README).
+- Filtered build log: the editor's Log tab "Only lines that need action" and `build.py --quiet-log` show texfot-style lines only; the log file keeps everything.
+- `build-report.json`: optional `steps` (seconds per latexmk rule run, also in `--profile`) and `outputs` keys.
+- `build.py --deps make|json DOC` prints the files a document's last build read (from its `.fls`).
+- `build.toml` `strict = true` / `build.py --strict` fails a document on undefined or multiply defined references and citations and on overfull boxes over 1 pt.
+- `build.toml` `[[output]]` tables build extra PDFs of a document (`out/<name>-<output>.pdf`, with `define`d macros, another engine, review or draft mode); CI publishes them with the document.
+- `build.py --preflight`: fonts not embedded, Type 3 fonts, mixed page sizes, PDF version and bookmarks of each built PDF (pdffonts and pdfinfo).
+- `build.toml` `anonymous = true` notes author names, e-mail addresses, acknowledgements and self-citation phrases in the log of a double-blind build.
+- `ci_report.py lint`: duplicate labels, and notices for a breakable space before `\cite`, `\cref` / `\Cref` against the sentence start and mixed US/UK spellings.
+- `.pre-commit-hooks.yaml` with `latex-lint`, `latex-format` and `bib-tidy` hooks; `build.py --format --check` changes nothing and exits 1 when tex-fmt would.
+- CI: `TEXLIVE_VERSION` in the workflow pins the tug.org TeX Live year; fonts in `.github/fonts/` and `.github/hooks/pre-build` / `post-build` scripts run in CI only.
+- `build.py --query DOC` prints title, author, pages, words, labels and sections as JSON.
+- `build.py --pages 1-3,7 DOC` writes `out/<name>.pages.pdf` with qpdf or pdftk (never published).
+- `build.py --watch --exec "cmd"` runs a command (no shell) after each successful build, with `LP_DOC` and `LP_PDF` set.
+- Remote compile API: `POST /api/v1/compile` takes a zip, a tar archive or a JSON files map and answers the PDF (or the log with `422`, or both as JSON). Locally on `serve.py` for the owner only; hosted with a personal API token of the `compile` scope (new `host.db` migration: `scopes` and `expires` on `api_tokens`, `api_usage`), built in a sandboxed per-person worker, with size caps, hourly and daily limits, a per-person result cache and audit entries (`[api]` in `config.toml`, off by default).
+- HTML export: `build.py --html [DOC ...]`, `build.toml` `html = true` (also published as `<name>.html.zip`) and the editor's "Export HTML" (owner-only) convert a document with make4ht into `out/<name>.html/` and `out/<name>.html.zip`, math as MathML, figures as SVG.
+- Live preview: editing the preamble (of `main.tex`, a local class or package, or a file the preamble reads) no longer pauses the preview until the next full build: a TeX process loads the typed preamble and the chapter is previewed again on it (about 3 s on `bench/sample-report`, see `docs/realtime.md`).
+- Live preview: the status line says "later pages +N" (with a tooltip) when the previewed chapter has more or fewer pages than in the full PDF, since page numbers after it stay those of the last full build.
+- Accessibility checks: `\documentclass{beamer}` reports the LaTeX Tagging Project's "no support" status with a pointer to `ltx-talk`, and frames without a title are flagged.
+- `build.py --arxiv [DOC ...]`: `out/<name>.arxiv.zip` with exactly the files the build read from the document directory, the generated `main.bbl` (`.ind`, `.gls`, `.nls`), `%` comments stripped from `.tex` files and a `00README.json` for XeLaTeX, plus a preflight (outside files, file names, hidden files, absolute or `..` paths, shell escape, missing figures, images over 34 megapixels, biblatex `.bbl` format, LuaLaTeX) printed and written to the log; "Export for arXiv" in the editor's More menu (owner-only, off while sharing).
+- Accessibility checks for `tagged = true` documents (`scripts/a11y.py`): missing PDF title, `\includegraphics` without `alt=`, skipped heading levels and packages the LaTeX Tagging Project lists as incompatible, in the log, `build-report.json` (new optional `a11y` key), the editor's Warnings tab and `ci_report.py lint` notices.
+
+### Changed
+
+- TikZ externalization: a figure is rebuilt when a `\tikzset`/`\pgfplotsset` style outside pictures (also in chapters), a macro or colour it uses, or a file it `\input`s changes, not only the preamble. `accel.py` is a build input, so every document rebuilds once.
+- `publish_release.py` uploads only the files of documents (each PDF and log, `[[output]]` PDFs and logs, and `<name>.html.zip` for `html = true`), never other files in `out/` (review, latexdiff, chapter preview or `--pages` PDFs).
+
+### Fixed
+
+- Hosted Git sync: a push that delivers commits left behind by an earlier refused push now says "Pushed." instead of "Pushed (no new changes)."; the message follows what the repository answered.
+- Git tab: the branch picker shows the current branch of a repository without commits (an unborn branch) instead of staying empty.
+- Hosted Account > Git: "Remove the stored token" appears right after saving a token and hides after removing it, without a reload.
+- MCP `render_page` with mutool (no pdftoppm) made portrait pages taller than `size`; the longest side is now `size`, as with pdftoppm.
+- Hosted: a Git sync (`/p/<id>/api/git/remote`) and `/api/people`, `/api/access/*` were answered by the gateway and then also relayed to the project's worker, which started it and wrote a second reply on the same connection.
+- Hosted Git tab: the result of a pull (the list of files that differ) was cleared at once by the panel's refresh, so conflicts were never shown.
+- Hosted Git sync: refused and failed pulls and pushes (wrong token, rejected push, size cap, timeout) are audited too (`git_pull`/`git_push` with `failed: <status>`).
+- Editor sidebar: with every tab shown (Symbols, Assistant, Git) the tabs ran under the editor, so Git and the close button could not be clicked; they wrap now.
+- Accessibility: the Git panel's diff is keyboard-scrollable, and the PDF viewer has a region role for its label (axe `scrollable-region-focusable`, `aria-prohibited-attr`).
+- A `.bib` outside the document's directory (`\bibliography{../shared/refs}`, `\addbibresource`) now counts for rebuild detection (local and CI `--changed-since`) and `--deps`: BibTeX and biber read it, so it was never in the `.fls`; it is now taken from latexmk's `.fdb_latexmk`. `build.py` changed, so every document rebuilds once.
+- A build that fails without a LaTeX error to show (an empty document body: "No pages of output", or latexmk failing outright) now says why in the summary, `build-report.json`'s `error`, the CI table and the editor, instead of a bare FAILED.
+- `publish_release.py --help` (or any argument) no longer publishes: it printed nothing and ran the whole release sync; it now shows its usage and refuses unknown arguments.
+- Builds of documents with TikZ pictures: a figure-listing pass (any file of the document with a `tikzpicture` changed, even one the document does not read) deleted `main.synctex.gz` and replaced `main.log` when latexmk then had nothing to redo, so source and PDF no longer jumped to each other until Rebuild from scratch; the editor now says "the build is still running" instead of "No SyncTeX data yet" during a build.
+- Editor: the palette had two commands with the id `references` (duplicate element ids); Find references is now `findrefs`.
+- Editor: switching the key bindings quickly (Emacs, then Default before Emacs had loaded) could leave the earlier bindings on.
+- Editor: the PDF no longer follows the cursor once "Follow the cursor" is turned off during its pause.
+- Editor: edit links no longer ask for the owner-only share state on load (a 403 in every guest's console).
+- Editor: Escape closes the notification list when it is empty (the focus stays on the bell then), and the bell has its name before the review data has loaded (axe `button-name`).
+- Editor accessibility (axe): the Symbols panel's group titles are `h2` (heading order), the PDF viewer has `role="region"` for its label, the links in a toast ("Recover it", "Discard") have the toast's contrast, and overlapping comment highlights no longer stack their tints, with text under a highlight in the ink colour (syntax colours fell below 4.5:1).
+- `tests/review_e2e.py` removes the cache, history and outputs of its throwaway document.
+- Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
+- Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
+- Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).
+
 ## [0.1.1] - 2026-10-12
 
 ### Changed

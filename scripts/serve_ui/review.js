@@ -7,6 +7,7 @@
 // Every bit of user text is rendered with textContent.
 import { makeAnchor, locate, partsOf, placeGroups } from "./anchors.js";
 import { ago } from "./history.js";
+import { exportReview } from "./reviewexport.js";
 
 const FILTERS = [["comments", "Comments"], ["suggestions", "Suggestions"], ["resolved", "Resolved"]];
 const IDLE_COMMIT = 1500;   // ms of no typing before a suggestion in progress is sent
@@ -16,10 +17,12 @@ const MAX_HOLD = 5000;      // ms an IME composition may hold the co-editing roo
 const clip = (s, n = 280) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 /**
- * ctx = {api, el, icon, doc(), canEdit, me() -> {name, key}, view(), activePath(), openFile(path, line, opts),
+ * ctx = {api, el, icon, doc(), canEdit (comment and suggest), reviewer (suggest mode locked on; withdraws only its own
+ *        suggestions, never accepts, rejects or moves anchors), me() -> {name, key}, view(), activePath(), openFile(path, line, opts),
  *        showPanel(), toast(msg), live(msg), onCount(n),
  *        fromYjs() -> true while the co-editing binding applies a change that already happened to the shared text,
- *        hold(on) -> keep the editor's text from co-editors and the disk while an IME composition is in progress}
+ *        hold(on) -> keep the editor's text from co-editors and the disk while an IME composition is in progress,
+ *        mention(textarea) -> @name completion, onData() -> the review data changed}
  */
 export function reviewSupport(S, V, ctx) {
   const { el } = ctx;
@@ -88,7 +91,7 @@ export function reviewSupport(S, V, ctx) {
   function reanchorSoon() { clearTimeout(anchorTimer); anchorTimer = setTimeout(reanchor, 1500); }
   function reanchor() {
     const view = ctx.view();
-    if (!ctx.canEdit || !view) return;
+    if (!ctx.canEdit || ctx.reviewer || !view) return;   // the server refuses a reviewer's reanchor
     const text = view.state.doc.toString(), path = ctx.activePath(), now = places(view.state, true), items = [];
     for (const item of [...data.threads, ...data.suggestions]) {
       if (item.path !== path || String(item.id).startsWith("tmp")) continue;
@@ -132,11 +135,69 @@ export function reviewSupport(S, V, ctx) {
       mousedown(view, line) {
         const ids = [...places(view.state)].filter(([, at]) => at.from >= line.from && at.from <= line.to).map(([id]) => id);
         if (!ids.length) return false;
+        if (data.suggestions.some((s) => s.id === ids[0])) { setTimeout(() => openCard(view, places(view.state).get(ids[0]).from), 0); return true; }
         focusItem(ids[0]);
         return true;
       },
     },
   });
+
+  // ---- the suggestion card: who and when, old -> new, replies, and the decision; on hover, Alt+Enter or the gutter --
+  const sugAt = (state, pos) => {
+    for (const [id, at] of places(state)) {
+      const s = data.suggestions.find((x) => x.id === id);
+      if (s && at.from <= pos && pos <= at.to) return { s, ...at };
+    }
+    return null;
+  };
+  const cards = new Set();   // open cards, redrawn when the review data changes
+  function cardView(id, pinned) {
+    const dom = el("div", { className: "cm-sug-card" });
+    dom.setAttribute("role", "group");
+    const card = { draw() {
+      const s = data.suggestions.find((x) => x.id === id);
+      if (!s) { dom.replaceChildren(el("p", { className: "mute", textContent: "This suggestion was accepted, rejected or withdrawn." })); return; }
+      dom.setAttribute("aria-label", `Suggestion by ${s.name}`);
+      const keep = dom.querySelector("textarea")?.value || "";
+      const pending = String(s.id).startsWith("tmp");
+      const acts = [];
+      const iconBtn = (name, label, onclick, cls = "icon") => { const b = el("button", { type: "button", className: cls, title: label, onclick }, ctx.icon(name)); b.setAttribute("aria-label", label); b.disabled = pending; return b; };
+      if (ctx.canEdit && !ctx.reviewer) acts.push(iconBtn("check", "Accept suggestion", () => { close(); decide([s.id], true); }, "icon ok"));
+      if (ctx.canEdit && (!ctx.reviewer || s.mine)) acts.push(iconBtn("x", s.mine ? "Withdraw suggestion" : "Reject suggestion", () => { close(); decide([s.id], false); }, "icon no"));
+      const reply = ctx.canEdit && !pending ? textBox("Reply to this suggestion", async (text) => {
+        dom.querySelector("textarea").value = "";   // the redraw after sending must not bring it back
+        const ok = !!(await run({ op: "reply", suggestion: s.id, text }, "Reply sent"));
+        if (!ok && dom.querySelector("textarea")) dom.querySelector("textarea").value = text;
+        return ok;
+      }, close, "Reply") : null;
+      if (reply) { reply.querySelector("textarea").rows = 2; reply.querySelector("textarea").value = keep; }
+      dom.replaceChildren(
+        el("div", { className: "rv-head" }, el("span", { className: "rv-who" }, el("b", { textContent: s.name }), stamp(s.time)), el("span", { className: "spacer" }), ...acts),
+        ...changeLines(s), ...commentNodes(s, { suggestion: s.id }), ...(reply ? [reply] : []));
+    } };
+    function close() { const view = ctx.view(); if (view?.state.field(pinField, false)) view.dispatch({ effects: pinCard.of(null) }); view?.focus(); }
+    dom.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); close(); } });
+    card.draw();
+    return { dom, mount() { cards.add(card); if (pinned) dom.querySelector("button, textarea")?.focus(); }, destroy() { cards.delete(card); } };
+  }
+  const hoverCard = V.hoverTooltip((view, pos) => {
+    const hit = sugAt(view.state, pos);
+    return hit && { pos: hit.from, end: hit.to, above: true, create: () => cardView(hit.s.id, false) };
+  }, { hideOnChange: true });
+  const pinCard = S.StateEffect.define();
+  const pinField = S.StateField.define({
+    create: () => null,
+    update(v, tr) { for (const e of tr.effects) if (e.is(pinCard)) return e.value; return tr.docChanged ? null : v; },
+    provide: (f) => V.showTooltip.from(f),
+  });
+  /** Open the card of the suggestion at pos (the keyboard's way to it); false when there is none. */
+  function openCard(view, pos = view.state.selection.main.head) {
+    const hit = sugAt(view.state, pos);
+    if (!hit) return false;
+    view.dispatch({ effects: pinCard.of({ pos: hit.from, end: hit.to, above: true, create: () => cardView(hit.s.id, true) }) });
+    return true;
+  }
+  const cardKeys = V.keymap.of([{ key: "Alt-Enter", run: (view) => openCard(view) }]);
 
   // ---- suggest mode: typing makes a suggestion instead of changing the text ---------------------------------------
   // The state of the open file: the draft being typed ({id, path, parts: [{from, to, insert}]}, one part per
@@ -356,7 +417,7 @@ export function reviewSupport(S, V, ctx) {
   ]));
 
   function setSuggest(on) {
-    if (!ctx.canEdit) return;
+    if (!ctx.canEdit || (ctx.reviewer && !on)) return;
     if (!on) flush();
     suggesting = !!on;
     render();
@@ -380,7 +441,7 @@ export function reviewSupport(S, V, ctx) {
   }
   const changed = () => { clearTimeout(loadTimer); loadTimer = setTimeout(load, 150); };
 
-  function redraw() { refresh(); render(); }
+  function redraw() { refresh(); render(); for (const card of cards) card.draw(); ctx.onData?.(); }
 
   // ---- actions ---------------------------------------------------------------------------------------------------------
   async function run(body, ok) {
@@ -465,6 +526,7 @@ export function reviewSupport(S, V, ctx) {
   function textBox(label, onSend, onCancel, sendLabel) {
     const id = "rv-t" + Math.random().toString(36).slice(2, 8);
     const area = el("textarea", { id, rows: 3, maxLength: 4000, className: "rv-text" });
+    ctx.mention?.(area);   // @name completion (notify.js)
     const lab = el("label", { htmlFor: id, className: "sr", textContent: label });
     const go = btn(sendLabel, async () => { const text = area.value.trim(); if (!text) { area.focus(); return; } go.disabled = true; if (await onSend(text)) return; go.disabled = false; }, "btn primary");
     area.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); go.click(); } else if (e.key === "Escape") { e.stopPropagation(); onCancel(); } });
@@ -475,10 +537,7 @@ export function reviewSupport(S, V, ctx) {
     const li = el("li", { className: "rv-item" + (t.id === activeId ? " active" : "") });
     li.dataset.id = t.id;
     const quote = el("blockquote", { className: "rv-quote", textContent: clip(t.anchor.quote, 200) });
-    const comments = t.comments.map((c) => el("div", { className: "rv-c" },
-      el("div", { className: "rv-who" }, el("b", { textContent: c.name }), stamp(c.time),
-        ...(ctx.canEdit && (c.mine || data.moderator) ? [btn("Delete", () => { if (confirm("Delete this comment?")) run({ op: "delete", thread: t.id, comment: c.id }, "Comment deleted"); }, "link rv-del", "Delete this comment")] : [])),
-      el("p", { className: "rv-body", textContent: c.text })));
+    const comments = commentNodes(t, { thread: t.id });
     const actions = [];
     if (ctx.canEdit) {
       if (!t.resolved) actions.push(btn("Reply", () => { replyOpen.add(t.id); render(); root.querySelector(`[data-id="${CSS.escape(t.id)}"] textarea`)?.focus(); }));
@@ -492,21 +551,38 @@ export function reviewSupport(S, V, ctx) {
     return li;
   }
 
+  /** A thread's comments or a suggestion's replies (ref: {thread} or {suggestion}), each deletable by its author. */
+  function commentNodes(item, ref) {
+    return (item.comments || []).map((c) => el("div", { className: "rv-c" },
+      el("div", { className: "rv-who" }, el("b", { textContent: c.name }), stamp(c.time),
+        ...(ctx.canEdit && (c.mine || data.moderator) ? [btn("Delete", () => { if (confirm("Delete this comment?")) run({ op: "delete", ...ref, comment: c.id }, "Comment deleted"); }, "link rv-del", "Delete this comment")] : [])),
+      el("p", { className: "rv-body", textContent: c.text })));
+  }
+
+  /** The old -> new lines of a suggestion (one per part), with a sentence for screen readers. */
+  function changeLines(s) {
+    const parts = partsOf(s);
+    return [...(parts.length > 1 ? [el("p", { className: "mute rv-group", textContent: `One edit in ${parts.length} places, accepted or rejected together:` })] : []),
+      ...parts.map(({ anchor: { quote }, insert }) => {
+        const shown = el("span", {}, ...(quote ? [el("del", { textContent: clip(quote) })] : []), ...(quote && insert ? [" → "] : []),
+          ...(insert ? [el("ins", { textContent: clip(insert) })] : []));
+        shown.setAttribute("aria-hidden", "true");
+        const say = quote && insert ? `Replace "${clip(quote, 80)}" with "${clip(insert, 80)}"` : insert ? `Insert "${clip(insert, 80)}"` : `Delete "${clip(quote, 80)}"`;
+        return el("p", { className: "rv-change" }, el("span", { className: "sr", textContent: say }), shown);
+      })];
+  }
+
   function suggestionNode(s) {
     const li = el("li", { className: "rv-item" + (s.id === activeId ? " active" : "") });
     li.dataset.id = s.id;
-    const parts = partsOf(s);
-    const changes = parts.map(({ anchor: { quote }, insert }) => {
-      const shown = el("span", {}, ...(quote ? [el("del", { textContent: clip(quote) })] : []), ...(quote && insert ? [" "] : []),
-        ...(insert ? [el("ins", { textContent: clip(insert) })] : []));
-      shown.setAttribute("aria-hidden", "true");
-      const say = quote && insert ? `Replace "${clip(quote, 80)}" with "${clip(insert, 80)}"` : insert ? `Insert "${clip(insert, 80)}"` : `Delete "${clip(quote, 80)}"`;
-      return el("p", { className: "rv-change" }, el("span", { className: "sr", textContent: say }), shown);
-    });
     const pending = String(s.id).startsWith("tmp");
     li.append(el("div", { className: "rv-head" }, where(s), el("span", { className: "rv-who" }, el("b", { textContent: s.name }), stamp(s.time))),
-      ...(parts.length > 1 ? [el("p", { className: "mute rv-group", textContent: `One edit in ${parts.length} places, accepted or rejected together:` })] : []), ...changes);
-    if (ctx.canEdit) {
+      ...changeLines(s), ...commentNodes(s, { suggestion: s.id }));
+    if (ctx.reviewer && s.mine) {   // a reviewer withdraws its own suggestions; accepting and rejecting is for editors
+      const no = btn("Withdraw", () => decide([s.id], false));
+      no.disabled = pending;
+      li.append(el("div", { className: "rv-actions" }, no, ...(pending ? [el("span", { className: "mute", textContent: "Saving..." })] : [])));
+    } else if (ctx.canEdit && !ctx.reviewer) {
       const yes = btn("Accept", () => decide([s.id], true)), no = btn(s.mine ? "Withdraw" : "Reject", () => decide([s.id], false));
       yes.disabled = no.disabled = pending;
       li.append(el("div", { className: "rv-actions" }, yes, no, ...(pending ? [el("span", { className: "mute", textContent: "Saving..." })] : [])));
@@ -527,12 +603,13 @@ export function reviewSupport(S, V, ctx) {
       return b;
     });
     const only = el("input", { type: "checkbox", checked: fileOnly, id: "rvOnly", onchange: () => { fileOnly = only.checked; render(); } });
-    const tools = [];
+    const tools = [btn("Export…", () => exportReview(ctx, data), "btn", "Download every comment and open suggestion as Markdown or JSON")];
     if (ctx.canEdit) {
       const sw = btn("Suggest", () => ctx.toggleSuggest(), "chip rv-switch", "Suggest mode: your edits become suggestions that others accept or reject");
       sw.setAttribute("role", "switch"); sw.setAttribute("aria-checked", String(suggesting));
+      if (ctx.reviewer) { sw.disabled = true; sw.title = "Reviewers always suggest: what you type becomes a suggestion"; }
       tools.push(btn("Comment", startComment, "btn", "Comment on the selected text (Ctrl+Alt+M)"), sw);
-      if (filter === "suggestions" && sugg.length) {
+      if (filter === "suggestions" && sugg.length && !ctx.reviewer) {
         tools.push(btn("Accept all", () => { if (confirm(`Accept ${sugg.length} ${sugg.length === 1 ? "suggestion" : "suggestions"}${fileOnly ? " in this file" : ""}?`)) decide(sugg.map((s) => s.id), true); }),
           btn("Reject all", () => { if (confirm(`Reject ${sugg.length} ${sugg.length === 1 ? "suggestion" : "suggestions"}${fileOnly ? " in this file" : ""}?`)) decide(sugg.map((s) => s.id), false); }));
       }
@@ -564,8 +641,9 @@ export function reviewSupport(S, V, ctx) {
   }
 
   return {
-    extension: [itemsField, sugField, filterTr, listener, imeEnd, undoKeys, gutter],
-    bypass, mount, load, changed, refresh, flush, startComment, setSuggest, focusItem,
+    extension: [itemsField, sugField, filterTr, listener, imeEnd, undoKeys, gutter, hoverCard, pinField, cardKeys],
+    bypass, mount, load, changed, refresh, flush, startComment, setSuggest, focusItem, openCard,
+    get data() { return data; },
     get suggesting() { return suggesting; },
     reset() { data = { threads: [], suggestions: [], moderator: false }; activeId = null; composing = null; replyOpen.clear(); render(); },
   };

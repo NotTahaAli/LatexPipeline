@@ -51,7 +51,11 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import ai
 import build
+import compile_api
+import host_git
 import host_mcp
+import host_tokens
+import library
 import zotero
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,9 +75,10 @@ CONFIG_DEFAULTS: dict = {
     "public_url": "http://localhost:8080", "listen": "127.0.0.1", "port": 8080, "trust_proxy": False,
     "site_name": "LaTeX Studio", "session_days": 14, "session_idle_hours": 12, "providers": {},
     "max_connections": 256, "max_upload_mb": 50, "max_streams_per_user": 8, "signups_per_ip_hour": 10, "ai": {},
-    "mcp": {},
+    "mcp": {}, "api": {},
 }
-AI_DEFAULTS: dict = {"enabled": False, "model": ai.DEFAULT_MODEL, "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
+AI_DEFAULTS: dict = {"enabled": False, "provider": "anthropic", "base_url": "", "model": ai.DEFAULT_MODEL,
+                     "api_key_env": "ANTHROPIC_API_KEY", "api_key": "",
                      "daily_per_user": 50, "daily_per_workspace": 500, "daily_total": 2000,
                      "daily_tokens_per_user": 1_000_000}
 CONFIG_RANGES = {"max_connections": (8, 100000), "max_upload_mb": (1, 10000), "max_streams_per_user": (1, 1000),
@@ -107,17 +112,22 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # client_id = "..."
 # client_secret_env = "GITHUB_CLIENT_SECRET"
 
-# AI assistant in the editor (optional). Off unless enabled. The gateway makes the Anthropic API calls itself;
-# project workers never get the key. Editors' text, logs and questions are sent to api.anthropic.com.
+# AI assistant in the editor (optional). Off unless enabled. The gateway makes the API calls itself; project
+# workers never get the key. Editors' text, logs and questions are sent to api.anthropic.com (or to base_url).
 # [ai]
 # enabled = true
 # model = "claude-opus-5-5"            # or claude-sonnet-5-5, claude-haiku-5-5
 # api_key_env = "ANTHROPIC_API_KEY"    # the environment variable holding the key
+# Or an OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Mistral, a vLLM or Ollama server you run):
+# provider = "openai"
+# base_url = "https://api.openai.com/v1"  # http:// only for a server on this machine or network
+# model = "the-model-id"
+# api_key_env = "OPENAI_API_KEY"       # leave api_key_env = "" for a local server without a key
 # daily_per_user = 50                  # requests per person per day (UTC)
 # daily_per_workspace = 500            # requests per workspace per day
 # daily_total = 2000                   # requests for the whole server per day (the spending cap)
 # daily_tokens_per_user = 1000000      # input + output tokens per person per day
-""" + host_mcp.CONFIG_TEMPLATE
+""" + host_mcp.CONFIG_TEMPLATE + compile_api.CONFIG_TEMPLATE
 
 SIGNUP_MODES = ("invite_only", "open", "open_domains")
 SETTING_DEFAULTS: dict = {
@@ -130,8 +140,13 @@ SETTING_RANGES = {
     "max_workers": (1, 500), "max_workers_per_tenant": (1, 500), "worker_idle_minutes": (1, 1440),
     "build_timeout": (10, 3600),
 }
-ROLES = ("admin", "editor", "viewer")
+ROLES = ("admin", "editor", "reviewer", "viewer")
 EDIT_ROLES = ("admin", "editor")
+
+
+def worker_role(tenant_role: str) -> str:
+    """The role a project's worker (serve.py --gateway) gets in X-Host-Role for a workspace role."""
+    return "edit" if tenant_role in EDIT_ROLES else "review" if tenant_role == "reviewer" else "view"
 
 
 class ConfigError(Exception):
@@ -176,13 +191,21 @@ def load_config(data: Path) -> dict:
     if not isinstance(config["ai"], dict) or set(config["ai"]) - set(AI_DEFAULTS):
         raise ConfigError(f"{path}: [ai] takes only {', '.join(AI_DEFAULTS)}")
     config["ai"] = cfg = {**AI_DEFAULTS, **config["ai"]}
-    if not isinstance(cfg["enabled"], bool) or cfg["model"] not in ai.MODELS \
-            or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key")):
-        raise ConfigError(f"{path}: [ai] needs enabled = true/false, a model from {ai.MODELS} and text for the keys")
+    if not isinstance(cfg["enabled"], bool) or cfg["provider"] not in ai.PROVIDERS \
+            or not all(isinstance(cfg[k], str) for k in ("api_key_env", "api_key", "base_url")):
+        raise ConfigError(f"{path}: [ai] needs enabled = true/false, provider = one of {ai.PROVIDERS} and text "
+                          "for the keys and base_url")
+    try:  # the operator may point at a local server (http to loopback or the local network); users never can
+        cfg["model"] = ai.check_model(cfg["model"], cfg["provider"])
+        if cfg["provider"] == "openai":
+            cfg["base_url"] = ai.check_base_url(cfg["base_url"])
+    except ai.AiError as exc:
+        raise ConfigError(f"{path}: [ai] {exc} (model must be one of {ai.MODELS} for Anthropic)") from None
     for key in ("daily_per_user", "daily_per_workspace", "daily_total", "daily_tokens_per_user"):
         if not (isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and 0 <= cfg[key] <= 10 ** 9):
             raise ConfigError(f"{path}: [ai] {key} must be a whole number from 0 to 1000000000")
     host_mcp.check_config(config, path)
+    compile_api.check_config(config, path)
     return config
 
 
@@ -274,6 +297,62 @@ MIGRATIONS = [
         kind TEXT NOT NULL CHECK(kind IN ('access', 'refresh')), resource TEXT NOT NULL, expires REAL NOT NULL,
         used REAL);
     CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
+    """,
+    # The reviewer role (comments and suggestions, no direct edits): SQLite changes a CHECK only by a new table.
+    """
+    CREATE TABLE members_new(
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'editor', 'reviewer', 'viewer')), PRIMARY KEY(tenant_id, user_id));
+    INSERT INTO members_new(tenant_id, user_id, role) SELECT tenant_id, user_id, role FROM members;
+    DROP TABLE members;
+    ALTER TABLE members_new RENAME TO members;
+    CREATE TABLE invites_new(
+        id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'editor', 'reviewer', 'viewer')), email TEXT, created_by INTEGER,
+        created REAL NOT NULL, expires REAL NOT NULL, used_by INTEGER, used REAL);
+    INSERT INTO invites_new(id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used)
+        SELECT id, token_hash, tenant_id, role, email, created_by, created, expires, used_by, used FROM invites;
+    DROP TABLE invites;
+    ALTER TABLE invites_new RENAME TO invites;
+    """,
+    # Git sync (host_git.py): each person's token for the Git host, each project's remote. Personal API tokens
+    # (host_tokens.py, stored as SHA-256) for scripts and the VS Code extension.
+    """
+    CREATE TABLE git_tokens(
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, username TEXT NOT NULL,
+        token TEXT NOT NULL);
+    CREATE TABLE git_remotes(
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, url TEXT NOT NULL,
+        branch TEXT NOT NULL, user_id INTEGER, created REAL NOT NULL, synced REAL, commit_id TEXT);
+    CREATE TABLE api_tokens(
+        id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE, projects TEXT NOT NULL, created REAL NOT NULL, used REAL);
+    CREATE INDEX api_tokens_user ON api_tokens(user_id);
+    """,
+    # Requests for more access from the editor (a viewer or reviewer asks; a workspace admin grants or dismisses).
+    """
+    CREATE TABLE access_requests(
+        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('editor', 'reviewer')), project_id TEXT, note TEXT NOT NULL DEFAULT '',
+        created REAL NOT NULL, PRIMARY KEY(tenant_id, user_id));
+    """,
+    # Personal reference library (library.py): one JSON document per account, shared by all its projects.
+    """
+    CREATE TABLE library(
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL);
+    """,
+    # One personal API token system (host_tokens.py): space-separated scopes ("projects" for the project proxy and
+    # the VS Code extension, "compile" for /api/v1/compile) and an optional expiry; older tokens keep "projects".
+    # api_usage counts compiles per person and UTC day (compile_api.py).
+    """
+    ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT 'projects';
+    ALTER TABLE api_tokens ADD COLUMN expires REAL;
+    CREATE TABLE api_usage(
+        day TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        compiles INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day, user_id));
     """,
 ]
 
@@ -812,6 +891,9 @@ class App:
         self.signups = Throttle(config["signups_per_ip_hour"], 3600)  # sign-ups per address (hard cap)
         self.invite_tries = Throttle(10, 3600)  # wrong invite links per address
         self.zotero_syncs = Throttle(10, 600)  # Zotero previews per account (hard cap)
+        self.git_syncs = Throttle(20, 600)  # Git pulls and pushes per account (hard cap)
+        self.access_requests = Throttle(5, 3600)  # requests for a better role per account and hour
+        self.api_token_tries = Throttle(30, 900)  # wrong API tokens per address (hard cap, host_tokens.py)
         self.streams: collections.Counter = collections.Counter()  # open WebSockets / long-polls per user id
         self.streams_lock = threading.Lock()
         self.sizes: dict[str, tuple[float, int]] = {}
@@ -1224,6 +1306,8 @@ class Handler(BaseHTTPRequestHandler):
             self.session = self.load_session()
             if host_mcp.endpoint(self, url.path):  # /mcp, /oauth/*, /.well-known/oauth-*: no cookies, no CSRF
                 return
+            if compile_api.endpoint(self, url.path):  # /api/v1/*: API tokens only, no cookies, no CSRF
+                return
             if url.path.startswith("/p/"):
                 self.project_proxy(url.path, url.query)
                 return
@@ -1294,6 +1378,9 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(404, "Not found.")
         pid, rest = match.group(1), match.group(2)
         upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
+        token = host_tokens.bearer(self, "projects")  # an API token (scripts, VS Code), never mixed with the session
+        if token is not None:
+            self.session = token
         if self.command == "GET" and not upgrade and self.headers.get("Sec-Fetch-Site") == "cross-site" and not (
                 self.headers.get("Sec-Fetch-Mode") == "navigate" and self.headers.get("Sec-Fetch-Dest") == "document"):
             raise HttpError(403, "Cross-site request refused.")  # Another site's <img>, fetch or <script>.
@@ -1303,25 +1390,38 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raise HttpError(401, "Sign in first.")
         found = project_access(APP, self.session, pid)
-        if not found:
+        if not found or (token is not None and pid not in token["token_projects"]):
             raise HttpError(404, "No such project.")
         project, tenant_role_ = found
         if rest is None:
             self.redirect(f"/p/{pid}/")
             return
-        role = "edit" if tenant_role_ in EDIT_ROLES else "view"
+        role = worker_role(tenant_role_)
         if self.command not in ("GET", "POST", "PUT"):
             raise HttpError(405, "Method not allowed.")
-        if (self.command != "GET" or upgrade) and not self.origin_ok():
-            raise HttpError(403, "Cross-site request refused.")
+        if (self.command != "GET" or upgrade) and token is None and not self.origin_ok():
+            raise HttpError(403, "Cross-site request refused.")  # a bearer token is never sent by a browser on its own
+        if token is not None and (upgrade or rest in host_tokens.NOT_WITH_TOKEN):
+            raise HttpError(403, "Not with an API token: open the project in the browser.")
         size = self.body_size(MAX_PROXY_BODY)
-        if rest == "/api/mcp":  # only through /mcp (OAuth grant, audit, limits), never with a browser session
-            raise HttpError(404, "Not found.")
+        if rest == "/api/mcp" or (rest or "").startswith("/api/v1/"):
+            raise HttpError(404, "Not found.")  # only through /mcp and /api/v1 (grant or token, audit, limits)
         if rest == "/api/ai":
             self.assistant(project, role, size)
             return
         if rest in ("/api/zotero", "/api/zotero/fetch", "/api/zotero/preview"):
             self.zotero_sync(rest, role, size)
+            return
+        if rest == "/api/git" or rest.startswith("/api/git/"):  # the gateway syncs; workers have no Git at all
+            if rest != "/api/git/remote":
+                raise HttpError(404, "Not found.")
+            host_git.handle(self, project, role)
+            return
+        if rest in ("/api/people", "/api/access/request", "/api/access/status"):
+            self.team(project, rest, tenant_role_, size)
+            return
+        if rest == "/api/library":
+            self.library(size)
             return
         if self.command != "GET" and rest in QUOTA_PATHS and role == "edit":
             limit = APP.settings()["max_project_mb"] * 1024 * 1024
@@ -1347,7 +1447,8 @@ class Handler(BaseHTTPRequestHandler):
         """/p/<id>/api/ai stops here: the gateway holds the operator's key and the daily quotas, so the worker (and
         the LaTeX it runs) never sees either. GET says whether the editor may show the assistant."""
         cfg, key = ai_config(), ai_key()
-        on = bool(cfg["enabled"] and key)
+        on = bool(cfg["enabled"] and (key or cfg["provider"] == "openai"))  # a local server may need no key
+        conf = {"key": key, "model": cfg["model"], "provider": cfg["provider"], "base_url": cfg["base_url"]}
         uid, tid, day = self.session["id"], project["tenant_id"], time.strftime("%Y-%m-%d", time.gmtime())
 
         def left() -> int:
@@ -1373,11 +1474,12 @@ class Handler(BaseHTTPRequestHandler):
                        0 if billed else 1, usage.get("input", 0), usage.get("output", 0) - ai.MAX_TOKENS,
                        day, uid, tid)
 
-        reason = ("View-only members cannot use the assistant." if role != "edit"
+        reason = ("Only editors can use the assistant." if role != "edit"
                   else "The AI assistant is off on this server." if not on
                   else "The daily AI limit is reached; try again tomorrow." if not left() else None)
         if self.command == "GET":
-            self.send_json({"enabled": reason is None, "model": cfg["model"], "notice": ai.NOTICE, "hosted": True,
+            self.send_json({"enabled": reason is None, "model": cfg["model"], "hosted": True, "vision": True,
+                            "notice": ai.notice(cfg["provider"], cfg["base_url"]),
                             "left": left() if on else 0, "reason": reason})
             return
         if self.command != "POST":
@@ -1402,15 +1504,51 @@ class Handler(BaseHTTPRequestHandler):
                        "ON CONFLICT(day, user_id, tenant_id) DO UPDATE SET requests = requests + 1, "
                        "output_tokens = output_tokens + excluded.output_tokens", day, uid, tid, ai.MAX_TOKENS)
         if "stream" in self.query:
-            self.assistant_stream(data, key, cfg["model"], record)
+            self.assistant_stream(data, conf, record)
             return
         try:
-            result = ai.ask(data, key=key, model=cfg["model"])
+            result = ai.ask(data, **conf)
         except ai.AiError as exc:
             record(exc.usage)  # a refusal, cut-off or malformed answer is billed too
             raise HttpError(exc.status, str(exc))
         record(result["usage"])
         self.send_json(result)
+
+    def library(self, size: int) -> None:
+        """/p/<id>/api/library stops here: the person's own reference library (host.db, one row per account),
+        the same in every project they open; workers never see it. Any role: it is the person's data, and
+        inserting an entry into a document goes through the worker's /api/bib/edit, which needs the edit role."""
+        uid = self.session["id"]
+
+        def stored() -> dict:
+            row = APP.db.one("SELECT data FROM library WHERE user_id = ?", uid)
+            return library.loads(row["data"] if row else None)
+
+        if self.command == "GET":
+            self.send_json(library.listing(stored()))
+            return
+        if self.command != "POST":
+            raise HttpError(405, "Method not allowed.")
+        if size > library.MAX_ADD + MAX_JSON:
+            raise HttpError(413, "Too large.")
+        if "json" not in self.headers.get("Content-Type", ""):
+            raise HttpError(415, "Expected application/json.")
+        try:
+            data = json.loads(self.read_exact(size) or b"{}")
+        except ValueError:
+            raise HttpError(400, "Bad JSON.")
+        if not isinstance(data, dict):
+            raise HttpError(400, "Expected a JSON object.")
+        try:
+            if "text" in data:  # parsed before the transaction, which holds the database lock
+                data = {"op": data.get("op"), "entries": library.parse_text(data["text"])}
+            with APP.db.tx():
+                lib, reply = library.apply(stored(), data)
+                APP.db.run("INSERT INTO library(user_id, data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                           "data = excluded.data", uid, library.dumps(lib))
+        except library.LibraryError as exc:
+            raise HttpError(exc.status, str(exc))
+        self.send_json({**library.listing(lib), **reply})
 
     def zotero_sync(self, rest: str, role: str, size: int) -> None:
         """/p/<id>/api/zotero[/fetch] stops here: each person's own Zotero key (Account page) lives in host.db and
@@ -1419,7 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
         project's worker (/api/zotero/compare and /apply, no network), never in this shared process."""
         cfg = zotero_settings(self.session["id"])
         allowed = role == "edit" and zotero.configured(cfg)
-        reason = ("View-only members cannot sync from Zotero." if role != "edit" else None if allowed
+        reason = ("Only editors can sync from Zotero." if role != "edit" else None if allowed
                   else "Add your Zotero library and API key on the Account page first.")
         if self.command == "GET" and rest == "/api/zotero":
             self.send_json({**zotero_public(cfg), "hosted": True, "can_sync": allowed, "reason": reason})
@@ -1457,7 +1595,43 @@ class Handler(BaseHTTPRequestHandler):
             ZOTERO_SLOTS.release()
         self.send_json({"text": text, "version": version, "cached": cached, "source": "web"})
 
-    def assistant_stream(self, data: dict, key: str, model: str, record) -> None:
+    def team(self, project: dict, rest: str, tenant_role_: str, size: int) -> None:
+        """/p/<id>/api/people (workspace members to @mention) and /api/access/* (ask the workspace admins for a
+        better role) stop here: the worker knows neither the members nor the roles."""
+        tid, uid = project["tenant_id"], self.session["id"]
+        if rest == "/api/people" and self.command == "GET":
+            rows = APP.db.all("SELECT u.name FROM members m JOIN users u ON u.id = m.user_id WHERE m.tenant_id = ? "
+                              "ORDER BY u.name LIMIT 500", tid)
+            self.send_json({"people": [r["name"] for r in rows]})
+        elif rest == "/api/access/status" and self.command == "GET":
+            row = APP.db.one("SELECT role FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, uid)
+            self.send_json({"state": "pending" if row else "none", "want": row and row["role"]})
+        elif rest == "/api/access/request" and self.command == "POST":
+            if size > MAX_JSON:
+                raise HttpError(413, "Too large.")
+            try:
+                data = json.loads(self.read_exact(size) or b"{}")
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise HttpError(400, "Expected a JSON object.")
+            want = {"edit": "editor", "review": "reviewer"}.get(data.get("role"))
+            note = data.get("note") or ""
+            if not isinstance(note, str) or len(note) > 300:
+                raise HttpError(400, "Keep the note under 300 characters.")
+            if want is None or tenant_role_ not in ("viewer", "reviewer") or want == tenant_role_:
+                raise HttpError(400, "Viewers can ask for the editor or reviewer role, reviewers for editor.")
+            if APP.access_requests.full(f"access:{uid}"):
+                raise HttpError(429, "Too many requests; wait a while.")
+            APP.access_requests.fail(f"access:{uid}")
+            APP.db.run("INSERT OR REPLACE INTO access_requests(tenant_id, user_id, role, project_id, note, created) "
+                       "VALUES (?, ?, ?, ?, ?, ?)", tid, uid, want, project["id"], note.strip(), time.time())
+            audit_log(APP, "access_requested", uid, self.ip, tid, want)
+            self.send_json({"state": "pending", "want": want})
+        else:
+            raise HttpError(405, "Method not allowed.")
+
+    def assistant_stream(self, data: dict, conf: dict, record) -> None:
         """?stream: the gateway reads Anthropic's stream itself and relays the answer as NDJSON (ai.relay); usage is
         recorded however it ends, also when the browser stops it or goes away."""
         spent = {"input": 0, "output": 0}
@@ -1474,7 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            ai.relay(ai.ask_stream(data, key=key, model=model, spent=spent), begin, write)
+            ai.relay(ai.ask_stream(data, spent=spent, **conf), begin, write)
         except ai.AiError as exc:
             raise HttpError(exc.status, str(exc))
         finally:
@@ -1554,7 +1728,7 @@ class Handler(BaseHTTPRequestHandler):
                 checked = now
                 current = session_for(session)
                 found = project_access(APP, current, pid) if current and current["stage"] == "full" else None
-                if not found or ("edit" if found[1] in EDIT_ROLES else "view") != role:
+                if not found or worker_role(found[1]) != role:
                     return
             if not ready:
                 if now - traffic > WS_IDLE:
@@ -1745,6 +1919,7 @@ def api_reset(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), row["user_id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ?", row["user_id"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", row["user_id"])  # connected AI clients too
+        APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", row["user_id"])
     audit_log(APP, "password_reset", row["user_id"], h.ip)
     h.ok()
 
@@ -1844,6 +2019,7 @@ def api_password(h: Handler) -> None:
         APP.db.run("UPDATE users SET pw_hash = ? WHERE id = ?", hash_password(password), h.user["id"])
         APP.db.run("DELETE FROM sessions WHERE user_id = ? AND id_hash != ?", h.user["id"], h.session["id_hash"])
         APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", h.user["id"])  # connected AI clients too
+        APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", h.user["id"])
     audit_log(APP, "password_changed", h.user["id"], h.ip)
     h.ok()
 
@@ -1927,6 +2103,10 @@ def api_tenant(h: Handler, tid: str) -> None:
                                     "ON u.id = m.user_id WHERE m.tenant_id = ? ORDER BY u.name", tid)
         out["invites"] = APP.db.all("SELECT id, role, email, created, expires FROM invites WHERE tenant_id = ? "
                                     "AND used IS NULL AND expires > ? ORDER BY created DESC", tid, time.time())
+        out["requests"] = APP.db.all("SELECT r.user_id AS id, u.name, u.email, r.role, r.note, r.created, "
+                                     "p.name AS project FROM access_requests r JOIN users u ON u.id = r.user_id "
+                                     "LEFT JOIN projects p ON p.id = r.project_id WHERE r.tenant_id = ? "
+                                     "ORDER BY r.created", tid)
     h.ok(out)
 
 
@@ -1936,7 +2116,7 @@ def api_invite_create(h: Handler, tid: str) -> None:
     data = h.json_body()
     role = data.get("role")
     if role not in ROLES:
-        raise HttpError(400, "Pick a role: admin, editor or viewer.")
+        raise HttpError(400, "Pick a role: admin, editor, reviewer or viewer.")
     email = norm_email(data.get("email")) if data.get("email") else None
     days = data.get("days", 7)
     if not (isinstance(days, int) and 1 <= days <= 30):
@@ -1967,7 +2147,7 @@ def api_member_role(h: Handler, tid: str, uid: str) -> None:
     need_role(h, tid, ("admin",))
     role = h.json_body().get("role")
     if role not in ROLES:
-        raise HttpError(400, "Pick a role: admin, editor or viewer.")
+        raise HttpError(400, "Pick a role: admin, editor, reviewer or viewer.")
     with APP.db.tx():
         member = APP.db.one("SELECT role FROM members WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
         if not member:
@@ -1975,7 +2155,16 @@ def api_member_role(h: Handler, tid: str, uid: str) -> None:
         if member["role"] == "admin" and role != "admin" and not admins_left(tid, int(uid)):
             raise HttpError(409, "A workspace needs at least one admin.")
         APP.db.run("UPDATE members SET role = ? WHERE tenant_id = ? AND user_id = ?", role, tid, int(uid))
+        APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))  # answered
     audit_log(APP, "role_changed", h.user["id"], h.ip, tid, f"user {uid}: {member['role']} -> {role}")
+    h.ok()
+
+
+@route("DELETE", r"/api/tenants/([0-9a-f]{16})/requests/(\d+)")
+def api_request_dismiss(h: Handler, tid: str, uid: str) -> None:
+    need_role(h, tid, ("admin",))
+    APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
+    audit_log(APP, "access_dismissed", h.user["id"], h.ip, tid, f"user {uid}")
     h.ok()
 
 
@@ -1989,6 +2178,7 @@ def api_member_remove(h: Handler, tid: str, uid: str) -> None:
         if member["role"] == "admin" and not admins_left(tid, int(uid)):
             raise HttpError(409, "A workspace needs at least one admin.")
         APP.db.run("DELETE FROM members WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
+        APP.db.run("DELETE FROM access_requests WHERE tenant_id = ? AND user_id = ?", tid, int(uid))
     audit_log(APP, "member_removed", h.user["id"], h.ip, tid, f"user {uid}")
     h.ok()
 
@@ -2089,7 +2279,7 @@ def api_project_delete(h: Handler, pid: str) -> None:
         raise HttpError(404, "No such project.")
     project, role = found
     if role not in EDIT_ROLES:
-        raise HttpError(403, "Viewers cannot delete projects.")
+        raise HttpError(403, "Only editors can delete projects.")
     delete_project(project)
     audit_log(APP, "project_deleted", h.user["id"], h.ip, project["tenant_id"], f"{pid} {project['name']}")
     h.ok()
@@ -2099,6 +2289,7 @@ def delete_project(project: dict) -> None:
     APP.workers.stop(project["id"])
     APP.db.run("DELETE FROM projects WHERE id = ?", project["id"])
     shutil.rmtree(APP.project_root(project), ignore_errors=True)
+    host_git.forget(project)
 
 
 # --- site admin -------------------------------------------------------------------------------------------------
@@ -2171,6 +2362,7 @@ def api_admin_user(h: Handler, uid: str) -> None:
         if data.get("disabled"):
             APP.db.run("DELETE FROM sessions WHERE user_id = ?", int(uid))
             APP.db.run("DELETE FROM oauth_grants WHERE user_id = ?", int(uid))
+            APP.db.run("DELETE FROM api_tokens WHERE user_id = ?", int(uid))
     audit_log(APP, "user_changed", h.user["id"], h.ip, detail=f"user {uid}: {json.dumps(data)[:200]}")
     h.ok()
 
@@ -2465,6 +2657,9 @@ def api_unlink(h: Handler, name: str) -> None:
 
 
 host_mcp.install(sys.modules[__name__])  # the consent and connected-clients API
+host_git.install(sys.modules[__name__])  # each person's Git token (Account page)
+host_tokens.install(sys.modules[__name__])  # personal API tokens (Account page)
+compile_api.install(sys.modules[__name__])  # /api/v1/compile with a token of the compile scope
 
 
 # ---------------------------------------------------------------------------

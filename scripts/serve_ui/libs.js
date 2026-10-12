@@ -7,11 +7,12 @@ import * as language from "@codemirror/language";
 import * as commands from "@codemirror/commands";
 import * as search from "@codemirror/search";
 import * as autocomplete from "@codemirror/autocomplete";
+import * as lint from "@codemirror/lint";
 import * as highlight from "@lezer/highlight";
 
 import * as Y from "yjs";
 export { Y };
-export { state, view, language, commands, search, autocomplete, highlight };
+export { state, view, language, commands, search, autocomplete, lint, highlight };
 export const { stex } = await import("stex");
 
 // Loaded on demand (progressive disclosure: most sessions never need them).

@@ -1,6 +1,7 @@
 // Visual mode: decorations over the LaTeX source. The source stays the truth; markup is
 // hidden (or replaced by a widget) only while the cursor is elsewhere.
 import { state as S, view as V, loadKatex } from "./libs.js";
+import { mathTex } from "./latex.js";
 
 const { Decoration, WidgetType, EditorView } = V;
 const { StateField, Facet, RangeSetBuilder } = S;
@@ -94,14 +95,6 @@ class ImageWidget extends WidgetType {
     box.append(img);
     return box;
   }
-}
-
-function mathTex(kind, body) {
-  let tex = body.replace(/\\label\{[^}]*\}|\\nonumber|\\notag/g, "").trim();
-  if (kind === "align" || kind === "eqnarray") tex = `\\begin{aligned}${tex.replace(/&=&/g, "&=")}\\end{aligned}`;
-  else if (kind === "gather") tex = `\\begin{gathered}${tex}\\end{gathered}`;
-  else if (kind === "multline") tex = `\\begin{gathered}${tex}\\end{gathered}`;
-  return tex;
 }
 
 function refTip(env, kind, key) {

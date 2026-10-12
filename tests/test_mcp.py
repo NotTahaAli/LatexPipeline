@@ -447,6 +447,44 @@ class Parity(DocCase):
         with self.assertRaises(mcp_tools.ToolError):  # viewers read threads only
             self.doc("view", "8;Vi").run("reply_comment", {"thread": tid, "comment": "x"})
 
+    def test_reviewers_comment_and_suggest_but_change_nothing(self):
+        rev = self.doc("review", "9;Rea")
+        before = {p: (self.root / p).read_text() for p in ("main.tex", "refs.bib", "build.toml")}
+        tid = rev.run("add_comment", {"path": "main.tex", "quote": "Hello world", "comment": "Cite?"})[
+            "structuredContent"]["id"]
+        rev.run("reply_comment", {"thread": tid, "comment": "Still?"})
+        rev.run("resolve_thread", {"thread": tid})
+        mine = serve.review_store("thesis").load()["threads"][0]["comments"][0]["id"]
+        rev.run("delete_comment", {"thread": tid, "comment": mine})
+        sid = rev.run("add_suggestion", {"path": "main.tex", "quote": "Hello", "replacement": "Hi"})[
+            "structuredContent"]["id"]
+        rev.run("withdraw_suggestion", {"id": sid})
+        self.assertEqual(serve.review_store("thesis").load()["suggestions"], [])
+        refused = (("edit_file", {"path": "main.tex", "old_text": "Hello", "new_text": "Hi"}),
+                   ("write_file", {"path": "new.tex", "content": "x"}),
+                   ("rename_file", {"path": "main.tex", "to": "x.tex"}),
+                   ("delete_file", {"path": "refs.bib"}),
+                   ("build", {}), ("label_version", {"label": "x"}), ("restore_version", {"id": 1}),
+                   ("grammar_check", {"path": "main.tex"}), ("bib_delete_entry", {"path": "refs.bib", "key": "a"}),
+                   ("insert_citation", {"path": "main.tex", "quote": "Hello", "key": "a"}),
+                   ("add_comment", {"path": "build.toml", "quote": "engine", "comment": "x"}))
+        for name, args in refused:
+            with self.subTest(tool=name), self.assertRaises(mcp_tools.ToolError):
+                rev.run(name, args)
+        with self.assertRaisesRegex(mcp_tools.ToolError, "reviewer"):
+            rev.run("edit_file", {"path": "main.tex", "old_text": "Hello", "new_text": "Hi"})
+        self.assertEqual({p: (self.root / p).read_text() for p in before}, before)
+        self.assertFalse((self.root / "new.tex").exists())
+        human = serve.review_change("thesis", "edit", "7;Ed", {"op": "suggest", "path": "main.tex", "insert": "Hi",
+                                                               "anchor": rev.anchor("main.tex", "Hello", None)})
+        with self.assertRaises(mcp_tools.ToolError):  # not this client's
+            rev.run("withdraw_suggestion", {"id": human["item"]["id"]})
+        with self.assertRaises(serve.ApiError):  # and the review API keeps a reviewer from deciding
+            serve.review_change("thesis", "review", "9;Rea", {"op": "reject", "ids": [human["item"]["id"]]})
+        out = mcp_tools.worker_call(serve, "thesis", "review", "9;Rea via T", {"tool": "add_comment", "arguments": {
+            "path": "main.tex", "quote": "Hello world", "comment": "x"}})
+        self.assertFalse(out["isError"], out)
+
     def test_grouped_suggestions_and_withdrawing(self):
         made = self.ok("add_suggestion", project="thesis", path="chapters/one.tex", quote="Alpha", occurrence=1,
                        replacement="Omega", quote_2="Alpha again", replacement_2="Omega again")

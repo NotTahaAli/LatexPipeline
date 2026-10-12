@@ -3,6 +3,7 @@
 // like bib.js's Apply, so co-editing stays consistent and the normal save path writes the file.
 import { addBibLookup } from "./bib.js";
 import { zoteroUi } from "./zotero.js";
+import { libraryUi } from "./library.js";
 
 // Fields shown first for each type (the server's lint list wins where it has one), then the usual optional ones.
 const TYPES = {
@@ -48,7 +49,7 @@ export function suggestKey(fields, taken) {
  */
 export function refsPanel(root, ctx) {
   const { el, icon } = ctx;
-  const S = { data: null, scope: "", filter: "all", sort: "author", q: "", sel: new Set(), open: new Set(), form: null, busy: false };
+  const S = { data: null, scope: "", filter: "all", sort: "author", q: "", sel: new Set(), open: new Set(), form: null, busy: false, verify: new Map(), verifyNote: "" };
   const uid = (() => { let n = 0; return (p) => `refs-${p}-${++n}`; })();
 
   // ---- skeleton ------------------------------------------------------------------------------------------------
@@ -59,10 +60,12 @@ export function refsPanel(root, ctx) {
   const addBtn = el("button", { type: "button", className: "icon", title: "New reference", hidden: ctx.readOnly }, icon("plus"));
   addBtn.setAttribute("aria-label", "New reference");
   const zotActs = ctx.readOnly ? [] : [action("Sync from Zotero...", () => zot.sync()), action("Zotero settings...", () => zot.settings())];
+  const libAct = action("My library...", () => mine.open());
+  libAct.hidden = true;   // Shown once the server says this viewer has a personal library here.
   zotActs.forEach((b) => { b.hidden = true; });   // Shown once the server says this viewer may sync (and configure).
   const more = details("More reference actions", [
-    ...(ctx.readOnly ? [] : [action("Import BibTeX, RIS or DOI...", () => openImport()), ...zotActs, action("New .bib file...", () => newBib())]),
-    action("Refresh", () => load()),
+    ...(ctx.readOnly ? [] : [action("Import BibTeX, RIS or DOI...", () => openImport()), action("Verify with Crossref", () => verifyAll()), ...zotActs, action("New .bib file...", () => newBib())]),
+    libAct, action("Download cited-only .bib", () => citedBib()), action("Refresh", () => load()),
   ]);
   const chips = el("div", { className: "refs-chips", role: "group" });
   chips.setAttribute("aria-label", "Show");
@@ -81,6 +84,8 @@ export function refsPanel(root, ctx) {
   root.querySelector(".refs-bar").setAttribute("aria-label", "References");
 
   const zot = zoteroUi({ ...ctx, box: formBox, data: () => S.data, scope: () => S.scope, uid, authorLabel, yearOf, reload: () => load() });
+  const mine = libraryUi({ ...ctx, box: formBox, data: () => S.data, selected: () => [...S.sel], uid, suggestKey, reload: () => load() });
+  mine.probe().then((ok) => { libAct.hidden = !ok; });
   if (zotActs.length) zot.probe().then((info) => { zotActs[0].hidden = !info?.can_sync; zotActs[1].hidden = !(info?.can_configure || (info?.hosted && info.can_sync)); });
   search.oninput = () => { S.q = search.value; render(); };
   scope.onchange = () => { S.scope = scope.value; render(); };
@@ -103,6 +108,17 @@ export function refsPanel(root, ctx) {
     return d;
   }
   document.addEventListener("click", (e) => { for (const d of root.querySelectorAll("details.refs-ovf[open]")) if (!d.contains(e.target)) d.open = false; });
+
+  /** Only the entries the last build cited (serve.cited_bib, from its .aux/.bcf), as a .bib download. */
+  async function citedBib() {
+    const r = await fetch(`api/cited-bib?doc=${encodeURIComponent(ctx.doc())}`);
+    const d = await r.json().catch(() => null);
+    if (!r.ok) { ctx.toast(d?.error || r.statusText); return; }
+    const a = el("a", { href: URL.createObjectURL(new Blob([d.text], { type: "application/x-bibtex" })), download: `${ctx.doc().split("/").pop() || "references"}.cited.bib` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    ctx.toast(`${d.keys.length} cited entries.` + (d.missing.length ? ` Cited but in no .bib file: ${d.missing.slice(0, 5).join(", ")}${d.missing.length > 5 ? "..." : ""}.` : ""));
+  }
 
   // ---- data ----------------------------------------------------------------------------------------------------------
   async function fetchData() { return ctx.api.bib(ctx.doc(), await ctx.openTexts()); }
@@ -153,11 +169,38 @@ export function refsPanel(root, ctx) {
     const missRows = (S.filter === "all" || S.filter === "missing") ? shownMissing.filter((k) => !S.q.trim() || fold(k).toLowerCase().includes(fold(S.q).toLowerCase())) : [];
     notes.replaceChildren(
       ...d.problems.map((p) => el("p", { className: "refs-warn", textContent: p })),
+      ...(S.verifyNote ? [el("p", { className: "mute", textContent: S.verifyNote })] : []),
       ...(d.nocite_all ? [el("p", { className: "mute", textContent: "\\nocite{*} is on: every entry is printed, so none counts as unused." })] : []),
       ...(!d.files.length ? [el("p", { className: "mute" }, "No .bib file in this document yet. ", ...(ctx.readOnly ? [] : [el("button", { type: "button", className: "link", textContent: "Create references.bib", onclick: () => newBib("references.bib") })]))] : []));
     list.replaceChildren(...missRows.map(missingRow), ...rows.map((e) => entryRow(e, byKey)),
       ...(!rows.length && !missRows.length && d.files.length ? [el("li", { className: "none", textContent: S.q ? "Nothing matches the filter." : "No references here." })] : []));
     renderSel();
+  }
+
+  // ---- Verify: one Crossref request per entry (only the DOI, title and first author's surname leave), a badge each ----
+  const checkedFp = (e) => JSON.stringify([e.file, e.key, e.fields]);   // an edited entry is checked again
+  const VERDICT = { verified: ["verified", "ok"], mismatch: ["mismatch", "warn"], "not-found": ["not found", "bad"] };
+  function verifyBadge(e) {
+    const r = S.verify.get(checkedFp(e)), v = r && VERDICT[r.status];
+    return v ? [badge(v[0], v[1], `Crossref: ${r.message}`)] : [];
+  }
+  async function verifyAll() {
+    if (S.busy || !S.data) return;
+    S.busy = true;
+    const todo = S.data.entries.filter((e) => (!S.scope || e.file === S.scope) && !S.verify.has(checkedFp(e)));
+    let done = 0;
+    try {
+      for (const e of todo) {
+        S.verifyNote = `Verifying with Crossref: ${done + 1} of ${todo.length}...`; render();
+        const r = await ctx.api.bibVerify(ctx.doc(), e.fields);
+        if (r.error) { S.verifyNote = `Verify stopped after ${done} of ${todo.length}: ${r.error} Run it again to continue.`; return; }
+        S.verify.set(checkedFp(e), r); done++;
+      }
+      const all = [...S.verify.values()], n = (s) => all.filter((r) => r.status === s).length;
+      S.verifyNote = `Crossref: ${n("verified")} verified, ${n("mismatch")} mismatch, ${n("not-found")} not found. Check flagged entries against the source; Crossref does not list everything (many books, theses and web pages).`;
+    } catch (err) {
+      S.verifyNote = `Verify stopped after ${done} of ${todo.length}: ${err.message}`;
+    } finally { S.busy = false; render(); }
   }
 
   function badge(text, kind, title) { return el("span", { className: `rbadge ${kind}`, textContent: text, title: title || text }); }
@@ -196,6 +239,7 @@ export function refsPanel(root, ctx) {
       ...(n ? [badge(`${n}x`, "ok", `Cited ${n} ${n === 1 ? "time" : "times"}`)] : isUnused(e) ? [badge("unused", "mute", "In the .bib file but never cited")] : []),
       ...(dups.length ? [badge("dup", "warn", `The key ${e.key} is also in ${dups.map((x) => x.file).join(", ")}`)] : []),
       ...(e.missing.length ? [badge("fields", "bad", `Lacks ${e.missing.join(", ")}`)] : []),
+      ...verifyBadge(e),
     ];
     const fieldList = el("dl", { className: "refs-fields" }, ...Object.entries(f).flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
     const body = [

@@ -41,6 +41,8 @@ SAMPLES = [
     ("! Double superscript.", "l.11 x^a^b"),
     ("Warning--I didn't find a database entry for \"smith\"", ""),
     ("I couldn't open database file refs.bib", ""),
+    ("ERROR - Error: Found biblatex control file version 3.10, expected version 3.11.",
+     "This means that your biber (2.20) and biblatex (3.19) versions are incompatible."),
     ("LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.", ""),
 ]
 

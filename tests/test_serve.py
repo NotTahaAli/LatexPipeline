@@ -1,5 +1,7 @@
 """serve.py: path safety, atomic writes, outline and word counts, message bus, WebSocket frames, HTTP API."""
 
+from __future__ import annotations
+
 import collections
 import http.client
 import importlib.util
@@ -232,6 +234,33 @@ class Outline(TempDoc):
         self.assertEqual(found["bib"]["smith20"]["title"], "A Great Paper")
         self.assertEqual(found["bib"]["smith20"]["year"], "2020")
         self.assertEqual((found["labels"]["fig:b"]["file"], found["labels"]["fig:b"]["line"]), ("lab.tex", 2))
+
+    def test_references_collects_user_macros_and_environments(self):
+        self.write("defs.tex", "\\newcommand{\\R}{\\mathbb{R}}\n\\renewcommand*\\vec[1]{#1}\n"
+                               "\\DeclareMathOperator{\\Tr}{tr}\n\\def\\foo#1{#1}\n\\NewDocumentCommand{\\bar}{m}{}\n"
+                               "% \\newcommand{\\hidden}{}\n"
+                               "\\newenvironment{myproof}{}{}\n\\NewDocumentEnvironment{box*}{}{}{}\n")
+        self.write("my.sty", "\\newcommand\\fromsty{x}\n\\def\\my@internal{}\n")
+        found = serve.references(self.root)
+        self.assertLessEqual({"R", "Tr", "bar", "foo", "fromsty", "vec"}, set(found["macros"]))
+        self.assertFalse({"hidden", "my"} & set(found["macros"]))
+        self.assertLessEqual({"box*", "myproof"}, set(found["envs"]))
+
+    def test_references_collects_glossary_entries_and_editorconfig(self):
+        self.write("gloss.tex", "\\newglossaryentry{latex}{name={LaTeX}, description={a system}}\n"
+                                "\\newglossaryentry{cpu}\n  {name=processor,description={x}}\n"
+                                "\\newacronym[longplural={frames}]{fps}{FPS}{frames per second}\n"
+                                "% \\newacronym{hidden}{H}{hidden}\n\\newacronym{bad key}{B}{b}\n")
+        found = serve.references(self.root)
+        self.assertEqual(found["glossary"]["latex"], {"text": "LaTeX", "kind": "entry", "file": "gloss.tex"})
+        self.assertEqual(found["glossary"]["cpu"]["text"], "processor")
+        self.assertEqual(found["glossary"]["fps"],
+                         {"text": "FPS: frames per second", "kind": "acronym", "file": "gloss.tex"})
+        self.assertNotIn("hidden", found["glossary"])
+        self.assertNotIn("bad key", found["glossary"])
+        self.assertEqual(found["editorconfig"], "")
+        self.write(".editorconfig", "[*.tex]\nindent_style = tab\n")
+        self.assertEqual(serve.references(self.root)["editorconfig"], "[*.tex]\nindent_style = tab\n")
 
     def test_log_excerpt_starts_at_the_tex_error(self):
         log = ("summary\nfiles/x/main.tex:3: Undefined control sequence.\n\n! Undefined control sequence.\n"
@@ -572,7 +601,8 @@ class GatewayMode(SharedState, ServerCase):
     def test_owner_only_features_are_unavailable(self):
         for method, path in [("GET", "/api/share"), ("POST", "/api/share"), ("POST", "/api/share/stop"),
                              ("POST", "/api/grammar/settings"), ("POST", "/api/docx?doc=demo"), ("GET", "/docx/demo"),
-                             ("GET", "/events")]:
+                             ("POST", "/api/arxiv?doc=demo"), ("GET", "/arxiv/demo"), ("GET", "/events"),
+                             ("POST", "/api/html?doc=demo"), ("GET", "/html/demo")]:
             with self.subTest(path=path):
                 self.assertEqual(self.as_("edit", method, path, {} if method == "POST" else None)[0], 403)
         self.assertNotIn("url", self.as_("edit", "GET", "/api/config")[1]["grammar"])
@@ -705,6 +735,22 @@ class GatewayQuota(GatewayMode):
             serve.run_build(self.root / "main.tex", "latexmk", True)
         ran.assert_not_called()  # already over quota: no LaTeX run at all
         self.assertIn("quota", serve.STATE[name]["error"])
+
+class SynctexWhileBuilding(unittest.TestCase):
+    def test_missing_synctex_says_whether_a_build_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main.tex"
+            main.write_text("x", encoding="utf-8")
+            name = serve.build.doc_name(main)
+            self.addCleanup(serve.STATE.pop, name, None)
+            with mock.patch.object(serve, "synctex_file", return_value=Path(tmp) / "none.synctex.gz"):
+                serve.STATE[name] = {"status": "building"}
+                with self.assertRaisesRegex(serve.SynctexError, "still running"):
+                    serve.synctex(main, "view", "1:1:main.tex")
+                serve.STATE[name] = {"status": "ok"}
+                with self.assertRaisesRegex(serve.SynctexError, "Rebuild from scratch"):
+                    serve.synctex(main, "view", "1:1:main.tex")
+
 
 class TunnelParsing(unittest.TestCase):
     def test_urls_from_each_tools_output(self):
@@ -931,7 +977,7 @@ class ShareHttp(SharedState, ServerCase):
 
     def test_view_role_is_read_only_and_confined_to_the_shared_document(self):
         ok = ["/", "/api/config", "/api/health", "/api/files?doc=demo", "/api/file?doc=demo&path=main.tex",
-              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png", "/api/warnings?doc=demo"]
+              "/api/outline?doc=demo", "/api/raw?doc=demo&path=fig.png", "/api/warnings?doc=demo", "/api/refs?doc=demo"]
         for path in ok:
             with self.subTest(path=path):
                 self.assertEqual(self.get("GET", path, "view")[0], 200)
@@ -940,7 +986,7 @@ class ShareHttp(SharedState, ServerCase):
         self.assertEqual(self.get("GET", "/api/health", "view")[1]["docs"], ["demo"])  # no 'second'
         denied = [
             ("GET", "/api/files?doc=second"), ("GET", "/api/file?doc=second&path=main.tex"), ("GET", "/pdf/second"),
-            ("GET", "/api/warnings?doc=second"),
+            ("GET", "/api/warnings?doc=second"), ("GET", "/api/refs?doc=second"),
             ("GET", "/events"), ("GET", "/api/share"), ("GET", "/forward?doc=demo&file=main.tex&line=1"),
             ("POST", "/rebuild?doc=demo"), ("POST", "/forward?doc=demo&file=main.tex&line=1"),
             ("POST", "/api/share"), ("POST", "/api/share/stop"),
@@ -1198,6 +1244,43 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("GET", "/docx/demo", "owner")[0], 200)
             self.assertEqual(self.get("GET", "/docx/demo")[0], 401)
 
+    def test_arxiv_export_is_owner_only_off_while_sharing_and_downloads_as_zip(self):
+        url = "/api/arxiv?doc=demo"
+        found = [{"level": "error", "file": None, "message": "m", "hint": "h"}]
+        with mock.patch.object(build, "export_arxiv", return_value=(found, ["x"])) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)  # sharing is on
+            export.assert_not_called()
+            serve.SHARE["on"] = False
+            self.assertEqual(self.get("POST", url, "owner"), (200, {"ok": True, "findings": found}))
+        with mock.patch.object(build, "export_arxiv", return_value=(None, ["ERROR: no recorded build (.fls)"])):
+            self.assertEqual(self.get("POST", url, "owner"), (500, {"error": "no recorded build (.fls)"}))
+        serve.SHARE["on"] = True
+        (self.root / "demo.arxiv.zip").write_bytes(b"PK")
+        with mock.patch.object(build, "arxiv_path_for", return_value=self.root / "demo.arxiv.zip"):
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/arxiv/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/arxiv/demo", "owner"), (200, b"PK"))
+
+    def test_html_export_is_owner_only_off_while_sharing_and_downloads_the_zip(self):
+        url = "/api/html?doc=demo"
+        with mock.patch.object(build, "export_html", return_value=(True, "out/demo.html/index.html")) as export:
+            for who in (None, "view", "edit"):
+                self.assertEqual(self.get("POST", url, who)[0], 401 if who is None else 403)
+            self.assertEqual(self.get("POST", url, "owner")[0], 409)  # sharing is on
+            export.assert_not_called()
+            serve.SHARE["on"] = False
+            self.assertEqual(self.get("POST", url, "owner"), (200, {"ok": True, "message": "out/demo.html/index.html"}))
+        with mock.patch.object(build, "export_html", return_value=(False, "make4ht was not found")):
+            self.assertEqual(self.get("POST", url, "owner"), (500, {"error": "make4ht was not found"}))
+        serve.SHARE["on"] = True
+        (self.root / "demo.html.zip").write_bytes(b"PK")
+        with mock.patch.object(build, "html_paths", return_value=(self.root / "x", self.root / "demo.html.zip")):
+            for who in ("view", "edit"):
+                self.assertEqual(self.get("GET", "/html/demo", who)[0], 403)
+            self.assertEqual(self.get("GET", "/html/demo", "owner"), (200, b"PK"))
+
     def test_docx_download_name_has_an_ascii_fallback_and_a_utf8_name(self):
         header = serve.attachment_header("Отчёт 1.docx")
         header.encode("ascii")
@@ -1224,6 +1307,35 @@ class ShareHttp(SharedState, ServerCase):
             self.assertEqual(self.get("GET", "/pdf/second?focus=1", "view")[0], 403)
             self.assertEqual(self.get("GET", "/log/second?focus=1", "edit")[0], 403)
             self.assertEqual(self.get("GET", "/pdf/demo?focus=1")[0], 401)
+
+    def test_review_pdf_is_built_by_editors_and_read_by_viewers_of_the_shared_document_only(self):
+        built = []
+        with mock.patch.object(serve, "review_pdf", side_effect=lambda name, data: built.append((name, data)) or {}):
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", None, {})[0], 401)
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", "view", {})[0], 403)
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=second", "edit", {})[0], 403)
+            self.assertEqual(built, [])
+            self.assertEqual(self.get("POST", "/api/review-pdf?doc=demo", "edit", {"comments": False})[0], 200)
+            self.assertEqual(built, [("demo", {"comments": False})])
+            limit = serve.REBUILD_LIMIT[0]
+            codes = [self.get("POST", "/api/review-pdf?doc=demo", "edit", {})[0] for _ in range(limit)]
+        self.assertEqual(codes[-1], 429)  # counts against the rebuild limit
+        (self.root / "demo.review.pdf").write_bytes(b"%PDF")
+        with mock.patch.object(build, "review_paths", return_value=(self.root / "demo.review.pdf", self.root / "x")):
+            self.assertEqual(self.get("GET", "/pdf/demo?review=1", "view")[0], 200)
+            self.assertEqual(self.get("GET", "/pdf/second?review=1", "view")[0], 403)
+            self.assertEqual(self.get("GET", "/pdf/demo?review=1")[0], 401)
+
+    def test_review_pdf_reads_the_documents_review_data_and_hides_build_config_paths(self):
+        result = {"ok": True, "applied": 1, "notes": 0, "error": None, "skipped": [
+            {"id": "a", "kind": "suggestion", "path": "build.toml", "reason": "x"},
+            {"id": "b", "kind": "suggestion", "path": "ch.tex", "reason": "y"}]}
+        with mock.patch.object(build, "build_review_pdf", return_value=result) as run, \
+                mock.patch.object(serve, "quota_after_build", return_value=None):
+            reply = serve.review_pdf("demo", {"comments": False})
+        self.assertEqual([s["id"] for s in reply["skipped"]], ["b"])
+        args = run.call_args[0]
+        self.assertEqual((args[2], args[3]), (serve.history_folder("demo") / "review.json", False))
 
     def test_the_preview_state_of_another_document_never_reaches_a_shared_session(self):
         state = {"rev": 1, "topic": "doc", "type": "state", "data": {"docs": [
@@ -1804,6 +1916,21 @@ class LogWarnings(ServerCase):
         self.assertEqual(self.request("GET", "/api/warnings?doc=demo")[1], {"warnings": []})
         self.assertEqual(self.request("GET", "/api/warnings?doc=nope")[0], 404)
 
+    def test_accessibility_lines_of_the_log_are_warnings_with_links(self):
+        self.write("main.tex", "\\section{A}\n\\subsubsection{B}\n")
+        self.log.write_text(
+            "Build of files/demo/main.tex: SUCCESS\n"
+            "ACCESSIBILITY: The PDF has no title (pdftitle is empty).\n  Hint: Add a title.\n"
+            "ACCESSIBILITY: files/demo/main.tex:2: \\subsubsection follows \\section: a level is skipped.\n"
+            "  Hint: Use the next level.\n"
+            "ACCESSIBILITY: files/demo/../secret.tex:1: outside\n  Hint: h\n"
+            "\n===== latexmk output =====\nACCESSIBILITY: x.tex:1: not a header line\n  Hint: h\n",
+            encoding="utf-8")
+        with mock.patch.object(build, "SOURCE_DIR", Path("/somewhere/files")):
+            rows = [w for w in self.request("GET", "/api/warnings?doc=demo")[1]["warnings"] if w["kind"] == "a11y"]
+        self.assertEqual([(w["file"], w["line"]) for w in rows], [(None, None), ("main.tex", 2), (None, None)])
+        self.assertEqual((rows[0]["source"], rows[0]["hint"]), ("Accessibility", "Add a title."))
+
     def test_remember_build_merges_into_the_report_without_dropping_other_documents(self):
         report = self.root / "report"
         report.mkdir()
@@ -2006,9 +2133,10 @@ class Upload(SharedState, ServerCase):
         SharedState.setUp(self)
         ServerCase.setUp(self)
 
-    def up(self, name, data, ctype="image/png"):
+    def up(self, name, data, ctype="image/png", folder=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("POST", f"/api/upload?doc=demo&name={quote(name, safe='%')}", data,
+        extra = "" if folder is None else f"&folder={quote(folder, safe='%')}"
+        conn.request("POST", f"/api/upload?doc=demo&name={quote(name, safe='%')}{extra}", data,
                      {"Host": f"127.0.0.1:{self.port}", "Content-Type": ctype})
         res = conn.getresponse()
         body = json.loads(res.read())
@@ -2045,6 +2173,18 @@ class Upload(SharedState, ServerCase):
                 self.assertTrue((self.root / body["path"]).is_file())
         self.assertFalse((self.base / "evil.png").exists())
         self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.suffix == ".svg"), [])
+
+    def test_figure_dialog_folder_is_made_inside_the_document_only(self):
+        self.assertEqual(self.up("a.png", self.PNG, folder="figs//plots/")[1]["path"], "figs/plots/a.png")
+        (self.root / "Figures").mkdir()
+        self.assertEqual(self.up("b.png", self.PNG, folder="/")[1]["path"], "b.png")  # "/": the document folder
+        self.assertEqual(self.up("b.png", self.PNG, folder="/etc/")[1]["path"], "etc/b.png")  # always relative
+        self.write("notadir.png", "x")
+        for folder in ("../out", ".git", "a/../../x", "build.toml", "notadir.png"):
+            with self.subTest(folder=folder):
+                self.assertEqual(self.up("c.png", self.PNG, folder=folder)[0], 400)
+        self.assertFalse((self.base / "out" / "c.png").exists())
+        self.assertFalse((self.root / "build.toml").exists())
 
     def test_upload_tells_browsers_and_never_overwrites(self):
         rev = serve.BUS.rev
@@ -2491,6 +2631,86 @@ class BibLookupApi(SharedState, ServerCase):
         self.assertEqual(self.lookup({"text": "x" * serve.BIB_MAX_CHARS, "key": "k"})[0], 200)
 
 
+class BibVerifyApi(SharedState, ServerCase):
+    """POST /api/bib/verify: roles, the Look up rate limit, input checks and the reply. Crossref is mocked."""
+
+    FIELDS = {"doi": "10.1000/xyz_123", "title": "Deep Learning & Beyond: A 100% Study", "year": "2019",
+              "author": "Lovelace, Ada and Turing, Alan"}
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        import bibfix
+        self.bibfix = bibfix
+        work = json.loads((Path(__file__).parent / "fixtures" / "crossref_work.json").read_text(encoding="utf-8"))
+        self.fetch = mock.patch.object(bibfix, "get_json", return_value=work).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def verify(self, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/bib/verify?doc={doc}", body or {"fields": self.FIELDS}, hdrs)
+
+    def test_statuses_and_bad_input(self):
+        self.assertEqual(self.verify()[1]["status"], "verified")
+        self.assertEqual(self.verify({"fields": {**self.FIELDS, "year": "2010"}})[1]["status"], "mismatch")
+        self.fetch.side_effect = self.bibfix.NotFound("gone")
+        self.assertEqual(self.verify()[1]["status"], "not-found")
+        self.fetch.side_effect = self.bibfix.BibLookupError("Too many Crossref lookups; wait a moment.")
+        self.assertEqual(self.verify()[1], {"status": None, "error": "Too many Crossref lookups; wait a moment."})
+        for bad in ({"fields": "x"}, {"fields": {"title": 3}}, {"fields": {"t": "x" * 100_001}}):
+            with self.subTest(bad=str(bad)[:40]):
+                self.assertEqual(self.verify(bad)[0], 400)
+
+    def test_roles_and_shared_rate_limit(self):
+        self.tokens = self.share_on()
+        self.assertEqual(self.verify(role="view")[0], 403)
+        self.assertEqual(self.fetch.call_count, 0)
+        self.assertEqual(self.verify(role="edit", doc="demo2")[0], 403)
+        codes = [self.verify(role="edit")[0] for _ in range(11)]
+        self.assertEqual(codes.count(429), 1)
+        self.assertEqual(self.request("POST", "/api/bib/lookup?doc=demo", {"text": "@a{k, title={T}}", "key": "k"},
+                                      {"Cookie": f"{serve.cookie_name()}={self.tokens['edit']}"})[0], 429)
+        self.assertEqual(self.verify(role="owner")[0], 200)
+
+
+class FormatApi(SharedState, ServerCase):
+    """POST /api/format: tex-fmt on the editor's text, never a write; roles, rate limit, size cap."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.fmt = mock.patch.object(serve.build, "format_text", side_effect=lambda folder, text: text.upper()).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def fmt_request(self, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"/api/format?doc={doc}", body or {"text": "a\n"}, hdrs)
+
+    def test_returns_the_formatted_text_and_writes_nothing(self):
+        before = {p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}
+        self.assertEqual(self.fmt_request(), (200, {"text": "A\n"}))
+        self.assertEqual(self.fmt.call_args[0][0], serve.DOCS["demo"].parent)
+        self.assertEqual({p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}, before)
+
+    def test_size_cap_errors_and_missing_tex_fmt(self):
+        self.assertEqual(self.fmt_request({"text": "x" * (serve.FORMAT_MAX_CHARS + 1)})[0], 413)
+        self.assertEqual(self.fmt_request({"text": 4})[0], 413)
+        self.fmt.side_effect = FileNotFoundError("tex-fmt was not found on your PATH")
+        status, body = self.fmt_request()
+        self.assertEqual(status, 501)
+        self.assertIn("tex-fmt", body["error"])
+        self.fmt.side_effect = ValueError("tex-fmt failed: boom")
+        self.assertEqual(self.fmt_request()[0], 422)
+
+    def test_view_role_cannot_format_edit_role_is_rate_limited(self):
+        self.tokens = self.share_on()
+        self.assertEqual(self.fmt_request(role="view")[0], 403)
+        self.assertEqual(self.fmt.call_count, 0)
+        self.assertEqual(self.fmt_request(role="edit", doc="demo2")[0], 403)
+        codes = [self.fmt_request(role="edit")[0] for _ in range(21)]
+        self.assertEqual(codes.count(429), 1)
+
+
 class BibPanelApi(SharedState, ServerCase):
     """POST /api/bib, /api/bib/edit, /api/bib/import: the References panel. Crossref is mocked."""
 
@@ -2593,6 +2813,49 @@ class BibPanelApi(SharedState, ServerCase):
         codes = [self.post("/api/bib/import", {"doi": "10.1000/xyz_123"}, role="edit")[0] for _ in range(11)]
         self.assertEqual(codes.count(429), 1)  # shares the guests' Crossref budget with Look up
         self.assertEqual(self.post("/api/bib/lookup", {"text": self.BIB, "key": "used"}, role="edit")[0], 429)
+
+
+class BuildToolsApi(SharedState, ServerCase):
+    """POST /api/bib/tidy (sorted, aligned .bib text; nothing written) and /api/build/cancel (the Stop button)."""
+
+    BIB = "@misc{b, title={B}}\n@article{a,\n  year = 2020, title = {A}}\n"
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.cancel = mock.patch.object(serve.build, "cancel", return_value=True).start()
+        self.addCleanup(mock.patch.stopall)
+        self.tokens = {}
+
+    def post(self, path, body=None, role=None, doc="demo"):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request("POST", f"{path}?doc={doc}", body, hdrs)
+
+    def test_tidy_returns_text_and_writes_nothing(self):
+        before = {p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}
+        status, body = self.post("/api/bib/tidy", {"text": self.BIB + "@misc{a2, title={a}}\n"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["text"].startswith("@article{a,\n  title = {A},\n  year  = 2020,\n}\n\n@misc{a2,"))
+        self.assertEqual(body["duplicates"], ["a and a2: same title"])
+        self.assertEqual({p: p.read_bytes() for p in serve.DOCS["demo"].parent.rglob("*") if p.is_file()}, before)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": 3})[0], 400)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": self.BIB, "order": "color"})[0], 422)
+        self.assertEqual(self.post("/api/bib/tidy", {"text": "x" * (serve.BIB_MAX_CHARS + 1)})[0], 413)
+
+    def test_cancel_stops_the_documents_build(self):
+        self.assertEqual(self.post("/api/build/cancel"), (200, {"ok": True}))
+        self.cancel.assert_called_once_with(serve.DOCS["demo"])
+
+    def test_roles(self):
+        self.tokens = self.share_on()
+        for path, body in (("/api/bib/tidy", {"text": self.BIB}), ("/api/build/cancel", None)):
+            with self.subTest(path=path):
+                self.assertEqual(self.post(path, body, role="view")[0], 403)
+                self.assertEqual(self.post(path, body, role="edit", doc="demo2")[0], 403)
+                self.assertEqual(self.post(path, body, role="edit")[0], 200)
+        self.assertEqual(self.cancel.call_count, 1)
+        codes = [self.post("/api/build/cancel", role="edit")[0] for _ in range(20)]
+        self.assertEqual(codes.count(429), 1)
 
 
 class ZoteroApi(SharedState, ServerCase):
@@ -3462,6 +3725,11 @@ class NamedLinks(SharedState, ServerCase):
         self.assertIsNone(serve.role_for_token(self.tokens["alice"]))  # a link names one document
         self.assertEqual(self.get("POST", "/api/share/links", "owner", {"name": "Bob", "role": "view"})[0], 401)
 
+    def test_people_lists_named_links_only_to_roles_that_can_mention(self):
+        self.assertIn("Alice", serve.people("demo", "edit")["people"])
+        self.assertIn("Alice", serve.people("demo", "review")["people"])
+        self.assertNotIn("Alice", serve.people("demo", "view")["people"])  # a view link cannot comment
+
     def test_a_link_belongs_to_one_checkout_of_its_document(self):
         clone = self.base / "clone" / "demo"
         clone.mkdir(parents=True)
@@ -3769,6 +4037,426 @@ class HistoryAndReviewLimits(SharedState, ServerCase):
             status, err = self.call("POST", "/api/review?doc=demo", {"op": "reply", "thread": made["id"],
                                                                      "text": "y" * 600, "key": "a" * 32})
         self.assertEqual(status, 413)
+
+
+class ReviewerRole(SharedState, ServerCase):
+    """The review role (a "can review" named link, or a hosted reviewer): comments and suggestions, nothing else."""
+
+    as_ = GatewayMode.as_
+    SECRET = GatewayMode.SECRET
+    ANCHOR = {"from": 12, "to": 17, "quote": "hello", "prefix": "\\section{A}\n", "suffix": "\n"}
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("build.toml", "engine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        serve.SHARE["port"] = self.port
+        self.tokens = dict(self.share_on())
+        for who, name, role in (("bea", "Bea", "review"), ("ed", "Ed", "edit")):
+            status, info = self.request("POST", "/api/share/links", {"name": name, "role": role},
+                                        {"Cookie": f"{serve.cookie_name()}={self.tokens['owner']}"})
+            self.assertEqual(status, 200)
+            link = next(x for x in info["named"] if x["name"] == name)
+            self.assertEqual(link["role"], role)
+            self.tokens[who] = link["url"].split("token=")[1].split("#")[0]
+
+    def get(self, method, path, who, body=None):
+        return self.request(method, path, body, {"Cookie": f"{serve.cookie_name()}={self.tokens[who]}"})
+
+    def review(self, who, body):
+        return self.get("POST", "/api/review?doc=demo", who, {"key": "k" * 32, **body})
+
+    def test_a_review_link_is_the_review_role(self):
+        self.assertEqual(serve.identity_for_token(self.tokens["bea"])[0], "review")
+        self.assertEqual(self.get("GET", "/api/config", "bea")[1]["role"], "review")
+        self.assertEqual(self.get("GET", "/api/review?doc=demo", "bea")[0], 200)
+        self.assertEqual(self.get("GET", "/api/file?doc=demo&path=main.tex", "bea")[0], 200)
+        self.assertEqual(set(serve.share_links()), {"view", "edit"})  # the anonymous pair stays as it was
+        with self.assertRaises(serve.named.LinkError):
+            serve.named.create([], "Eve", "owner", "demo", serve.link_root("demo"))
+
+    def test_reviewers_comment_reply_resolve_suggest_and_take_back_their_own(self):
+        status, made = self.review("bea", {"op": "comment", "path": "main.tex", "anchor": self.ANCHOR, "text": "Why?"})
+        self.assertEqual((status, made["item"]["comments"][0]["name"]), (200, "Bea"))
+        tid = made["item"]["id"]
+        self.assertEqual(self.review("bea", {"op": "reply", "thread": tid, "text": "Also."})[0], 200)
+        _, ed = self.review("ed", {"op": "reply", "thread": tid, "text": "Because."})
+        eds = ed["item"]["comments"][-1]["id"]
+        self.assertEqual(self.review("bea", {"op": "delete", "thread": tid, "comment": eds})[0], 403)  # not hers
+        self.assertEqual(self.review("bea", {"op": "delete", "thread": tid,
+                                             "comment": made["item"]["comments"][0]["id"]})[0], 200)
+        self.assertEqual(self.review("bea", {"op": "resolve", "thread": tid, "resolved": True})[0], 200)
+        status, mine = self.review("bea", {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "hi"})
+        self.assertEqual(status, 200)
+        _, theirs = self.review("ed", {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "yo"})
+        both = [mine["item"]["id"], theirs["item"]["id"]]
+        for body in ({"op": "accept", "ids": [mine["item"]["id"]]}, {"op": "reject", "ids": both},
+                     {"op": "reject", "ids": [theirs["item"]["id"]]}, {"op": "release", "ids": both},
+                     {"op": "reject", "ids": []}, {"op": "reject", "ids": "x"},
+                     {"op": "reanchor", "items": [{"id": tid, "anchor": self.ANCHOR}]}):
+            with self.subTest(body=body):
+                self.assertEqual(self.review("bea", body)[0], 403)
+        self.assertEqual(len(self.get("GET", "/api/review?doc=demo", "ed")[1]["suggestions"]), 2)
+        self.assertEqual(self.review("bea", {"op": "reject", "ids": [mine["item"]["id"]]})[0], 200)  # withdraw
+        self.assertEqual(self.review("ed", {"op": "accept", "ids": [theirs["item"]["id"]]})[0], 200)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")  # the editor applies it
+
+    def test_reviewers_change_no_files_and_run_nothing(self):
+        refused = [
+            ("PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"}),
+            ("PUT", "/api/file?doc=demo&path=new.tex", {"text": "x"}),
+            ("PUT", "/api/file?doc=demo&path=build.toml", {"text": "x"}),
+            ("POST", "/api/fs?doc=demo&op=newfile&path=x.tex", None),
+            ("POST", "/api/fs?doc=demo&op=rename&path=main.tex&to=b.tex", None),
+            ("POST", "/api/fs?doc=demo&op=delete&path=fig.png", None),
+            ("POST", "/api/upload?doc=demo&name=a.png", None),
+            ("POST", "/rebuild?doc=demo", None),
+            ("POST", "/api/focus?doc=demo&path=main.tex", None),
+            ("POST", "/api/preview?doc=demo&cid=c1", {"path": "main.tex", "text": "x"}),
+            ("POST", "/api/history/label?doc=demo", {"label": "v"}),
+            ("POST", "/api/history/restore?doc=demo", {"id": 1}),
+            ("POST", "/api/history/pending?doc=demo&cid=c1", {"op": "claim", "path": "main.tex"}),
+            ("POST", "/api/grammar?doc=demo", {"text": "x"}),
+            ("POST", "/api/ai?doc=demo", {"question": "x"}),
+            ("POST", "/api/bib/edit?doc=demo", {}),
+            ("POST", "/api/bib/tidy?doc=demo", {"text": "@misc{a, title={A}}"}),
+            ("POST", "/api/build/cancel?doc=demo", None),
+            ("POST", "/api/bib/lookup?doc=demo", {}),
+            ("POST", "/api/zotero/apply?doc=demo", {}),
+            ("POST", "/api/share/links", {"name": "Eve", "role": "edit"}),
+        ]
+        for method, path, body in refused:
+            with self.subTest(path=path):
+                self.assertEqual(self.get(method, path, "bea", body)[0], 403)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["build.toml", "fig.png", "main.tex"])
+        status, _ = self.review("bea", {"op": "comment", "path": "build.toml", "text": "x",
+                                        "anchor": {"from": 0, "to": 0, "quote": "", "prefix": "", "suffix": ""}})
+        self.assertEqual(status, 403)  # build configuration stays the owner's, for comments too
+        self.assertEqual(serve.ai_info("review")["enabled"], False)
+        self.assertFalse(serve.zotero_info("review")["can_sync"])
+
+    def test_reviewers_see_live_edits_but_cannot_push_their_own(self):
+        def send(cid, who, *messages):
+            return self.get("POST", f"/api/send?cid={cid}", who, {"messages": list(messages)})[1]["replies"]
+
+        room = "demo\nmain.tex"
+        send("c-ed", "ed", {"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 1}})
+        self.assertEqual(send("c-ed", "ed", {"type": "y-update", "data": {"room": room, "u": "EDIT1"}}), [])
+        (joined,) = send("c-bea", "bea", {"type": "y-join", "data": {"doc": "demo", "path": "main.tex", "aid": 2,
+                                                                       "epoch": "made-up"}})
+        self.assertEqual((joined["type"], joined["data"]["updates"]), ("y-state", ["EDIT1"]))
+        self.assertNotEqual(joined["data"]["epoch"], "made-up")  # no lineage claims either
+        self.assertEqual(joined["data"]["leader"], "c-ed")
+        replies = send("c-bea", "bea", {"type": "y-update", "data": {"room": room, "u": "BEA1"}},
+                       {"type": "restore-done", "data": {"doc": "demo", "path": "main.tex", "token": "t"}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "build.toml", "aid": 2}},
+                       {"type": "y-join", "data": {"doc": "demo", "path": "new.tex", "aid": 2}})
+        self.assertEqual([r["data"]["status"] for r in replies], [403, 403, 403, 404])
+        self.assertEqual(serve.ROOMS[room]["log"], ["EDIT1"])
+        send("c-ed", "ed", {"type": "y-update", "data": {"room": room, "u": "EDIT2"}})
+        seen = serve.visible(serve.BUS.since(0), "review")
+        self.assertIn("EDIT2", [m["data"].get("u") for m in seen if m["type"] == "y-update"])
+        send("c-bea", "bea", {"type": "hello", "data": {"name": "x", "doc": "demo", "path": "main.tex"}})
+        users = {u["name"]: u["role"] for u in serve.presence("review")["users"]}
+        self.assertEqual(users["Bea"], "review")
+        serve.client_gone("c-ed")
+        self.assertIsNone(serve.ROOMS[room]["leader"])  # a reviewer never leads (and so never saves) a room
+
+    def test_hosted_reviewers_are_the_review_role(self):
+        mock.patch.dict(serve.GATEWAY, {"secret": b""}).start()
+        serve.gateway_enable(self.SECRET, "demo")
+        self.assertEqual(self.as_("review", "GET", "/api/config")[1]["role"], "review")
+        self.assertEqual(self.as_("review", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "x"})[0], 403)
+        self.assertEqual(self.as_("review", "POST", "/rebuild?doc=demo")[0], 403)
+        status, made = self.as_("review", "POST", "/api/review?doc=demo",
+                                {"op": "suggest", "path": "main.tex", "anchor": self.ANCHOR, "insert": "hi"})
+        self.assertEqual(status, 200)
+        accept = {"op": "accept", "ids": [made["item"]["id"]]}
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", accept)[0], 403)
+        withdraw = {"op": "reject", "ids": [made["item"]["id"]]}
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", withdraw, user="8;Bob")[0], 403)
+        self.assertEqual(self.as_("review", "POST", "/api/review?doc=demo", withdraw)[0], 200)
+        clean = {"X-Host-Admin": "1"}
+        self.assertEqual(self.as_("review", "POST", "/api/history/clean?doc=demo", {}, headers=clean)[0], 403)
+        self.assertEqual((self.root / "main.tex").read_text(), "\\section{A}\nhello\n")
+
+
+class SearchReplace(SharedState, ServerCase):
+    """Project-wide search (view role) and replace (edit role): caps, owner-only regexes, rooms, build config."""
+
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        self.write("main.tex", "\\section{Intro}\nThe cat sat.\n\\input{ch/one}\n")
+        self.write("ch/one.tex", "A Cat and a category.\ncat\n")
+        self.write("build.toml", "# cat\nengine = 'pdflatex'\n")
+        mock.patch.dict(serve.HISTORY, {"dir": self.base / ".hist"}).start()
+        self.tokens = {}
+
+    def call(self, method, path, body=None, role=None):
+        hdrs = {"Cookie": f"{serve.cookie_name()}={self.tokens[role]}"} if role else {}
+        return self.request(method, path, body, hdrs)
+
+    def search(self, q, role=None, **flags):
+        query = "".join(f"&{k}=1" for k in flags)
+        return self.call("GET", f"/api/search?doc=demo&q={quote(q)}{query}", role=role)
+
+    def replace(self, body, role=None):
+        return self.call("POST", "/api/replace?doc=demo", body, role=role)
+
+    def test_search_groups_by_file_with_options(self):
+        status, data = self.search("cat")
+        self.assertEqual(status, 200)
+        found = {f["path"]: f["matches"] for f in data["files"]}
+        self.assertEqual(sorted(found), ["build.toml", "ch/one.tex", "main.tex"])  # the owner sees build config
+        self.assertEqual([(m["line"], m["col"], m["len"]) for m in found["ch/one.tex"]],
+                         [(1, 2, 3), (1, 12, 3), (2, 0, 3)])
+        first = found["main.tex"][0]
+        self.assertEqual((first["before"], first["match"], first["after"]), ("The ", "cat", " sat."))
+        self.assertEqual(self.search("cat", case=1)[1]["total"], 4)  # "Cat" no longer matches
+        self.assertEqual(self.search("cat", word=1)[1]["total"], 4)  # not "category"
+        self.assertEqual(self.search("")[0], 400)
+        self.assertEqual(self.search("c(a)t", regex=1)[1]["total"], 5)
+        self.assertEqual(self.search("(", regex=1)[0], 400)
+
+    def test_caps(self):
+        with mock.patch.object(serve, "SEARCH_HITS", 2):
+            data = self.search("cat")[1]
+        self.assertEqual((data["total"], data["truncated"]), (2, True))
+        with mock.patch.object(serve, "SEARCH_FILE_MAX", 30):
+            data = self.search("cat")[1]
+        self.assertIn("main.tex", data["skipped"])
+        self.assertNotIn("main.tex", [f["path"] for f in data["files"]])
+
+    def test_guests_view_searches_edit_replaces_no_regex_no_build_config(self):
+        self.tokens = self.share_on()
+        status, data = self.search("cat", role="view")
+        self.assertEqual(status, 200)
+        self.assertNotIn("build.toml", [f["path"] for f in data["files"]])
+        self.assertEqual(self.search("c.t", role="edit", regex=1)[0], 403)
+        body = {"q": "cat", "replace": "dog"}
+        self.assertEqual(self.replace(body, role="view")[0], 403)
+        self.assertEqual(self.replace({**body, "regex": True}, role="edit")[0], 403)
+        self.assertEqual(self.replace({**body, "path": "build.toml"}, role="edit")[0], 403)
+        self.assertEqual(self.replace({**body, "path": "build.toml", "text": "cat"}, role="edit")[0], 403)
+        status, done = self.replace(body, role="edit")
+        self.assertEqual((status, done["count"], done["rooms"]), (200, 4, []))
+        self.assertIn("cat", (self.root / "build.toml").read_text(encoding="utf-8"))  # never touched by a guest
+        self.assertEqual((self.root / "ch/one.tex").read_text(encoding="utf-8"), "A dog and a dogegory.\ndog\n")
+
+    def test_replace_all_writes_with_history_and_leaves_room_files_to_the_editor(self):
+        rev = serve.BUS.rev
+        with mock.patch.object(serve, "room_open", lambda doc, path: path == "main.tex"):
+            status, done = self.replace({"q": "cat", "replace": "dog", "word": True})
+        self.assertEqual((status, done["rooms"], done["files"]), (200, ["main.tex"], [
+            {"path": "build.toml", "count": 1}, {"path": "ch/one.tex", "count": 2}]))
+        self.assertIn("The cat sat.", (self.root / "main.tex").read_text(encoding="utf-8"))  # the room's editor does it
+        store = serve.history_store("demo")
+        self.assertEqual(store.text_at(store.latest("ch/one.tex")["id"], "ch/one.tex"), "A dog and a category.\ndog\n")
+        fs = [m for m in serve.BUS.since(rev) if m["type"] == "fs"]
+        self.assertEqual(fs[-1]["data"]["changed"], ["build.toml", "ch/one.tex"])
+        # The editor sends the room's text and gets the result back; nothing is written.
+        status, out = self.replace({"q": "cat", "replace": "dog", "path": "main.tex", "text": "cat cat\r\n"})
+        self.assertEqual((status, out["text"], out["count"]), (200, "dog dog\n", 2))
+        self.assertIn("The cat sat.", (self.root / "main.tex").read_text(encoding="utf-8"))
+
+    def test_replace_one_and_regex_groups_for_the_owner(self):
+        body = {"q": "cat", "replace": "dog", "path": "ch/one.tex", "nth": 1, "line": 1}
+        self.assertEqual(self.replace(body)[1]["count"], 1)
+        self.assertEqual((self.root / "ch/one.tex").read_text(encoding="utf-8"), "A Cat and a dogegory.\ncat\n")
+        self.assertEqual(self.replace(body)[0], 409)  # match 1 is now on line 2: the file moved on
+        self.assertEqual(self.replace({**body, "nth": 9})[0], 409)
+        self.assertEqual(self.replace({"q": "cat", "nth": 0})[0], 400)  # one match needs its file
+        status, out = self.replace({"q": r"(\w+) sat", "replace": r"\1 stood", "regex": True, "path": "main.tex"})
+        self.assertEqual((status, out["count"]), (200, 1))
+        self.assertIn("The cat stood.", (self.root / "main.tex").read_text(encoding="utf-8"))
+        self.assertEqual(self.replace({"q": "(c)", "replace": r"\2", "regex": True, "path": "main.tex"})[0], 400)
+
+
+
+# --- POST /api/v1/compile (compile_api.py) ---------------------------------------------------------------------------
+
+DOC_TEX = "\\documentclass{article}\n\\begin{document}\nHello from the API.\n\\end{document}\n"
+
+
+def archive_zip(entries: dict, link: str | None = None) -> bytes:
+    import stat
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, text in entries.items():
+            archive.writestr(name, text)
+        if link:
+            info = zipfile.ZipInfo(link)
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "/etc/passwd")
+    return buf.getvalue()
+
+
+def archive_tar(entries: dict, link: str | None = None, mode: str = "w:gz") -> bytes:
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as archive:
+        for name, text in entries.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        if link:
+            info = tarfile.TarInfo(link)
+            info.type, info.linkname = tarfile.SYMTYPE, "/etc/passwd"
+            archive.addfile(info)
+    return buf.getvalue()
+
+
+class CompileUploads(unittest.TestCase):
+    unpack = staticmethod(serve.compile_api.unpack)
+
+    def test_zip_tar_and_json_give_the_same_files_and_one_wrapping_folder_is_dropped(self):
+        files = {"P/main.tex": "x", "P/ch/a.tex": "y"}
+        want = {"main.tex": b"x", "ch/a.tex": b"y"}
+        self.assertEqual(self.unpack(archive_zip(files), "application/zip", 10 ** 6), (want, []))
+        self.assertEqual(self.unpack(archive_tar(files), "application/gzip", 10 ** 6), (want, []))
+        self.assertEqual(self.unpack(archive_tar(files, mode="w"), "application/x-tar", 10 ** 6), (want, []))
+        data = json.dumps({"files": {"main.tex": "x", "ch/a.tex": {"base64": "eQ=="}}}).encode()
+        self.assertEqual(self.unpack(data, "application/json", 10 ** 6), (want, []))
+
+    def test_build_configuration_is_left_out_unless_the_owner_sent_it(self):
+        files = {"main.tex": "x", "build.toml": "shell_escape = true", "sub/.LatexMkRc": "$x"}
+        self.assertEqual(self.unpack(archive_zip(files), "application/zip", 10 ** 6),
+                         ({"main.tex": b"x"}, ["build.toml", "sub/.LatexMkRc"]))
+        self.assertEqual(len(self.unpack(archive_zip(files), "application/zip", 10 ** 6, keep_rc=True)[0]), 3)
+
+    def test_unsafe_uploads_are_refused(self):
+        cases = {
+            "zip slip": (archive_zip({"main.tex": "x", "../evil.tex": "y"}), "application/zip"),
+            "tar slip": (archive_tar({"main.tex": "x", "a/../../evil.tex": "y"}), "application/gzip"),
+            "absolute": (archive_tar({"/etc/x.tex": "y"}), "application/gzip"),
+            "backslash": (archive_zip({"main.tex": "x", "..\\evil.tex": "y"}), "application/zip"),
+            "drive": (json.dumps({"files": {"C:/x.tex": "y"}}).encode(), "application/json"),
+            "twice": (json.dumps({"files": {"A.tex": "y", "a.tex": "z"}}).encode(), "application/json"),
+            "too big": (archive_zip({"main.tex": "x" * 2000}), "application/zip"),
+            "bad base64": (json.dumps({"files": {"a.png": {"base64": "!!"}}}).encode(), "application/json"),
+            "not an archive": (b"hello", "application/octet-stream"),
+            "empty": (archive_zip({}), "application/zip"),
+        }
+        for name, (data, kind) in cases.items():
+            with self.subTest(name=name), self.assertRaises(serve.compile_api.UploadError):
+                self.unpack(data, kind, 1000)
+        with self.assertRaises(serve.compile_api.UploadError):
+            self.unpack(archive_zip({"a.tex": "x", "b.tex": "y", "c.tex": "z"}), "application/zip", 10 ** 6,
+                        max_files=2)
+
+    def test_links_and_special_entries_are_never_written(self):
+        self.assertEqual(self.unpack(archive_zip({"main.tex": "x"}, link="leak.tex"), "application/zip", 10 ** 6),
+                         ({"main.tex": b"x"}, []))
+        self.assertEqual(self.unpack(archive_tar({"main.tex": "x"}, link="leak.tex"), "application/gzip", 10 ** 6),
+                         ({"main.tex": b"x"}, []))
+
+    def test_main_and_output_parameters(self):
+        self.assertEqual(serve.compile_api.main_name({}), "main.tex")
+        self.assertEqual(serve.compile_api.main_name({"main": ["paper/talk.tex"]}), "paper/talk.tex")
+        for bad in ("../x.tex", "x.sty", "/abs.tex", "a//b.tex"):
+            with self.subTest(bad=bad), self.assertRaises(serve.compile_api.UploadError):
+                serve.compile_api.main_name({"main": [bad]})
+        with self.assertRaises(serve.compile_api.UploadError):
+            serve.compile_api.output_kind({"output": ["html"]})
+
+
+OK_RESULT = {"ok": True, "pdf": b"%PDF-1.7 fake", "log": "the log", "seconds": 0.5, "pages": 1, "errors": []}
+
+
+class CompileApi(SharedState, ServerCase):
+    def setUp(self):
+        SharedState.setUp(self)
+        ServerCase.setUp(self)
+        serve.SHARE["port"] = self.port
+
+    def post(self, data, kind="application/zip", query="", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+        conn.request("POST", "/api/v1/compile" + query, data,
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": kind, **(headers or {})})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        return res.status, body, res
+
+    def test_only_the_owner_compiles_and_share_links_never(self):
+        tokens = self.share_on()
+        data = archive_zip({"main.tex": DOC_TEX})
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            for role in ("view", "edit"):
+                cookie = {"Cookie": f"{serve.cookie_name()}={tokens[role]}"}
+                self.assertEqual(self.post(data, headers=cookie)[0], 403, role)
+            self.assertEqual(self.post(data)[0], 401)
+            run.assert_not_called()
+            self.assertEqual(self.post(data, headers={"Cookie": f"{serve.cookie_name()}={tokens['owner']}",
+                                                      "Origin": "http://evil.example"})[0], 403)
+            status, body, res = self.post(data, headers={"Cookie": f"{serve.cookie_name()}={tokens['owner']}"})
+            self.assertEqual((status, body, res.getheader("Content-Type")), (200, b"%PDF-1.7 fake", "application/pdf"))
+            self.assertEqual(json.loads(res.getheader("X-Compile"))["pages"], 1)
+            self.assertEqual(run.call_args[0][1], "main.tex")
+
+    def test_failures_answer_the_log_and_json_carries_both(self):
+        failed = {**OK_RESULT, "ok": False, "pdf": None, "log": "! Undefined control sequence.",
+                  "errors": [{"file": "main.tex", "line": 3, "message": "Undefined control sequence."}]}
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=failed):
+            status, body, res = self.post(archive_zip({"main.tex": DOC_TEX}))
+        self.assertEqual((status, body), (422, b"! Undefined control sequence."))
+        self.assertEqual(json.loads(res.getheader("X-Compile"))["errors"][0]["line"], 3)
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)):
+            status, body, _ = self.post(json.dumps({"files": {"main.tex": DOC_TEX}}).encode(), "application/json",
+                                        "?output=json")
+        data = json.loads(body)
+        self.assertEqual((status, data["log"], data["pdf"]), (200, "the log", "JVBERi0xLjcgZmFrZQ=="))
+        self.assertEqual(self.post(b"garbage")[0], 400)
+        self.assertEqual(self.post(archive_zip({"main.tex": DOC_TEX}), query="?main=other.tex")[0], 400)
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+    def test_a_real_build_answers_the_pdf_and_leaves_nothing_behind(self):
+        work, out = self.base / "cache", self.base / "out"
+        with mock.patch.object(build, "CACHE_DIR", work), mock.patch.object(build, "OUT_DIR", out):
+            status, body, res = self.post(archive_tar({"paper/main.tex": DOC_TEX}), "application/gzip")
+            self.assertEqual(status, 200, body[-2000:])
+            self.assertTrue(body.startswith(b"%PDF"))
+            status, body, _ = self.post(archive_zip({"main.tex": DOC_TEX.replace("Hello", "\\nosuchmacro")}),
+                                        query="?output=log")
+            self.assertEqual(status, 422)
+            self.assertIn(b"Undefined control sequence", body)
+        self.assertEqual(list((work / "api-compile").iterdir()) + list((out / ".api-compile").iterdir()), [])
+
+
+class CompileGateway(GatewayMode):
+    def post(self, role, data, user="7-api;Ada (API)"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        conn.request("POST", "/api/v1/compile?doc=demo&output=json", data,
+                     {"Host": f"127.0.0.1:{self.port}", "Content-Type": "application/zip", "X-Host-Secret": self.SECRET,
+                      "X-Host-Role": role, "X-Host-User": quote(user, safe=";")})
+        res = conn.getresponse()
+        body = res.read()
+        conn.close()
+        return res.status, body
+
+    def test_the_gateway_compile_worker_needs_the_edit_role_and_gets_no_build_configuration(self):
+        data = archive_zip({"main.tex": DOC_TEX, "build.toml": "shell_escape = true\n"})
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            for role in ("view", "review"):
+                self.assertEqual(self.post(role, data)[0], 403, role)
+            run.assert_not_called()
+            status, body = self.post("edit", data)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["skipped"], ["build.toml"])
+        self.assertEqual(list(run.call_args[0][0]), ["main.tex"])
+
+    def test_uploads_count_against_the_project_quota(self):
+        serve.QUOTA.update(bytes=50 * 1024, area=self.base)
+        self.addCleanup(serve.QUOTA.update, bytes=0, area=None)
+        with mock.patch.object(serve.compile_api, "compile_files", return_value=dict(OK_RESULT)) as run:
+            status, _ = self.post("edit", archive_zip({"main.tex": DOC_TEX, "big.bin": "x" * 60000}))
+        self.assertIn(status, (413, 507))
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

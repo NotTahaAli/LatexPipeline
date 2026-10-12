@@ -1,7 +1,8 @@
 """Suggest missing BibTeX fields from Crossref, and insert them into a .bib without touching the rest.
 
 Stdlib-only. The only network use is `get_json` (Crossref's public works API, which sees just a DOI or a
-title); callers must opt in (`ci_report.py lint --bib-lookup`, the editor's "Look up" button). Tests replace
+title); callers must opt in (`ci_report.py lint --bib-lookup` / `--verify-citations`, the editor's "Look up" and
+"Verify" buttons). Tests replace
 `get_json`. `insert_fields` / `edit_for` are pure: they cut nothing and leave every other byte as it was.
 """
 
@@ -13,6 +14,7 @@ import html
 import json
 import re
 import threading
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +37,10 @@ CONTAINER_KINDS = {"article": "journal", "inproceedings": "booktitle", "conferen
 
 class BibLookupError(Exception):
     pass
+
+
+class NotFound(BibLookupError):
+    """Crossref answered 404: it has no record at that address (a DOI that does not resolve)."""
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +405,9 @@ def get_json(url: str, timeout: float = 15.0) -> dict:
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             data = json.loads(reply.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        raise BibLookupError("Crossref does not know this DOI." if error.code == 404
-                             else f"Crossref answered HTTP {error.code}.")
+        if error.code == 404:
+            raise NotFound("Crossref does not know this DOI.")
+        raise BibLookupError(f"Crossref answered HTTP {error.code}.")
     except (OSError, ValueError) as error:
         raise BibLookupError(f"Crossref is not reachable: {error}")
     with CACHE_LOCK:
@@ -466,17 +473,108 @@ def map_item(item: dict, kind: str) -> dict[str, str]:
     return out
 
 
-def accept_by_title(item: dict, title: str, year: str) -> bool:
-    """High title similarity and (if the entry has a year) a year within one. Anything less is a guess."""
+SEARCH_ROWS = 5
+
+
+def search(query: str) -> list[dict]:
+    """Crossref candidates for a free-text search phrase (the AI claims scan's query): [{"type", "fields"}], at
+    most SEARCH_ROWS. Only candidates: the person reads them and picks one; nothing is matched or added here."""
+    query = re.sub(r"\s+", " ", query if isinstance(query, str) else "").strip()[:200]
+    if len(query) < 3:
+        raise BibLookupError("Search for at least three characters.")
+    url = f"{API}?{urllib.parse.urlencode({'query.bibliographic': query, 'rows': SEARCH_ROWS})}"
+    items = ((get_json(url) or {}).get("message") or {}).get("items") or []
+    out = []
+    for item in items[:SEARCH_ROWS]:
+        if not isinstance(item, dict):
+            continue
+        kind = KINDS_FROM_CROSSREF.get(item.get("type", ""), "misc")
+        fields = map_item(item, kind)
+        if fields.get("title"):
+            out.append({"type": kind, "fields": fields})
+    return out
+
+
+def title_matches(item: dict, title: str) -> bool:
+    """The Crossref title (with or without its subtitle) is at least MIN_SIMILARITY like `title`."""
     titles = item.get("title") or []
     candidates = [titles[0] + " " + sub for sub in item.get("subtitle") or []] + titles[:1]
     want = _norm(title)
     if not want or not candidates:
         return False
-    if max(difflib.SequenceMatcher(None, want, _norm(c)).ratio() for c in candidates) < MIN_SIMILARITY:
-        return False
+    return max(difflib.SequenceMatcher(None, want, _norm(c)).ratio() for c in candidates) >= MIN_SIMILARITY
+
+
+def _year_off(item: dict, year: str) -> bool:
+    """The entry's year and Crossref's differ by more than one (online-first and print years often differ by one)."""
     found = _year(item)
-    return not (re.fullmatch(r"\d{4}", year) and found and abs(int(found) - int(year)) > 1)
+    return bool(re.fullmatch(r"\d{4}", year) and found and abs(int(found) - int(year)) > 1)
+
+
+def accept_by_title(item: dict, title: str, year: str) -> bool:
+    """High title similarity and (if the entry has a year) a year within one. Anything less is a guess."""
+    return title_matches(item, title) and not _year_off(item, year)
+
+
+def _surname(text: str) -> str:
+    """Letters only, accents and LaTeX accent commands dropped: M{\\"u}ller and Müller are both "muller"."""
+    text = re.sub(r"\\[a-zA-Z]+\s*|\\.|[{}]", "", text)
+    text = unicodedata.normalize("NFKD", text)
+    return re.sub(r"[^a-z]", "", "".join(c for c in text if not unicodedata.combining(c)).lower())
+
+
+def first_surname(author: str) -> str:
+    """The first author's family name from a BibTeX author field ("Last, First and ..." or "First Last and ...")."""
+    first = re.split(r"\s+and\s+", author.strip(), maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    if first.startswith("{") and _balanced(first, 0) == len(first):
+        return _surname(first)  # {The Example Consortium}: a corporate name, compared whole
+    return _surname(first.split(",")[0] if "," in first else (first.split() or [""])[-1])
+
+
+def verify(fields: dict[str, str]) -> dict:
+    """Does Crossref know this entry? {"status": "verified"|"mismatch"|"not-found"|"unchecked", "message", "doi"}.
+
+    With a DOI, the record must exist and agree on title, year (within one) and first author's surname; without
+    one, a search must find a title at MIN_SIMILARITY that agrees likewise. Network and rate-limit errors raise
+    BibLookupError: an entry nobody could check is never reported as fabricated, nor as verified."""
+    doi = clean_doi(fields.get("doi", ""))
+    title, author = fields.get("title", ""), fields.get("author") or fields.get("editor") or ""
+    year_match = re.search(r"\d{4}", fields.get("year") or fields.get("date") or "")
+    year = year_match.group(0) if year_match else ""
+    if doi:
+        if not re.fullmatch(r"10\.\S+/\S+", doi):
+            return {"status": "not-found", "message": f"'{doi}' is not a DOI (10.xxxx/...).", "doi": doi}
+        try:
+            item = (get_json(f"{API}/{urllib.parse.quote(doi, safe='/')}") or {}).get("message") or {}
+        except NotFound:
+            item = {}
+        if not item:
+            return {"status": "not-found", "message": f"The DOI {doi} does not resolve on Crossref.", "doi": doi}
+        if title and not title_matches(item, title):
+            shown = tex((item.get("title") or [""])[0])
+            return {"status": "mismatch", "message": f"Crossref's title for this DOI is '{shown}'.", "doi": doi}
+    elif title:
+        query = {"query.bibliographic": title, "rows": 5}
+        if first_surname(author):
+            query["query.author"] = first_surname(author)
+        items = ((get_json(f"{API}?{urllib.parse.urlencode(query)}") or {}).get("message") or {}).get("items") or []
+        item = next((candidate for candidate in items if title_matches(candidate, title)), {})
+        if not item:
+            return {"status": "not-found", "message": "No Crossref record closely matches this title.", "doi": ""}
+    else:
+        return {"status": "unchecked", "message": "The entry has neither a DOI nor a title to verify.", "doi": ""}
+    found_doi = clean_doi(item.get("DOI", doi))
+    if _year_off(item, year):
+        return {"status": "mismatch", "message": f"Crossref has the year {_year(item)}, the entry {year}.",
+                "doi": found_doi}
+    theirs = next((person for person in item.get("author") or [] if person.get("family") or person.get("name")), None)
+    mine = first_surname(author)
+    if theirs and mine:
+        other = _surname(theirs.get("family") or theirs.get("name", ""))
+        if other and mine not in other and other not in mine:  # "beethoven" in "vanbeethoven" agrees
+            shown = tex(theirs.get("family") or theirs.get("name", ""))
+            return {"status": "mismatch", "message": f"Crossref's first author is {shown}.", "doi": found_doi}
+    return {"status": "verified", "message": "Crossref has a matching record.", "doi": found_doi}
 
 
 def suggest(kind: str, fields: dict[str, str]) -> dict:
