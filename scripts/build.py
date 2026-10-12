@@ -421,7 +421,9 @@ def source_date_epoch(main_tex: Path) -> str:
 def recorded_inputs(main_tex: Path, everything: bool = False) -> list[Path]:
     """
     Files outside the document's directory that its last build read, from the
-    .fls that latexmk writes (-recorder). Empty before the first build.
+    .fls that latexmk writes (-recorder) and, for BibTeX and biber, which the
+    recorder does not see, the sources in latexmk's .fdb_latexmk. Empty before
+    the first build.
     everything=True keeps the files inside the document directory too (--deps).
 
     Files whose real path is inside the document directory are skipped (newest_input scans it; a symlinked
@@ -446,10 +448,21 @@ def recorded_inputs(main_tex: Path, everything: bool = False) -> list[Path]:
     found: dict[str, None] = {}
     seen: set[str] = set()
 
-    for line in recorder.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith("INPUT "):
+    names = [line[len("INPUT "):].strip() for line in recorder.read_text(encoding="utf-8", errors="replace")
+             .splitlines() if line.startswith("INPUT ")]
+    # BibTeX and biber are not recorded in the .fls: their sources (the .bib files) come from latexmk's database.
+    database = recorder.with_suffix(".fdb_latexmk")
+    rule = ""
+    for line in database.read_text(encoding="utf-8", errors="replace").splitlines() if database.is_file() else []:
+        if line.startswith("["):
+            rule = line
+        elif rule.startswith(('["bibtex ', '["biber ')) and line.startswith('  "'):
+            names.append(line[3:line.index('"', 3)] if '"' in line[3:] else "")
+
+    for line in names:
+        if not line:
             continue
-        name = os.path.normpath(os.path.join(base, line[len("INPUT "):].strip()))
+        name = os.path.normpath(os.path.join(base, line))
         if name in seen or os.path.normcase(name).startswith(outside):
             continue
         seen.add(name)
@@ -2332,7 +2345,8 @@ def export_arxiv(main_tex: Path) -> tuple[list[dict] | None, list[str]]:
         if not (cache_dir_for(main_tex) / f"{main_tex.stem}.fls").is_file():
             raise OSError("no recorded build (.fls); build the document first")
         target = arxiv_path_for(main_tex)
-        findings = arxiv.export(main_tex, settings, cache_dir_for(main_tex), target, recorded_inputs(main_tex))
+        outside = [path for path in recorded_inputs(main_tex) if path.suffix.lower() != ".bib"]  # the .bbl goes in
+        findings = arxiv.export(main_tex, settings, cache_dir_for(main_tex), target, outside)
     except (ConfigError, OSError, ValueError) as exc:
         return None, [f"ERROR: arXiv export failed: {exc}"]
     lines = [f"arXiv archive: {display(target)}"]

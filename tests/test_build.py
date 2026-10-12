@@ -347,7 +347,7 @@ class ReadSettingsTests(unittest.TestCase):
         with fake_repo() as root:
             pdf = root / "a.pdf"
             pdf.write_bytes(b"%PDF-1.7\n<pdfaid:part>2</pdfaid:part>\n/OutputIntents [1 0 R]\n")
-            self.assertIn("present", build.pdfa_check(pdf, "a-2b"))
+            self.assertIn("present", build.pdfa_check(pdf, "a-2b", validate=False))  # veraPDF may be installed
             pdf.write_bytes(b"%PDF-1.7\n")
             self.assertIn("no XMP pdfaid or OutputIntent", build.pdfa_check(pdf, "a-2b"))
 

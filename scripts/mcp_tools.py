@@ -552,7 +552,9 @@ def render_png(pdf: Path, page: int, size: int) -> bytes:
                 cmd = [pdftoppm, "-png", "-f", str(page), "-l", str(page), "-singlefile", "-scale-to", str(attempt),
                        "in.pdf", "page"]
             else:
-                cmd = [mutool, "draw", "-q", "-o", "page.png", "-w", str(attempt), "in.pdf", str(page)]
+                # -w with -h: the page fits both (the longest side is `attempt`, like pdftoppm -scale-to)
+                cmd = [mutool, "draw", "-q", "-o", "page.png", "-w", str(attempt), "-h", str(attempt), "in.pdf",
+                       str(page)]
             out = work / "page.png"
             try:
                 spawn = sandbox.spawn(cmd, work, work, cpu=60)
