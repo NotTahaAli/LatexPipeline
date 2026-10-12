@@ -313,6 +313,71 @@ class OutsideSource(TempDoc):
             name, box = serve.forward({"doc": ["doc"], "file": ["main.tex"], "line": ["3"]})
         self.assertEqual((name, box["page"]), ("doc", 1))
 
+    @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("synctex"), "needs pdflatex and synctex")
+    def test_forward_search_after_a_failed_build_uses_the_good_one(self):
+        # out/ keeps the good PDF; the failed run's SyncTeX data stops at its error and knows no later file.
+        self.write("chap.tex", "Chapter text.\n")
+        good = "\\documentclass{article}\n\\begin{document}\nHello.\n\\input{chap}\n\\end{document}\n"
+        self.write("main.tex", good)
+        main = (self.root / "main.tex").resolve()
+        with tempfile.TemporaryDirectory() as repo, \
+                mock.patch.object(build, "ROOT_DIR", Path(repo).resolve()), \
+                mock.patch.object(build, "CACHE_DIR", Path(repo).resolve() / ".latex-cache"), \
+                mock.patch.object(build, "SOURCE_DIR", self.base.resolve()), \
+                mock.patch.dict(serve.DOCS, {"doc": main}, clear=True):
+            cache = build.cache_dir_for(main)
+            cache.mkdir(parents=True)
+            run = ["pdflatex", "-interaction=batchmode", "-halt-on-error", "-synctex=1", f"-output-directory={cache}",
+                   "main.tex"]
+            subprocess.run(run, cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+            serve.keep_good(main)
+            self.write("main.tex", good.replace("Hello.", "Hello. \\undefinedmacro"))
+            subprocess.run(run, cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            name, box = serve.forward({"doc": ["doc"], "file": ["chap.tex"], "line": ["1"]})
+        self.assertEqual((name, box["page"]), ("doc", 1))
+
+    @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("synctex"), "needs pdflatex and synctex")
+    def test_forward_search_when_the_folder_case_differs(self):
+        # macOS: \input{chapters/ch1} opens Chapters/ch1.tex; SyncTeX records chapters/, the editor sends Chapters/.
+        # Here a symlink stands in for the case-insensitive file system.
+        self.write("Chapters/ch1.tex", "Chapter text.\n")
+        (self.root / "chapters").symlink_to("Chapters")
+        self.write("main.tex", "\\documentclass{article}\n\\begin{document}\nHello.\n"
+                   "\\input{chapters/ch1}\n\\end{document}\n")
+        main = (self.root / "main.tex").resolve()
+        with tempfile.TemporaryDirectory() as repo, \
+                mock.patch.object(build, "ROOT_DIR", Path(repo).resolve()), \
+                mock.patch.object(build, "CACHE_DIR", Path(repo).resolve() / ".latex-cache"), \
+                mock.patch.object(build, "SOURCE_DIR", self.base.resolve()), \
+                mock.patch.dict(serve.DOCS, {"doc": main}, clear=True):
+            cache = build.cache_dir_for(main)
+            cache.mkdir(parents=True)
+            subprocess.run(["pdflatex", "-interaction=batchmode", "-synctex=1", f"-output-directory={cache}",
+                            "main.tex"], cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+            name, box = serve.forward({"doc": ["doc"], "file": ["Chapters/ch1.tex"], "line": ["1"]})
+            focus_map = cache / "main.focusmap"
+            entries = [{"kind": "input", "depth": 1, "path": "chapters/ch1", "counters": ""}]
+            with mock.patch.object(build.accel, "read_focusmap", return_value=entries):
+                focus_map.write_text("")
+                target = serve.focus_target(main, "Chapters/ch1.tex")
+        self.assertEqual((name, box["page"]), ("doc", 1))
+        self.assertEqual(target, "chapters/ch1")
+
+    def test_disk_case_spells_a_path_as_on_disk(self):
+        self.write("Chapters/ch1.tex", "x")
+        self.assertEqual(serve.disk_case(self.root, "Chapters/ch1.tex"), "Chapters/ch1.tex")
+        self.assertEqual(serve.disk_case(self.root, "chapters/CH1.tex"), "Chapters/ch1.tex")
+        self.assertEqual(serve.disk_case(self.root, "gone/x.tex"), "gone/x.tex")
+
+    def test_no_chapter_preview_after_a_failed_build(self):
+        self.write("main.tex", "x")
+        self.write("chap.tex", "y")
+        main = (self.root / "main.tex").resolve()
+        with mock.patch.dict(serve.DOCS, {"doc": main}, clear=True), \
+                mock.patch.dict(serve.STATE, {"doc": {"ok": False}}):
+            with self.assertRaisesRegex(serve.ApiError, "last build failed"):
+                serve.start_focus("doc", "chap.tex")
+
 
 class BusTests(unittest.TestCase):
     def test_resume_from_revision(self):

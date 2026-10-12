@@ -6,7 +6,7 @@ export function tooltips(doc = document) {
   const tip = doc.createElement("div");
   if (!tip.showPopover) return;   // no Popover API: the browser's own title tooltips stay
   tip.id = "tip"; tip.setAttribute("popover", "manual"); tip.setAttribute("role", "tooltip");
-  doc.body.append(tip);
+  (doc.querySelector("main") || doc.body).append(tip);   // inside a landmark (axe "region"); a popover shows in the top layer anyway
   let target = null, timer = 0;
   function hide() {
     clearTimeout(timer);
@@ -38,5 +38,5 @@ export function tooltips(doc = document) {
   doc.addEventListener("pointerout", (e) => { if (!e.relatedTarget) hide(); });   // left the window
   doc.addEventListener("pointerdown", hide, true);
   doc.addEventListener("keydown", (e) => { if (e.key === "Escape" && target) hide(); }, true);
-  doc.addEventListener("scroll", hide, true);
+  doc.addEventListener("scroll", () => { if (tip.matches(":popover-open")) hide(); }, true);   // a pending tip is placed when it shows
 }

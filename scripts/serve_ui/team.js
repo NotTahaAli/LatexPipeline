@@ -65,8 +65,10 @@ export function teamSupport(ctx) {
   }
 
   // ---- asking for more access (view and review links; hosted, viewers and reviewers) -----------------------------
-  const accessBtn = el("button", { type: "button", className: "btn quiet", id: "accessBtn", textContent: "Request access", hidden: ctx.role !== "view" && ctx.role !== "review" });
+  const accessBtn = el("button", { type: "button", className: "btn quiet", id: "accessBtn", hidden: ctx.role !== "view" && ctx.role !== "review" });
   accessBtn.title = "Ask the owner to let you edit or review";
+  const accessLabel = (text) => { accessBtn.replaceChildren(ctx.icon("edit"), el("span", { className: "lbl", textContent: text })); accessBtn.setAttribute("aria-label", text); };
+  accessLabel("Request access");
   const ticketKey = () => "access:" + ctx.doc();
   let pollTimer;
   async function poll() {
@@ -75,7 +77,7 @@ export function teamSupport(ctx) {
     if (!ctx.config.hosted && !ticket) return;
     let r;
     try { r = await ctx.api.accessStatus(ctx.doc(), ticket); } catch (e) { if (e.status === 404) localStorage.removeItem(ticketKey()); return; }
-    accessBtn.textContent = r.state === "pending" ? "Access requested" : "Request access";
+    accessLabel(r.state === "pending" ? "Access requested" : "Request access");
     if (r.state === "granted" && r.url) {
       localStorage.removeItem(ticketKey());
       ctx.toast(el("span", { textContent: "The owner granted your request. " }), el("a", { href: r.url, textContent: "Open your new link" }));
@@ -91,7 +93,7 @@ export function teamSupport(ctx) {
       el("label", { htmlFor: "accRole", textContent: "Role" }), role, el("label", { htmlFor: "accNote", textContent: "Note (optional)" }), note], "Send request", async () => {
       const r = await ctx.api.accessRequest(ctx.doc(), { role: role.value, note: note.value, name: ctx.me().name });
       if (r.ticket) { try { localStorage.setItem(ticketKey(), r.ticket); } catch { /* this tab still polls once */ } }
-      accessBtn.textContent = "Access requested";
+      accessLabel("Access requested");
       ctx.live("Request sent");
       pollTimer = setTimeout(poll, ACCESS_POLL);
     });

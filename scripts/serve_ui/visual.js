@@ -2,6 +2,7 @@
 // hidden (or replaced by a widget) only while the cursor is elsewhere.
 import { state as S, view as V, loadKatex } from "./libs.js";
 import { mathTex } from "./latex.js";
+import { tablesIn, maskComments } from "./tableedit.js";
 
 const { Decoration, WidgetType, EditorView } = V;
 const { StateField, Facet, RangeSetBuilder } = S;
@@ -97,6 +98,104 @@ class ImageWidget extends WidgetType {
   }
 }
 
+// A table cell's LaTeX as DOM nodes: math through KaTeX, the text styles, escapes and dashes; other commands
+// show their last argument (\multirow{2}{*}{Text}, \makecell{...}). Text only through textContent.
+const CELL_STYLE = { ...STYLE_CLASS, textsf: "", mbox: "", text: "" };
+const ESCAPES = { "%": "%", "&": "&", "$": "$", "#": "#", "_": "_", "{": "{", "}": "}", " ": " ", ",": "\u2009", ";": " " };
+function cellNodes(tex, katex) {
+  const out = [];
+  const text = (t) => t && out.push(document.createTextNode(t.replace(/---/g, "\u2014").replace(/--/g, "\u2013").replace(/~/g, "\u00a0").replace(/``|''/g, "\u201d")));
+  let i = 0, plain = "";
+  const flush = () => { text(plain); plain = ""; };
+  const group = (at) => { const end = matchBrace(tex, at); return end < 0 ? null : [tex.slice(at + 1, end), end + 1]; };
+  while (i < tex.length) {
+    const c = tex[i];
+    if (c === "$" || tex.startsWith("\\(", i)) {
+      const close = c === "$" ? tex.indexOf("$", i + 1) : tex.indexOf("\\)", i + 2);
+      if (close < 0) { plain += tex.slice(i); break; }
+      flush();
+      const span = document.createElement("span");
+      span.className = "v-math";
+      const body = tex.slice(i + (c === "$" ? 1 : 2), close);
+      span.textContent = body;
+      if (katex) katex.render(body, span, { throwOnError: false, errorColor: "var(--ox)" });
+      out.push(span);
+      i = close + (c === "$" ? 1 : 2);
+    } else if (c === "{") {
+      const g = group(i);
+      if (!g) { plain += c; i++; continue; }
+      flush(); out.push(...cellNodes(g[0], katex)); i = g[1];
+    } else if (c === "\\") {
+      const m = /^\\([A-Za-z@]+\*?|.)/s.exec(tex.slice(i));
+      const name = m ? m[1] : "";
+      i += m ? m[0].length : 1;
+      if (name in ESCAPES) { plain += ESCAPES[name]; continue; }
+      if (name === "\\" || name === "newline") { flush(); out.push(document.createElement("br")); continue; }
+      while (tex[i] === "[") { const e = tex.indexOf("]", i); if (e < 0) break; i = e + 1; }
+      const args = [];
+      for (let g; tex[i] === "{" && (g = group(i));) { args.push(g[0]); i = g[1]; }
+      if (!args.length) continue;   // \centering, \small, \hfill...
+      flush();
+      if (/^(cite|ref|eqref|autoref|cref|Cref|pageref)/.test(name)) {
+        const chip = document.createElement("span");
+        chip.className = `v-chip v-chip-${name.startsWith("cite") ? "cite" : "ref"}`;
+        chip.textContent = args[args.length - 1];
+        out.push(chip);
+        continue;
+      }
+      const span = document.createElement("span");
+      if (CELL_STYLE[name]) span.className = CELL_STYLE[name];
+      span.append(...cellNodes(args[args.length - 1], katex));
+      out.push(span);
+    } else { plain += c; i++; }
+  }
+  flush();
+  return out;
+}
+
+class TableWidget extends WidgetType {
+  constructor(table, source) { super(); this.table = table; this.source = source; }
+  eq(o) { return o.source === this.source; }
+  draw(el, katex) {
+    const t = this.table, n = Math.max(t.cols.length, ...t.rows.map((r) => r.cells.reduce((k, c) => k + c.span, 0)));
+    const tbl = document.createElement("table");
+    tbl.className = "v-table";
+    const rule = (td, side, kind) => { if (kind) td.classList.add(`v-rule-${side}-${kind}`); };
+    t.rows.forEach((row, ri) => {
+      const tr = tbl.insertRow();
+      let col = 1;
+      for (const cell of row.cells) {
+        const td = tr.insertCell();
+        td.colSpan = cell.span;
+        td.style.textAlign = cell.align;
+        td.append(...cellNodes(maskComments(cell.src).trim(), katex));
+        const last = col + cell.span - 1;
+        rule(td, "top", row.rule.kind || (row.rule.parts.some(([a, b]) => a <= last && b >= col) ? "thin" : null));
+        if (ri === t.rows.length - 1) rule(td, "bottom", t.bottom.kind);
+        if (col === 1 && t.cols[0]?.left) td.classList.add("v-rule-left");
+        if (t.cols[last - 1]?.right) td.classList.add("v-rule-right");
+        col = last + 1;
+      }
+      for (; col <= n; col++) tr.insertCell();   // short rows still fill the grid
+    });
+    el.replaceChildren(tbl);
+  }
+  toDOM(view) {
+    const el = document.createElement("div");
+    el.className = "v-table-box";
+    el.title = "Click to edit";
+    this.draw(el, null);
+    if (/\$|\\\(/.test(this.source)) loadKatex().then((katex) => this.draw(el, katex)).catch(() => {});
+    el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      view.dispatch({ selection: { anchor: Math.min(view.posAtDOM(el) + 1, view.state.doc.length) }, scrollIntoView: true });
+      view.focus();
+    });
+    return el;
+  }
+  ignoreEvent() { return true; }
+}
+
 function refTip(env, kind, key) {
   const refs = env.refs?.() || {};
   if (kind.startsWith("cite")) {
@@ -121,7 +220,13 @@ function build(st) {
   const taken = [];  // spans consumed by math (so nothing is decorated inside them)
   const inTaken = (p) => taken.some(([a, b]) => p >= a && p < b);
 
-  // Math first: it wins over everything inside it.
+  // Tables first: a drawn table holds its math and styles itself.
+  for (const t of tablesIn(text)) {
+    if (touched(t.from, t.to)) continue;
+    taken.push([t.from, t.to]);
+    add(t.from, t.to, Decoration.replace({ widget: new TableWidget(t, text.slice(t.from, t.to)), block: true }));
+  }
+  // Math next: it wins over everything inside it.
   const math = (re, pick) => {
     for (const m of text.matchAll(re)) {
       const from = m.index, to = from + m[0].length;

@@ -20,6 +20,7 @@ import atexit
 import base64
 import bisect
 import collections
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -494,8 +495,10 @@ def run_build(main_tex: Path, latexmk: str, force: bool, record: bool = False) -
         if over is None:
             entry, _ = build.build_safely(main_tex, latexmk, False, force, record=record, validate=False)
             over = quota_after_build(started)
-            if entry["ok"] and over is None and main_tex in preview.WARM:
-                refresh_preview(main_tex)
+            if entry["ok"] and over is None:
+                keep_good(main_tex)
+                if main_tex in preview.WARM:
+                    refresh_preview(main_tex)
     if over is not None:
         publish(name, status="failed", ok=False, error=over, error_hint=None, errors=[], finished=time.time(),
                 version=pdf_version(main_tex))
@@ -528,11 +531,65 @@ def focus_map(main_tex: Path) -> Path:
     return build.cache_dir_for(main_tex) / f"{main_tex.stem}.focusmap"
 
 
+def good_dir(main_tex: Path) -> Path:
+    return build.cache_dir_for(main_tex) / "good"
+
+
+def keep_good(main_tex: Path) -> None:
+    """
+    (BUILD_LOCK held, after a good full build) Keep its PDF and SyncTeX data apart. A failed build rewrites them
+    in the cache only up to its error while out/ keeps showing the good PDF, so jumping between source and PDF
+    reads these instead.
+    """
+    src, target = build.cache_dir_for(main_tex), good_dir(main_tex)
+    fresh = target.with_name("good.new")
+    try:
+        shutil.rmtree(fresh, ignore_errors=True)
+        fresh.mkdir()
+        for suffix in (".pdf", ".synctex.gz"):
+            path = src / f"{main_tex.stem}{suffix}"
+            if path.is_file() and not path.is_symlink():
+                shutil.copy2(path, fresh / path.name)
+        shutil.rmtree(target, ignore_errors=True)
+        fresh.rename(target)
+    except OSError as exc:
+        build.error(f"{build.doc_name(main_tex)}: could not keep the good build's SyncTeX data: {exc}")
+
+
 def focus_target(main_tex: Path, rel: str) -> str | None:
     """The top-level file (read by main.tex) that holds rel, from the last full build's recorded input tree."""
     if not focus_map(main_tex).exists():
         return None
-    return build.accel.top_unit(build.accel.read_focusmap(focus_map(main_tex)), rel)
+    entries = build.accel.read_focusmap(focus_map(main_tex))
+    found = build.accel.top_unit(entries, rel)
+    if found is None:  # \input{chapters/x} opens Chapters/x.tex on a case-insensitive file system (or a symlink)
+        target = main_tex.parent / rel
+        same = next((e["path"] for e in entries if same_file(main_tex.parent / (e["path"] + ".tex"), target)), None)
+        found = same and build.accel.top_unit(entries, same)
+    return found
+
+
+def same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def disk_case(root: Path, rel: str) -> str:
+    """rel spelled as on disk, part by part: a case-insensitive file system opens chapters/ for Chapters/."""
+    here, parts = root, []
+    for part in rel.split("/"):
+        try:
+            names = os.listdir(here)
+        except OSError:
+            return rel
+        if part not in names:
+            match = [n for n in names if n.casefold() == part.casefold()]
+            part = match[0] if len(match) == 1 else part
+        parts.append(part)
+        here = here / part
+    return "/".join(parts)
 
 
 def focus_error(main_tex: Path) -> str:
@@ -611,6 +668,10 @@ def start_focus(name: str, rel) -> float:
         raise ApiError("Open a .tex file of a chapter to preview it.", 400)
     if not resolve_in_doc(main_tex.parent, rel).is_file():
         raise ApiError("No such file.", 404)
+    with LOCK:
+        failed = STATE.get(name, {}).get("ok") is False
+    if failed:  # its input tree and references stop at the error, so the chapter may look missing
+        raise ApiError("The last build failed: fix its error, then preview the chapter.", 409)
     if rel == "main.tex" or (focus_map(main_tex).exists() and focus_target(main_tex, rel) is None):
         raise ApiError("This file is not a chapter: main.tex does not \\input or \\include it.", 409)
     with LOCK:
@@ -2027,10 +2088,11 @@ class SynctexError(Exception):
 
 def synctex(main_tex: Path, kind: str, spec: str, pdf: Path | None = None) -> dict[str, str]:
     """Run the synctex CLI against the cached PDF (its .synctex.gz sits beside it), or another PDF."""
-    # ponytail: the cache PDF can be newer than the out/ PDF after a failed build; line-level error is small.
+    # The good build's copy (keep_good) matches the out/ PDF; the cache one is used only before the first good build.
     if pdf is None:
-        pdf = build.cache_dir_for(main_tex) / f"{main_tex.stem}.pdf"
-        if not synctex_file(main_tex).exists():
+        kept = good_dir(main_tex) / f"{main_tex.stem}.synctex.gz"
+        pdf = (good_dir(main_tex) if kept.is_file() else build.cache_dir_for(main_tex)) / f"{main_tex.stem}.pdf"
+        if not kept.is_file() and not synctex_file(main_tex).exists():
             with LOCK:  # TeX removes the .synctex.gz while it writes a new one
                 building = STATE.get(build.doc_name(main_tex), {}).get("status") == "building"
             raise SynctexError("The build is still running; try again when it ends." if building
@@ -2062,6 +2124,23 @@ def number(query: dict, key: str, default: str | None = None) -> float:
         raise SynctexError(f"Bad or missing parameter: {key}")
 
 
+def synctex_name(main_tex: Path, source: Path) -> str | None:
+    """The Input name in the SyncTeX data (the good build's, else the cache's) that is the same file as source."""
+    data = good_dir(main_tex) / f"{main_tex.stem}.synctex.gz"
+    try:
+        data = data if data.is_file() else synctex_file(main_tex)
+        with gzip.open(data, "rt", encoding="utf-8", errors="replace") as f:
+            for row in f:
+                if row.startswith("Input:"):
+                    name = row.rstrip("\n").split(":", 2)[2]
+                    same_name = Path(name).name.casefold() == source.name.casefold()
+                    if name != str(source) and same_name and same_file(Path(name), source):
+                        return name
+    except (OSError, EOFError, IndexError):
+        return None
+    return None
+
+
 def inverse(main_tex: Path, query: dict) -> dict:
     """PDF position -> source line. With preview=<cid>: a page of that browser tab's newest live preview."""
     page, x, y = number(query, "page"), number(query, "x"), number(query, "y")
@@ -2078,7 +2157,7 @@ def inverse(main_tex: Path, query: dict) -> dict:
     source = Path(posixpath.normpath(source.as_posix()))
     line = max(1, int(fields.get("Line", "1")))
     try:
-        rel = source.resolve().relative_to(main_tex.parent.resolve()).as_posix()
+        rel = disk_case(main_tex.parent.resolve(), source.resolve().relative_to(main_tex.parent.resolve()).as_posix())
     except ValueError:
         rel = None
     return {"file": source.as_posix(), "rel": rel, "line": line, "link": editor_link(source, line)}
@@ -2102,7 +2181,13 @@ def forward(query: dict, only: str | None = None) -> tuple[str, dict]:
     main_tex = DOCS[owner]
     line = int(number(query, "line", "1"))
     column = int(number(query, "col", "-1"))
-    fields = synctex(main_tex, "view", f"{line}:{column}:{source}")
+    try:
+        fields = synctex(main_tex, "view", f"{line}:{column}:{source}")
+    except SynctexError:
+        recorded = synctex_name(main_tex, source)  # the name TeX wrote, when it differs in case or by a symlink
+        if recorded is None:
+            raise
+        fields = synctex(main_tex, "view", f"{line}:{column}:{recorded}")
     height = float(fields.get("H", 0))
     return owner, {
         "page": int(fields["Page"]), "x": float(fields["h"]), "y": float(fields["v"]) - height,

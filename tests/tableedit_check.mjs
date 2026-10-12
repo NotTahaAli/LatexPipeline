@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   maskComments, findEnv, findTable, parseBody, serializeBody, parseSpec, serializeSpec, specInsert, specRemove, specMove, specSetType,
   insertRow, removeRow, moveRow, insertColumn, removeColumn, moveColumn, ruleStyle, setRuleStyle, tableText, alignTable, columnCount,
+  tablesIn,
 } from "../scripts/serve_ui/tableedit.js";
 
 assert.equal(maskComments("a % b\n50\\% c %d"), "a    \n50\\% c   ");
@@ -125,5 +126,20 @@ insertColumn(tm, 3);
 const out = tableText(doc, t, specInsert(t.spec, 3), tm);
 assert.ok(out.startsWith("\\begin{tabular}[t]{|l|c|r|l|}\n    \\hline\n    Name & Qty & {Cost, \\&} &  \\\\"));
 assert.ok(out.endsWith("\\end{tabular}"));
+
+// Visual mode: every outermost table, with column alignment, rules and \multicolumn spans.
+const shown = tablesIn(doc);
+assert.equal(shown.length, 1);   // the nested tabular and the commented-out one are not tables of their own
+assert.equal(doc.slice(shown[0].from, shown[0].to).split("\n").length, 9);
+assert.deepEqual(shown[0].cols.map((c) => [c.align, c.left, c.right]), [["left", true, true], ["center", true, true], ["right", true, true]]);
+assert.deepEqual(shown[0].rows.map((r) => r.cells.map((c) => [c.span, c.align])), [[[1, "left"], [1, "center"], [1, "right"]], [[1, "left"], [1, "center"], [1, "right"]], [[2, "center"], [1, "right"]]]);
+assert.equal(shown[0].rows[2].cells[0].src, "Total");
+assert.deepEqual(shown[0].rows.map((r) => r.rule.kind), ["thin", "thin", null]);
+assert.equal(shown[0].bottom.kind, "thin");
+const bk = tablesIn("\\begin{tabularx}{\\linewidth}{lX}\\toprule a & b \\\\ \\cmidrule(lr){2-2} c & d \\\\ \\bottomrule\\end{tabularx} \\begin{tabular*}{5cm}{r}x\\end{tabular*}");
+assert.deepEqual(bk.map((t) => t.rows.length), [2, 1]);
+assert.deepEqual([bk[0].rows[0].rule.kind, bk[0].rows[1].rule, bk[0].bottom.kind], ["thick", { kind: null, parts: [[2, 2]] }, "thick"]);
+assert.equal(bk[1].cols[0].align, "right");
+assert.equal(tablesIn("\\begin{tabular}{l} open").length, 0);
 
 console.log("tableedit ok");

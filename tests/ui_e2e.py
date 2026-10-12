@@ -7,8 +7,9 @@ Every UI feature of the local editor (scripts/serve_ui) and of the hosted pages 
 
 local: serve.py on a throwaway source folder (a document with math, a citation, labels, a TODO, a table, a TikZ
 picture, an \\input chapter and a .bib file, plus a second document to link a file from). It prints the inventory
-(every command of the palette, every item of the More view (the palette grouped, opened by "..."), side and drawer tabs, toolbar buttons, dialogs and
-keyboard shortcuts), runs every palette command and asserts its visible effect, then the features one by one:
+(every command of the palette, every item of the More view (the palette grouped, opened by "..."), side and drawer
+tabs, toolbar buttons, dialogs and keyboard shortcuts), runs every palette command and asserts its visible effect,
+then the features one by one:
 hover cards (math, \\cite, \\ref, suggestion with author, time, replies and accept / reject / withdraw by role),
 folding, snippets, figure, table and TikZ dialogs, symbols, TODOs, bookmarks, file graph, zen mode, comments on the
 selection and on the PDF (click and drag), the bell (empty and filled) and the @-mention list, version history
@@ -332,7 +333,8 @@ def more_view(page):
     groups = page.evaluate(
         "() => { const out = []; for (const li of document.querySelectorAll('#paletteList li')) {"
         " if (li.classList.contains('pal-group')) out.push([li.textContent, []]);"
-        " else out.at(-1)[1].push(li.firstChild.textContent + (li.getAttribute('aria-disabled') ? ' (disabled)' : '')); }"
+        " else out.at(-1)[1].push(li.firstChild.textContent"
+        " + (li.getAttribute('aria-disabled') ? ' (disabled)' : '')); }"
         " return out; }"
     )
     page.keyboard.press("Escape")
@@ -345,10 +347,13 @@ def inventory(page, who):
     page.wait_for_selector("#palette[open]")
     page.fill("#paletteInput", "")
     commands = page.evaluate(
-        "() => [...document.querySelectorAll('#paletteList li')].map((li) => "
+        "() => [...document.querySelectorAll('#paletteList li[role=option]')].map((li) => "
         "[li.id.slice(4), li.firstChild.textContent, li.querySelector('.keys')?.textContent || ''])"
     )
-    untold = page.evaluate("() => [...document.querySelectorAll('#paletteList li[role=option]')].filter((li) => !li.title).map((li) => li.id)")
+    untold = page.evaluate(
+        "() => [...document.querySelectorAll('#paletteList li[role=option]')]"
+        ".filter((li) => !li.title).map((li) => li.id)"
+    )
     assert not untold, f"palette rows without a tooltip (add them to serve_ui/cmdhelp.js): {untold}"
     page.keyboard.press("Escape")
     menu = more_view(page)
@@ -452,7 +457,11 @@ def new_page(browser, name, **kw):
     page.add_init_script("""addEventListener('DOMContentLoaded', () => { window.__toasts = [];
         new MutationObserver(() => { const t = document.getElementById('toast');
                 if (t && t.textContent) __toasts.push(t.textContent); })
-            .observe(document.getElementById('toast') || document.body, { childList: true, subtree: true }); })""")
+            .observe(document.getElementById('toast') || document.body, { childList: true, subtree: true });
+        // and every live-region announcement: a later one (a build ending) replaces the text being waited for
+        window.__lives = []; const live = document.getElementById('live');
+        if (live) new MutationObserver(() => { if (live.textContent) __lives.push(live.textContent); })
+            .observe(live, { childList: true, characterData: true, subtree: true }); })""")
 
     def answer(d):
         w.dialogs.append(f"{d.type}: {d.message[:80]}")
@@ -531,7 +540,8 @@ def run_local(args, browser, origin, src, doc, other, stub, port):
     ok(f"command palette: {len(done)} commands, each with its visible effect, no console error or failed request")
     done = sweep(owner, w, cmds, ctx, "keys", ids)
     ok(f"keyboard shortcuts: {len(done)} ({', '.join(done)}), each with the same effect")
-    in_menu = {t for label, items in more_view(owner) if label != "Other" for t in items if not t.endswith("(disabled)")}
+    grouped = [items for label, items in more_view(owner) if label != "Other"]
+    in_menu = {t for items in grouped for t in items if not t.endswith("(disabled)")}
     done = sweep(owner, w, {k: v for k, v in cmds.items() if v[0] in in_menu}, ctx, "menu", ids)
     ok(f"More (\"...\"): {len(done)} grouped items, each with the same effect")
     ctx.update(axe=args.axe, browser=browser, origin=origin, src=src, stub=stub, config=src.parent / "config")
@@ -736,8 +746,12 @@ def command_specs(page, ctx):
         "typeset": (lambda: at("f(x) = (a + b)", 0, 14), dlg("#navDlg[open] .nav-typeset canvas"), close_dialogs),
         "present": (None, dlg(".nav-present canvas"), lambda: page.keyboard.press("Escape")),
         "pdftab": (None, popup("/pdf/"), None),
-        "pdfdownload": (None, lambda: any(n.endswith(".pdf") for n in ctx["downloads"]), lambda: ctx["downloads"].clear()),
-        "srczip": (None, lambda: f"{ctx['doc'].split('/')[-1]}.zip" in ctx["downloads"], lambda: ctx["downloads"].clear()),
+        "pdfdownload": (
+            None, lambda: any(n.endswith(".pdf") for n in ctx["downloads"]), lambda: ctx["downloads"].clear()
+        ),
+        "srczip": (
+            None, lambda: f"{ctx['doc'].split('/')[-1]}.zip" in ctx["downloads"], lambda: ctx["downloads"].clear()
+        ),
         "numbers": (None, flip("labelNumbers"), "again"),
         "mathprev": (None, flip("mathPreview"), "again"),
         "follow": (None, flip("follow"), "again"),
@@ -765,7 +779,7 @@ def command_specs(page, ctx):
         ),
         "refreshlinked": (
             lambda: select_tree(page, "shared.bib"),
-            js("() => /refreshed/.test(document.getElementById('live').textContent)"),
+            js("() => (window.__lives || []).some((m) => /refreshed/.test(m))"),
             None,
         ),
         "unlink": (
@@ -962,8 +976,11 @@ def check_spec(page, check, cid, how, ctx):
                     [sorted(p.name for p in d.iterdir()) for d in (ROOT / ".latex-cache").glob(f"_x*_2F{ctx['doc']}")],
                     page.evaluate("() => JSON.stringify(window.__app.docs[window.__app.cur])")[:600],
                 )
-            toast = page.evaluate("() => document.getElementById('toast').textContent")
-            raise AssertionError(f"{cid} ({how}): no visible effect ({expr}); toast: {toast!r}") from exc
+            toast = page.evaluate(
+                "() => (window.__toasts || []).slice(-3).join(' || ') + ' | live: ' + "
+                "(window.__lives || []).slice(-3).join(' || ')"
+            )
+            raise AssertionError(f"{cid} ({how}): no visible effect ({expr}); toasts: {toast!r}") from exc
 
 
 # Shortcuts the editor itself handles: pressed with the focus in it.
@@ -1018,7 +1035,7 @@ def sweep(page, w, cmds, ctx, how, ids=None):
         reset(page)
         page.evaluate(
             "() => { const t = document.getElementById('toast'); t.hidden = true; t.replaceChildren(); "
-            "window.__toasts = window.__toasts || []; "
+            "window.__toasts = window.__toasts || []; window.__lives = []; "
             "document.getElementById('live').textContent = ''; }"
         )
         if prepare:
@@ -1787,7 +1804,11 @@ def feature_sharing(page, w, ctx):
     palette_by_id(owner, "share")
     owner.select_option("#shareProvider", "local")
     owner.click("#shareStart")
-    owner.wait_for_selector("#link-view", timeout=30000)
+    try:
+        owner.wait_for_selector("#link-view", timeout=30000)
+    except Exception:
+        print("share dialog:", owner.inner_text("#share"), "toasts:", owner.evaluate("() => window.__toasts"))
+        raise
     for name, role in (("Edith", "edit"), ("Rita", "review"), ("Vic", "view")):
         owner.fill("#shareLinkName", name)
         owner.select_option("#shareLinkRole", role)
@@ -2039,7 +2060,9 @@ def feature_sharing(page, w, ctx):
         # Rita's link was revoked. Once sharing stops the server drops the guests' connections, aborting what was
         # on its way.
         gw.check(
-            f"{n}: sharing", allow=[r"ERR_ABORTED"] + ([r"HTTP 401 ", r"WebSocket connection"] if n == "Rita" else [])
+            f"{n}: sharing",
+            allow=[r"ERR_ABORTED", r"WebSocket connection .* failed"]
+            + ([r"HTTP 401 ", r"WebSocket connection"] if n == "Rita" else []),
         )
     for gpage, _ in guests.values():
         gpage.context.close()
@@ -2070,12 +2093,13 @@ def feature_layout(page, w, ctx):
         page.click("#pdfDlBtn")
     assert got.value.suggested_filename.endswith(".pdf"), got.value.suggested_filename
     assert Path(got.value.path()).read_bytes()[:5] == b"%PDF-"
+    pdf_name = got.value.suggested_filename
     with page.expect_download() as got:
         palette(page, "Download source (zip)")
     with zipfile.ZipFile(got.value.path()) as z:
         names = z.namelist()
     assert {"main.tex", "chapter.tex"} <= set(names), names
-    ok(f"downloads: the PDF ({got.value.suggested_filename}) and the source zip ({len(names)} files)")
+    ok(f"downloads: the PDF ({pdf_name}) and the source zip ({len(names)} files)")
     side_tab(page, "files")
     width = lambda: page.evaluate("() => document.getElementById('side').offsetWidth")  # noqa: E731
     start = width()
@@ -2105,6 +2129,25 @@ def feature_layout(page, w, ctx):
     assert scroll == [True, "auto"], scroll
     side_tab(page, "files")
     ok(f"sidebar: dragged {start}px to {dragged}px for Files only, reset by double-click, arrow keys, panels scroll")
+    open_file(page, "main.tex")
+    put_cursor(page, 0)
+    page.click("#visualBtn")
+    page.wait_for_selector(".v-table-box .v-table td")
+    cells = page.evaluate("() => [...document.querySelectorAll('.v-table td')].map((td) => td.textContent)")
+    assert cells[:4] == ["alpha", "beta", "gamma", "delta"], cells
+    axe_ok(page, ctx, "visual mode with a table")
+    page.click(".v-table-box")
+    page.wait_for_function("() => !document.querySelector('.v-table-box')")
+    assert "\\begin{tabular}" in page.inner_text(".cm-content")
+    page.click("#visualBtn")
+    ok("visual mode: the tabular is drawn as a table; a click shows its source again")
+    for phone in (320, 360):
+        page.set_viewport_size({"width": phone, "height": 800})
+        page.wait_for_timeout(300)
+        wide = page.evaluate("() => [document.documentElement.scrollWidth, innerWidth]")
+        assert wide[0] <= wide[1], f"page wider than a {phone}px phone: {wide}"
+    page.set_viewport_size({"width": 1400, "height": 900})
+    ok("phone: the page is never wider than a 320 or 360 px screen")
     w.check("layout")
 
 

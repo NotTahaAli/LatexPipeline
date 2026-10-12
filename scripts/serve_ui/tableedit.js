@@ -340,3 +340,63 @@ export function alignAmpersands(ctx) {
   if (!change) { ctx.toast("Put the cursor inside a tabular, tabularx or longtable first."); return; }
   if (view.state.sliceDoc(change.from, change.to) !== change.insert) view.dispatch({ changes: change, userEvent: "input.table" });
 }
+
+// ---- Visual mode: the tables of a text as rows of cells to draw (visual.js renders them) -------------------------
+
+const RULE = /^\\(toprule|midrule|bottomrule|hline|cline|cmidrule)/;
+
+/** The rules above a row: {kind: "thick" | "thin" | "double" | null, parts: [[first, last] columns, 1-based]}. */
+function rulesOf(pre) {
+  let kind = null, hlines = 0;
+  const parts = [];
+  for (const p of pre) {
+    const m = RULE.exec(p);
+    if (!m) continue;
+    if (m[1] === "cline" || m[1] === "cmidrule") {
+      const r = /\{\s*(\d+)\s*-\s*(\d+)\s*\}/.exec(p);
+      if (r) parts.push([+r[1], +r[2]]);
+    } else if (m[1] === "hline") kind = ++hlines > 1 ? "double" : kind === "thick" ? "thick" : "thin";
+    else kind = m[1] === "midrule" ? (kind || "thin") : "thick";
+  }
+  return { kind, parts };
+}
+
+const alignOf = (type) => ({ c: "center", r: "right" }[(type || "l")[0]] || "left");
+
+/**
+ * Every outermost tabular, tabular*, tabularx and longtable of text: {from, to, cols: [{align, left, right}],
+ * rows: [{rule, cells: [{src, span, align}]}], bottom}. Cell src is LaTeX; nested tables stay inside it.
+ */
+export function tablesIn(text) {
+  const src = maskComments(text), out = [], open = [];
+  for (const m of src.matchAll(/\\(begin|end)\s*\{(tabular\*?|tabularx|longtable)\}/g)) {
+    if (m[1] === "begin") { open.push(m); continue; }
+    const b = open.pop();
+    if (!b || b[2] !== m[2] || open.length) continue;   // only the outermost is drawn
+    let i = skipWs(src, b.index + b[0].length);
+    if (src[i] === "[") i = skipWs(src, groupEnd(src, i, "[", "]"));
+    if (b[2] === "tabularx" || b[2] === "tabular*") { const w = groupEnd(src, i); if (w < 0) continue; i = skipWs(src, w); }
+    const end = groupEnd(src, i);
+    if (end < 0 || end > m.index) continue;
+    const spec = parseSpec(text.slice(i + 1, end - 1));
+    const body = parseBody(text.slice(end, m.index));
+    const cols = (spec?.cols || []).map((c, k) => ({ align: alignOf(c.type), left: spec.seps[k].includes("|"), right: spec.seps[k + 1].includes("|") }));
+    const rows = body.rows.filter((r) => r.cells.length > 1 || r.cells[0]).map((r) => {
+      let col = 0;
+      const cells = r.cells.map((c) => {
+        const mc = /^\\multicolumn\s*\{\s*(\d+)\s*\}\s*/.exec(c);
+        let cell = { src: c, span: 1, align: cols[col]?.align || "left" };
+        if (mc) {
+          const a = mc[0].length, b2 = groupEnd(c, a), c3 = b2 < 0 ? -1 : groupEnd(c, skipWs(c, b2));
+          if (c3 > 0) cell = { src: c.slice(skipWs(c, b2) + 1, c3 - 1), span: Math.max(1, +mc[1]), align: alignOf(c.slice(a + 1, b2 - 1).replace(/[|\s]/g, "")) };
+        }
+        col += cell.span;
+        return cell;
+      });
+      return { rule: rulesOf(r.pre), cells };
+    });
+    const lastPre = body.rows.filter((r) => !(r.cells.length > 1 || r.cells[0])).flatMap((r) => r.pre);
+    out.push({ from: b.index, to: m.index + m[0].length, cols, rows, bottom: rulesOf([...lastPre, ...body.tail]) });
+  }
+  return out;
+}

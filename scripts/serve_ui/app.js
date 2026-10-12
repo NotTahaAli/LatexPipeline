@@ -1641,6 +1641,7 @@ let shareTimer;
 let sharing = false;  // DOCX export is off while sharing (pandoc reads any file the source names)
 const setSharing = (on) => { if (on !== sharing) { sharing = on; if ($("palette").open) renderPalette(); } };
 async function openShare() {
+  $("shareBody").replaceChildren(el("p", { className: "mute", role: "status", textContent: "Loading..." }));   // never act on the last opening's controls
   $("share").showModal();
   if (role === "owner") api.zotero().then((z) => { zoteroNote = zoteroShareNote(z); const n = $("shareBody").querySelector("#shareGrammar"); if (n) n.textContent = grammarShareNote(); }).catch(() => {});
   await refreshShare(); $("shareBody").querySelector("select, button")?.focus();

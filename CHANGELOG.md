@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: "Download PDF" (PDF toolbar icon and palette) and "Download source (zip)" (`GET /api/source/zip`, view role; build-config files only for the owner).
 - Editor: tooltips on hover for every button with a title and for each command palette row (a one-line explanation, `serve_ui/cmdhelp.js`), also shown over dialogs and on keyboard focus (`serve_ui/tooltip.js`).
 - Editor: the sidebar can be resized by dragging its edge or with the arrow keys; each tab keeps its own width, double-click resets.
+- Editor: Visual mode draws tables (`tabular`, `tabular*`, `tabularx`, `longtable`, with booktabs rules, `\hline` and `\multicolumn`), with bold, italics and math in cells; a click shows the source again.
 
 ### Changed
 
@@ -17,6 +18,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ### Fixed
 
 - Editor: the More menu ran off the bottom of the screen and could not scroll; sidebar tabs without their own scrolling (Symbols, Search) now scroll.
+- Editor: after a failed build, "Show cursor in PDF" and double-click in the PDF said "No match at that position" for every file after the error, because the failed run's SyncTeX data stops there while the PDF shown is the last good one; the last good build's PDF and SyncTeX data are now kept (`.latex-cache/<doc>/good/`) and used. "Preview chapter" after a failed build now says so instead of "This file is not a chapter".
+- Editor: on macOS (case-insensitive file system), "Show cursor in PDF" said "No match at that position" and "Preview chapter" said "This file is not a chapter" for every file in a folder whose name on disk differs in case from the `\input` (`Chapters/` read as `\input{chapters/...}`) or is reached through a symlink; both now match the file itself, and a click in the PDF opens the file under its name on disk.
+- Editor on a phone (320 to 412 px): the top bar no longer makes the page wider than the screen (an empty strip on the right, mostly with share links); the role chip, Request access and the status show as icons there, and a disabled Rebuild is hidden. "Fit width" no longer leaves a sideways scroll in the PDF.
+- Editor: opening Share showed the previous opening's controls until the server answered, so a quick click could start the wrong tunnel; LaTeX comments are darker so they stay readable (WCAG AA) under another person's selection.
 
 ## [0.2.0] - 2026-10-12
 
