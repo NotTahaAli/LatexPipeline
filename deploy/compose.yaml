@@ -1,0 +1,28 @@
+# Coolify: new resource > Docker Compose, compose file deploy/compose.yaml. Set the domain of the "latex" service
+# (Coolify fills SERVICE_URL_LATEX_8080) and LP_ADMIN_EMAIL / LP_ADMIN_PASSWORD for the first site admin.
+# Elsewhere: PUBLIC_URL=https://latex.example.org docker compose -f deploy/compose.yaml up -d, behind a TLS proxy.
+services:
+  latex:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PUBLIC_URL: ${SERVICE_URL_LATEX_8080:-${PUBLIC_URL:-http://localhost:8080}}
+      LP_ADMIN_EMAIL: ${LP_ADMIN_EMAIL:-}
+      LP_ADMIN_PASSWORD: ${LP_ADMIN_PASSWORD:-}
+    volumes:
+      - latex-data:/data
+    expose:
+      - "8080"
+    # Builds run under bubblewrap, which needs user namespaces and its own /proc inside the container:
+    # Docker's default seccomp profile plus 7 namespace syscalls, the default masks of /proc lifted, no
+    # capabilities, no privilege gain. LP_APPARMOR: the AppArmor profile (README "Docker and Coolify").
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./bwrap-seccomp.json
+      - systempaths=unconfined
+      - apparmor=${LP_APPARMOR:-unconfined}
+volumes:
+  latex-data:

@@ -615,7 +615,7 @@ python scripts/build.py --source bench sample-report
 
 ## Hosting on a VPS
 
-`scripts/host.py` turns the editor into a multi-user site: accounts, workspaces (organisations) with admin, editor, reviewer and viewer members, projects, and sign-in with a password (plus optional two-step codes), Google or any OIDC provider, or GitHub. Standard library only, Python 3.9+. **Serving runs on Linux only**: every build runs under [bubblewrap](#sandboxed-builds), and `host.py serve` refuses to start when `bwrap --unshare-all --ro-bind / / true` fails.
+`scripts/host.py` turns the editor into a multi-user site: accounts, workspaces (organisations) with admin, editor, reviewer and viewer members, projects, and sign-in with a password (plus optional two-step codes), Google or any OIDC provider, or GitHub. Standard library only, Python 3.9+. **Serving runs on Linux only**: every build runs under [bubblewrap](#sandboxed-builds), and `host.py serve` refuses to start when `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true` fails.
 
 How it works: `host.py` is the only thing that faces the network (behind a TLS proxy). It owns logins, sessions, workspaces and projects, and serves the account and admin pages. Each open project gets its own worker, `serve.py --gateway`, on 127.0.0.1 with a random secret; the gateway proxies `/p/<project>/...` to it (HTTP, long-poll and WebSocket) and tells it the user's role in `X-Host-*` headers, which it strips from client requests. Workers stop after an idle timeout.
 
@@ -662,6 +662,19 @@ sudoedit /var/lib/latex-host/data/config.toml        # public_url = "https://lat
 Site settings live in the database and are changed on the Site admin page: sign-up (`invite_only` by default; `open`, where each new person gets their own workspace; or `open_domains`, which needs a provider that confirms the email), linking providers to existing accounts by email, projects per workspace, megabytes per project, open projects on the server and per workspace (each worker builds one document at a time, so this also caps concurrent builds), idle timeout and build time limit. The megabytes per project count the document plus its build output and caches (`.out/`, `.cache/`, `.home/`); the project's worker measures them afresh on every save, co-editing save, upload and new file (`507` when full; shrinking and deleting always work), and a build that goes over loses what it wrote and reports a quota error. A changed quota applies to workers started after the change. When the server's open-project limit is reached and none is idle, the workspace with the most open projects gives up its least recently active one (fair share); a workspace that already has one open never takes another workspace's last one. Open sign-up gives each new account one workspace. The sign-up form answers the same whether or not the address already has an account, then signs in like the login form (so a taken address just gets "wrong email or password").
 
 Sign-in throttling: failed passwords back off per client address (IPv6 per `/64`) and per account. A browser that has signed in to the account before carries a signed known-device cookie and has its own backoff, so someone guessing the password elsewhere cannot lock the owner out. Each two-step code and recovery code works once, also when sent twice at the same moment.
+
+### Docker and Coolify
+
+`Dockerfile` and `deploy/compose.yaml` run `host.py` in one container (Ubuntu 24.04, the TeX Live packages of the install above, the editor's libraries served from the image instead of a CDN). Data (`config.toml`, the database, projects) lives in the `latex-data` volume at `/data`.
+
+- **Coolify:** new resource, Docker Compose, compose file `deploy/compose.yaml`. Give the `latex` service a domain; Coolify's proxy does TLS and fills `SERVICE_URL_LATEX_8080`, which becomes `public_url`. Set `LP_ADMIN_EMAIL` and `LP_ADMIN_PASSWORD` for the first site admin (used on the first start only). Coolify reads `deploy/bwrap-seccomp.json` from the repository, so keep the repository in the deployment (Coolify: Preserve repository during deployment).
+- **Elsewhere:** `PUBLIC_URL=https://latex.example.org LP_ADMIN_EMAIL=... LP_ADMIN_PASSWORD=... docker compose -f deploy/compose.yaml up -d`, with a TLS proxy in front of port 8080 of the container (it is not published on the host).
+
+The first start runs `host.py init` and sets `listen = "0.0.0.0"` and `trust_proxy = true` in `config.toml`; later starts only update `public_url`. Edit everything else in `/data/config.toml` (copy it out and back with `docker cp`) and restart the container.
+
+Builds run under bubblewrap inside the container, which Docker's defaults forbid, so the compose file sets: `deploy/bwrap-seccomp.json` (Docker's default seccomp profile from [moby/profiles](https://github.com/moby/profiles), Apache-2.0, plus `clone`, `clone3`, `unshare`, `setns`, `mount`, `umount2` and `pivot_root`), `systempaths=unconfined` (so the sandbox can mount its own `/proc`), `apparmor=unconfined`, no capabilities, `no-new-privileges`, and a non-root user. Tested with Docker 29 on a host without AppArmor: a sandboxed hosted build works. The container refuses to start, with a message, when the sandbox does not work.
+
+Hosts whose AppArmor restricts unprivileged user namespaces (Ubuntu 23.10 and later; `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`) need one more step, not tested here: load `deploy/apparmor-latex-host` on the host (the commands are in the file) and set `LP_APPARMOR=latex-host` in the environment of the compose project. The other way, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`, lifts the restriction for the whole host.
 
 ### Sign-in providers
 

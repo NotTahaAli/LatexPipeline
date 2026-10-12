@@ -2683,8 +2683,9 @@ def sandbox_works() -> bool:
     if not shutil.which("bwrap"):
         return False
     try:
-        return subprocess.run(["bwrap", "--unshare-all", "--ro-bind", "/", "/", "true"], capture_output=True,
-                              timeout=20).returncode == 0
+        # --proc and --dev as every build mounts them: a container that masks /proc fails here, not at the first build
+        probe = ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "true"]
+        return subprocess.run(probe, capture_output=True, timeout=20).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -2738,8 +2739,9 @@ def cmd_serve(data: Path, insecure: bool) -> int:
             build.error("host.py serve runs on Linux only (builds are isolated with bubblewrap).")
             return 2
         if not sandbox_works():
-            build.error("bubblewrap does not work here (`bwrap --unshare-all --ro-bind / / true` failed). Install "
-                        "it (apt install bubblewrap) and allow unprivileged user namespaces. Refusing to serve.")
+            build.error("bubblewrap does not work here (`bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev "
+                        "true` failed). Install it (apt install bubblewrap) and allow unprivileged user namespaces "
+                        "(in Docker: README \"Docker and Coolify\"). Refusing to serve.")
             return 2
     else:
         print("!" * 78 + "\nWARNING: --insecure-no-sandbox. LaTeX runs WITHOUT the bubblewrap sandbox: any user who "
@@ -2758,8 +2760,8 @@ def cmd_serve(data: Path, insecure: bool) -> int:
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
     build.info(f"Gateway on http://{host}:{server.server_address[1]}/ for {APP.config['public_url']}")
     if host not in ("127.0.0.1", "::1", "localhost"):
-        build.error(f"listen = {host!r}: the gateway should sit behind a TLS proxy (Caddy) on 127.0.0.1; it has no "
-                    "TLS and no slow-client timeouts of its own.")
+        build.error(f"listen = {host!r}: keep a TLS proxy (Caddy, Coolify's) in front and the port off the internet; "
+                    "the gateway has no TLS and no slow-client timeouts of its own.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

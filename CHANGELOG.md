@@ -9,6 +9,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: "Download PDF" (PDF toolbar icon and palette) and "Download source (zip)" (`GET /api/source/zip`, view role; build-config files only for the owner).
 - Editor: tooltips on hover for every button with a title and for each command palette row (a one-line explanation, `serve_ui/cmdhelp.js`), also shown over dialogs and on keyboard focus (`serve_ui/tooltip.js`).
 - Editor: the sidebar can be resized by dragging its edge or with the arrow keys; each tab keeps its own width, double-click resets.
+- `Dockerfile` and `deploy/compose.yaml`: the hosted editor (`host.py`) in one container, ready for Coolify (its proxy does TLS; `public_url` from the service domain; first site admin from `LP_ADMIN_EMAIL`/`LP_ADMIN_PASSWORD`). Builds stay sandboxed with bubblewrap inside it through a seccomp profile (Docker's default plus the namespace syscalls), `systempaths=unconfined`, no capabilities and a non-root user; an AppArmor profile for Ubuntu 23.10+ hosts is in `deploy/`. See README "Docker and Coolify".
+- Editor: Ctrl/Cmd+F opens the editor's find bar for the open file even when the focus is in the PDF, the sidebar or the top bar (not the browser's find); also a palette command, "Find and replace in this file".
 - Editor: Visual mode draws tables (`tabular`, `tabular*`, `tabularx`, `longtable`, with booktabs rules, `\hline` and `\multicolumn`), with bold, italics and math in cells; a click shows the source again.
 
 ### Changed

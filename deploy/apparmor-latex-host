@@ -1,0 +1,9 @@
+# Only for hosts whose AppArmor restricts unprivileged user namespaces (Ubuntu 23.10 and later): lets the
+# container's bubblewrap create its sandbox. Load it on the host, then set LP_APPARMOR=latex-host:
+#   sudo cp deploy/apparmor-latex-host /etc/apparmor.d/latex-host && sudo apparmor_parser -r /etc/apparmor.d/latex-host
+abi <abi/4.0>,
+include <tunables/global>
+
+profile latex-host flags=(unconfined) {
+  userns,
+}

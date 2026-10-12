@@ -1,0 +1,6 @@
+*
+!scripts/
+!LICENSE
+!deploy/entrypoint.sh
+scripts/__pycache__/
+scripts/serve_ui/vendor/
