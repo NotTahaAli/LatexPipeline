@@ -3709,6 +3709,11 @@ class NamedLinks(SharedState, ServerCase):
         self.assertIsNone(serve.role_for_token(self.tokens["alice"]))  # a link names one document
         self.assertEqual(self.get("POST", "/api/share/links", "owner", {"name": "Bob", "role": "view"})[0], 401)
 
+    def test_people_lists_named_links_only_to_roles_that_can_mention(self):
+        self.assertIn("Alice", serve.people("demo", "edit")["people"])
+        self.assertIn("Alice", serve.people("demo", "review")["people"])
+        self.assertNotIn("Alice", serve.people("demo", "view")["people"])  # a view link cannot comment
+
     def test_a_link_belongs_to_one_checkout_of_its_document(self):
         clone = self.base / "clone" / "demo"
         clone.mkdir(parents=True)

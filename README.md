@@ -631,7 +631,7 @@ The gateway adds `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referr
 ### Install and first start
 
 ```bash
-sudo apt-get install bubblewrap latexmk texlive-latex-extra texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex
+sudo apt-get install bubblewrap git latexmk texlive-latex-extra texlive-plain-generic texlive-fonts-recommended texlive-science texlive-xetex texlive-luatex texlive-bibtex-extra biber latexdiff
 sudo useradd --system --create-home --home-dir /var/lib/latex-host latexhost
 sudo -u latexhost git clone https://github.com/NotTahaAli/LatexPipeline /var/lib/latex-host/app
 sudo -u latexhost LP_ADMIN_EMAIL=you@example.org LP_ADMIN_PASSWORD='a long password' \

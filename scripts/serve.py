@@ -3875,7 +3875,7 @@ def people(name: str, role: str) -> dict:
     for item in [*data["threads"], *data["suggestions"]]:
         names.update(c.get("name") for c in [item, *(item.get("comments") or [])])
     names.update(u["name"] for u in presence(role)["users"] if u.get("doc") == name)
-    if SHARE["on"] and SHARE["doc"] == name and not GATEWAY["secret"]:
+    if role != "view" and SHARE["on"] and SHARE["doc"] == name and not GATEWAY["secret"]:  # view links cannot mention
         root = link_root(name)
         names.update(x["name"] for x in named.current() if x["doc"] == name and x["root"] == root)
     clean = {n.replace(" (unverified name)", "").strip() for n in names if isinstance(n, str)}
