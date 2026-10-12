@@ -844,7 +844,22 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-Put provider secrets in `/etc/latex-host.env` (mode 600), for example `GOOGLE_CLIENT_SECRET=...`. Workers get a minimal environment (never these secrets), and LaTeX inside the sandbox an even smaller one. `sudo systemctl enable --now latex-host caddy`. bubblewrap needs unprivileged user namespaces (on by default on Debian and Ubuntu; Ubuntu 24.04's AppArmor rule allows `bwrap`).
+Put provider secrets in `/etc/latex-host.env` (mode 600), for example `GOOGLE_CLIENT_SECRET=...`. Workers get a minimal environment (never these secrets), and LaTeX inside the sandbox an even smaller one. `sudo systemctl enable --now latex-host caddy`. bubblewrap needs unprivileged user namespaces. Debian allows them. Ubuntu 23.10 and later restrict them through AppArmor (`sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`; bwrap then fails with `loopback: Failed RTM_NEWADDR: Operation not permitted`), so give `/usr/bin/bwrap` its own profile:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+sudo -u latexhost bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true && echo sandbox works
+```
 
 `--insecure-no-sandbox` runs without bubblewrap (and on any OS) for development only: it prints a warning, and the admin page says so. Never use it on a server people can reach.
 

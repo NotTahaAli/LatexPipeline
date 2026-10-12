@@ -4,6 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Fixed
+
+- `host.py serve`: when the bubblewrap probe fails, the refusal now includes bwrap's own error. README: Ubuntu 23.10 and later need an AppArmor profile for `/usr/bin/bwrap` (the README wrongly said Ubuntu 24.04 allows it).
+
 ## [0.3.0] - 2026-10-12
 
 ### Added

@@ -91,6 +91,11 @@ class HostServe(unittest.TestCase):
         with mock.patch.object(host.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
                 mock.patch.object(host.shutil, "which", return_value="/usr/bin/bwrap"):
             self.assertTrue(host.sandbox_works())
+        failed = subprocess.CompletedProcess([], 1, "", "bwrap: setting up uid map: Permission denied\n")
+        with mock.patch.object(host.subprocess, "run", return_value=failed), \
+                mock.patch.object(host.shutil, "which", return_value="/usr/bin/bwrap"):
+            self.assertFalse(host.sandbox_works())
+        self.assertEqual(host.SANDBOX_ERROR["text"], "bwrap: setting up uid map: Permission denied")
 
     def test_main_reports_config_errors(self):
         with tempfile.TemporaryDirectory() as tmp, \

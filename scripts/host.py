@@ -2679,15 +2679,22 @@ def housekeeping(stop: threading.Event) -> None:
             traceback.print_exc()
 
 
+SANDBOX_ERROR = {"text": ""}  # what the last failed probe said, for the refusal message
+
+
 def sandbox_works() -> bool:
     if not shutil.which("bwrap"):
+        SANDBOX_ERROR["text"] = "bwrap is not on PATH"
         return False
     try:
         # --proc and --dev as every build mounts them: a container that masks /proc fails here, not at the first build
         probe = ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "true"]
-        return subprocess.run(probe, capture_output=True, timeout=20).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.run(probe, capture_output=True, text=True, errors="replace", timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        SANDBOX_ERROR["text"] = str(e)
         return False
+    SANDBOX_ERROR["text"] = (result.stderr or "").strip()[-300:] or f"exit {result.returncode}"
+    return result.returncode == 0
 
 
 def private(*paths: Path) -> None:
@@ -2740,8 +2747,8 @@ def cmd_serve(data: Path, insecure: bool) -> int:
             return 2
         if not sandbox_works():
             build.error("bubblewrap does not work here (`bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev "
-                        "true` failed). Install it (apt install bubblewrap) and allow unprivileged user namespaces "
-                        "(in Docker: README \"Docker and Coolify\"). Refusing to serve.")
+                        f"true` failed: {SANDBOX_ERROR['text']}). Install it (apt install bubblewrap) and allow "
+                        "unprivileged user namespaces (in Docker: README \"Docker and Coolify\"). Refusing to serve.")
             return 2
     else:
         print("!" * 78 + "\nWARNING: --insecure-no-sandbox. LaTeX runs WITHOUT the bubblewrap sandbox: any user who "
