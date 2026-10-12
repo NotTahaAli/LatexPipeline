@@ -4,10 +4,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
 ### Added
 
 - Integration tests that run the external tools for real when installed (`tests/test_integration_tools.py`: dvisvgm, qpdf, pdftoppm, mutool, latexdiff, texcount, chktex, tex-fmt, veraPDF) and the AI, Zotero, Crossref and LanguageTool HTTP code against loopback stub servers (`tests/test_integration_net.py`, `tests/netstubs.py`), with opt-in live checks (`LP_LIVE_NET=1`, `LANGUAGETOOL_URL`).
-- Coverage-driven tests (`tests/test_cov_*.py`, `node tests/cov_check.mjs`): every `serve.check_permission` route by role, document scope and rate limit (a new endpoint fails the test until it has a row), every hosted route's sign-in, site-admin and workspace guard, OAuth/MCP refusals, the fail-closed document lock, sandbox resource limits in a child process, release publishing against a fake `gh`, latexdiff in CI, and the editor API's relative, encoded URLs. Report: `releases/v0.2.0-coverage.md` in the project files.
+- Coverage-driven tests (`tests/test_cov_*.py`, `node tests/cov_check.mjs`): every `serve.check_permission` route by role, document scope and rate limit (a new endpoint fails the test until it has a row), every hosted route's sign-in, site-admin and workspace guard, OAuth/MCP refusals, the fail-closed document lock, sandbox resource limits in a child process, release publishing against a fake `gh`, latexdiff in CI, and the editor API's relative, encoded URLs.
 - `tests/ui_e2e.py`: a browser check of every palette command, shortcut and More menu entry of the editor, its features one by one (sharing with a link per role in separate browsers included) and every page of the hosted gateway, failing on console errors, failed requests and axe-core violations.
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Tests: `tests/test_git_live.py` runs hosted Git sync and the local Git panel against a real https Git server on loopback (git http-backend, self-signed certificate, token checked), including hostile remotes (symlinks, submodules, hooks, an oversize pack, redirects, a remote that never answers); `tests/git_e2e.py` checks the hosted Git tab, Account > Git and every button of the local Git panel in a browser with axe-core.
@@ -245,6 +247,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
 
-[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/NotTahaAli/LatexPipeline/releases/tag/v0.1.0
