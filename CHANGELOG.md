@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
 ### Added
 
 - Editor: "Download PDF" (PDF toolbar icon and palette) and "Download source (zip)" (`GET /api/source/zip`, view role; build-config files only for the owner).
@@ -268,7 +270,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
 
-[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/NotTahaAli/LatexPipeline/releases/tag/v0.1.0
