@@ -86,7 +86,8 @@ export function gitPanel(root, ctx) {
     const d = await act("Loading the diff", () => call(url("api/git/diff", { path, staged: staged ? 1 : 0 })));
     if (!d) return;
     const lines = d.untracked ? d.text.split("\n").map((l) => "+" + l) : d.diff.split("\n");
-    const pre = el("pre", { className: "git-pre" }, ...lines.map((l) => el("span", { className: "dl-" + lineKind(l), textContent: l + "\n" })));
+    const pre = el("pre", { className: "git-pre", tabIndex: 0 }, // focusable: it scrolls (keyboard users too)
+      ...lines.map((l) => el("span", { className: "dl-" + lineKind(l), textContent: l + "\n" })));
     diffBox.replaceChildren(el("div", { className: "git-row" }, el("strong", { textContent: path }), el("span", { className: "spacer" }),
       btn("Close", () => { diffBox.hidden = true; }, "btn ghost")), pre, ...(d.cut ? [note("The diff is cut short.")] : []));
     diffBox.hidden = false;
@@ -165,6 +166,12 @@ export function gitPanel(root, ctx) {
 
   // ---- hosted: sync with a remote repository through the gateway -----------------------------------------------------
   const remote = (data) => call(`api/git/remote?${qs({ doc: ctx.doc() })}`, data);
+  const result = el("div", { className: "git-result" }); // kept across reloads: the panel re-renders right after a sync
+  const show = (r) => {
+    if (!r) return;
+    result.replaceChildren(...(r.conflicts?.length ? [note("These files changed both here and in the repository, so nothing was merged. Change them so they agree (or keep one version), then pull again:", ""),
+      el("ul", { className: "plist" }, ...r.conflicts.map((p) => el("li", { textContent: p })))] : [note(r.message || "Done.")]));
+  };
 
   async function loadHosted() {
     const s = await remote().catch((e) => { status.textContent = e.message; return null; });
@@ -186,15 +193,9 @@ export function gitPanel(root, ctx) {
         el("div", { className: "git-row" }, go), tokenNote);
       return;
     }
-    const result = el("div", { className: "git-result" });
-    const show = (r) => {
-      if (!r) return;
-      result.replaceChildren(...(r.conflicts?.length ? [note("These files changed both here and in the repository, so nothing was merged. Change them so they agree (or keep one version), then pull again:", ""),
-        el("ul", { className: "plist" }, ...r.conflicts.map((p) => el("li", { textContent: p })))] : [note(r.message || "Done.")]));
-    };
     const pull = btn("Pull", async () => { await ctx.saveAll(); show(await act("Pulling", () => remote({ op: "pull" }))); load(); }, "btn");
     const push = btn("Push", async () => { await ctx.saveAll(); show(await act("Pushing", () => remote({ op: "push" }))); load(); }, "btn");
-    const drop = btn("Disconnect", async () => { if (confirm("Disconnect this project from the repository? Its files stay as they are.")) await act("Disconnecting", () => remote({ op: "disconnect" })); load(); }, "btn danger");
+    const drop = btn("Disconnect", async () => { if (confirm("Disconnect this project from the repository? Its files stay as they are.") && await act("Disconnecting", () => remote({ op: "disconnect" }))) result.replaceChildren(); load(); }, "btn danger");
     for (const b of [pull, push, drop]) b.disabled = !ctx.canEdit;
     body.replaceChildren(el("p", { className: "git-where", textContent: `${s.url} (${s.branch})` }),
       note(s.synced ? `Last sync ${since(s.synced)}${s.commit ? `, commit ${s.commit.slice(0, 7)}` : ""}.` : "Not synced yet."),

@@ -895,6 +895,8 @@ The navigation features have one: `uv run --no-project --with playwright==1.56.0
 
 Suggest mode and named share links have one: `uv run --no-project --with playwright==1.56.0 python tests/review_e2e.py [--chromium PATH] [--axe PATH]` starts `serve.py --share local` on a throwaway document with an owner and two named guests and checks that a guest's typing becomes a suggestion under the link's name, undo and redo of own suggestions, one grouped suggestion from several cursors, IME composition, the suggestion card with an @mention reply and the bell, presence names and revoking a link, with axe-core in both themes and at phone width.
 
+Git has one against a real https Git server on loopback (git http-backend behind a throwaway self-signed certificate, from `tests/test_git_live.py`, which runs the same server in the unit tests on Linux): `uv run --no-project --with playwright==1.56.0 python tests/git_e2e.py [--chromium PATH] [--axe PATH] [--insecure-no-sandbox] [--only hosted|local]` (needs LaTeX, git, openssl and bubblewrap unless `--insecure-no-sandbox`). Hosted, an editor saves a Git token on the Account page, connects, pulls (a differing file is listed, never overwritten), pushes an edit, sees a push refused after the token was rotated, saves the new token, removes it and disconnects; the audit rows are checked. Locally it clicks every button of the Git panel (diff, stage, unstage, commit, push, pull, a conflicting pull and Abort merge, branch switch and New branch, history). axe-core runs on each state in both themes.
+
 ---
 
 ## GitHub Actions
