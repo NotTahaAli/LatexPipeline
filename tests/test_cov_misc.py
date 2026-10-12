@@ -8,9 +8,9 @@ import io
 import json
 import subprocess
 import tarfile
-import zipfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
