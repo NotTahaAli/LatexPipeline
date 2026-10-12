@@ -607,7 +607,13 @@ def select_tree(page, path):
         "document.getElementById('sideBtn').click(); }"
     )
     page.click("#tab-files")
-    page.click(f"#tree .row[data-path='{path}']")
+    row = f"#tree .row[data-path='{path}']"
+    page.click(row)
+    if "." in path.rsplit("/", 1)[-1]:
+        # opening the file focuses the editor once it loads, where F2 is "Rename label": keys go to the row
+        page.wait_for_function("p => window.__app.active?.path === p", arg=path)
+        page.wait_for_timeout(100)
+    page.focus(row)
 
 
 def command_specs(page, ctx):
