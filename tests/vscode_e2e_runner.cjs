@@ -2,7 +2,8 @@
 // extension folder it tests, so `require("vscode")` here is the extension's own API object and the input boxes and
 // quick picks it opens can be answered by replacing them. It is also the copy's main: activate() keeps the context
 // (secret storage, saved state) and calls the real one. Settings arrive in VSCODE_E2E (JSON): phase, base, doc,
-// dir (the document folder on disk), seed (state carried between the two windows), pdf (out/<doc>.pdf).
+// dir (the document folder on disk), seed (state carried between the two windows), pdf (out/<doc>.pdf), tokens
+// (hosted: good, compile, expired API tokens).
 "use strict";
 
 const assert = require("assert/strict");
@@ -131,6 +132,47 @@ async function ownerPhase() {
   fs.writeFileSync(path.join(cfg.dir, "ch/intro.tex"), disk("ch/intro.tex") + "Changed on disk.\n");
   await until("editor reloaded", () => editor.document.getText().includes("Changed on disk."));
 
+  step("save conflict: another writer saved while this editor has unsaved edits");
+  const intro = "ch/intro.tex", mine = "Mine, not saved yet.\n";
+  const introPuts = () => requests.filter((r) => r.method === "PUT" && new URL(r.url).searchParams.get("path") === intro);
+  await editor.edit((e) => e.insert(new vscode.Position(editor.document.lineCount - 1, 0), mine));
+  const theirs = disk(intro) + "Theirs, saved first.\n";
+  const current = await (await realFetch(`${cfg.base}api/file?doc=${cfg.doc}&path=${intro}`)).json();
+  const put = await realFetch(`${cfg.base}api/file?doc=${cfg.doc}&path=${intro}&cid=other-writer`, { method: "PUT",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: theirs, base: current.version, eol: "\n" }) });
+  assert.equal(put.status, 200, "the other writer saved");
+  await until("the bus told VS Code", async () => (await vscode.workspace.fs.stat(uri(intro))).size === Buffer.byteLength(theirs));
+  // files.saveConflictResolution "askUser" (the default): VS Code compares the stat with the version it read and
+  // shows its conflict message (Compare / Overwrite) without writing anything.
+  const puts = introPuts().length;
+  assert.equal(await editor.document.save(), false, "the save is refused");
+  assert.equal(introPuts().length, puts, "VS Code saw the newer file itself: nothing was sent");
+  assert.ok(editor.document.isDirty && editor.document.getText().includes(mine), "the unsaved edit stays in the editor");
+  assert.equal(disk(intro), theirs, "the other writer's text stays on the server");
+
+  step("Overwrite (the dialog's button, or files.saveConflictResolution = overwriteFileOnDisk) is refused by the server");
+  // Both save with ignoreModifiedSince; the extension still sends the version the text was read at, so serve.py says 409.
+  const files = vscode.workspace.getConfiguration("files");
+  await files.update("saveConflictResolution", "overwriteFileOnDisk", vscode.ConfigurationTarget.Global);
+  try {
+    assert.equal(await editor.document.save(), false, "the overwrite is refused");
+    assert.equal(introPuts().length, puts + 1, "this time the save was sent");
+    assert.equal(introPuts().at(-1).status, 409);
+    assert.ok(editor.document.isDirty && editor.document.getText().includes(mine), "the unsaved edit stays in the editor");
+    assert.equal(disk(intro), theirs, "the other writer's text is not overwritten");
+  } finally {
+    await files.update("saveConflictResolution", undefined, vscode.ConfigurationTarget.Global);
+  }
+
+  step("as the message says: reopen for the current text, redo the edit, save");
+  await vscode.window.showTextDocument(editor.document);
+  await run("workbench.action.files.revert");
+  await until("reverted to the server's text", () => !editor.document.isDirty && editor.document.getText() === theirs);
+  const again = vscode.window.activeTextEditor;
+  await again.edit((e) => e.insert(new vscode.Position(again.document.lineCount - 1, 0), mine));
+  assert.ok(await again.document.save(), "the save on top of the current text goes through");
+  assert.equal(disk(intro), theirs + mine, "both changes are kept");
+
   step("create, rename and delete files and folders");
   await vscode.workspace.fs.writeFile(uri("extra.tex"), Buffer.from("% extra\r\nline\r\n"));
   assert.equal(disk("extra.tex"), "% extra\r\nline\r\n", "CRLF kept");
@@ -227,9 +269,80 @@ async function reconnectPhase() {
   assert.equal(context.globalState.get("latexPipeline.target"), undefined, "and the saved address");
 }
 
+async function hostedPhase() {
+  const ext = vscode.extensions.getExtension(EXT);
+  await ext.activate();
+  const { tokens } = cfg;
+  const key = `latexPipeline:${cfg.base}`;
+  const folderAdded = () => (vscode.workspace.workspaceFolders || []).some((f) => f.uri.scheme === "latexpipeline");
+  const connectHosted = async (token) => {
+    shown.info.length = 0; shown.error.length = 0;
+    answers.input.push(cfg.base, token);
+    await run("latexPipeline.connect");
+    assert.equal(answers.input.length, 0, "the address and the token were asked for");
+  };
+
+  for (const [what, token, why] of [["an expired token", tokens.expired, /Unknown, expired or revoked API token/],
+    ["a token without the projects scope", tokens.compile, /lacks the projects scope/]]) {
+    step(`${what} is refused and not kept`);
+    await connectHosted(token);
+    assert.match(shown.error.pop() || "", why);
+    assert.deepEqual(shown.info, []);
+    assert.equal(await context.secrets.get(key), undefined, "no secret stored");
+    assert.equal(context.globalState.get("latexPipeline.target"), undefined, "no saved address");
+    assert.ok(!folderAdded(), "no folder added");
+  }
+
+  step("a projects token connects");
+  const sent = requests.length;
+  await connectHosted(tokens.good);
+  assert.deepEqual(shown.error, [], "connect shows no error");
+  assert.deepEqual(shown.info, [`Connected to ${cfg.doc} as edit.`]);
+  await until("workspace folder added", folderAdded);
+
+  step("the token goes only in the Authorization header and in secret storage");
+  const mine = () => requests.slice(sent);
+  assert.ok(mine().every((r) => r.url.startsWith(cfg.base)), "requests stay on the project");
+  assert.ok(mine().every((r) => r.headers.Authorization === `Bearer ${tokens.good}` && !r.headers.Cookie), "bearer token, no cookie");
+  assert.ok(mine().every((r) => !r.url.includes(tokens.good)), "never in a URL");
+  assert.equal(await context.secrets.get(key), tokens.good, "the token is in secret storage");
+  const target = context.globalState.get("latexPipeline.target");
+  assert.deepEqual(target, { kind: "hosted", base: cfg.base, project: new URL(cfg.base).pathname.split("/")[2], doc: cfg.doc });
+  assert.ok(!JSON.stringify(target).includes(tokens.good), "the saved state holds no token");
+
+  step("list, open and save through the gateway");
+  const top = new Map(await vscode.workspace.fs.readDirectory(uri("")));
+  assert.equal(top.get("main.tex"), vscode.FileType.File);
+  assert.equal((await vscode.workspace.fs.stat(uri("main.tex"))).permissions, undefined, "an editor may write");
+  answers.pick.push("main.tex");
+  await run("latexPipeline.openFile");
+  const editor = await until("editor open", () => vscode.window.activeTextEditor?.document.uri.path === "/main.tex" && vscode.window.activeTextEditor);
+  assert.equal(editor.document.getText(), disk("main.tex"));
+  const end = editor.document.getText().lastIndexOf("\\end{document}");
+  await editor.edit((e) => e.insert(editor.document.positionAt(end), "Saved from VS Code through the gateway.\n\n"));
+  assert.ok(await editor.document.save(), "save succeeded");
+  assert.match(disk("main.tex"), /Saved from VS Code through the gateway\./);
+
+  step("build in the sandboxed worker, then the PDF");
+  await run("latexPipeline.build");
+  const pdfUrl = `${cfg.base}pdf/${encodeURIComponent(cfg.doc)}`;
+  const auth = { headers: { Authorization: `Bearer ${tokens.good}` } };
+  await until("PDF built", async () => (await realFetch(pdfUrl, auth)).ok, 180000);
+  const pdfRequests = () => requests.filter((r) => r.url.startsWith(pdfUrl) && r.status === 200);
+  await run("latexPipeline.showPdf");
+  await until("PDF fetched for the webview", () => pdfRequests().length > 0, 60000);
+  assert.deepEqual(shown.error, [], "no errors");
+
+  step("disconnect forgets the token");
+  await run("latexPipeline.disconnect");
+  await until("folder removed", () => !folderAdded());
+  assert.equal(await context.secrets.get(key), undefined, "disconnect deletes the token");
+  assert.equal(context.globalState.get("latexPipeline.target"), undefined, "and the saved address");
+}
+
 exports.run = async function run() {
   try {
-    await (cfg.phase === "owner" ? ownerPhase() : reconnectPhase());
+    await ({ owner: ownerPhase, reconnect: reconnectPhase, hosted: hostedPhase }[cfg.phase])();
     step("ok");
   } catch (err) {
     console.error(`[vscode_e2e] ${cfg.phase} FAILED:`, err && err.stack || err);

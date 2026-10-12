@@ -93,6 +93,13 @@ function fsError(err, uri) {
 const provider = {
   onDidChangeFile: changes.event,
   versions: new Map(),  // path -> {version, eol} the open text was read at: the base of the next save
+  reads: new Map(),  // path -> {version, eol, text} of the latest read, for adoptRead
+
+  adoptRead(doc) {
+    if (doc.uri.scheme !== SCHEME || doc.isDirty) return;
+    const rel = lib.relPath(doc.uri.path), read = this.reads.get(rel);
+    if (read && doc.getText() === read.text) this.versions.set(rel, { version: read.version, eol: read.eol });
+  },
 
   watch() { return new vscode.Disposable(() => {}); },  // the bus poll reports every change (startPoll)
 
@@ -128,8 +135,15 @@ const provider = {
       if (node.kind === "image") return await conn.request("GET", "api/raw", { query: { path: rel }, raw: true });
       if (node.kind !== "text") throw vscode.FileSystemError.Unavailable("The editor serves only text files and images.");
       const f = await conn.request("GET", "api/file", { query: { path: rel } });
-      this.versions.set(rel, { version: f.version, eol: f.eol });
-      return Buffer.from(lib.withEol(f.text, f.eol), "utf8");
+      Object.assign(node, { version: f.version, ...lib.parseVersion(f.version) });  // stat() shows what was read
+      const text = lib.withEol(f.text, f.eol);
+      // VS Code also reads a file whose editor has unsaved edits (after a change, for a compare): those edits still
+      // rest on the version they were read at. Such a read becomes the base only once the editor shows its text
+      // unmodified (a revert; adoptRead), so an Overwrite of a change the person never loaded is still refused.
+      const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
+      if (!open || !open.isDirty || !this.versions.has(rel)) this.versions.set(rel, { version: f.version, eol: f.eol });
+      this.reads.set(rel, { version: f.version, eol: f.eol, text });
+      return Buffer.from(text, "utf8");
     } catch (err) { throw err instanceof vscode.FileSystemError ? err : fsError(err, uri); }
   },
 
@@ -145,6 +159,7 @@ const provider = {
       const base = exists ? this.versions.get(rel)?.version ?? exists.version : null;
       const res = await conn.request("PUT", "api/file", { query: { path: rel, cid: conn.cid }, json: { text, base, eol } });
       this.versions.set(rel, { version: res.version, eol });
+      this.reads.delete(rel);
       await refreshTree().catch(() => {});
     } catch (err) { throw fsError(err, uri); }
   },
@@ -347,6 +362,7 @@ function activate(context) {
     vscode.commands.registerCommand("latexPipeline.build", wrap(build)),
     vscode.commands.registerCommand("latexPipeline.showPdf", wrap(showPdf)),
     vscode.commands.registerCommand("latexPipeline.openFile", wrap(openFile)),
+    vscode.workspace.onDidChangeTextDocument((e) => provider.adoptRead(e.document)),
     diagnostics, status, changes, { dispose: () => poller?.dispose() },
   );
   const saved = context.globalState.get(STATE_KEY);
