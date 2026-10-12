@@ -191,6 +191,7 @@ export function navSupport({ S, V, loadKatex }, ctx) {
     if (!ctx.settings.follow || !/\.tex$/i.test(path)) return;
     clearTimeout(followTimer);
     followTimer = setTimeout(() => {
+      if (!ctx.settings.follow) return;   // turned off during the pause
       const line = state.doc.lineAt(state.selection.main.head).number;
       if (followed === `${path}:${line}`) return;
       followed = `${path}:${line}`;

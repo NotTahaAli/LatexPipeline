@@ -1374,7 +1374,19 @@ def _build_document(
                         phases["figures"] += time.monotonic() - began
                     else:
                         figures.mark_recorded()
-                        run(figures.discover_command(), "figures")
+                        # The listing pass runs as the main job: TeX deletes its .synctex.gz and writes its
+                        # .log. When latexmk then has nothing to redo (a figure changed in a file the document
+                        # does not read), the last real build's must still be there.
+                        kept = [(p, p.with_name(p.name + ".keep")) for p in
+                                (build_dir / f"{main_tex.stem}.synctex.gz", build_dir / f"{main_tex.stem}.log")
+                                if p.is_file()]
+                        for path, keep in kept:
+                            os.replace(path, keep)
+                        try:
+                            run(figures.discover_command(), "figures")
+                        finally:
+                            for path, keep in kept:
+                                os.replace(keep, path)
                         if errors:  # Timed out: no figures, no plain rebuild.
                             return -1, ""
                         console.clear()  # The listing run is not a result; latexmk's output is.

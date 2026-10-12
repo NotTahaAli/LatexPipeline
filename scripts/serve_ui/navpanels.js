@@ -59,7 +59,7 @@ export function navPanels(ctx) {
     grid.replaceChildren(...GROUPS.map((g) => {
       const mine = found.filter((s) => s.group === g);
       if (!mine.length) return "";
-      return el("section", { className: "sym-group" }, el("h3", { className: "eyebrow", textContent: g }), el("div", { className: "sym-grid" }, ...mine.map((s) => {
+      return el("section", { className: "sym-group" }, el("h2", { className: "eyebrow", textContent: g }), el("div", { className: "sym-grid" }, ...mine.map((s) => {
         const b = el("button", { type: "button", className: "sym", title: `${s.cmd.replace("{}", "{...}")}`, disabled: !ctx.insert, onclick: () => ctx.insert?.(s.cmd, s.cmd.includes("{}") ? s.cmd.indexOf("{}") + 1 : undefined) }, el("span", { textContent: s.ch }));
         b.setAttribute("aria-label", `${s.cmd} (${s.name})`);
         return b;

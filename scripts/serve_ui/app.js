@@ -284,13 +284,16 @@ function markErrors() {
   view.dispatch({ effects: setErrors.of(V.Decoration.set(marks.sort((a, b) => a.from - b.from), true)) });
 }
 
+let configRun = 0;
 async function applyConfig() {
   if (!view) return;
+  const run = ++configRun;
   let keys = [];
   try {
     if (settings.keys === "vim") keys = (await loadVim()).vim();
     else if (settings.keys === "emacs") keys = (await loadEmacs()).emacs();
   } catch (e) { console.warn("keybindings", e); toast(el("span", { textContent: "Could not load the " + settings.keys + " keybindings (offline?)." })); }
+  if (run !== configRun) return;   // a later call (Emacs, then Default before Emacs loaded) has already applied its keys
   const env = visualEnv.of({
     refs: () => refs,
     imageUrl: (name) => cur ? api.imageUrl(cur, name, active?.path || "") : null,
@@ -1402,7 +1405,7 @@ const COMMANDS = [
   { id: "review", title: "Show comments and suggestions", run: () => setDrawer(true, "review") },
   { id: "history", title: "Show version history", run: () => setDrawer(true, "history") },
   { id: "definition", title: "Go to definition", keys: "F12", run: () => view && nav.run.definition(view) },
-  { id: "references", title: "Find references", keys: "Shift+F12", run: () => view && nav.run.references(view) },
+  { id: "findrefs", title: "Find references", keys: "Shift+F12", run: () => view && nav.run.references(view) },
   { id: "renamelabel", edit: true, title: "Rename label everywhere", keys: "F2", run: () => view && nav.run.rename(view) },
   { id: "pkgdoc", title: "Package documentation (texdoc.org)", run: () => { const s = active?.kind === "text" && nav.under(view.state, view.state.selection.main.head); if (s?.kind === "package") window.open(nav.docUrl(s.name), "_blank", "noopener"); else toast(el("span", { textContent: "Put the cursor on a package name in \\usepackage{...}." })); } },
   { id: "bookmark", title: "Bookmark: set or clear on this line", keys: `${mod}+Alt+K`, run: () => view && nav.run.toggleMark(view) },
@@ -1672,7 +1675,7 @@ $("roleChip").before(TEAM.chip, NOTE.node, TEAM.accessBtn);
 TEAM.treeTools(document.querySelector("#panel-files .tree-tools"));
 TEAM.dropFolder($("panel-files"));
 if (role === "view" || role === "review") setTimeout(() => TEAM.poll(), 1000);   // a request from an earlier visit
-else api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
+else if (role === "owner") api.share().then((i) => { $("shareBtn").classList.toggle("on", i.on); setSharing(!!i.on); }).catch(() => {});
 // Roles: say who you are, and keep what you cannot do visible but disabled, with the reason.
 if (role !== "owner") {
   const chip = $("roleChip");
