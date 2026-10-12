@@ -1,5 +1,7 @@
 """serve.py: path safety, atomic writes, outline and word counts, message bus, WebSocket frames, HTTP API."""
 
+from __future__ import annotations
+
 import collections
 import http.client
 import importlib.util
