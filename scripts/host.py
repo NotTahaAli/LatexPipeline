@@ -112,8 +112,8 @@ signups_per_ip_hour = 10              # account sign-ups from one address (IPv6:
 # client_id = "..."
 # client_secret_env = "GITHUB_CLIENT_SECRET"
 
-# AI assistant in the editor (optional). Off unless enabled. The gateway makes the Anthropic API calls itself;
-# project workers never get the key. Editors' text, logs and questions are sent to api.anthropic.com.
+# AI assistant in the editor (optional). Off unless enabled. The gateway makes the API calls itself; project
+# workers never get the key. Editors' text, logs and questions are sent to api.anthropic.com (or to base_url).
 # [ai]
 # enabled = true
 # model = "claude-opus-5-5"            # or claude-sonnet-5-5, claude-haiku-5-5
