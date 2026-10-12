@@ -190,6 +190,10 @@ def branches(folder: Path) -> dict:
             local.append({"name": ref[11:], "current": head == "*", "upstream": upstream or None})
         elif not ref.endswith("/HEAD"):
             remote.append(ref[13:])
+    if not any(b["current"] for b in local):  # an unborn branch (no commit yet) has no ref to list
+        head = run(root, ["symbolic-ref", "-q", "--short", "HEAD"], check=False).stdout.strip()
+        if head:
+            local.insert(0, {"name": head, "current": True, "upstream": None})
     return {"local": local, "remote": remote, "remotes": run(root, ["remote"]).stdout.split()}
 
 

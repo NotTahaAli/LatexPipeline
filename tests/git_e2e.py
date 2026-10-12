@@ -153,8 +153,7 @@ def run_hosted(browser, git, base, origin, data) -> None:
     gform.get_by_role("button", name="Save Git token").click()
     expect(ed.get_by_text("Saved. Pull and Push are in each project's Git tab.")).to_be_visible()
     assert TOKEN not in ed.content()
-    ed.reload()  # the Remove button comes with the next rendering of the page
-    expect(ed.get_by_role("button", name="Remove the stored token")).to_be_visible()
+    expect(ed.get_by_role("button", name="Remove the stored token")).to_be_visible()  # no reload needed
     expect(ed.get_by_label("Access token")).to_have_attribute("placeholder", re.compile("Stored"))
     axe(ed, "account page with a stored Git token")
     ok("an editor saves a Git token on the Account page; the page never shows it again")
@@ -235,6 +234,8 @@ def run_hosted(browser, git, base, origin, data) -> None:
     ed.goto("/#account")
     ed.get_by_role("button", name="Remove the stored token").click()
     expect(ed.get_by_role("button", name="Remove the stored token")).to_have_count(0)
+    expect(ed.get_by_label("Access token")).to_be_focused()
+    expect(ed.get_by_label("Access token")).to_have_attribute("placeholder", "Paste a token")
     assert ed.request.get(origin + "/api/account/git").json() == {"has_key": False, "username": ""}
     ed.goto(f"/p/{pid}/")
     ed.wait_for_function(LOADED, timeout=60000)
@@ -273,8 +274,13 @@ def local(browser, git: live.GitServer, base: Path) -> None:
     work.mkdir()
     doc = work / "demo"
     subprocess.run(["git", "clone", "-q", git.url("local.git"), str(doc)], check=True, env=env)
+    fresh = work / "fresh"  # a new repository without a commit: its branch is unborn
+    fresh.mkdir()
+    (fresh / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n",
+                                    encoding="utf-8")
+    live.run_git(work, "init", "-q", "-b", "start", str(fresh))
     port = host_e2e.free_port()
-    server = subprocess.Popen([sys.executable, str(ROOT / "scripts/serve.py"), "demo", "--source", str(work),
+    server = subprocess.Popen([sys.executable, str(ROOT / "scripts/serve.py"), "demo", "fresh", "--source", str(work),
                                "--no-open", "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
                               env=env)
     try:
@@ -358,6 +364,15 @@ def local(browser, git: live.GitServer, base: Path) -> None:
         assert subjects[:3] == ["mine", "four upstream", "Edit notes in the browser"], subjects
         axe(page, "local Git panel after switching branches")
         ok("switch to a remote branch, New branch (pushed with its upstream), switch back; the history lists commits")
+
+        page.goto(f"http://127.0.0.1:{port}/#fresh")
+        page.reload()  # a new hash alone does not load another document
+        page.wait_for_function(LOADED, timeout=60000)
+        page.locator("#tab-git").click()
+        expect(panel.get_by_text(re.compile("^On start"))).to_be_visible()
+        expect(panel.get_by_label("Branch")).to_have_value("start")
+        axe(page, "local Git panel on an unborn branch")
+        ok("a repository without commits shows its branch in the picker")
     finally:
         server.terminate()
         server.wait(10)

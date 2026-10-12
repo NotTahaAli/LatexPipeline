@@ -122,6 +122,13 @@ class GitOps(unittest.TestCase):
         self.assertEqual((result["ok"], result["conflicts"]), (True, []))
         self.assertEqual((self.doc / "main.tex").read_text(encoding="utf-8"), "one\ntwo\nthree\nfour\n")
 
+    def test_unborn_branch_is_listed(self):
+        fresh = self.base / "fresh"
+        git(self.base, "init", "-q", "-b", "start", str(fresh))
+        listed = gitops.branches(fresh)
+        self.assertEqual(listed["local"], [{"name": "start", "current": True, "upstream": None}])
+        self.assertEqual(gitops.status(fresh)["branch"], "start")
+
     def test_conflicts_are_shown_and_never_resolved(self):
         self.upstream_commit("one\nREMOTE\nthree\n")
         (self.doc / "main.tex").write_text("one\nLOCAL\nthree\n", encoding="utf-8")

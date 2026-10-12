@@ -358,7 +358,8 @@ class HostedLive(test_host.HostCase):
         self.assertEqual(status, 502, data)
         self.set_token(new)
         status, result, _ = self.sync("push")
-        self.assertEqual((status, result["ok"]), (200, True), result)
+        # the refused push already committed the change here; this one delivers it
+        self.assertEqual((status, result["ok"], result["message"]), (200, True, "Pushed."), result)
         self.assertEqual(self.remote_file("ch2.tex"), "After rotation\n")
         self.assertEqual(self.git.requests[-1][2], self.header(new))
         for token in (self.TOKEN, new):

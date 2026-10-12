@@ -405,16 +405,25 @@ async function accountPage() {
 // never given to a project's editor process.
 async function gitSection(sect) {
   const g = await api("/api/account/git");
+  const hint = (has) => has ? "Stored; paste a new one to replace it" : "Paste a token";
+  let clear;
+  const stored = (has, f) => { clear.hidden = !has; f.querySelector("[name=token]").placeholder = hint(has); };
   const git = form([
     field("User name on the Git host", input("username", "text", { value: g.username, required: true, maxLength: 100, autocomplete: "off" })),
-    field("Access token", input("token", "password", { required: true, autocomplete: "off", placeholder: g.has_key ? "Stored; paste a new one to replace it" : "Paste a token" }),
+    field("Access token", input("token", "password", { required: true, autocomplete: "off", placeholder: hint(g.has_key) }),
       "A personal access token with read and write access to the repositories you sync (repository contents only)."),
   ], "Save Git token", async (v, f) => {
-    await api("/api/account/git", "POST", v);
+    const r = await api("/api/account/git", "POST", v);
     f.querySelector("[name=token]").value = "";
+    stored(r.has_key, f);
     return "Saved. Pull and Push are in each project's Git tab.";
   });
-  const clear = g.has_key ? button("Remove the stored token", async () => { await api("/api/account/git", "POST", { clear_token: true }); accountPage(); }, "btn ghost danger") : null;
+  clear = button("Remove the stored token", async () => {
+    await api("/api/account/git", "POST", { clear_token: true });
+    stored(false, git);
+    git.querySelector("[name=token]").focus();  // the button just hid itself
+    announce("The Git token was removed.");
+  }, "btn ghost danger", { hidden: !g.has_key });
   return sect("Git", "Your token for syncing projects with a Git repository over https. It is kept on this server and never shown again.", git, clear);
 }
 

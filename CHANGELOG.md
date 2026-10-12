@@ -102,6 +102,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- Hosted Git sync: a push that delivers commits left behind by an earlier refused push now says "Pushed." instead of "Pushed (no new changes)."; the message follows what the repository answered.
+- Git tab: the branch picker shows the current branch of a repository without commits (an unborn branch) instead of staying empty.
+- Hosted Account > Git: "Remove the stored token" appears right after saving a token and hides after removing it, without a reload.
 - `--deps` now lists the `.bib` files BibTeX or biber read (from latexmk's `.fdb_latexmk`; the `.fls` recorder never sees them), and a `.bib` outside the document directory now counts for rebuild detection and `--changed-since`.
 - MCP `render_page` with mutool (no pdftoppm) made portrait pages taller than `size`; the longest side is now `size`, as with pdftoppm.
 - Hosted: a Git sync (`/p/<id>/api/git/remote`) and `/api/people`, `/api/access/*` were answered by the gateway and then also relayed to the project's worker, which started it and wrote a second reply on the same connection.
