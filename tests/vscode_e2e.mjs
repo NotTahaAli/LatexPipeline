@@ -2,10 +2,13 @@
 // discover`; needs LaTeX, a display (xvfb-run on a headless machine) and network for VS Code and pdf.js:
 //
 //   npm install --prefix /tmp/vt @vscode/test-electron@3.1.0
-//   xvfb-run -a node tests/vscode_e2e.mjs --modules /tmp/vt/node_modules [--cache DIR] [--code PATH/TO/code]
+//   xvfb-run -a node tests/vscode_e2e.mjs --modules /tmp/vt/node_modules [--cache DIR] [--code PATH/TO/code] [--vsix FILE]
 //
 // --modules: the node_modules holding @vscode/test-electron (kept out of the extension, which has no dependencies).
 // --cache: where test-electron downloads VS Code (default .vscode-test). --code: an already unpacked VS Code.
+// --vsix: the packaged extension (`npx @vscode/vsce package` in vscode/). Every window then runs the files from the
+// package instead of vscode/, and a last window ("installed") checks the extension VS Code installed from it with
+// `code --install-extension`: a file missing from the package fails the run.
 // It writes a tiny document to a temporary folder, serves it and copies vscode/ with tests/vscode_e2e_runner.cjs as
 // the copy's main (the runner must sit inside the extension to get the extension's own `vscode` API object, so it
 // can answer the input boxes, and it keeps the extension's context to check secret storage). Two windows run on one
@@ -14,7 +17,9 @@
 // state in memory during extension tests, so the runner carries the saved state and secret from the first window to
 // the second. A third window, "hosted", connects to a project of a local scripts/host.py (temporary data folder,
 // workers in bubblewrap, so `bwrap` must work) with a personal API token: an expired token and one without the
-// projects scope are refused, the good one lists, opens, saves and builds and lives only in secret storage.
+// projects scope are refused, malformed input is rejected by the token box's own validateInput, the good one lists,
+// opens, saves (and a save conflict comes back as 409 through the gateway), builds (errors in the Problems panel) and
+// lives only in secret storage; a fourth window, "hosted-reconnect", reopens and reconnects with it quietly.
 // Removes its temporary folders, out/vscode-e2e.* and the document's cache and history afterwards.
 import { spawn, execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -26,7 +31,7 @@ import { parseArgs } from "node:util";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const DOC = "vscode-e2e";
-const { values: opts } = parseArgs({ options: { modules: { type: "string" }, cache: { type: "string" }, code: { type: "string" } } });
+const { values: opts } = parseArgs({ options: { modules: { type: "string" }, cache: { type: "string" }, code: { type: "string" }, vsix: { type: "string" } } });
 if (!opts.modules) { console.error("usage: node tests/vscode_e2e.mjs --modules DIR/node_modules [--cache DIR] [--code PATH]"); process.exit(2); }
 const te = createRequire(join(resolve(opts.modules), "noop.js"))("@vscode/test-electron");
 
@@ -89,7 +94,13 @@ mkdirSync(wsDir);
 writeFileSync(join(dir, "main.tex"), MAIN);
 writeFileSync(join(dir, "ch", "intro.tex"), "An included chapter.\n");
 writeFileSync(join(dir, "fig.png"), PNG);
-cpSync(join(ROOT, "vscode"), ext, { recursive: true });
+if (opts.vsix) {  // a .vsix is a zip with the extension under extension/
+  execFileSync("python3", ["-I", "-c", "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); "
+    + "[z.extract(n, sys.argv[2]) for n in z.namelist() if n.startswith('extension/')]", resolve(opts.vsix), join(tmp, "vsix")]);
+  cpSync(join(tmp, "vsix", "extension"), ext, { recursive: true });
+} else {
+  cpSync(join(ROOT, "vscode"), ext, { recursive: true });
+}
 cpSync(join(ROOT, "tests", "vscode_e2e_runner.cjs"), join(ext, "e2e-runner.js"));
 // The runner is also the copy's main: it hands the real activate() the context and keeps it for its checks.
 const manifest = JSON.parse(readFileSync(join(ext, "package.json"), "utf8"));
@@ -107,10 +118,11 @@ let failed = false, host = null;
 try {
   await waitUp(base + "api/health", server);
   const vscodeExecutablePath = opts.code || await te.downloadAndUnzipVSCode({ cachePath: opts.cache ? resolve(opts.cache) : undefined });
-  const launch = (phase, extra = {}, ws = workspace) => te.runTests({
-    vscodeExecutablePath, extensionDevelopmentPath: ext, extensionTestsPath: join(ext, "e2e-runner.js"),
+  const launch = (phase, extra = {}, ws = workspace, dev = ext) => te.runTests({
+    vscodeExecutablePath, extensionDevelopmentPath: dev, extensionTestsPath: join(dev, "e2e-runner.js"),
     extensionTestsEnv: { VSCODE_E2E: JSON.stringify({ phase, base, doc: DOC, dir, seed: join(tmp, "seed.json"), pdf: join(ROOT, "out", `${DOC}.pdf`), ...extra }) },
-    launchArgs: [ws, "--user-data-dir", userData, "--extensions-dir", join(tmp, "exts"), "--disable-extensions",
+    launchArgs: [ws, "--user-data-dir", phase === "installed" ? join(tmp, "user-installed") : userData, "--extensions-dir", join(tmp, "exts"),
+      ...(phase === "installed" ? [] : ["--disable-extensions"]),
       "--password-store=basic", "--disable-workspace-trust", "--skip-welcome", "--skip-release-notes", "--disable-gpu",
       ...(process.getuid && process.getuid() === 0 ? ["--no-sandbox"] : [])],
   });
@@ -120,6 +132,20 @@ try {
   const hostedWs = join(tmp, "hosted.code-workspace");  // a fresh workspace: no folder left from the windows above
   writeFileSync(hostedWs, JSON.stringify({ folders: [{ path: wsDir }] }));
   await launch("hosted", { base: host.base, dir: host.dir, pdf: null, tokens: host.tokens }, hostedWs);
+  await launch("hosted-reconnect", { base: host.base, dir: host.dir, pdf: null }, hostedWs);
+  if (opts.vsix) {
+    const [cli, ...cliArgs] = te.resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
+    execFileSync(cli, [...cliArgs, "--user-data-dir", join(tmp, "user-installed"), "--extensions-dir", join(tmp, "exts"),
+      "--install-extension", resolve(opts.vsix)], { stdio: "inherit" });
+    // A probe extension carries only the runner, so the extension under test is the installed one.
+    const probe = join(tmp, "probe");
+    mkdirSync(probe);
+    cpSync(join(ROOT, "tests", "vscode_e2e_runner.cjs"), join(probe, "e2e-runner.js"));
+    writeFileSync(join(probe, "package.json"), JSON.stringify({ name: "e2e-probe", publisher: "e2e", version: "0.0.0", engines: manifest.engines }));
+    const plainWs = join(tmp, "installed.code-workspace");
+    writeFileSync(plainWs, JSON.stringify({ folders: [{ path: wsDir }] }));
+    await launch("installed", { extensionsDir: join(tmp, "exts") }, plainWs, probe);
+  }
   console.log("vscode_e2e: ok");
 } catch (err) {
   failed = true;

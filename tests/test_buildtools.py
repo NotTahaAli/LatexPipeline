@@ -316,6 +316,49 @@ class DoctoolsTests(unittest.TestCase):
             self.assertNotIn("doc", " ".join(doctools.notify_command()))  # text only through the environment
 
 
+class NotifyPlatformTests(unittest.TestCase):
+    """
+    The real notification command of this platform runs (lint.yml's unittest matrix has macos-latest and
+    windows-latest). macOS: /usr/bin/osascript is part of the OS; Windows: Windows PowerShell 5.1 ships with
+    Windows Server, and the runner image lists PowerShell 7 too (actions/runner-images, Windows2025-VS2026-Readme.md,
+    "PowerShell Tools"). Linux has no notify-send on the runners, so it is checked live only on request.
+    """
+    TITLE, MESSAGE = "LaTeX Pipeline test", "unittest; $(not run) `not run` \"quoted\""
+
+    @unittest.skipUnless(sys.platform in ("darwin", "win32"), "osascript and PowerShell: macOS and Windows only")
+    def test_platform_command_runs(self):
+        command = doctools.notify_command()
+        self.assertIsNotNone(command, "this platform has a notification command")
+        self.assertTrue(shutil.which(command[0]) or Path(command[0]).is_file(), command[0])
+        result = subprocess.run(command, env={**os.environ, "LP_TITLE": self.TITLE, "LP_MESSAGE": self.MESSAGE},
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        # PowerShell reports script errors on stderr, not always in the exit code.
+        self.assertEqual((result.returncode, result.stderr.strip()), (0, ""), result.stdout)
+
+    @unittest.skipUnless(os.environ.get("LP_NOTIFY_LIVE") == "1",
+                         "set LP_NOTIFY_LIVE=1 in a desktop session (Linux: notify-send, a notification daemon, "
+                         "dbus-monitor) to watch a real notification")
+    def test_linux_notification_reaches_the_daemon(self):
+        if sys.platform != "linux" or not (shutil.which("notify-send") and shutil.which("dbus-monitor")):
+            self.skipTest("Linux with notify-send and dbus-monitor")
+        watch = "interface='org.freedesktop.Notifications',member='Notify'"
+        monitor = subprocess.Popen(["dbus-monitor", "--session", watch],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            time.sleep(1)
+            self.assertTrue(doctools.notify(self.TITLE, self.MESSAGE))
+            seen = []
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and f'string "{self.TITLE}"' not in "".join(seen):
+                seen.append(monitor.stdout.readline())
+            text = "".join(seen)
+            self.assertIn('string "LaTeX build"', text)  # --app-name
+            self.assertIn(f'string "{self.TITLE}"', text)
+        finally:
+            monitor.kill()
+            monitor.communicate()
+
+
 class BibTidyTests(unittest.TestCase):
     BIB = ("% my refs\n@string{jnl = \"J. Test\"}\n\n% about zeta\n"
            "@Article{zeta2020, title={Zeta}, author = {Zed, A. and B, C}, year=2020, journal=jnl, doi={10.1/x}}\n"

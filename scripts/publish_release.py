@@ -18,6 +18,7 @@ Meant for CI after `build.py`; needs the `gh` CLI and GH_TOKEN.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -203,4 +204,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # No options, but --help (or a typo) must not publish: argparse prints the usage and exits first.
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     sys.exit(main())
