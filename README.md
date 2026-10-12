@@ -310,6 +310,13 @@ Run **LaTeX Pipeline: Connect** and paste the address you would open in a browse
 
 Plain `http://` is accepted only for this computer. The document then appears as a folder in the Explorer (`latexpipeline:` files): opening, saving, creating, renaming and deleting go through the editor's API, so the server's rules apply (a view link cannot save, build-config files stay owner-only, every save is a version in History). A save sends the version the file was read at; if someone saved it since (or the file is open in a co-editing room in the browser and changed there), the save is refused instead of overwriting, and VS Code says so: reopen the file and save again. **Build** asks the server to build (edit role); the status bar shows the build state, build errors and the log's warnings land in the Problems panel, and **Show the PDF** opens it in a tab (pdf.js from the same pinned CDN URL as the browser editor), refreshed after each good build. **Open a file** picks one by name. **Disconnect** forgets the address and the token. Changes made elsewhere (the browser, other people) arrive over the editor's long-poll and refresh the Explorer.
 
+`tests/vscode_e2e.mjs` runs the extension in a real VS Code against a live `serve.py` (not in CI; needs LaTeX, network for VS Code and pdf.js, and a display, so `xvfb-run` on a headless machine). It serves a tiny generated document, runs every command (connect, open, save, build, Problems, PDF tab, disconnect), file operations, view and edit share links with the cookie in secret storage, the refusal of plain `http://` to another computer, and the quiet reconnect of a reopened window. `@vscode/test-electron` stays outside the extension:
+
+```bash
+npm install --prefix /tmp/vt @vscode/test-electron@3.1.0
+xvfb-run -a node tests/vscode_e2e.mjs --modules /tmp/vt/node_modules   # downloads VS Code to .vscode-test/; --cache DIR or --code PATH to reuse one
+```
+
 ---
 
 ## Live preview and editor

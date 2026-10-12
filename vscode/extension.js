@@ -65,6 +65,7 @@ const diagnostics = vscode.languages.createDiagnosticCollection("latex-pipeline"
 const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 let tree = new Map();
 let pdfPanel = null;
+let reconnecting = null;  // a reopened window's quiet reconnect: file requests wait for it instead of failing
 
 const uriFor = (rel) => vscode.Uri.from({ scheme: SCHEME, authority: "project", path: "/" + rel });
 
@@ -73,7 +74,8 @@ async function refreshTree() {
   return tree;
 }
 
-function needConn() {
+async function needConn() {
+  if (!conn && reconnecting) await reconnecting;
   if (!conn) throw vscode.FileSystemError.Unavailable("Not connected: run \"LaTeX Pipeline: Connect\".");
   return conn;
 }
@@ -95,7 +97,7 @@ const provider = {
   watch() { return new vscode.Disposable(() => {}); },  // the bus poll reports every change (startPoll)
 
   async stat(uri) {
-    needConn();
+    await needConn();
     const rel = lib.relPath(uri.path);
     if (!tree.has(rel)) await refreshTree().catch(() => {});
     const node = tree.get(rel);
@@ -106,7 +108,7 @@ const provider = {
   },
 
   async readDirectory(uri) {
-    needConn();
+    await needConn();
     const rel = lib.relPath(uri.path);
     await refreshTree().catch((e) => { throw fsError(e, uri); });
     const node = tree.get(rel);
@@ -118,7 +120,7 @@ const provider = {
   },
 
   async readFile(uri) {
-    needConn();
+    await needConn();
     const rel = lib.relPath(uri.path);
     const node = tree.get(rel) || (await refreshTree(), tree.get(rel));
     if (!node || node.type !== "file") throw vscode.FileSystemError.FileNotFound(uri);
@@ -132,7 +134,7 @@ const provider = {
   },
 
   async writeFile(uri, content, options) {
-    needConn();
+    await needConn();
     const rel = lib.relPath(uri.path);
     const exists = tree.get(rel);
     if (!exists && !options.create) throw vscode.FileSystemError.FileNotFound(uri);
@@ -148,18 +150,18 @@ const provider = {
   },
 
   async createDirectory(uri) {
-    try { await needConn().request("POST", "api/fs", { query: { op: "mkdir", path: lib.relPath(uri.path), cid: conn.cid } }); await refreshTree(); }
+    try { await (await needConn()).request("POST", "api/fs", { query: { op: "mkdir", path: lib.relPath(uri.path), cid: conn.cid } }); await refreshTree(); }
     catch (err) { throw fsError(err, uri); }
   },
 
   async delete(uri) {
-    try { await needConn().request("POST", "api/fs", { query: { op: "delete", path: lib.relPath(uri.path), cid: conn.cid } }); await refreshTree(); }
+    try { await (await needConn()).request("POST", "api/fs", { query: { op: "delete", path: lib.relPath(uri.path), cid: conn.cid } }); await refreshTree(); }
     catch (err) { throw fsError(err, uri); }
   },
 
   async rename(from, to) {
     try {
-      await needConn().request("POST", "api/fs", { query: { op: "rename", path: lib.relPath(from.path), to: lib.relPath(to.path), cid: conn.cid } });
+      await (await needConn()).request("POST", "api/fs", { query: { op: "rename", path: lib.relPath(from.path), to: lib.relPath(to.path), cid: conn.cid } });
       await refreshTree();
     } catch (err) { throw fsError(err, from); }
   },
@@ -348,7 +350,7 @@ function activate(context) {
     diagnostics, status, changes, { dispose: () => poller?.dispose() },
   );
   const saved = context.globalState.get(STATE_KEY);
-  if (saved) wrap(() => connect(context, saved))();  // a window reopened with the folder: reconnect quietly
+  if (saved) reconnecting = wrap(() => connect(context, saved))();  // a window reopened with the folder: reconnect quietly
 }
 
 function deactivate() { poller?.dispose(); }

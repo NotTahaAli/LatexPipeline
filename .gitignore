@@ -4,6 +4,8 @@
 !.vscode/tasks.json
 !.vscode/settings.json
 !.vscode/extensions.json
+# VS Code downloaded by tests/vscode_e2e.mjs
+.vscode-test/
 
 out/
 .latex-cache/
