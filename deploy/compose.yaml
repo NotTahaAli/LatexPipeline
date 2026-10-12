@@ -8,7 +8,10 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      PUBLIC_URL: ${SERVICE_URL_LATEX_8080:-${PUBLIC_URL:-http://localhost:8080}}
+      # Coolify fills SERVICE_URL_LATEX_8080 from the service's domain (written as in its docs, so it detects it);
+      # PUBLIC_URL wins when set. Plain `docker compose` warns that SERVICE_URL_LATEX_8080 is unset: harmless.
+      SERVICE_URL_LATEX_8080: ${SERVICE_URL_LATEX_8080}
+      PUBLIC_URL: ${PUBLIC_URL:-}
       LP_ADMIN_EMAIL: ${LP_ADMIN_EMAIL:-}
       LP_ADMIN_PASSWORD: ${LP_ADMIN_PASSWORD:-}
     volumes:

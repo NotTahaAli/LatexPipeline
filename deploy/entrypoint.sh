@@ -1,6 +1,6 @@
 #!/bin/sh
 # First start: create /data (config.toml, database, the site admin from LP_ADMIN_EMAIL and LP_ADMIN_PASSWORD).
-# Every start: public_url follows PUBLIC_URL when it is set. Then serve.
+# Every start: public_url follows PUBLIC_URL, else Coolify's SERVICE_URL_LATEX_8080, when one is set. Then serve.
 set -eu
 DATA=/data
 if [ ! -f "$DATA/host.db" ]; then
@@ -10,7 +10,8 @@ if [ ! -f "$DATA/host.db" ]; then
          -e 's/^trust_proxy = false .*/trust_proxy = true                    # behind the proxy: client IPs from X-Forwarded-For/' \
       "$DATA/config.toml"
 fi
-if [ -n "${PUBLIC_URL:-}" ]; then
+PUBLIC_URL=${PUBLIC_URL:-${SERVICE_URL_LATEX_8080:-}}
+if [ -n "$PUBLIC_URL" ]; then
   url=$(printf '%s' "$PUBLIC_URL" | sed 's|/*$||; s|[\\&|"]||g')
   sed -i "s|^public_url = \"[^\"]*\"|public_url = \"$url\"|" "$DATA/config.toml"
 fi
