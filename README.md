@@ -116,7 +116,7 @@ python scripts/build.py --watch --notify --exec "cp out/my-paper.pdf ~/Dropbox/"
 
 `--pages 1-3,7` copies those pages of one document's PDF to `out/<name>.pages.pdf` with qpdf (or pdftk); without either it prints where to get qpdf and exits 1. The file is never published.
 
-`--deps make` prints a Make rule `out/<name>.pdf: <inputs>` with every file the last build read (from the `.fls`: the document's own files and files outside it, not the TeX installation or the cache), `--deps json` the same as `{"target", "inputs"}`. `--query` prints JSON per document: `title` and `author` from `main.tex` (commands dropped), `pages` from the last build's log, `words` (texcount, `null` without it), `labels` (`key`, `number`, `page` from the `.aux` files) and `sections` (`level`, `number`, `title`, `page` from the `.toc`). Neither builds; both need one earlier build.
+`--deps make` prints a Make rule `out/<name>.pdf: <inputs>` with every file the last build read (from the `.fls`, plus the `.bib` files BibTeX or biber read, from `.fdb_latexmk`: the document's own files and files outside it, not the TeX installation or the cache), `--deps json` the same as `{"target", "inputs"}`. `--query` prints JSON per document: `title` and `author` from `main.tex` (commands dropped), `pages` from the last build's log, `words` (texcount, `null` without it), `labels` (`key`, `number`, `page` from the `.aux` files) and `sections` (`level`, `number`, `title`, `page` from the `.toc`). Neither builds; both need one earlier build.
 
 `--watch --notify` shows a desktop notification after each build (osascript on macOS, `notify-send` on Linux, a PowerShell tray balloon on Windows; nothing if none is there). `--watch --exec "command"` runs the command after each successful build, split like a shell would split it but without a shell, in the repository root, with `LP_DOC` (the document name) and `LP_PDF` (its PDF path) in the environment. Only the command line runs it; the editor and shared links never do.
 
@@ -124,7 +124,7 @@ With uv you can use `uv run scripts/build.py ...` instead of `python`.
 
 Output is coloured on a terminal. Set `NO_COLOR=1` to turn colour off. With several jobs, each document's output appears as one block when that document finishes. `--watch` waits for half a second without changes before rebuilding, so one save builds once. Ctrl+C in a parallel build cancels the documents still in the queue and exits with status 130.
 
-A document counts as **out of date** when any file in its directory, any file outside it that its last build read (from the `.fls` above), or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored. Before the first build, only the directory counts.
+A document counts as **out of date** when any file in its directory, any file outside it that its last build read (from the `.fls` and `.fdb_latexmk` above, so a shared `.bib` counts), or `build.py` itself, is newer than its PDF. Dotfiles such as `.DS_Store` are ignored. Before the first build, only the directory counts.
 
 For each document, the script:
 
@@ -163,7 +163,7 @@ files/My New Document/
 
 `python scripts/build.py --new MyDoc --template report` writes this kind of layout for you (`article` is the default; `report` adds `chapters/`, `refs.bib`, `figures/` and a commented `build.toml`; `beamer` and `letter` are single files).
 
-You don't need to change `build.py`. Keep inputs inside the document's directory where you can. A file outside it (for example `\input{../shared/x}`) is tracked for rebuilds once the document's first build has read it: the build records every file it reads in `.latex-cache/<name>/<name>.fls` (latexmk `-recorder`). TeX installation files and the cache are never tracked.
+You don't need to change `build.py`. Keep inputs inside the document's directory where you can. A file outside it (for example `\input{../shared/x}`) is tracked for rebuilds once the document's first build has read it: the build records every file it reads in `.latex-cache/<name>/<name>.fls` (latexmk `-recorder`), and the `.bib` files BibTeX or biber read in `<name>.fdb_latexmk` beside it. TeX installation files and the cache are never tracked.
 
 ### DOCX export
 
@@ -880,7 +880,7 @@ python3 -m unittest discover -s tests   # unit tests, standard library only
 uvx ruff check scripts tests            # lint: rules in pyproject.toml
 ```
 
-The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, ruff (pinned version) and the editor's co-editing check (`node tests/collab_check.mjs scripts/serve_ui/collab.js`) and the table-paste, review-export, editing-tools, navigation and visual-tool checks (`node tests/tablepaste_check.mjs`, `node tests/reviewexport_check.mjs`, `node tests/edits_check.mjs`, `node tests/nav_check.mjs scripts/serve_ui`, `tableedit_check.mjs`, `figure_check.mjs`, `tikz_check.mjs`, `markdown_check.mjs`) and the VS Code extension's and Git panel's helpers (`node tests/vscode_check.mjs`) on Ubuntu, and the `requirements.txt` check. It runs when `scripts/`, `tests/`, `vscode/` or the Python project files change.
+The [Lint and tests](.github/workflows/lint.yml) workflow runs the unit tests on Ubuntu, Windows and macOS under Python 3.9 and 3.13, ruff (pinned version) and the editor's co-editing check (`node tests/collab_check.mjs scripts/serve_ui/collab.js`) and the table-paste, review-export, editing-tools, navigation and visual-tool checks (`node tests/tablepaste_check.mjs`, `node tests/reviewexport_check.mjs`, `node tests/edits_check.mjs`, `node tests/nav_check.mjs scripts/serve_ui`, `tableedit_check.mjs`, `figure_check.mjs`, `tikz_check.mjs`, `markdown_check.mjs`) the editor's API and bus helpers (`node tests/cov_check.mjs`) and the VS Code extension's and Git panel's helpers (`node tests/vscode_check.mjs`) on Ubuntu, and the `requirements.txt` check. It runs when `scripts/`, `tests/`, `vscode/` or the Python project files change.
 
 The hosted mode has a browser end-to-end check, run by hand (needs LaTeX, bubblewrap and Chromium for Playwright; the editor loads its libraries from CDNs): `uv run --no-project --with playwright==1.56.0 python tests/host_e2e.py`. It signs in with two-step codes, invites editors and a viewer, builds and co-edits a project, makes an API token on the Account page (`[api]` on), checks workspace isolation, sign-out and session expiry, and runs axe-core on every host page in both themes and at phone width.
 

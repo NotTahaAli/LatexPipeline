@@ -418,6 +418,23 @@ def source_date_epoch(main_tex: Path) -> str:
     return found if found.isdigit() else str(int(newest_input(main_tex)))
 
 
+def bib_sources(fdb: Path) -> list[str]:
+    """The files latexmk's bibtex and biber rules read (its .fdb_latexmk), as written there (relative or absolute)."""
+    try:
+        lines = fdb.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    found, reading = [], False
+    for line in lines:
+        if line.startswith("["):  # a rule: ["bibtex <base>"] ... then its source files, one per line
+            reading = line.startswith(('["bibtex ', '["biber '))
+        elif line.strip().startswith("("):  # "(generated)" ends the sources
+            reading = False
+        elif reading and line.startswith('  "'):
+            found.append(line[3:].split('"', 1)[0])
+    return found
+
+
 def recorded_inputs(main_tex: Path, everything: bool = False) -> list[Path]:
     """
     Files outside the document's directory that its last build read, from the
@@ -446,10 +463,11 @@ def recorded_inputs(main_tex: Path, everything: bool = False) -> list[Path]:
     found: dict[str, None] = {}
     seen: set[str] = set()
 
-    for line in recorder.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith("INPUT "):
-            continue
-        name = os.path.normpath(os.path.join(base, line[len("INPUT "):].strip()))
+    names = [line[len("INPUT "):].strip() for line in recorder.read_text(encoding="utf-8", errors="replace")
+             .splitlines() if line.startswith("INPUT ")]
+    names += bib_sources(recorder.with_suffix(".fdb_latexmk"))  # BibTeX and biber read outside TeX's .fls
+    for raw in names:
+        name = os.path.normpath(os.path.join(base, raw))
         if name in seen or os.path.normcase(name).startswith(outside):
             continue
         seen.add(name)
@@ -1439,8 +1457,11 @@ def _build_document(
         os.utime(mode_file, (started, started))
 
         problems = strict_problems(build_dir / f"{main_tex.stem}.log") if settings["strict"] and code == 0 else []
+        last_log = build_dir / f"{main_tex.stem}.log"
         if not errors:
-            if code != 0:
+            if code != 0 and last_log.exists() and "\nNo pages of output." in last_log.read_text("utf-8", "replace"):
+                errors.append("LaTeX produced no pages: the document body is empty.")
+            elif code != 0:
                 errors.append(f"LaTeX compilation failed: {relative}")
             elif not generated_pdf.exists():
                 errors.append("LaTeX reported success, but no PDF was produced.")
@@ -1531,7 +1552,9 @@ def _build_document(
         "size": size,
         "errors": latex_errors,
         "warnings": warnings,
-        "error": next((text for text in errors if text == CANCEL_TEXT or text.startswith("Strict mode: ")), None),
+        # A failure with no LaTeX error to show (no pages, no PDF, a crash of latexmk) still says why.
+        "error": next((text for text in errors if text == CANCEL_TEXT or text.startswith("Strict mode: ")),
+                      errors[0] if errors and not latex_errors else None),
         "phases": {name: round(seconds, 1) for name, seconds in phases.items()},
     }
     if access is not None:

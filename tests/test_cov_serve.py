@@ -145,5 +145,44 @@ class Bodies(Docs):
         self.assertEqual(self.raw(b"{}", {**json_type, "Content-Length": "2"}), 200)
 
 
+class Awareness(unittest.TestCase):
+    """y-aware: only a member of the room may publish its cursor, and at most 64 KiB of it."""
+
+    def setUp(self):
+        mock.patch.dict(serve.ROOMS, {"d\nmain.tex": {"members": {"me": {"role": "edit"}}, "aware": {}}},
+                        clear=True).start()
+        self.addCleanup(mock.patch.stopall)
+        self.published = []
+        mock.patch.object(serve.BUS, "publish", side_effect=lambda *a, **k: self.published.append(a)).start()
+
+    def test_members_only_and_capped(self):
+        serve.on_aware({"data": {"room": "d\nmain.tex", "u": "AA"}}, "me", "edit")
+        serve.on_aware({"data": {"room": "d\nmain.tex", "u": "BB"}}, "stranger", "edit")
+        serve.on_aware({"data": {"room": "d\nother.tex", "u": "CC"}}, "me", "edit")
+        serve.on_aware({"data": {"room": "d\nmain.tex", "u": "x" * (64 * 1024 + 1)}}, "me", "edit")
+        serve.on_aware({"data": {"room": "d\nmain.tex", "u": 5}}, "me", "edit")
+        serve.on_aware({}, "me", "edit")
+        self.assertEqual(serve.ROOMS["d\nmain.tex"]["aware"], {"me": "AA"})
+        self.assertEqual([a[1]["u"] for a in self.published], ["AA"])
+
+
+class HttpEdges(Docs):
+    def test_image_lint_and_bad_upgrade(self):
+        self.write("figs/p.png", "png")
+        self.write("main.tex", "\\graphicspath{{figs/}}\n")
+        status, body = self.request("GET", "/api/image?doc=demo&name=p")
+        self.assertEqual((status, body), (200, b"png"))
+        self.assertEqual(self.request("GET", "/api/image?doc=demo&name=../secret")[0], 404)
+        status, body = self.request("GET", "/api/lint?doc=demo")
+        self.assertEqual(status, 200)
+        self.assertIn("findings", body)
+        self.assertEqual(self.request("GET", "/ws?cid=abc")[0], 400)  # no Upgrade header
+
+    def test_share_links_need_sharing_on(self):
+        with self.assertRaises(serve.ApiError) as ctx:
+            serve.share_link_create({"name": "Ann", "role": "edit"})
+        self.assertEqual(ctx.exception.status, 409)
+
+
 if __name__ == "__main__":
     unittest.main()

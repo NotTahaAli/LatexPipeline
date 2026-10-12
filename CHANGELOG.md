@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Coverage-driven tests (`tests/test_cov_*.py`, `node tests/cov_check.mjs`): every `serve.check_permission` route by role, document scope and rate limit (a new endpoint fails the test until it has a row), every hosted route's sign-in, site-admin and workspace guard, OAuth/MCP refusals, the fail-closed document lock, sandbox resource limits in a child process, release publishing against a fake `gh`, latexdiff in CI, and the editor API's relative, encoded URLs. Report: `releases/v0.2.0-coverage.md` in the project files.
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
 - Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
@@ -101,6 +102,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- A `.bib` outside the document's directory (`\bibliography{../shared/refs}`, `\addbibresource`) now counts for rebuild detection (local and CI `--changed-since`) and `--deps`: BibTeX and biber read it, so it was never in the `.fls`; it is now taken from latexmk's `.fdb_latexmk`. `build.py` changed, so every document rebuilds once.
+- A build that fails without a LaTeX error to show (an empty document body: "No pages of output", or latexmk failing outright) now says why in the summary, `build-report.json`'s `error`, the CI table and the editor, instead of a bare FAILED.
 - Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
 - Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
 - Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).
