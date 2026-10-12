@@ -26,6 +26,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - Editor: on macOS (case-insensitive file system), "Show cursor in PDF" said "No match at that position" and "Preview chapter" said "This file is not a chapter" for every file in a folder whose name on disk differs in case from the `\input` (`Chapters/` read as `\input{chapters/...}`) or is reached through a symlink; both now match the file itself, and a click in the PDF opens the file under its name on disk.
 - Editor on a phone (320 to 412 px): the top bar no longer makes the page wider than the screen (an empty strip on the right, mostly with share links); the role chip, Request access and the status show as icons there, and a disabled Rebuild is hidden. "Fit width" no longer leaves a sideways scroll in the PDF.
 - Editor: opening Share showed the previous opening's controls until the server answered, so a quick click could start the wrong tunnel; LaTeX comments are darker so they stay readable (WCAG AA) under another person's selection.
+- Editor: a failed Word export showed only "^" (the caret line of pandoc's message); it now shows pandoc's error with its line, such as `Error at "main.tex" (line 42, column 11): unexpected \begin`. A build over the quota no longer also logs "could not keep the good build's SyncTeX data".
+- Editor: Visual mode drew a `longtable`'s `\caption` as a row and showed its repeated page heads and "continued" feet; it now shows the caption above the table, the first head, the rows and the last foot.
 
 ## [0.2.0] - 2026-10-12
 

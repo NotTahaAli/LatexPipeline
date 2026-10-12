@@ -2157,11 +2157,19 @@ def export_docx(main_tex: Path) -> tuple[bool, str]:
         return False, f"pandoc failed: {exc}"
 
     if result.returncode != 0:
-        lines = [line for line in result.stderr.splitlines() if line.strip()]
-        return False, next((line for line in reversed(lines) if not line.startswith("[WARNING]")),
-                           lines[-1] if lines else f"pandoc exited with {result.returncode}")
+        return False, pandoc_error(result.stderr) or f"pandoc exited with {result.returncode}"
 
     return True, display(target)
+
+
+def pandoc_error(stderr: str) -> str:
+    """pandoc's error in one line: 'Error at "main.tex" (line 42, column 11): unexpected \\begin', without the
+    quoted source line and the caret under it that follow."""
+    lines = [line.strip() for line in stderr.splitlines() if line.strip() and not line.startswith("[WARNING]")]
+    start = max((i for i, line in enumerate(lines) if line.startswith(("Error", "pandoc:"))), default=None)
+    if start is None:
+        return lines[-1] if lines else ""
+    return " ".join(lines[start:start + 2]) if start + 1 < len(lines) and lines[start].endswith(":") else lines[start]
 
 
 def export_docx_all(documents: list[Path]) -> int:

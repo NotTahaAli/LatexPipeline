@@ -178,6 +178,7 @@ class TableWidget extends WidgetType {
       }
       for (; col <= n; col++) tr.insertCell();   // short rows still fill the grid
     });
+    if (t.caption) tbl.createCaption().append(...cellNodes(maskComments(t.caption).trim(), katex));
     el.replaceChildren(tbl);
   }
   toDOM(view) {

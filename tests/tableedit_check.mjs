@@ -141,5 +141,24 @@ assert.deepEqual(bk.map((t) => t.rows.length), [2, 1]);
 assert.deepEqual([bk[0].rows[0].rule.kind, bk[0].rows[1].rule, bk[0].bottom.kind], ["thick", { kind: null, parts: [[2, 2]] }, "thick"]);
 assert.equal(bk[1].cols[0].align, "right");
 assert.equal(tablesIn("\\begin{tabular}{l} open").length, 0);
+// A longtable reads as its first page: first head, rows, last foot; the \caption row is the caption.
+const lt = tablesIn(String.raw`\begin{longtable}{|l|l|}
+\caption{Cap \textbf{x}} \label{t} \\ \hline
+A & B \\ \hline
+\endfirsthead
+\multicolumn{2}{c}{Continued} \\ \hline
+A & B \\ \hline
+\endhead
+\hline \multicolumn{2}{r}{Next page} \\
+\endfoot
+\hline
+\endlastfoot
+1 & 2 \\
+3 & 4 \\
+\end{longtable}`)[0];
+assert.equal(lt.caption, "Cap \\textbf{x}");
+assert.deepEqual(lt.rows.map((r) => [r.rule.kind, r.cells.map((c) => c.src).join("|")]), [["thin", "A|B"], ["thin", "1|2"], [null, "3|4"]]);
+assert.equal(lt.bottom.kind, "thin");
+assert.equal(tablesIn("\\begin{longtable}{l} a \\\\ \\hline \\endhead b \\\\ \\end{longtable}")[0].rows.length, 2);
 
 console.log("tableedit ok");

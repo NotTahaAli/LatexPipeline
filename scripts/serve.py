@@ -542,6 +542,8 @@ def keep_good(main_tex: Path) -> None:
     reads these instead.
     """
     src, target = build.cache_dir_for(main_tex), good_dir(main_tex)
+    if not src.is_dir():  # a build over the quota loses its output
+        return
     fresh = target.with_name("good.new")
     try:
         shutil.rmtree(fresh, ignore_errors=True)

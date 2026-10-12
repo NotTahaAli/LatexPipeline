@@ -363,6 +363,46 @@ function rulesOf(pre) {
 
 const alignOf = (type) => ({ c: "center", r: "right" }[(type || "l")[0]] || "left");
 
+const SECTION = /^\\end(firsthead|head|foot|lastfoot)$/;
+
+/**
+ * A longtable body as it reads on its first and last page: the first head (\endfirsthead, else \endhead), the rows
+ * and the last foot (\endlastfoot, else \endfoot); a \caption row becomes caption. Other bodies come back as they are.
+ */
+function longtableParts(body) {
+  const sections = {}, cur = { pre: [], rows: [] };
+  let caption = "";
+  const take = (pre) => {
+    for (const [k, p] of pre.entries()) {
+      const s = SECTION.exec(p);
+      if (!s) continue;
+      sections[s[1]] = { rows: cur.rows.splice(0), trail: [...cur.pre, ...pre.slice(0, k)] };
+      cur.pre = [];
+      return take(pre.slice(k + 1));
+    }
+    cur.pre.push(...pre);
+  };
+  for (const r of body.rows) {
+    take(r.pre);
+    const c = /^\\caption\s*(?:\[[^\]]*\]\s*)?\{/.exec(r.cells.length === 1 ? r.cells[0] : "");
+    if (c) { const e = groupEnd(r.cells[0], c[0].length - 1); caption = e > 0 ? r.cells[0].slice(c[0].length, e - 1) : ""; continue; }
+    cur.rows.push({ ...r, pre: cur.pre.splice(0) });
+  }
+  take(body.tail);
+  if (!Object.keys(sections).length) return { ...body, caption };
+  const out = [];
+  let carry = [];
+  const add = (part) => {
+    if (!part) return;
+    for (const r of part.rows) { out.push({ ...r, pre: [...carry, ...r.pre] }); carry = []; }
+    carry.push(...part.trail);
+  };
+  add(sections.firsthead || sections.head);
+  add({ rows: cur.rows, trail: [] });
+  add(sections.lastfoot || sections.foot);
+  return { ...body, rows: out, tail: [...carry, ...cur.pre], caption };
+}
+
 /**
  * Every outermost tabular, tabular*, tabularx and longtable of text: {from, to, cols: [{align, left, right}],
  * rows: [{rule, cells: [{src, span, align}]}], bottom}. Cell src is LaTeX; nested tables stay inside it.
@@ -379,7 +419,7 @@ export function tablesIn(text) {
     const end = groupEnd(src, i);
     if (end < 0 || end > m.index) continue;
     const spec = parseSpec(text.slice(i + 1, end - 1));
-    const body = parseBody(text.slice(end, m.index));
+    const body = longtableParts(parseBody(text.slice(end, m.index)));
     const cols = (spec?.cols || []).map((c, k) => ({ align: alignOf(c.type), left: spec.seps[k].includes("|"), right: spec.seps[k + 1].includes("|") }));
     const rows = body.rows.filter((r) => r.cells.length > 1 || r.cells[0]).map((r) => {
       let col = 0;
@@ -396,7 +436,7 @@ export function tablesIn(text) {
       return { rule: rulesOf(r.pre), cells };
     });
     const lastPre = body.rows.filter((r) => !(r.cells.length > 1 || r.cells[0])).flatMap((r) => r.pre);
-    out.push({ from: b.index, to: m.index + m[0].length, cols, rows, bottom: rulesOf([...lastPre, ...body.tail]) });
+    out.push({ from: b.index, to: m.index + m[0].length, cols, rows, bottom: rulesOf([...lastPre, ...body.tail]), caption: body.caption });
   }
   return out;
 }

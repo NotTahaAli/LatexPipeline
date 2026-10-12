@@ -396,6 +396,7 @@ dialog::backdrop{background:var(--scrim)}
 .v-image-missing{color:var(--muted);font:12px var(--sans)}
 .v-table-box{display:block;margin:8px 0;overflow-x:auto;cursor:pointer;font:inherit}
 .v-table{border-collapse:collapse;margin:0 auto}
+.v-table caption{padding:0 0 6px;font-style:italic}
 .v-table td{padding:3px 10px;vertical-align:top;border:0 solid var(--ink)}
 .v-table .v-rule-top-thin{border-top-width:1px}.v-table .v-rule-top-thick{border-top-width:2px}.v-table .v-rule-top-double{border-top:3px double var(--ink)}
 .v-table .v-rule-bottom-thin{border-bottom-width:1px}.v-table .v-rule-bottom-thick{border-bottom-width:2px}.v-table .v-rule-bottom-double{border-bottom:3px double var(--ink)}

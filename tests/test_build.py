@@ -634,6 +634,14 @@ class NewTemplateTests(unittest.TestCase):
             note.assert_not_called()
             self.assertEqual(build.pdfa_check(pdf, "a-2b"), "ran")
 
+    def test_pandoc_error_is_the_error_line_not_the_caret_under_it(self):
+        stderr = ('[WARNING] Could not convert TeX math x\nError at "main.tex" (line 42, column 11):\n'
+                  "unexpected \\begin\n\\section*{\\begin{center}X\\end{center}}\n          ^\n")
+        self.assertEqual(build.pandoc_error(stderr), 'Error at "main.tex" (line 42, column 11): unexpected \\begin')
+        self.assertEqual(build.pandoc_error("pandoc: x.tex: openBinaryFile: does not exist\n"),
+                         "pandoc: x.tex: openBinaryFile: does not exist")
+        self.assertEqual(build.pandoc_error(""), "")
+
     def test_template_needs_new_and_docx_excludes_watch_and_focus(self):
         for argv in (["--template", "report"], ["--docx", "--watch"], ["--docx", "--focus", "x"]):
             with mock.patch.object(build.sys, "argv", ["build.py", *argv]), \
