@@ -494,12 +494,13 @@ Work on your documents from the AI app you already pay for: Claude (claude.ai, D
 | `list_files`, `read_file`, `grep` | files; a file or a line range; lines containing text (regular expressions locally only) | read |
 | `outline`, `word_counts`, `references`, `lint` | headings with file, line and word counts; words per part, chapter and section (texcount when installed); labels, `.bib` entries, missing and unused citations, `\ref` to unknown labels; lint findings | read |
 | `list_versions`, `version_diff` | the version history of a file or the project; a line diff of a version against now or against the version before | read |
-| `build_status`, `list_reviews` | last build: ok, pages, errors with file, line, log excerpt and a plain-language hint, the end of the log; open comments and suggestions | read |
+| `build_status`, `list_reviews` | last build: ok, pages, errors with file, line, log excerpt and a plain-language hint, the end of the log; open comments (with their ids) and suggestions | read |
+| `list_members` | the people on the project by name (hosted: the workspace members, with roles for its admins; locally: commenters, people with it open, named share links) | read |
 | `render_page`, `source_for_pdf_position` | a PDF page as a PNG (by number, or the page showing a source line through SyncTeX; the chapter preview with `chapter`); the file and line behind a point of a page (inverse SyncTeX) | read |
 | `edit_file`, `write_file`, `rename_file`, `delete_file` | exact text replacement (must match once, or `replace_all`); create or replace a file; rename; delete | write |
 | `build`, `preview_chapter` | build now and return the report; typeset one chapter (`--focus`) | write |
 | `restore_version`, `label_version` | put a file or a named version back (the current text is kept as a version first); name the project as it is now | write |
-| `bib_add_entry`, `bib_edit_entry`, `bib_delete_entry`, `bib_import` | `.bib` entries given as BibTeX; import pasted BibTeX, RIS or a DOI (Crossref; keys already in the project are skipped); only the touched bytes change | write |
+| `bib_add_entry`, `bib_edit_entry`, `bib_delete_entry`, `bib_import` | `.bib` entries given as BibTeX; import pasted BibTeX, RIS or a DOI (Crossref; keys and DOIs already in the project are skipped); only the touched bytes change | write |
 | `bib_lookup`, `insert_citation` | missing fields from Crossref (shown, added only with `apply`); `\cite{key}` (or `citep`, `parencite`, ...) after a quoted passage, for keys that exist | write |
 | `zotero_sync_preview`, `zotero_apply` | compare a `.bib` file with Zotero (locally the owner's library, hosted your own from the Account page); add new entries and take changed fields by key, never deleting | write |
 | `new_document_from_template` | a new document from the article, report, beamer or letter template (hosted: a project in a workspace you connected as a whole and edit) | write |

@@ -108,6 +108,10 @@ TOOLS = [
     _tool("fetch", "Fetch a file", "read",
           "The full text of one file found by search, by its id.",
           {"id": _s("string", "An id from search: <project>::<path>.", maxLength=500)}, ["id"], project=False),
+    _tool("list_members", "List members", "read",
+          "The people working on a project, by name. Hosted: the members of its workspace (with their roles when "
+          "you are an admin there). Locally: the people who commented or suggested, who have it open, and the "
+          "owner's named share links."),
     _tool("list_files", "List files", "read",
           "List the files of a project (path, size in bytes, kind: text, image or other) and its empty folders."),
     _tool("read_file", "Read a file", "read",
@@ -697,6 +701,9 @@ class Doc:
         return written
 
     # --- read ------------------------------------------------------------------------------------------------
+
+    def t_list_members(self) -> dict:
+        return result({"members": [{"name": n} for n in self.s.people(self.name, self.role)["people"]]})
 
     def t_list_files(self) -> dict:
         files = self.s.list_files(self.root)

@@ -2030,6 +2030,15 @@ class Mcp(HostCase):
         comment = self.tool(token, "add_comment", project=self.pid, path="main.tex", quote="MCP was here.",
                             comment="Check this")
         self.assertFalse(comment["isError"], comment)
+        members = self.tool(token, "list_members", project=self.pid)["structuredContent"]["members"]
+        self.assertEqual(members, [{"name": "Ed"}, {"name": "Re"}, {"name": "Vi"}])  # names only, like /api/people
+        self.assertTrue(self.tool(token, "list_members", project=self.opid)["isError"])  # not in this connection
+        self.app.db.run("UPDATE members SET role = 'admin' WHERE user_id = (SELECT id FROM users WHERE email = ?)",
+                        "ed@x.org")
+        members = self.tool(token, "list_members", project=self.pid)["structuredContent"]["members"]
+        self.assertEqual(members[0], {"name": "Ed", "role": "admin"})  # admins see roles, as on the workspace page
+        self.app.db.run("UPDATE members SET role = 'editor' WHERE user_id = (SELECT id FROM users WHERE email = ?)",
+                        "ed@x.org")
         actions = [r["detail"] for r in self.app.db.all("SELECT detail FROM audit WHERE action = 'mcp_tool' "
                                                         "ORDER BY id")]
         self.assertEqual(len(actions), 3)

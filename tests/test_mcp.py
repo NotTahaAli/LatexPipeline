@@ -439,6 +439,8 @@ class Parity(DocCase):
                                                               "name": "Ada"})["item"]["comments"][-1]["id"]
         self.assertIn("Only comments this AI client wrote", self.error("delete_comment", project="thesis",
                                                                        thread=tid, comment=human))
+        members = self.ok("list_members", project="thesis")["structuredContent"]["members"]
+        self.assertEqual([m["name"] for m in members], ["Ada", "Tester (MCP)"])  # who commented
         listed = self.ok("list_reviews", project="thesis")["structuredContent"]["threads"][0]["comments"]
         mine = listed[0]["id"]  # list_reviews gives the comment ids delete_comment needs
         self.assertEqual(mine, thread["comments"][0]["id"])

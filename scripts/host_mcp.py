@@ -18,7 +18,8 @@ host.py imports this module, has its tables in MIGRATIONS, calls endpoint() from
   (RFC 8707); refresh tokens rotate on every use and a reused one revokes the whole grant.
 - /mcp takes only a bearer token (cookies are ignored), refuses a foreign Origin, and runs each tool with the
   person's role in that workspace narrowed by the grant: list_projects/search/fetch in the gateway (reading the
-  project folder), everything else in the project's worker (POST /api/mcp, X-Host-* like the proxy).
+  project folder) and list_members (workspace members), everything else in the project's worker (POST /api/mcp,
+  X-Host-* like the proxy).
 
 Threat model as in host.py: every signed-in user, the AI client and the model are untrusted.
 """
@@ -651,6 +652,8 @@ class Hosted:
             raise mcp_tools.ToolError(f"No project {pid!r} in this connection. list_projects shows the ones you "
                                       "can use.")
         project, role = reachable[pid]
+        if name == "list_members":  # the worker knows no members: like the editor's /api/people, the gateway answers
+            return self.members(project)
         if name in WRITE_TOOLS:
             if role == "review" and mcp_tools.TOOL_BY_NAME[name]["_scope"] != "review":
                 raise mcp_tools.ToolError("Your role in this workspace is reviewer: you can comment and suggest, but "
@@ -661,6 +664,15 @@ class Hosted:
                         f"{self.grant['client_name']}: {name} {pid}")
         remote = self.zotero_library() if name in ("zotero_sync_preview", "zotero_apply") else None
         return self.worker(project, role if name in WRITE_TOOLS else "view", name, args, remote)
+
+    def members(self, project: dict) -> dict:
+        """Names of the project's workspace members; roles only for its admins (as on the workspace page)."""
+        tid = project["tenant_id"]
+        admin = H.tenant_role(H.APP, self.user, tid) == "admin"
+        rows = H.APP.db.all("SELECT u.name, m.role FROM members m JOIN users u ON u.id = m.user_id "
+                            "WHERE m.tenant_id = ? ORDER BY u.name LIMIT 500", tid)
+        return mcp_tools.result({"members": [{"name": r["name"], **({"role": r["role"]} if admin else {})}
+                                             for r in rows]})
 
     def zotero_library(self) -> str:
         """The person's own Zotero library (their key from the Account page, never sent on), fetched like the

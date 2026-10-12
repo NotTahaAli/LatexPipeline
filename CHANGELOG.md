@@ -4,6 +4,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-12
+
+### Added
+
+- MCP `list_members`: the people on a project by name. Hosted, the gateway answers with the workspace's members (with their roles for the workspace's admins, as on the workspace page); locally, the names the editor offers for @mentions.
+
 ### Fixed
 
 - MCP `outline` and `word_counts`: a heading wrapped in an environment (`\chapter*{\begin{center}Title\end{center}}`) no longer shows the environment's name in its title.
@@ -296,7 +302,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `sample-report` from `files/` (now `bench/sample-report`).
 - The apt-only TeX Live install in CI as the primary path (kept as the cache-miss fallback).
 
-[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/NotTahaAli/LatexPipeline/compare/v0.1.1...v0.2.0
