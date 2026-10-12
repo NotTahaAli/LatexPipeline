@@ -7,7 +7,7 @@ Every UI feature of the local editor (scripts/serve_ui) and of the hosted pages 
 
 local: serve.py on a throwaway source folder (a document with math, a citation, labels, a TODO, a table, a TikZ
 picture, an \\input chapter and a .bib file, plus a second document to link a file from). It prints the inventory
-(every command of the palette, every item of the More menu, side and drawer tabs, toolbar buttons, dialogs and
+(every command of the palette, every item of the More view (the palette grouped, opened by "..."), side and drawer tabs, toolbar buttons, dialogs and
 keyboard shortcuts), runs every palette command and asserts its visible effect, then the features one by one:
 hover cards (math, \\cite, \\ref, suggestion with author, time, replies and accept / reject / withdraw by role),
 folding, snippets, figure, table and TikZ dialogs, symbols, TODOs, bookmarks, file graph, zen mode, comments on the
@@ -325,6 +325,20 @@ def palette(page, title):
         page.wait_for_function("() => !document.getElementById('palette').open")
 
 
+def more_view(page):
+    """The palette as "..." opens it: [[group, [titles]]], disabled rows marked."""
+    page.click("#moreBtn")
+    page.wait_for_selector("#palette[open]")
+    groups = page.evaluate(
+        "() => { const out = []; for (const li of document.querySelectorAll('#paletteList li')) {"
+        " if (li.classList.contains('pal-group')) out.push([li.textContent, []]);"
+        " else out.at(-1)[1].push(li.firstChild.textContent + (li.getAttribute('aria-disabled') ? ' (disabled)' : '')); }"
+        " return out; }"
+    )
+    page.keyboard.press("Escape")
+    return groups
+
+
 def inventory(page, who):
     """Everything this role can reach: palette commands, More menu, tabs, toolbar buttons, dialogs, shortcuts."""
     page.keyboard.press("Control+k")
@@ -334,14 +348,10 @@ def inventory(page, who):
         "() => [...document.querySelectorAll('#paletteList li')].map((li) => "
         "[li.id.slice(4), li.firstChild.textContent, li.querySelector('.keys')?.textContent || ''])"
     )
+    untold = page.evaluate("() => [...document.querySelectorAll('#paletteList li[role=option]')].filter((li) => !li.title).map((li) => li.id)")
+    assert not untold, f"palette rows without a tooltip (add them to serve_ui/cmdhelp.js): {untold}"
     page.keyboard.press("Escape")
-    page.click("#moreBtn")
-    menu = page.evaluate(
-        "() => [...document.querySelectorAll('#moreMenu .mgroup')].map((g) => "
-        "[g.querySelector('.mlabel').textContent, [...g.querySelectorAll('button')].map((b) => "
-        "b.firstChild.textContent + (b.disabled ? ' (disabled)' : ''))])"
-    )
-    page.keyboard.press("Escape")
+    menu = more_view(page)
     tabs = page.evaluate(
         "() => [...document.querySelectorAll('#side [role=tab], #drawer [role=tab]')]"
         ".filter((t) => !t.hidden).map((t) => t.id + ': ' + t.textContent.trim())"
@@ -360,7 +370,7 @@ def inventory(page, who):
     print(f"palette commands ({len(commands)}):")
     for cid, title, k in commands:
         print(f"  {cid:14} {title}{'  [' + k + ']' if k else ''}")
-    print("More menu:")
+    print("More (\"...\"):")
     for label, items in menu:
         print(f"  {label}: {' | '.join(items)}")
     print("tabs:", ", ".join(tabs))
@@ -460,6 +470,7 @@ def run_local(args, browser, origin, src, doc, other, stub, port):
         "dialogs": w.dialogs,
         "popups": [],
         "popup_urls": [],
+        "downloads": [],
         "allow": {},
         "other": other,
         "disk": lambda path: (src / doc / path).read_text(encoding="utf-8"),
@@ -469,6 +480,7 @@ def run_local(args, browser, origin, src, doc, other, stub, port):
         "https://texdoc.org/**", lambda r: r.fulfill(status=200, body="texdoc stub", content_type="text/plain")
     )
     owner.context.on("page", lambda p: ctx["popups"].append(p))
+    owner.on("download", lambda d: ctx["downloads"].append(d.suggested_filename))
     # A popup's own requests: the PDF tab may turn into a download in headless Chromium, leaving its URL blank.
     owner.context.on("request", lambda r: r.is_navigation_request() and ctx["popup_urls"].append(r.url))
 
@@ -519,15 +531,9 @@ def run_local(args, browser, origin, src, doc, other, stub, port):
     ok(f"command palette: {len(done)} commands, each with its visible effect, no console error or failed request")
     done = sweep(owner, w, cmds, ctx, "keys", ids)
     ok(f"keyboard shortcuts: {len(done)} ({', '.join(done)}), each with the same effect")
-    in_menu = set(
-        owner.evaluate(
-            "() => { document.getElementById('moreBtn').click(); const t = [...document.querySelectorAll("
-            "'#moreMenu button')].filter((b) => !b.disabled).map((b) => b.firstChild.textContent); "
-            "document.getElementById('moreBtn').click(); return t; }"
-        )
-    )
+    in_menu = {t for label, items in more_view(owner) if label != "Other" for t in items if not t.endswith("(disabled)")}
     done = sweep(owner, w, {k: v for k, v in cmds.items() if v[0] in in_menu}, ctx, "menu", ids)
-    ok(f"More menu: {len(done)} items, each with the same effect")
+    ok(f"More (\"...\"): {len(done)} grouped items, each with the same effect")
     ctx.update(axe=args.axe, browser=browser, origin=origin, src=src, stub=stub, config=src.parent / "config")
     wanted = os.environ.get("UI_E2E_FEATURES")
     for name, feature in FEATURES:
@@ -730,6 +736,8 @@ def command_specs(page, ctx):
         "typeset": (lambda: at("f(x) = (a + b)", 0, 14), dlg("#navDlg[open] .nav-typeset canvas"), close_dialogs),
         "present": (None, dlg(".nav-present canvas"), lambda: page.keyboard.press("Escape")),
         "pdftab": (None, popup("/pdf/"), None),
+        "pdfdownload": (None, lambda: any(n.endswith(".pdf") for n in ctx["downloads"]), lambda: ctx["downloads"].clear()),
+        "srczip": (None, lambda: f"{ctx['doc'].split('/')[-1]}.zip" in ctx["downloads"], lambda: ctx["downloads"].clear()),
         "numbers": (None, flip("labelNumbers"), "again"),
         "mathprev": (None, flip("mathPreview"), "again"),
         "follow": (None, flip("follow"), "again"),
@@ -915,9 +923,10 @@ def run_command(page, how, cid, title, keys):
         palette(page, title)
     elif how == "keys":
         page.keyboard.press(keys)
-    else:  # the More menu
+    else:  # "...": the palette, grouped, without typing
         page.click("#moreBtn")
-        page.locator("#moreMenu button").filter(has_text=title).first.click()
+        page.wait_for_selector("#palette[open]")
+        page.locator(f"#paletteList li#pal-{cid}").click()
 
 
 def check_spec(page, check, cid, how, ctx):
@@ -1115,8 +1124,8 @@ def feature_panels(page, w, ctx):
     )
     ok("TODO list: a row jumps to its line")
     page.click("#moreBtn")
-    page.wait_for_selector("#moreMenu:not([hidden])")
-    axe_ok(page, ctx, "More menu open")
+    page.wait_for_selector("#palette[open] .pal-group")
+    axe_ok(page, ctx, "More (palette grouped) open")
     page.keyboard.press("Escape")
     for cid, sel in (
         ("settings", "#settings[open]"),
@@ -1792,12 +1801,7 @@ def feature_sharing(page, w, ctx):
     }
     axe_ok(owner, ctx, "Share dialog while sharing, three named links")
     owner.keyboard.press("Escape")
-    owner.click("#moreBtn")
-    off = owner.evaluate(
-        "() => [...document.querySelectorAll('#moreMenu button')].filter((b) => b.disabled)"
-        ".map((b) => b.firstChild.textContent)"
-    )
-    owner.keyboard.press("Escape")
+    off = [t for _, items in more_view(owner) for t in items if t.endswith("(disabled)")]
     assert any("arXiv" in t for t in off), off
     ok(f"sharing on (no tunnel); named links for Edith, Rita and Vic; off while sharing: {', '.join(off)}")
 
@@ -2043,7 +2047,69 @@ def feature_sharing(page, w, ctx):
     ok("revoke: Rita's tab says the link no longer works at once; sharing stops")
 
 
+def feature_layout(page, w, ctx):
+    """Tooltips on hover (icons and palette rows), the PDF and source downloads, the sidebar's per-tab width and
+    scrolling."""
+    page.mouse.move(0, 300)
+    page.hover("#toCursor")
+    page.wait_for_selector("#tip:popover-open")
+    assert "Show cursor in PDF" in page.inner_text("#tip"), page.inner_text("#tip")
+    assert page.get_attribute("#toCursor", "title") is None, "the native tooltip would double ours"
+    page.mouse.move(0, 300)
+    page.wait_for_function("() => !document.getElementById('tip').matches(':popover-open')")
+    assert "Show cursor in PDF" in (page.get_attribute("#toCursor", "title") or ""), "title not given back"
+    page.click("#moreBtn")
+    page.wait_for_selector("#palette[open]")
+    page.hover("#pal-cursor")
+    page.wait_for_selector("#tip:popover-open")
+    assert "Scroll the PDF" in page.inner_text("#tip"), page.inner_text("#tip")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    ok("tooltips: icon buttons and palette rows show theirs on hover, over the dialog too")
+    with page.expect_download() as got:
+        page.click("#pdfDlBtn")
+    assert got.value.suggested_filename.endswith(".pdf"), got.value.suggested_filename
+    assert Path(got.value.path()).read_bytes()[:5] == b"%PDF-"
+    with page.expect_download() as got:
+        palette(page, "Download source (zip)")
+    with zipfile.ZipFile(got.value.path()) as z:
+        names = z.namelist()
+    assert {"main.tex", "chapter.tex"} <= set(names), names
+    ok(f"downloads: the PDF ({got.value.suggested_filename}) and the source zip ({len(names)} files)")
+    side_tab(page, "files")
+    width = lambda: page.evaluate("() => document.getElementById('side').offsetWidth")  # noqa: E731
+    start = width()
+    box = page.locator("#sideResize").bounding_box()
+    page.mouse.move(box["x"] + 3, box["y"] + 200)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 153, box["y"] + 200, steps=5)
+    page.mouse.up()
+    dragged = width()
+    assert abs(dragged - (start + 150)) <= 8, (start, dragged)
+    side_tab(page, "refs")
+    assert width() != dragged, "each tab keeps its own width"
+    side_tab(page, "files")
+    assert width() == dragged, (width(), dragged)
+    page.dblclick("#sideResize")
+    assert width() == start, (width(), start)
+    page.focus("#sideResize")
+    page.keyboard.press("ArrowRight")
+    assert width() == start + 20, (width(), start)
+    page.dblclick("#sideResize")
+    side_tab(page, "symbols")
+    page.wait_for_selector("#panel-symbols .sym-grid")
+    scroll = page.evaluate(
+        "() => { const p = document.getElementById('panel-symbols'); return [p.scrollHeight > p.clientHeight,"
+        " getComputedStyle(p).overflowY]; }"
+    )
+    assert scroll == [True, "auto"], scroll
+    side_tab(page, "files")
+    ok(f"sidebar: dragged {start}px to {dragged}px for Files only, reset by double-click, arrow keys, panels scroll")
+    w.check("layout")
+
+
 FEATURES = [
+    ("layout", feature_layout),
     ("panels", feature_panels),
     ("hovers", feature_hovers),
     ("edittools", feature_edit_tools),

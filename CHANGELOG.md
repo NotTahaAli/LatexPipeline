@@ -4,6 +4,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Editor: "Download PDF" (PDF toolbar icon and palette) and "Download source (zip)" (`GET /api/source/zip`, view role; build-config files only for the owner).
+- Editor: tooltips on hover for every button with a title and for each command palette row (a one-line explanation, `serve_ui/cmdhelp.js`), also shown over dialogs and on keyboard focus (`serve_ui/tooltip.js`).
+- Editor: the sidebar can be resized by dragging its edge or with the arrow keys; each tab keeps its own width, double-click resets.
+
+### Changed
+
+- Editor: the "..." button opens the command palette, grouped like the old More menu (Panels, Build, Review, Document, Session, Help, then Other); typing filters as before. Ctrl+K shows the same grouped view.
+
+### Fixed
+
+- Editor: the More menu ran off the bottom of the screen and could not scroll; sidebar tabs without their own scrolling (Symbols, Search) now scroll.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added

@@ -3846,6 +3846,22 @@ def history_zip(name: str, role: str, vid) -> tuple[bytes, str]:
     return team.zip_bytes(files), f"{posixpath.basename(name) or 'document'}-{label}.zip"
 
 
+def source_zip(name: str, role: str) -> tuple[bytes, str]:
+    """GET /api/source/zip: the document's files as they are now (build configuration only for the owner)."""
+    root, files, total = DOCS[name].parent, {}, 0
+    for f in list_files(root):
+        if role != "owner" and is_rc(f["path"]):
+            continue
+        total += f["size"]
+        if total > MAX_ZIP:
+            raise ApiError(f"This document is larger than {MAX_ZIP // 1048576} MB.", 413)
+        try:
+            files[f["path"]] = resolve_in_doc(root, f["path"]).read_bytes()
+        except OSError:
+            continue
+    return team.zip_bytes(files), f"{posixpath.basename(name) or 'document'}.zip"
+
+
 def latexdiff_pdf(name: str, role: str, data: dict) -> dict:
     """POST /api/latexdiff: out/<name>.diff.pdf, what changed between a version and now (build.build_diff_pdf)."""
     _, texts = version_texts(name, role, data.get("id"))
@@ -4016,7 +4032,7 @@ DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 READ_API = {
     "/api/files", "/api/file", "/api/raw", "/api/image", "/api/outline", "/api/refs", "/api/lint", "/api/warnings",
     "/synctex/edit", "/api/history", "/api/history/version", "/api/history/diff", "/api/history/pending",
-    "/api/review", "/api/search", "/api/people", "/api/history/zip", "/api/cited-bib",
+    "/api/review", "/api/search", "/api/people", "/api/history/zip", "/api/cited-bib", "/api/source/zip",
 }
 
 
@@ -4774,6 +4790,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/people":
             self.doc_root(query)
             self.json(people(query["doc"][0], self.role))
+        elif path == "/api/source/zip":
+            self.doc_root(query)
+            body, filename = source_zip(query["doc"][0], self.role)
+            self.reply(200, body, "application/zip", {"Content-Disposition": attachment_header(filename)})
         elif path == "/api/history/zip":
             self.doc_root(query)
             body, filename = history_zip(query["doc"][0], self.role, query.get("id", [None])[0])

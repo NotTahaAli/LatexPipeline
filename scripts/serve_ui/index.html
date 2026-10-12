@@ -79,6 +79,7 @@
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
     <symbol id="i-italic" viewBox="0 0 24 24"><path d="M10 5h8M6 19h8M14 5 10 19"/></symbol>
     <symbol id="i-present" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M12 16v4M8 20h8"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
     <symbol id="i-newtab" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
     <symbol id="i-omega" viewBox="0 0 24 24"><path d="M5 19h4v-2a6 6 0 1 1 6 0v2h4"/></symbol>
   </defs>
@@ -105,10 +106,7 @@
   <button id="shareBtn" class="btn quiet" title="Share this document: view and edit links"><svg class="ic"><use href="#i-share"/></svg><span class="lbl">Share</span></button>
   <button id="visualBtn" class="btn quiet" role="switch" aria-checked="false" title="Visual mode: show formatting, math and figures inline instead of raw LaTeX (Ctrl+Alt+V)"><svg class="ic"><use href="#i-eye"/></svg><span class="lbl">Visual</span></button>
   <button id="rebuildBtn" class="btn primary" title="Rebuild from scratch" aria-label="Rebuild from scratch"><svg class="ic"><use href="#i-refresh"/></svg><span class="lbl">Rebuild</span></button>
-  <div class="menu-wrap">
-    <button id="moreBtn" class="btn icon" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu" title="More" aria-label="More"><svg class="ic"><use href="#i-more"/></svg></button>
-    <div id="moreMenu" class="menu" role="menu" hidden></div>
-  </div>
+  <button id="moreBtn" class="btn icon" aria-haspopup="dialog" aria-controls="palette" title="All commands (Ctrl+K)" aria-label="All commands"><svg class="ic"><use href="#i-more"/></svg></button>
 </header>
 
 <div id="progress" role="presentation" hidden><i></i></div>
@@ -149,6 +147,7 @@
       <div id="outlineExtra" role="group" aria-label="Figures, tables, labels and TODOs"></div>
     </div>
   </aside>
+  <div id="sideResize" role="separator" aria-orientation="vertical" aria-controls="side" aria-label="Sidebar width" tabindex="0" title="Drag to resize the sidebar (arrow keys too; double-click resets)" hidden></div>
 
   <section id="editorPane" aria-label="Editor">
     <div class="tabbar">
@@ -193,6 +192,7 @@
       <button id="toCursor" class="icon" aria-label="Show cursor position in PDF" title="Show cursor in PDF (Ctrl+Enter)"><svg class="ic"><use href="#i-jump"/></svg></button>
       <button id="presentBtn" class="icon" aria-label="Present the PDF" title="Present: full screen, one page at a time, arrow keys (Esc ends)"><svg class="ic"><use href="#i-present"/></svg></button>
       <button id="pdfTabBtn" class="icon" aria-label="Open the PDF in a new tab" title="Open the PDF in a new tab"><svg class="ic"><use href="#i-newtab"/></svg></button>
+      <button id="pdfDlBtn" class="icon" aria-label="Download PDF" title="Download the PDF"><svg class="ic"><use href="#i-download"/></svg></button>
       <span id="liveState" class="live-state" hidden></span>
     </div>
     <div id="focusNote" class="focus-note" role="status" hidden></div>

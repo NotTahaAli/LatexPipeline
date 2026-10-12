@@ -26,6 +26,8 @@ import { notifySupport } from "./notify.js";
 import { navSupport } from "./nav.js";
 import { navPanels } from "./navpanels.js";
 import { buildControls } from "./buildctl.js";
+import { HELP } from "./cmdhelp.js";
+import { tooltips } from "./tooltip.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
@@ -766,6 +768,10 @@ const live = new LivePreview(pdfView, {
 let focusView = null;   // {path} while the person asked for a chapter preview of that file
 const isChapter = (tab) => tab?.kind === "text" && tab.path.endsWith(".tex") && tab.path !== "main.tex";
 const isLive = (tab) => tab?.kind === "text" && /\.(tex|cls|sty)$/.test(tab.path);   // main.tex and the preamble's files too
+function downloadPdf() {
+  if (!docs[cur]?.version) { toast(el("span", { textContent: "There is no PDF yet." })); return; }
+  el("a", { href: api.pdfUrl(cur, docs[cur].version), download: (cur.split("/").pop() || "document") + ".pdf" }).click();
+}
 async function exportDocx() {
   toast(el("span", { textContent: "Converting to DOCX with pandoc..." }));
   try { await api.docx(cur); const a = el("a", { href: api.docxUrl(cur), download: "" }); a.click(); toast(el("span", { textContent: "DOCX ready; your browser is downloading it." })); }
@@ -1138,6 +1144,7 @@ const navUi = navPanels({
 });
 $("presentBtn").onclick = () => navUi.present();
 $("pdfTabBtn").onclick = () => navUi.newTab();
+$("pdfDlBtn").onclick = () => downloadPdf();
 REV.mount($("dpanel-review"));
 $("commentBtn").onclick = () => REV.startComment();
 $("suggestBtn").onclick = () => toggleSuggest();
@@ -1284,7 +1291,29 @@ function setSide(open, tabName) {
     $("tab-" + n).setAttribute("aria-selected", String(ui.sideTab === n));
     $("panel-" + n).hidden = ui.sideTab !== n;
   }
+  $("sideResize").hidden = !open; sideWidth();
   if (open) { loadFiles(); renderTree(); loadOutline(); if (ui.sideTab === "refs") refsUi.load(); if (ui.sideTab === "ai") aiUi.load(); if (ui.sideTab === "git") gitUi.load(); }
+}
+// Each sidebar tab keeps its own width (dragged on #sideResize); no stored width means the stylesheet's default.
+function sideWidth(px) {
+  const side = $("side"), w = ui.sideW || (ui.sideW = {});
+  if (px === null) delete w[ui.sideTab];
+  else if (px !== undefined) w[ui.sideTab] = Math.round(Math.max(180, Math.min(px, $("work").clientWidth - 240, 1200)));
+  if (px !== undefined) saveUi();
+  side.style.width = w[ui.sideTab] ? w[ui.sideTab] + "px" : "";
+  const sr = $("sideResize"), now = side.hidden ? 0 : side.offsetWidth;
+  sr.setAttribute("aria-valuemin", "180"); sr.setAttribute("aria-valuemax", "1200"); sr.setAttribute("aria-valuenow", String(now));
+}
+{
+  const sr = $("sideResize");
+  sr.addEventListener("pointerdown", (e) => { sr.setPointerCapture(e.pointerId); sr.classList.add("drag"); document.body.style.userSelect = "none"; });
+  sr.addEventListener("pointermove", (e) => sr.hasPointerCapture(e.pointerId) && sideWidth(e.clientX - $("side").getBoundingClientRect().left));
+  sr.addEventListener("pointerup", (e) => { sr.releasePointerCapture(e.pointerId); sr.classList.remove("drag"); document.body.style.userSelect = ""; });
+  sr.addEventListener("keydown", (e) => {
+    const d = { ArrowLeft: -20, ArrowRight: 20 }[e.key];
+    if (d) { sideWidth($("side").offsetWidth + d); e.preventDefault(); }
+  });
+  sr.addEventListener("dblclick", () => sideWidth(null));
 }
 $("sideBtn").onclick = () => setSide(!ui.side);
 $("sideClose").onclick = () => setSide(false);
@@ -1417,6 +1446,8 @@ const COMMANDS = [
   { id: "typeset", edit: true, title: "Typeset selection", run: () => view && nav.run.typesetSelection(view) },
   { id: "present", title: "Present the PDF (full screen)", run: () => navUi.present() },
   { id: "pdftab", title: "Open the PDF in a new tab", run: () => navUi.newTab() },
+  { id: "pdfdownload", title: "Download PDF", run: () => downloadPdf() },
+  { id: "srczip", title: "Download source (zip)", run: () => el("a", { href: api.sourceZipUrl(cur), download: "" }).click() },
   { id: "numbers", get title() { return `Label numbers: ${settings.labelNumbers ? "on" : "off"} (change)`; }, run: () => { settings.labelNumbers = !settings.labelNumbers; saveSettings(); applyConfig(); } },
   { id: "mathprev", get title() { return `Math preview under equations: ${settings.mathPreview ? "on" : "off"} (change)`; }, run: () => { settings.mathPreview = !settings.mathPreview; saveSettings(); applyConfig(); } },
   { id: "follow", get title() { return `PDF follows the cursor: ${settings.follow ? "on" : "off"} (change)`; }, run: () => { settings.follow = !settings.follow; saveSettings(); if (settings.follow) nav.afterBuild(); } },
@@ -1468,19 +1499,46 @@ const COMMANDS = [
 ];
 
 let paletteItems = [], paletteSel = 0;
-function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; renderPalette(); $("paletteInput").focus(); }
+// The palette is also the More menu ("..."): with an empty query it lists the commands in these groups, then the rest.
+function paletteGroups() {
+  return [["Panels", ["files", "outline", "references", "symbols", "assistant", "todos", "bookmarks"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", ["comment", "suggest", "review", "history", "reviewpdf"]],
+    ["Document", ["prose", "format", "typeset", "visual", "graph", "zen", "pdfdownload", "srczip", "docx", "arxiv", "html"]],
+    ["Session", ["share", "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
+}
+const offered = (c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc) && !(c.id === "html" && !config.make4ht);
+const blocked = (c) => c.id === "docx" && sharing ? "Off while sharing: pandoc reads any file the shared source names."
+  : (c.id === "arxiv" || c.id === "html") && sharing ? "Off while sharing." : "";
+function openPalette() { $("palette").showModal(); $("paletteInput").value = ""; paletteSel = 0; renderPalette(); $("paletteInput").focus(); }
 function renderPalette() {
   const words = $("paletteInput").value.toLowerCase().split(/\s+/).filter(Boolean);
-  paletteItems = COMMANDS.filter((c) => !(readOnly && c.edit) && !(c.owner && role !== "owner") && !(c.id === "docx" && !config.pandoc) && !(c.id === "html" && !config.make4ht)).filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+  const shown = COMMANDS.filter(offered);
+  let sections;
+  if (words.length) sections = [[null, shown.filter((c) => words.every((w) => c.title.toLowerCase().includes(w)))]];
+  else {
+    const byId = new Map(shown.map((c) => [c.id, c])), used = new Set();
+    sections = paletteGroups().map(([label, ids]) => [label, ids.filter((id) => byId.has(id) && !used.has(id) && used.add(id)).map((id) => byId.get(id))]);
+    sections.push(["Other", shown.filter((c) => !used.has(c.id))]);
+  }
+  paletteItems = sections.flatMap(([, list]) => list);
   paletteSel = Math.min(paletteSel, Math.max(0, paletteItems.length - 1));
-  $("paletteList").replaceChildren(...paletteItems.map((c, i) => {
-    const li = el("li", { role: "option", id: "pal-" + c.id, onclick: () => runPalette(i) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
-    li.setAttribute("aria-selected", String(i === paletteSel));
-    return li;
-  }));
+  let i = 0;
+  $("paletteList").replaceChildren(...sections.filter(([, list]) => list.length).flatMap(([label, list]) => [
+    ...(label ? [el("li", { role: "presentation", className: "pal-group", textContent: label })] : []),
+    ...list.map((c) => {
+      const n = i++, why = blocked(c);
+      const li = el("li", { role: "option", id: "pal-" + c.id, title: why || HELP[c.id] || "", onclick: () => runPalette(n) }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
+      li.setAttribute("aria-selected", String(n === paletteSel));
+      if (why) li.setAttribute("aria-disabled", "true");
+      return li;
+    })]));
   $("paletteInput").setAttribute("aria-activedescendant", paletteItems[paletteSel] ? "pal-" + paletteItems[paletteSel].id : "");
+  $("pal-" + paletteItems[paletteSel]?.id)?.scrollIntoView({ block: "nearest" });
 }
-function runPalette(i) { const c = paletteItems[i]; $("palette").close(); if (c) setTimeout(c.run, 0); }
+function runPalette(i) {
+  const c = paletteItems[i];
+  if (c && blocked(c)) { toast(el("span", { textContent: blocked(c) })); return; }
+  $("palette").close(); if (c) setTimeout(c.run, 0);
+}
 $("paletteInput").addEventListener("input", () => { paletteSel = 0; renderPalette(); });
 $("paletteInput").addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown") { paletteSel = Math.min(paletteSel + 1, paletteItems.length - 1); renderPalette(); e.preventDefault(); }
@@ -1540,38 +1598,8 @@ for (const d of ["settings", "cheat"]) $(d).addEventListener("click", (e) => { i
 
 $("cheatList").replaceChildren(...[...COMMANDS.filter((c) => c.keys && !(readOnly && c.edit)), { title: "Close dialogs and panels", keys: "Esc" }].flatMap((c) => [el("dt", { textContent: c.title }), el("dd", {}, el("kbd", { textContent: c.keys }))]));
 
-function buildMenu() {
-  const m = $("moreMenu");
-  const groups = [["Panels", ["files", "outline", "references", "symbols", "assistant", "todos", "bookmarks"]], ["Build", ["problems", "warnings", "lint", "grammar", "log"]], ["Review", [...(readOnly ? (reviewer ? ["comment"] : []) : ["comment", "suggest"]), "review", "history", ...(readOnly ? [] : ["reviewpdf"])]],
-    ["Document", [...(readOnly ? [] : ["prose", "format", "typeset"]), "visual", "graph", "zen", ...(role === "owner" && config.pandoc ? ["docx"] : []), ...(role === "owner" ? ["arxiv"] : []), ...(role === "owner" && config.make4ht ? ["html"] : [])]],
-    ["Session", [...(role === "owner" ? ["share"] : []), "theme", "settings"]], ["Help", ["cheat", "tips", "palette"]]];
-  m.replaceChildren(...groups.map(([label, ids], g) => withLabel(el("div", { role: "group", className: "mgroup" },
-    el("div", { className: "mlabel", id: "mg" + g, textContent: label }), ...ids.map((id) => {
-      const c = COMMANDS.find((x) => x.id === id);
-      const b = el("button", { role: "menuitem", onclick: () => { closeMenu(); c.run(); } }, el("span", { textContent: c.title }), ...(c.keys ? [el("span", { className: "keys", textContent: c.keys })] : []));
-      if (id === "docx" && sharing) { b.disabled = true; b.title = "Off while sharing: pandoc reads any file the shared source names."; }
-      if ((id === "arxiv" || id === "html") && sharing) { b.disabled = true; b.title = "Off while sharing."; }
-      return b;
-    })), "mg" + g)));
-}
-const withLabel = (n, id) => (n.setAttribute("aria-labelledby", id), n);
-function closeMenu() { $("moreMenu").hidden = true; $("moreBtn").setAttribute("aria-expanded", "false"); }
-$("moreBtn").onclick = (e) => {
-  e.stopPropagation();
-  const open = $("moreMenu").hidden;
-  buildMenu();
-  $("moreMenu").hidden = !open; $("moreBtn").setAttribute("aria-expanded", String(open));
-  if (open) $("moreMenu").querySelector("button").focus();
-};
-$("moreMenu").addEventListener("keydown", (e) => {
-  const items = [...$("moreMenu").querySelectorAll("button")], i = items.indexOf(document.activeElement);
-  if (e.key === "ArrowDown") { items[(i + 1) % items.length].focus(); e.preventDefault(); }
-  else if (e.key === "ArrowUp") { items[(i - 1 + items.length) % items.length].focus(); e.preventDefault(); }
-  else if (e.key === "Home") { items[0].focus(); e.preventDefault(); }
-  else if (e.key === "End") { items[items.length - 1].focus(); e.preventDefault(); }
-  else if (e.key === "Escape") { closeMenu(); $("moreBtn").focus(); e.stopPropagation(); }
-});
-document.addEventListener("click", (e) => { if (!e.target.closest(".menu-wrap")) closeMenu(); });
+$("moreBtn").onclick = () => openPalette();
+$("moreBtn").title = `All commands (${mod}+K)`;
 $("rebuildBtn").onclick = () => api.rebuild(cur);
 
 document.addEventListener("keydown", (e) => {
@@ -1611,7 +1639,7 @@ document.addEventListener("click", (e) => { if (!e.target.closest("#usersWrap"))
 
 let shareTimer;
 let sharing = false;  // DOCX export is off while sharing (pandoc reads any file the source names)
-const setSharing = (on) => { if (on !== sharing) { sharing = on; buildMenu(); } };
+const setSharing = (on) => { if (on !== sharing) { sharing = on; if ($("palette").open) renderPalette(); } };
 async function openShare() {
   $("share").showModal();
   if (role === "owner") api.zotero().then((z) => { zoteroNote = zoteroShareNote(z); const n = $("shareBody").querySelector("#shareGrammar"); if (n) n.textContent = grammarShareNote(); }).catch(() => {});
@@ -1802,7 +1830,7 @@ window.addEventListener("pagehide", () => { for (const t of tabs.values()) if (t
 
 // ---- boot --------------------------------------------------------------------------------------------------------------
 view = new EditorView({ state: EditorState.create({ doc: "" }), parent: $("cm") });
-applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); buildMenu(); showTips();
+applyAppearance(); setSide(ui.side); setDrawer(ui.drawer); setProse(ui.prose); showTips(); tooltips();
 if (window.matchMedia("(max-width: 1000px)").matches) { ui.side = false; setSide(false); }
 channel.start();
 pushGrammarSettings();

@@ -233,6 +233,18 @@ class VersionsZipAndDiff(Team):
         self.assertEqual(self.as_("view", "GET", "/api/history/zip?doc=demo&id=999")[0], 404)
         self.assertEqual(self.as_("view", "GET", f"/api/history/zip?doc=second&id={vid}")[0], 403)
 
+    def test_the_source_downloads_as_a_zip(self):
+        self.write("intro.tex", "chapter")
+        status, raw = self.as_("view", "GET", "/api/source/zip?doc=demo")
+        self.assertEqual(status, 200)
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+        self.assertEqual(archive.read("intro.tex"), b"chapter")
+        self.assertIn("fig.png", archive.namelist())
+        self.assertNotIn("build.toml", archive.namelist())  # build configuration: the owner's only
+        owner = zipfile.ZipFile(io.BytesIO(self.as_("owner", "GET", "/api/source/zip?doc=demo")[1]))
+        self.assertIn("build.toml", owner.namelist())
+        self.assertEqual(self.as_("view", "GET", "/api/source/zip?doc=second")[0], 403)
+
     def test_files_history_never_saw_are_in_an_unnamed_version(self):
         self.write("intro.tex", "never edited")
         self.as_("edit", "PUT", "/api/file?doc=demo&path=main.tex", {"text": "v1"})
