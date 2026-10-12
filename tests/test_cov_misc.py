@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 import subprocess
+import tarfile
+import zipfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +16,7 @@ from unittest import mock
 
 import _support  # noqa: F401 - puts scripts/ on sys.path
 import accel
+import compile_api
 import doctools
 import preview
 import vendor_ui
@@ -161,6 +164,62 @@ class PreviewFigures(unittest.TestCase):
 
     def test_document_inputs_without_a_recorder_file(self):
         self.assertEqual(preview.document_inputs(self.main, self.main.parent / "missing.fls"), [])
+
+
+class CompileUnpack(unittest.TestCase):
+    """compile_api.unpack: the refusals of untrusted uploads that test_serve's cases leave out."""
+
+    def refused(self, body, kind, **kw):
+        with self.assertRaises(compile_api.UploadError) as ctx:
+            compile_api.unpack(body, kind, 10 ** 6, **kw)
+        return str(ctx.exception)
+
+    def test_json_shapes(self):
+        self.assertIn("Bad JSON", self.refused(b"{nope", "application/json"))
+        self.assertIn("Expected", self.refused(b"[1]", "application/json"))
+        self.assertIn("give text", self.refused(json.dumps({"files": {"a.tex": 5}}).encode(), "application/vnd+json"))
+        for bad in ("a\x01.tex", "x" * 256, "./../a.tex"):
+            with self.subTest(bad=bad):
+                self.assertIn("Unsafe path", self.refused(json.dumps({"files": {bad: "x"}}).encode(),
+                                                          "application/json"))
+        files, _ = compile_api.unpack(json.dumps({"files": {"./main.tex": "x", "dir/": "y"}}).encode(),
+                                      "application/json", 10 ** 6)
+        self.assertEqual(files, {"main.tex": b"x"})
+
+    def test_zip_limits(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            for i in range(5):
+                archive.writestr(f"f{i}.tex", "x")
+        self.assertIn("more than 2 files", self.refused(buf.getvalue(), "application/zip", max_files=2))
+        self.assertIn("Bad zip file", self.refused(b"PK\x03\x04 broken", "application/octet-stream"))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr("main.tex", "x")
+        data = bytearray(buf.getvalue())
+        data[6] |= 0x1  # the local header's general purpose flag: encrypted
+        central = data.rfind(b"PK\x01\x02")
+        data[central + 8] |= 0x1  # and the central directory's
+        self.assertIn("Encrypted", self.refused(bytes(data), "application/zip"))
+
+    def test_tar_limits_and_directories(self):
+        def tar(names):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as archive:
+                for name in names:
+                    info = tarfile.TarInfo(name)
+                    if name.endswith("/"):
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                    else:
+                        info.size = 1
+                        archive.addfile(info, io.BytesIO(b"x"))
+            return buf.getvalue()
+
+        self.assertIn("more than 1 files", self.refused(tar(["a.tex", "b.tex", "c.tex"]), "application/x-tar",
+                                                        max_files=1))
+        files, _ = compile_api.unpack(tar(["sub/", "main.tex"]), "application/x-tar", 10 ** 6)
+        self.assertEqual(files, {"main.tex": b"x"})
 
 
 if __name__ == "__main__":

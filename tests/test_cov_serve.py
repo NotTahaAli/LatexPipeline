@@ -178,6 +178,14 @@ class HttpEdges(Docs):
         self.assertIn("findings", body)
         self.assertEqual(self.request("GET", "/ws?cid=abc")[0], 400)  # no Upgrade header
 
+    def test_websocket_refuses_a_client_id_of_another_session(self):
+        with mock.patch.dict(serve.CLIENTS, {}, clear=True):
+            serve.bind_client("taken", "edit")
+            upgrade = {"Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Version": "13",
+                       "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="}
+            self.assertEqual(self.request("GET", "/ws?cid=taken", headers=upgrade)[0], 403)
+            self.assertEqual(serve.CLIENTS["taken"]["role"], "edit")
+
     def test_share_links_need_sharing_on(self):
         with self.assertRaises(serve.ApiError) as ctx:
             serve.share_link_create({"name": "Ann", "role": "edit"})
