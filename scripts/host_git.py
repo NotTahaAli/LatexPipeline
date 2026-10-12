@@ -377,8 +377,11 @@ def handle(h, project: dict, role: str) -> None:
                      project["id"])
         clash = " ".join(result.get("conflicts") or [])[:300]
         H.audit_log(H.APP, f"git_{op}", uid, h.ip, tid, f"{project['id']} {'conflicts: ' + clash if clash else 'ok'}")
-    except gitops.GitError as exc:
-        raise H.HttpError(exc.status, "Git: " + scrub(str(exc))[-1000:])
+    except (gitops.GitError, H.HttpError) as exc:  # a refused or failed sync is audited too
+        H.audit_log(H.APP, f"git_{op}", uid, h.ip, tid, f"{project['id']} failed: {exc.status}")
+        if isinstance(exc, gitops.GitError):
+            raise H.HttpError(exc.status, "Git: " + scrub(str(exc))[-1000:])
+        raise
     finally:
         lock.release()
     h.send_json(result)

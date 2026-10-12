@@ -1416,8 +1416,10 @@ class Handler(BaseHTTPRequestHandler):
             if rest != "/api/git/remote":
                 raise HttpError(404, "Not found.")
             host_git.handle(self, project, role)
+            return
         if rest in ("/api/people", "/api/access/request", "/api/access/status"):
             self.team(project, rest, tenant_role_, size)
+            return
         if rest == "/api/library":
             self.library(size)
             return

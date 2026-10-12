@@ -150,7 +150,7 @@ button.tip:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
 .side-tabs button[role=tab]:hover{color:var(--ink)}
 .side-tabs button[role=tab][aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}
 .side-tabs button[role=tab] .ic{display:none}
-.side-tabs .tl{display:flex;gap:2px}
+.side-tabs .tl{display:flex;flex-wrap:wrap;gap:2px;min-width:0}
 .side-tabs .x{margin-left:auto;margin-bottom:4px}
 #panel-files,#panel-outline,#panel-refs{flex:1;min-height:0;overflow:auto;padding:6px}
 .count{display:inline-flex;align-items:center;justify-content:center;height:18px;min-width:18px;padding:0 5px;border-radius:9px;background:var(--sunk);color:var(--ink-2);font-size:11px;font-weight:700}

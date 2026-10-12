@@ -2370,7 +2370,9 @@ class GitSync(HostCase):
         self.pid = Workspaces.make_project(self, self.editor, self.tenant, "Doc", "article")
         self.project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
         self.source = self.app.project_source(self.project)
-        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Git")).start()
+        acquire = mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Git"))
+        acquire = acquire.start()
+        self.addCleanup(lambda: self.assertEqual(acquire.call_count, 0, "a Git request went on to a worker"))
         self.addresses = ["8.8.8.8"]
         mock.patch.object(host_git, "resolve", side_effect=lambda h, p: list(self.addresses)).start()
         self.transfers = []
@@ -2496,6 +2498,8 @@ class GitSync(HostCase):
         self.pulled()
         (self.source / "ch2.tex").write_text("New chapter\n", encoding="utf-8")
         self.assertEqual(self.sync(self.editor, "push")[0], 400)  # no token yet
+        self.assertEqual(self.app.db.all("SELECT detail FROM audit WHERE action = 'git_push'")[-1]["detail"],
+                         f"{self.pid} failed: 400")  # refused attempts are audited too
         self.set_token()
         status, result, _ = self.sync(self.editor, "push")
         self.assertEqual((status, result["ok"]), (200, True), result)
@@ -2678,7 +2682,8 @@ class TeamGateway(HostCase):
         self.vid = self.user("vi@x.org", "viewer", self.tenant)
         self.user("out@x.org", "editor", self.other)
         self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
-        mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker")).start()
+        acquire = mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker")).start()
+        self.addCleanup(lambda: self.assertEqual(acquire.call_count, 0, "the request went on to a worker"))
 
     def test_people_are_the_workspace_members(self):
         status, data, _ = self.client("vi@x.org").call("GET", f"/p/{self.pid}/api/people")
