@@ -664,6 +664,7 @@ def command_specs(page, ctx):
         ),
         "palette": (None, dlg("#palette[open]"), close_dialogs),
         "files": (None, side("files"), None),
+        "find": (None, dlg(".cm-panel.cm-search"), lambda: page.keyboard.press("Escape")),
         "search": (None, side("search"), None),
         "outline": (None, side("outline"), None),
         "references": (None, side("refs"), None),

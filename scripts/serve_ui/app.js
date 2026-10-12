@@ -1416,6 +1416,7 @@ const COMMANDS = [
   { id: "save", edit: true, title: "Save file", keys: `${mod}+S`, run: () => saveNow() },
   { id: "palette", title: "Command palette", keys: `${mod}+K`, run: () => openPalette() },
   { id: "files", title: "Toggle files", keys: `${mod}+B`, run: () => (ui.side && ui.sideTab === "files") ? setSide(false) : setSide(true, "files") },
+  { id: "find", title: "Find and replace in this file", keys: `${mod}+F`, run: () => { if (view && active?.kind === "text") { view.focus(); SR.openSearchPanel(view); } } },
   { id: "search", title: "Search and replace in all files", keys: `${mod}+Shift+F`, run: () => showSearch() },
   { id: "outline", title: "Toggle outline", keys: `${mod}+Shift+O`, run: () => (ui.side && ui.sideTab === "outline") ? setSide(false) : setSide(true, "outline") },
   { id: "references", title: "Toggle references", run: () => (ui.side && ui.sideTab === "refs") ? setSide(false) : setSide(true, "refs") },
@@ -1609,6 +1610,7 @@ document.addEventListener("keydown", (e) => {
   else if (m && e.shiftKey && k === "p") { e.preventDefault(); openPalette(); }
   else if (m && !e.shiftKey && !e.altKey && k === "b" && !e.defaultPrevented) { e.preventDefault(); COMMANDS.find((c) => c.id === "files").run(); }
   else if (m && e.shiftKey && k === "f") { e.preventDefault(); showSearch(); }
+  else if (m && !e.shiftKey && !e.altKey && k === "f" && !typing && view && active?.kind === "text") { e.preventDefault(); COMMANDS.find((c) => c.id === "find").run(); }   // the editor's find bar, not the browser's
   else if (m && e.shiftKey && k === "o") { e.preventDefault(); COMMANDS.find((c) => c.id === "outline").run(); }
   else if (m && !e.shiftKey && !e.altKey && k === "j") { e.preventDefault(); toggleDrawer(); }
   else if (m && e.altKey && k === "v") { e.preventDefault(); setVisual(!settings.visual); }

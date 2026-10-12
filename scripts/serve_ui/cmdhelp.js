@@ -4,6 +4,7 @@ export const HELP = {
   save: "Write the open file to disk now instead of waiting for autosave.",
   palette: "Open this list of every command; type to filter it.",
   files: "Show or hide the file tree in the sidebar.",
+  find: "Open the find bar for the open file (also from the PDF or the sidebar), with replace, case and regex options.",
   search: "Find, and optionally replace, text across every file of the document.",
   outline: "Show or hide the sections, figures, tables and labels of the document.",
   references: "Show or hide the bibliography entries, with look-up and Zotero tools.",
