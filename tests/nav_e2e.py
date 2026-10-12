@@ -1,9 +1,11 @@
 """
 Browser check of the editor's navigation features (serve_ui/nav.js, navpanels.js) on a throwaway document: label
 numbers, go to definition, find references, rename, outline extras, TODOs, bookmarks and cursor sessions, symbol
-palette, file graph, math preview, typeset selection, presentation mode. Needs LaTeX and Chromium:
+palette, file graph, math preview, typeset selection, presentation mode. Then axe-core (light and dark) on the
+editor's tool dialogs: snippets, the figure dialog of a pasted image, the table editor, the TikZ canvas and the Git
+panel (the document folder is a throwaway repository). Needs LaTeX, git and Chromium:
 
-    uv run --no-project --with playwright==1.56.0 python tests/nav_e2e.py [--chromium PATH]
+    uv run --no-project --with playwright==1.56.0 python tests/nav_e2e.py [--chromium PATH] [--axe PATH_OR_URL]
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+AXE = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.2/axe.min.js"
 LOADED = "() => window.__app && window.__app.active && window.__app.view.state.doc.length > 0"
 LINE = "window.__app.view.state.doc.lineAt(window.__app.view.state.selection.main.head).number"  # the cursor's line
 MARK = ".cm-navMarks .cm-gutterElement:not([style*=visibility]) .cm-navMark"  # not the hidden spacer
@@ -39,6 +42,18 @@ CHAP = r"""\section{More}
 Back to \ref{sec:intro}.
 \begin{figure}\centering\fbox{x}\caption{A box}\label{fig:box}\end{figure}
 """
+EXTRA = r"""\begin{tabular}{lc}
+a & b \\
+c & d \\
+\end{tabular}
+
+\begin{tikzpicture}
+\node (a) at (0,0) {A};
+\node (b) at (2,0) {B};
+\draw[->] (a) -- (b);
+\end{tikzpicture}
+"""
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="  # 1x1
 
 
 def free_port() -> int:
@@ -50,12 +65,18 @@ def free_port() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--chromium", default=None)
+    parser.add_argument("--axe", default=AXE)
     args = parser.parse_args()
     tmp = tempfile.TemporaryDirectory()
     doc = Path(tmp.name) / "demo"
     doc.mkdir()
     (doc / "main.tex").write_text(MAIN, encoding="utf-8")
     (doc / "chap.tex").write_text(CHAP, encoding="utf-8")
+    (doc / "extra.tex").write_text(EXTRA, encoding="utf-8")  # not built: only for the table and TikZ editors
+    git = ["git", "-C", str(doc), "-c", "user.name=E2E", "-c", "user.email=e2e@example.org"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "main.tex"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "first"], check=True)
     port = free_port()
     server = subprocess.Popen([sys.executable, str(ROOT / "scripts/serve.py"), "demo", "--source", tmp.name,
                                "--no-open", "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -70,7 +91,7 @@ def main() -> int:
                 time.sleep(0.1)
         with sync_playwright() as pw:
             browser = pw.chromium.launch(executable_path=args.chromium)
-            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            page = browser.new_context(bypass_csp=True, viewport={"width": 1400, "height": 900}).new_page()
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(f"{origin}/#demo")
             page.wait_for_function(LOADED, timeout=60000)
@@ -190,6 +211,60 @@ def main() -> int:
             assert line == 9, line
             assert page.wait_for_selector(MARK), "bookmark lost on reload"
             print("session restore: ok")
+
+            def axe(label: str) -> None:
+                for theme in ("light", "dark"):
+                    page.evaluate("t => document.documentElement.dataset.theme = t", theme)
+                    if not page.evaluate("() => !!window.axe"):
+                        if args.axe.startswith("http"):
+                            page.add_script_tag(url=args.axe)
+                        else:
+                            page.add_script_tag(path=args.axe)
+                    result = page.evaluate("() => axe.run(document, {resultTypes: ['violations']})")
+                    bad = [f"{v['id']}: {v['help']} ({v['nodes'][0]['target']})" for v in result["violations"]]
+                    assert not bad, f"axe ({label}, {theme}): {bad}"
+                print(f"axe: 0 violations, {label} (light and dark)")
+
+            # Snippets, from the Settings dialog.
+            page.keyboard.press("Control+,")
+            page.wait_for_selector("#settings[open]")
+            page.click("#sEditTools summary")
+            page.click("#settings button:has-text('Edit snippets...')")
+            page.wait_for_selector("#snippetsDlg[open] .et-snip")
+            axe("snippets dialog")
+            page.click("#snippetsDlg button:has-text('Done')")
+            page.evaluate("() => document.getElementById('settings').close()")
+
+            # A pasted image asks for its name, folder, caption... first.
+            page.evaluate("""png => {
+                const b = Uint8Array.from(atob(png), (c) => c.charCodeAt(0)), d = new DataTransfer();
+                d.items.add(new File([b], "dot.png", { type: "image/png" }));
+                document.querySelector(".cm-content").dispatchEvent(new ClipboardEvent("paste",
+                  { clipboardData: d, bubbles: true, cancelable: true })); }""", PNG)
+            page.wait_for_selector("dialog.fig-dlg[open]")
+            axe("figure dialog")
+            page.keyboard.press("Escape")
+            page.wait_for_selector("dialog.fig-dlg[open]", state="detached")
+
+            # Table editor and TikZ canvas, from the status-bar chips.
+            page.evaluate("() => window.__app.openFile('extra.tex', 0)")
+            page.wait_for_function("() => window.__app.active.path === 'extra.tex'")
+            cursor_at(2, 1)
+            page.click("#editorStatus button:has-text('Edit table')")
+            page.wait_for_selector("dialog.tbl-dlg[open]")
+            axe("table editor")
+            page.keyboard.press("Escape")
+            cursor_at(7, 1)
+            page.click("#editorStatus button:has-text('Edit picture')")
+            page.wait_for_selector("dialog.tz-dlg[open] svg")
+            axe("TikZ canvas")
+            page.keyboard.press("Escape")
+
+            # Git panel (the owner's repository).
+            page.evaluate("() => document.getElementById('tab-git').click()")
+            page.wait_for_function("() => /first/.test(document.getElementById('panel-git').textContent)",
+                                   timeout=20000)
+            axe("Git panel")
             browser.close()
         assert not errors, errors
         print("nav_e2e: ok")

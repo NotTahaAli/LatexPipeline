@@ -101,6 +101,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
+- Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
 - Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).
 
 ## [0.1.1] - 2026-10-12

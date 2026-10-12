@@ -77,7 +77,7 @@ export function notifySupport(ctx) {
   function mention(area) {
     const id = "mention-" + ++boxes, menu = el("ul", { className: "menu mention-list", id, hidden: true });
     menu.setAttribute("role", "listbox"); menu.setAttribute("aria-label", "People");
-    area.setAttribute("aria-autocomplete", "list"); area.setAttribute("aria-controls", id);
+    area.setAttribute("aria-autocomplete", "list");
     let shown = [], at = 0, start = -1;
     const hide = () => { menu.hidden = true; shown = []; area.removeAttribute("aria-activedescendant"); };
     const pick = (i) => {
@@ -93,7 +93,8 @@ export function notifySupport(ctx) {
         li.setAttribute("role", "option"); li.setAttribute("aria-selected", String(i === at));
         return li;
       }));
-      if (!menu.isConnected) area.after(menu);
+      // aria-controls only once the list is in the page: an id nothing has is an invalid value (axe).
+      if (!menu.isConnected) { area.after(menu); area.setAttribute("aria-controls", id); }
       menu.hidden = !shown.length;
       if (shown.length) area.setAttribute("aria-activedescendant", `${id}-${at}`); else area.removeAttribute("aria-activedescendant");
     };
