@@ -2070,6 +2070,8 @@ def git_panel(name: str, path: str, query: dict, data: dict | None = None) -> di
             return gitops.log(folder)
         if path == "/api/git/branches":
             return gitops.branches(folder)
+        if path == "/api/git/show":
+            return gitops.show(folder, query.get("id", [""])[0])
         return gitops.status(folder)
     except gitops.GitError as exc:
         raise ApiError(str(exc), exc.status, **exc.extra)
@@ -4860,7 +4862,7 @@ class Handler(BaseHTTPRequestHandler):
             data = outline(DOCS[name])
             data["pages"] = STATE.get(name, {}).get("pages")
             self.json(data)
-        elif path in ("/api/git", "/api/git/diff", "/api/git/log", "/api/git/branches"):
+        elif path in ("/api/git", "/api/git/diff", "/api/git/log", "/api/git/branches", "/api/git/show"):
             self.doc_root(query)  # owner only (check_permission)
             self.json(git_panel(query["doc"][0], path, query))
         elif path == "/api/refs":

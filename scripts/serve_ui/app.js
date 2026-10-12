@@ -1328,7 +1328,7 @@ $("tab-ai").onclick = () => setSide(true, "ai");
 const gitUi = gitPanel($("panel-git"), { el, doc: () => cur, hosted: !!config.hosted, canEdit: role === "edit" || role === "owner",
   toast: (m) => toast(el("span", { textContent: m })), live: (m) => { $("live").textContent = m; },
   async saveAll() { await Promise.all([...tabs.values()].filter((t) => t.kind === "text" && t.dirty).map((t) => saveTab(t))); } });
-$("tab-git").hidden = !(config.hosted ? role === "edit" : role === "owner");
+$("tab-git").hidden = !(config.hosted || role === "owner");  // hosted: everyone reads, editors change
 $("tab-git").onclick = () => setSide(true, "git");
 
 // ---- visual mode and prose panel --------------------------------------------------------------------------

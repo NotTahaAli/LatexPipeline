@@ -4,7 +4,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+
+- Hosted editor: the Git tab is a full Git panel on the connected branch: changed files with their diffs, Stage, Unstage, Stage all (one staging area per project), Commit as the signed-in person, and the history with each commit's changes. Everyone in the project can read it; editors change. Pull and Push no longer commit everything on their own: Push sends the commits and says how many uncommitted changes stay; Pull merges into the project's commits and changes nothing when it would overwrite an uncommitted change.
+- Hosted Git never commits virtual environments, caches, editor and OS files or LaTeX build files (`host_git.IGNORE`), on top of the project's `.gitignore`.
+- Git panel (local too): click a commit in the history to see its changes (`GET /api/git/show`, owner only locally).
+
 ### Fixed
+
+- Git panel: a commit message being typed was lost when the panel re-rendered (Stage, Stage all, Refresh).
+- Hosted pages: the theme button always said "Dark theme"; it now names the theme a click switches to.
 
 - `host.py serve`: when the bubblewrap probe fails, the refusal now includes bwrap's own error. README: Ubuntu 23.10 and later need an AppArmor profile for `/usr/bin/bwrap` (the README wrongly said Ubuntu 24.04 allows it).
 

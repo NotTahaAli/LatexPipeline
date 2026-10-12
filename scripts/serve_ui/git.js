@@ -1,8 +1,10 @@
 // Git panel: the sidebar's Git tab. Locally (the owner only; serve.py refuses everyone else) it drives the document
 // folder's repository through the owner's own git: status, a diff per file, stage and unstage, commit (author from
 // git config), pull (fast-forward or merge; conflicts are listed, never resolved for you), push, branches and log.
-// Hosted (editors) it syncs the project with a remote https repository through the gateway, which holds each
-// person's Git token (Account page) and runs git itself: workers never see the token.
+// Hosted it is the same panel on the project's repository, run by the gateway: anyone in the project reads status,
+// diffs and history, editors stage, commit (as themselves), pull and push on the connected branch (no branch
+// switching: the project's files are everyone's). Pull and push use each person's Git token (Account page), which
+// only the gateway holds: workers never see it.
 // Pulled files that are open in a co-editing room are merged into the room by its leader like any outside edit.
 // Every text that came from git or the server is set with textContent.
 
@@ -52,6 +54,7 @@ export function lineKind(line) {
 export function gitPanel(root, ctx) {
   const { el } = ctx;
   let busy = false;
+  let draft = "";  // the commit message being written survives the panel re-rendering (Stage, Refresh)
   const btn = (text, onclick, cls = "btn", title) => el("button", { type: "button", className: cls, textContent: text, onclick, ...(title ? { title } : {}) });
   const note = (text, cls = "mute") => el("p", { className: cls, textContent: text });
   const status = el("p", { className: "mute git-status" });
@@ -78,19 +81,26 @@ export function gitPanel(root, ctx) {
     const toggle = staged
       ? btn("Unstage", () => act("Unstaging", () => post({ op: "unstage", paths: [f.path] })).then(load), "btn quiet")
       : btn("Stage", () => act("Staging", () => post({ op: "stage", paths: [f.path] })).then(load), "btn quiet");
+    toggle.disabled = !ctx.canEdit;
     return el("li", { className: "git-file" }, open, code, toggle);
   }
 
   const diffBox = el("div", { className: "git-diff", hidden: true });
-  async function showDiff(path, staged) {
-    const d = await act("Loading the diff", () => call(url("api/git/diff", { path, staged: staged ? 1 : 0 })));
-    if (!d) return;
-    const lines = d.untracked ? d.text.split("\n").map((l) => "+" + l) : d.diff.split("\n");
+  function showLines(title, lines, cut) {
     const pre = el("pre", { className: "git-pre", tabIndex: 0 }, // focusable: it scrolls (keyboard users too)
       ...lines.map((l) => el("span", { className: "dl-" + lineKind(l), textContent: l + "\n" })));
-    diffBox.replaceChildren(el("div", { className: "git-row" }, el("strong", { textContent: path }), el("span", { className: "spacer" }),
-      btn("Close", () => { diffBox.hidden = true; }, "btn ghost")), pre, ...(d.cut ? [note("The diff is cut short.")] : []));
+    diffBox.replaceChildren(el("div", { className: "git-row" }, el("strong", { textContent: title }), el("span", { className: "spacer" }),
+      btn("Close", () => { diffBox.hidden = true; }, "btn ghost")), pre, ...(cut ? [note("The diff is cut short.")] : []));
     diffBox.hidden = false;
+    diffBox.scrollIntoView({ block: "nearest" });
+  }
+  async function showDiff(path, staged) {
+    const d = await act("Loading the diff", () => call(url("api/git/diff", { path, staged: staged ? 1 : 0 })));
+    if (d) showLines(path, d.untracked ? d.text.split("\n").map((l) => "+" + l) : d.diff.split("\n"), d.cut);
+  }
+  async function showCommit(c) {
+    const d = await act("Loading the commit", () => call(url("api/git/show", { id: c.id })));
+    if (d) showLines(`${c.id.slice(0, 7)} ${c.subject}`, d.diff.split("\n"), d.cut);
   }
 
   async function branchPicker() {
@@ -114,13 +124,15 @@ export function gitPanel(root, ctx) {
     return el("span", { className: "git-row" }, pick, make);
   }
 
-  async function loadLocal() {
+  /** hosted: the remote's GET answer (connected); the panel then pulls and pushes through the gateway. */
+  async function loadLocal(hosted) {
     const s = await call(url("api/git")).catch((e) => { status.textContent = e.message; return null; });
     if (!s) return;
     if (!s.repo) { body.replaceChildren(note("This document's folder is not in a Git repository. Run `git init` in it (or clone it) to use this panel.")); return; }
     const { staged, unstaged } = splitChanges(s.files);
     const where = s.branch ? `On ${s.branch}` : "Not on a branch (detached)";
-    const track = s.upstream ? ` - ${s.upstream}${s.ahead ? `, ${s.ahead} to push` : ""}${s.behind ? `, ${s.behind} to pull` : ""}` : " - no upstream";
+    const track = s.upstream ? ` - ${s.upstream}${s.ahead ? `, ${s.ahead} to push` : ""}${s.behind ? `, ${s.behind} to pull` : ""}`
+      : hosted ? " - not pulled yet" : " - no upstream";
     const pull = btn("Pull", async () => {
       await ctx.saveAll();
       const r = await act("Pulling", () => post({ op: "pull" }));
@@ -133,7 +145,7 @@ export function gitPanel(root, ctx) {
       if (await act("Pushing", () => post({ op: "push", remote }))) ctx.toast("Pushed.");
       load();
     });
-    const parts = [el("div", { className: "git-row" }, el("span", { className: "git-where", textContent: where + track })),
+    const parts = hosted ? hostedHead(hosted, where + track) : [el("div", { className: "git-row" }, el("span", { className: "git-where", textContent: where + track })),
       await branchPicker(), el("div", { className: "git-row" }, pull, push, btn("Refresh", load, "btn ghost"))];
     if (s.merging) {
       parts.push(el("div", { className: "git-merge", role: "alert" },
@@ -142,23 +154,24 @@ export function gitPanel(root, ctx) {
     }
     const list = (rows, isStaged) => el("ul", { className: "plist git-list" }, ...(rows.length ? rows.map((f) => fileRow(f, isStaged))
       : [el("li", { className: "none", textContent: isStaged ? "Nothing staged." : "No changes." })]));
-    const stageAll = unstaged.length ? [btn("Stage all", () => act("Staging", () => post({ op: "stage", paths: unstaged.map((f) => f.path) })).then(load), "btn quiet")] : [];
+    const stageAll = unstaged.length && ctx.canEdit ? [btn("Stage all", () => act("Staging", () => post({ op: "stage", paths: unstaged.map((f) => f.path) })).then(load), "btn quiet")] : [];
     parts.push(el("div", { className: "git-row" }, el("span", { className: "eyebrow", textContent: `Changes (${unstaged.length})` }), el("span", { className: "spacer" }), ...stageAll),
       list(unstaged, false), el("div", { className: "git-row" }, el("span", { className: "eyebrow", textContent: `Staged (${staged.length})` })), list(staged, true));
-    const msg = el("textarea", { id: "gitMsg", rows: 3, placeholder: "Commit message" });
+    const msg = el("textarea", { id: "gitMsg", rows: 3, placeholder: "Commit message", value: draft, oninput: () => { draft = msg.value; } });
     msg.setAttribute("aria-label", "Commit message");
     const commit = btn("Commit", async () => {
       if (!msg.value.trim()) { status.textContent = "Write a commit message first."; msg.focus(); return; }
       await ctx.saveAll();
-      if (await act("Committing", () => post({ op: "commit", message: msg.value }))) { msg.value = ""; ctx.toast("Committed."); }
+      if (await act("Committing", () => post({ op: "commit", message: msg.value }))) { msg.value = draft = ""; ctx.toast("Committed."); }
       load();
     }, "btn primary");
     commit.disabled = !staged.length;
-    parts.push(el("div", { className: "git-commit" }, msg, commit), diffBox);
+    if (ctx.canEdit) parts.push(el("div", { className: "git-commit" }, msg, commit));
+    parts.push(diffBox);
     const log = await call(url("api/git/log")).catch(() => ({ commits: [] }));
     parts.push(el("div", { className: "git-row" }, el("span", { className: "eyebrow", textContent: "History" })),
-      el("ul", { className: "plist git-log" }, ...(log.commits.length ? log.commits.map((c) => el("li", { title: `${c.id}\n${c.author} <${c.email}>` },
-        el("span", { className: "git-subject", textContent: c.subject }),
+      el("ul", { className: "plist git-log" }, ...(log.commits.length ? log.commits.map((c) => el("li", {},
+        el("button", { type: "button", className: "link git-subject", textContent: c.subject, title: `Show the changes of ${c.id.slice(0, 7)} (${c.author} <${c.email}>)`, onclick: () => showCommit(c) }),
         el("span", { className: "mute", textContent: ` ${c.id.slice(0, 7)} - ${c.author}, ${since(c.time)}` })))
         : [el("li", { className: "none", textContent: "No commits yet." })])));
     body.replaceChildren(...parts);
@@ -169,8 +182,9 @@ export function gitPanel(root, ctx) {
   const result = el("div", { className: "git-result" }); // kept across reloads: the panel re-renders right after a sync
   const show = (r) => {
     if (!r) return;
-    result.replaceChildren(...(r.conflicts?.length ? [note("These files changed both here and in the repository, so nothing was merged. Change them so they agree (or keep one version), then pull again:", ""),
-      el("ul", { className: "plist" }, ...r.conflicts.map((p) => el("li", { textContent: p })))] : [note(r.message || "Done.")]));
+    const files = r.conflicts?.length ? r.conflicts : r.uncommitted?.length ? r.uncommitted : null;
+    result.replaceChildren(...(files ? [note(r.conflicts?.length ? "These files changed both here and in the repository, so nothing was merged. Change them so they agree (or keep one version), commit, then pull again:"
+      : r.message, ""), el("ul", { className: "plist" }, ...files.map((p) => el("li", { textContent: p })))] : [note(r.message || "Done.")]));
   };
 
   async function loadHosted() {
@@ -188,18 +202,26 @@ export function gitPanel(root, ctx) {
         if (await act("Connecting", () => remote({ op: "connect", url: u.value.trim(), branch: b.value.trim() }))) ctx.toast("Connected. Pull to bring the repository's files in.");
         load();
       }, "btn primary");
-      body.replaceChildren(note("Connect this project to a Git repository over https. Pull brings its files here; push sends this project's files there as one commit."),
+      body.replaceChildren(note("Connect this project to a Git repository over https. Pull brings its files here. Stage and commit your changes, then push sends your commits there."),
         el("label", { className: "git-field", htmlFor: "gitUrl" }, "Repository", u), el("label", { className: "git-field", htmlFor: "gitBranchName" }, "Branch", b),
         el("div", { className: "git-row" }, go), tokenNote);
       return;
     }
-    const pull = btn("Pull", async () => { await ctx.saveAll(); show(await act("Pulling", () => remote({ op: "pull" }))); load(); }, "btn");
-    const push = btn("Push", async () => { await ctx.saveAll(); show(await act("Pushing", () => remote({ op: "push" }))); load(); }, "btn");
+    return loadLocal(s);
+  }
+
+  /** The hosted panel's top: the repository, the last sync, Pull / Push / Disconnect and the last sync's result. */
+  function hostedHead(s, where) {
+    const pull = btn("Pull", async () => { await ctx.saveAll(); show(await act("Pulling", () => remote({ op: "pull" }))); load(); }, "btn", "Fetch the repository's branch and merge it into this project");
+    const push = btn("Push", async () => { await ctx.saveAll(); show(await act("Pushing", () => remote({ op: "push" }))); load(); }, "btn", "Send this project's commits to the repository (uncommitted changes stay here)");
     const drop = btn("Disconnect", async () => { if (confirm("Disconnect this project from the repository? Its files stay as they are.") && await act("Disconnecting", () => remote({ op: "disconnect" }))) result.replaceChildren(); load(); }, "btn danger");
     for (const b of [pull, push, drop]) b.disabled = !ctx.canEdit;
-    body.replaceChildren(el("p", { className: "git-where", textContent: `${s.url} (${s.branch})` }),
+    return [el("p", { className: "git-where", textContent: `${s.url} (${s.branch})` }),
+      el("div", { className: "git-row" }, el("span", { className: "git-where", textContent: where })),
       note(s.synced ? `Last sync ${since(s.synced)}${s.commit ? `, commit ${s.commit.slice(0, 7)}` : ""}.` : "Not synced yet."),
-      el("div", { className: "git-row" }, pull, push, drop), result, tokenNote);
+      el("div", { className: "git-row" }, pull, push, btn("Refresh", load, "btn ghost"), drop), result,
+      note(s.has_token ? "Your Git token is saved on your Account page; it is used for your pulls and pushes."
+        : "Add a Git access token on your Account page to push, or to pull from a private repository.")];
   }
 
   const load = () => (ctx.hosted ? loadHosted() : loadLocal());

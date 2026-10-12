@@ -43,6 +43,34 @@ LOCKS_GUARD = threading.Lock()
 SIZE_FACTOR = 2  # the repository (history included) may use this many times the project quota
 
 
+# Never committed by the hosted editor, whatever the project's own .gitignore says (git's info/exclude): virtual
+# environments, caches, editor and OS litter, and LaTeX's own build files. Files a pull brought in stay tracked.
+IGNORE = """.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+.latex-cache/
+.latex-history/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.aux
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.run.xml
+*.synctex.gz
+*.synctex(busy)
+*.toc
+*.xdv
+"""
+
+
 def repo_dir(project: dict) -> Path:
     return H.APP.data / "git" / project["id"]
 
@@ -88,11 +116,14 @@ def git(project: dict, args: list, check: bool = True, stdin: str | None = None,
 
 def ensure_repo(project: dict, branch: str) -> None:
     gitdir = repo_dir(project)
-    if (gitdir / "HEAD").is_file():
-        return
-    gitdir.parent.mkdir(parents=True, exist_ok=True)
-    gitops.run(gitdir.parent, ["init", "-q", "--bare", "--template=", str(gitdir)], environ=base_env())
-    git(project, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+    if not (gitdir / "HEAD").is_file():
+        gitdir.parent.mkdir(parents=True, exist_ok=True)
+        gitops.run(gitdir.parent, ["init", "-q", "--bare", "--template=", str(gitdir)], environ=base_env())
+        git(project, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+    exclude = gitdir / "info" / "exclude"
+    if not exclude.is_file() or exclude.read_text(encoding="utf-8") != IGNORE:  # repositories made before the list
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text(IGNORE, encoding="utf-8")
 
 
 # --- checks --------------------------------------------------------------------------------------------------------
@@ -221,16 +252,6 @@ def has_head(project: dict) -> bool:
     return git(project, ["rev-parse", "-q", "--verify", "HEAD"], check=False).returncode == 0
 
 
-def snapshot(project: dict, author: dict) -> bool:
-    """Commit the project's files as they are now (one commit by the person syncing); False when nothing changed."""
-    git(project, ["add", "-A"])
-    if has_head(project) and git(project, ["diff", "--cached", "--quiet"], check=False).returncode == 0:
-        return False
-    git(project, ["commit", "-q", "--no-verify", "-F", "-"], stdin=f"Update from the hosted editor ({project['name']})",
-        author=author)
-    return True
-
-
 def first_checkout(project: dict, branch: str, rev: str) -> list:
     """The project had no commit yet: take the repository's files, but never overwrite a file that differs."""
     rows = [r for r in git(project, ["ls-tree", "-r", "-z", rev]).stdout.split("\0") if r]
@@ -282,15 +303,20 @@ def pull(project: dict, remote: dict, user: dict) -> dict:
         if clash:
             return {"ok": False, "conflicts": clash, "message": "Some files differ here and in the repository."}
         return {"ok": True, "conflicts": [], "message": "Pulled the repository's files."}
-    snapshot(project, author)
+    # Uncommitted changes stay as they are; git refuses (and changes nothing) when the merge would overwrite one.
     done = git(project, ["merge", "-q", "--no-edit", "--no-verify", tracking], check=False, author=author)
     if done.returncode:
         found = [p for p in git(project, ["diff", "--name-only", "-z", "--diff-filter=U"], check=False).stdout
                  .split("\0") if p]
-        git(project, ["merge", "--abort"], check=False)
         if found:
+            git(project, ["merge", "--abort"], check=False)
             return {"ok": False, "conflicts": found, "message": "Nothing was merged."}
-        raise H.HttpError(409, "Could not merge: " + scrub(done.stdout + done.stderr))
+        text = done.stdout + done.stderr
+        if "would be overwritten" in text:
+            files = [line.strip() for line in text.splitlines() if line.startswith(("\t", "    "))]
+            return {"ok": False, "conflicts": [], "uncommitted": files,
+                    "message": "Nothing was merged: commit (or undo) your changes to these files first."}
+        raise H.HttpError(409, "Could not merge: " + scrub(text))
     return {"ok": True, "conflicts": [], "message": "Pulled."}
 
 
@@ -301,10 +327,7 @@ def push(project: dict, remote: dict, user: dict) -> dict:
     branch = remote["branch"]
     ensure_repo(project, branch)
     if not has_head(project):
-        git(project, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
-    snapshot(project, {"name": user["name"], "email": user["email"]})
-    if not has_head(project):
-        return {"ok": True, "message": "Nothing to push."}
+        return {"ok": True, "message": "Nothing to push: commit your changes first."}
     done = transfer(project, ["push", "--porcelain", "--recurse-submodules=no", "--no-verify", remote["url"],
                               f"HEAD:refs/heads/{branch}"], remote["url"], auth)
     if done.returncode:
@@ -313,7 +336,9 @@ def push(project: dict, remote: dict, user: dict) -> dict:
         raise H.HttpError(502, "Could not push to the repository: " + scrub(done.stderr))
     # the remote's answer, not "did this push commit": an earlier failed push may have left commits to deliver
     same = re.search(r"^=\t", done.stdout, re.M)
-    return {"ok": True, "message": "Pushed (no new changes)." if same else "Pushed."}
+    left = len(gitops.status(H.APP.project_source(project), repo_env(project))["files"])
+    return {"ok": True, "message": ("Pushed (no new commits)." if same else "Pushed.")
+            + (f" {left} uncommitted change(s) stay here." if left else "")}
 
 
 def project_lock(pid: str) -> threading.Lock:
@@ -321,8 +346,72 @@ def project_lock(pid: str) -> threading.Lock:
         return LOCKS.setdefault(pid, threading.Lock())
 
 
-def handle(h, project: dict, role: str) -> None:
+def changes(h, project: dict, role: str, rest: str) -> None:
+    """
+    /p/<id>/api/git (status; POST stage, unstage, commit), /api/git/diff, /api/git/log and /api/git/show: the Git
+    panel on the project's own repository, through gitops with this repository's environment. Reading is for anyone
+    in the project; changing is for editors, and commits carry the signed-in person as author. One staging area per
+    project, shared by its editors. No branches here: the project stays on the connected one.
+    """
+    row = remote_row(project)
+    if not row:
+        raise H.HttpError(409, "Connect the project to a repository first.")
+    ensure_repo(project, row["branch"])
+    source = H.APP.project_source(project)
+    try:
+        if h.command == "GET":
+            query = h.query
+            first = lambda key: (query.get(key) or [""])[0]  # noqa: E731
+            if rest == "/api/git":
+                info = gitops.status(source, repo_env(project))
+                tracking = f"refs/remotes/origin/{row['branch']}"
+                fetched = git(project, ["rev-parse", "-q", "--verify", tracking], check=False).returncode == 0
+                if has_head(project) and fetched:
+                    counts = git(project, ["rev-list", "--left-right", "--count", f"HEAD...{tracking}"]).stdout
+                    counts = counts.split()
+                    info.update(upstream=f"origin/{row['branch']}", ahead=int(counts[0]), behind=int(counts[1]))
+                info.update(root="", remotes=[])  # the gateway's paths stay here
+                h.send_json(info)
+            elif rest == "/api/git/diff":
+                h.send_json(gitops.diff(source, first("path"), first("staged") == "1", repo_env(project)))
+            elif rest == "/api/git/log":
+                h.send_json(gitops.log(source, 50, repo_env(project)))
+            elif rest == "/api/git/show":
+                h.send_json(gitops.show(source, first("id"), repo_env(project)))
+            else:
+                raise H.HttpError(404, "Not found.")
+            return
+        if h.command != "POST" or rest != "/api/git":
+            raise H.HttpError(405, "Method not allowed.")
+        if role != "edit":
+            raise H.HttpError(403, "Only editors can stage and commit.")
+        data = h.json_body()
+        op, uid = data.get("op"), h.session["id"]
+        if op not in ("stage", "unstage", "commit"):
+            raise H.HttpError(400, "Unknown Git operation.")
+        lock = project_lock(project["id"])
+        if not lock.acquire(blocking=False):
+            raise H.HttpError(409, "A Git sync of this project is running; try again in a moment.")
+        try:
+            if op == "commit":
+                user = H.APP.db.one("SELECT name, email FROM users WHERE id = ?", uid)
+                result = gitops.commit(source, data.get("message"), repo_env(project, author=user))
+                H.audit_log(H.APP, "git_commit", uid, h.ip, project["tenant_id"], f"{project['id']} {result['head']}")
+            else:
+                result = (gitops.stage if op == "stage" else gitops.unstage)(source, data.get("paths"),
+                                                                           repo_env(project))
+        finally:
+            lock.release()
+        h.send_json(result)
+    except gitops.GitError as exc:
+        raise H.HttpError(exc.status, "Git: " + scrub(str(exc))[-1000:])
+
+
+def handle(h, project: dict, role: str, rest: str = "/api/git/remote") -> None:
     """/p/<id>/api/git/remote (GET: anyone in the project; POST: editors). Called by host.Handler.project_proxy."""
+    if rest != "/api/git/remote":
+        changes(h, project, role, rest)
+        return
     row = remote_row(project)
     has_token = bool(H.APP.db.one("SELECT 1 FROM git_tokens WHERE user_id = ?", h.session["id"]))
     if h.command == "GET":

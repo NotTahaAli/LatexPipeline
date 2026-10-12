@@ -1413,9 +1413,9 @@ class Handler(BaseHTTPRequestHandler):
             self.zotero_sync(rest, role, size)
             return
         if rest == "/api/git" or rest.startswith("/api/git/"):  # the gateway syncs; workers have no Git at all
-            if rest != "/api/git/remote":
+            if rest not in ("/api/git", "/api/git/remote", "/api/git/diff", "/api/git/log", "/api/git/show"):
                 raise HttpError(404, "Not found.")
-            host_git.handle(self, project, role)
+            host_git.handle(self, project, role, rest)
             return
         if rest in ("/api/people", "/api/access/request", "/api/access/status"):
             self.team(project, rest, tenant_role_, size)

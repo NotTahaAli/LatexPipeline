@@ -620,11 +620,12 @@ const themeKey = "lp-host-theme";
 function applyTheme(theme) {
   const dark = theme ? theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
   if (theme) document.documentElement.dataset.theme = theme; else delete document.documentElement.dataset.theme;
-  $("theme").setAttribute("aria-pressed", String(dark));
+  $("theme").textContent = dark ? "Light theme" : "Dark theme";  // what a click switches to
+  $("theme").dataset.dark = String(dark);
 }
 try { applyTheme(localStorage.getItem(themeKey)); } catch { applyTheme(null); }
 $("theme").onclick = () => {
-  const theme = $("theme").getAttribute("aria-pressed") === "true" ? "light" : "dark";
+  const theme = $("theme").dataset.dark === "true" ? "light" : "dark";
   try { localStorage.setItem(themeKey, theme); } catch { /* private mode */ }
   applyTheme(theme);
 };

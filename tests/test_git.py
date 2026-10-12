@@ -171,7 +171,12 @@ class GitPanelApi(SharedState, ServerCase):
         self.assertEqual(self.call("GET", "/api/git/diff?path=main.tex")[0], 200)
         self.assertEqual(self.call("POST", "/api/git", {"op": "stage", "paths": ["main.tex"]})[0], 200)
         self.assertEqual(self.call("POST", "/api/git", {"op": "commit", "message": "edit"})[0], 200)
-        self.assertEqual(self.call("GET", "/api/git/log")[1]["commits"][0]["subject"], "edit")
+        head = self.call("GET", "/api/git/log")[1]["commits"][0]
+        self.assertEqual(head["subject"], "edit")
+        status, shown = self.call("GET", f"/api/git/show?id={head['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("+changed", shown["diff"])
+        self.assertEqual(self.call("GET", "/api/git/show?id=HEAD~1")[0], 404)  # only ids the log lists
         self.assertEqual(self.call("GET", "/api/git/branches")[1]["local"][0]["name"], "main")
         status, body = self.call("POST", "/api/git", {"op": "stage", "paths": ["--all"]})
         self.assertEqual(status, 400, body)
@@ -183,6 +188,7 @@ class GitPanelApi(SharedState, ServerCase):
         for role in [r for r in tokens if r != "owner"]:
             for method, path, body in (("GET", "/api/git", None), ("GET", "/api/git/log", None),
                                        ("GET", "/api/git/diff?path=main.tex", None), ("GET", "/api/git/branches", None),
+                                       ("GET", "/api/git/show?id=0", None),
                                        ("POST", "/api/git", {"op": "pull"}), ("POST", "/api/git", {"op": "push"})):
                 with self.subTest(role=role, path=path, method=method):
                     self.assertEqual(self.call(method, path, body, tokens[role])[0], 403)

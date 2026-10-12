@@ -70,13 +70,13 @@ def output(done: subprocess.CompletedProcess) -> str:
     return text if len(text) <= MAX_OUTPUT else text[:MAX_OUTPUT] + "\n[cut short]"
 
 
-def repo_root(folder: Path) -> Path | None:
-    done = run(folder, ["rev-parse", "--show-toplevel"], check=False)
+def repo_root(folder: Path, environ: dict | None = None) -> Path | None:
+    done = run(folder, ["rev-parse", "--show-toplevel"], check=False, environ=environ)
     return Path(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip() else None
 
 
-def need_root(folder: Path) -> Path:
-    root = repo_root(folder)
+def need_root(folder: Path, environ: dict | None = None) -> Path:
+    root = repo_root(folder, environ)
     if root is None:
         raise GitError("This document's folder is not in a Git repository (run `git init` there first).", 404)
     return root
@@ -121,39 +121,42 @@ def parse_status(raw: str) -> dict:
     return info
 
 
-def status(folder: Path) -> dict:
-    root = repo_root(folder)
+def status(folder: Path, environ: dict | None = None) -> dict:
+    """environ: host_git's (its own GIT_DIR, work tree and config); None is the user's own repository."""
+    root = repo_root(folder, environ)
     if root is None:
         return {"repo": False}
+    reading = {**environ, "GIT_OPTIONAL_LOCKS": "0"} if environ else env({"GIT_OPTIONAL_LOCKS": "0"})
     done = run(root, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
-               environ=env({"GIT_OPTIONAL_LOCKS": "0"}))  # reading must not take the index lock
+               environ=reading)  # reading must not take the index lock
     info = parse_status(done.stdout)
-    merging = run(root, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False).returncode == 0
-    remotes = run(root, ["remote"]).stdout.split()
+    merging = run(root, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False, environ=environ).returncode == 0
+    remotes = run(root, ["remote"], environ=environ).stdout.split()
     return {"repo": True, "root": str(root), "merging": merging, "remotes": remotes, **info}
 
 
-def known_paths(root: Path) -> set:
-    files = parse_status(run(root, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]).stdout)["files"]
+def known_paths(root: Path, environ: dict | None = None) -> set:
+    files = parse_status(run(root, ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                             environ=environ).stdout)["files"]
     return {f["path"] for f in files} | {f["from"] for f in files if f.get("from")}
 
 
-def check_paths(root: Path, paths) -> list:
+def check_paths(root: Path, paths, environ: dict | None = None) -> list:
     """Only paths `git status` lists right now: a request cannot name an option, a glob or a file elsewhere."""
     if not isinstance(paths, list) or not paths or len(paths) > 1000:
         raise GitError("Pick one or more files.", 400)
-    known = known_paths(root)
+    known = known_paths(root, environ)
     for path in paths:
         if not isinstance(path, str) or path not in known or path.startswith("-"):
             raise GitError(f"Not a changed file: {str(path)[:200]}", 400)
     return paths
 
 
-def diff(folder: Path, path, staged: bool) -> dict:
-    root = need_root(folder)
-    check_paths(root, [path])
-    entry = next(f for f in parse_status(run(root, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
-                                         .stdout)["files"] if path in (f["path"], f.get("from")))
+def diff(folder: Path, path, staged: bool, environ: dict | None = None) -> dict:
+    root = need_root(folder, environ)
+    check_paths(root, [path], environ)
+    entry = next(f for f in parse_status(run(root, ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                                             environ=environ).stdout)["files"] if path in (f["path"], f.get("from")))
     if entry["index"] == "?":  # untracked: no diff, the whole file is new
         target = root / path
         try:
@@ -162,14 +165,14 @@ def diff(folder: Path, path, staged: bool) -> dict:
             text = ""
         return {"path": path, "untracked": True, "text": text}
     args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"] + (["--cached"] if staged else []) + ["--", path]
-    text = run(root, args).stdout
+    text = run(root, args, environ=environ).stdout
     return {"path": path, "staged": staged, "diff": text[:MAX_OUTPUT], "cut": len(text) > MAX_OUTPUT}
 
 
-def log(folder: Path, limit: int = 50) -> dict:
-    root = need_root(folder)
+def log(folder: Path, limit: int = 50, environ: dict | None = None) -> dict:
+    root = need_root(folder, environ)
     done = run(root, ["log", f"-n{max(1, min(int(limit), LOG_LIMIT))}", "-z",
-                      "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%s"], check=False)
+                      "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%s"], check=False, environ=environ)
     commits = []
     for row in done.stdout.split("\0") if done.returncode == 0 else []:  # an unborn branch has no log
         fields = row.strip("\n").split("\x1f")
@@ -177,6 +180,16 @@ def log(folder: Path, limit: int = 50) -> dict:
             commits.append({"id": fields[0], "author": fields[1], "email": fields[2], "time": int(fields[3]),
                             "subject": fields[4]})
     return {"commits": commits}
+
+
+def show(folder: Path, commit, environ: dict | None = None) -> dict:
+    """One commit's changes, for a commit `log` lists (a request cannot name a revision expression or an option)."""
+    root = need_root(folder, environ)
+    if not isinstance(commit, str) or commit not in {c["id"] for c in log(folder, LOG_LIMIT, environ)["commits"]}:
+        raise GitError("Not a commit of this branch's recent history.", 404)
+    text = run(root, ["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", commit],
+               environ=environ).stdout
+    return {"id": commit, "diff": text[:MAX_OUTPUT], "cut": len(text) > MAX_OUTPUT}
 
 
 def branches(folder: Path) -> dict:
@@ -206,26 +219,29 @@ def check_branch(root: Path, name) -> str:
     return name
 
 
-def stage(folder: Path, paths) -> dict:
-    root = need_root(folder)
-    run(root, ["add", "-A", "--", *check_paths(root, paths)])
+def stage(folder: Path, paths, environ: dict | None = None) -> dict:
+    root = need_root(folder, environ)
+    run(root, ["add", "-A", "--", *check_paths(root, paths, environ)], environ=environ)
     return {"ok": True}
 
 
-def unstage(folder: Path, paths) -> dict:
-    root = need_root(folder)
-    run(root, ["reset", "-q", "--", *check_paths(root, paths)])  # also fine before the first commit
+def unstage(folder: Path, paths, environ: dict | None = None) -> dict:
+    root = need_root(folder, environ)
+    # also fine before the first commit
+    run(root, ["reset", "-q", "--", *check_paths(root, paths, environ)], environ=environ)
     return {"ok": True}
 
 
-def commit(folder: Path, message) -> dict:
-    root = need_root(folder)
+def commit(folder: Path, message, environ: dict | None = None) -> dict:
+    """environ: host_git's, which also names the author (the signed-in person); else the user's git config."""
+    root = need_root(folder, environ)
     if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE or "\0" in message:
         raise GitError("Write a commit message.", 400)
-    done = run(root, ["commit", "-q", "-F", "-"], stdin=message, check=False)  # author: the user's git config
+    done = run(root, ["commit", "-q", "--no-verify", "-F", "-"] if environ else ["commit", "-q", "-F", "-"],
+               stdin=message, check=False, environ=environ)
     if done.returncode:
         raise GitError(output(done) or "Nothing to commit.", 409)
-    return {"ok": True, "head": run(root, ["rev-parse", "HEAD"]).stdout.strip()}
+    return {"ok": True, "head": run(root, ["rev-parse", "HEAD"], environ=environ).stdout.strip()}
 
 
 def conflicts(root: Path) -> list:

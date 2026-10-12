@@ -2254,12 +2254,13 @@ def run_hosted(args, browser, origin, host):
     admin, aw = host_page(browser, origin, "site admin")
     admin.goto("/")
     expect(admin.get_by_role("heading", name="Sign in")).to_be_visible()
-    pressed = admin.get_attribute("#theme", "aria-pressed")
+    label = admin.text_content("#theme")
     admin.click("#theme")
-    assert admin.get_attribute("#theme", "aria-pressed") != pressed
-    assert admin.evaluate("() => document.documentElement.dataset.theme") in ("light", "dark")
+    theme = admin.evaluate("() => document.documentElement.dataset.theme")
+    assert admin.text_content("#theme") == ("Light theme" if theme == "dark" else "Dark theme") != label
     admin.click("#theme")
-    ok("theme button switches the theme and says so (aria-pressed)")
+    assert admin.text_content("#theme") == label
+    ok("theme button switches the theme and names the one it switches to")
     host_sign_in(admin, "root@example.org")
     admin.goto("/#admin")
     expect(admin.get_by_role("heading", name="Site admin")).to_be_visible()

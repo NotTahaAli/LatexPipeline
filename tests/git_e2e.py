@@ -204,15 +204,33 @@ def run_hosted(browser, git, base, origin, data) -> None:
 
     type_at_end(ed, "% pushed from the browser\n")
     wait_for(lambda: "pushed from the browser" in (source / "main.tex").read_text(encoding="utf-8"), "the save")
+    panel.get_by_role("button", name="Refresh").click()
+    panel.locator("li.git-file").filter(has_text="main.tex").get_by_role("button", name="Stage").click()
+    expect(panel.get_by_text("Staged (1)")).to_be_visible()
+    panel.get_by_role("button", name="main.tex").first.click()
+    expect(panel.locator(".git-diff .dl-add")).to_contain_text(["+% pushed from the browser"])
+    axe(ed, "hosted Git panel with a staged file and its diff")
+    panel.get_by_label("Commit message").fill("Edit from the browser")
+    panel.get_by_role("button", name="Commit").click()
+    expect(panel.get_by_text(re.compile("1 to push"))).to_be_visible()
     panel.get_by_role("button", name="Push").click()
     expect(panel.get_by_text("Pushed.", exact=True)).to_be_visible(timeout=30000)
     assert "pushed from the browser" in show(bare, "main.tex")
-    assert live.run_git(bare, "log", "-1", "--format=%an", "main").stdout.strip() == "Ed Itor"
-    ok("an edit in the editor is pushed as the editor's own commit")
+    assert live.run_git(bare, "log", "-1", "--format=%an %s", "main").stdout.strip() == "Ed Itor Edit from the browser"
+    panel.locator(".git-log").get_by_role("button", name="Edit from the browser").click()
+    expect(panel.locator(".git-diff .dl-add")).to_contain_text(["+% pushed from the browser"])
+    ok("an edit is staged, its diff shown, committed as the editor and pushed; History shows the commit's changes")
 
     git.users["ed"] = ROTATED  # the Git host rotated the token
     type_at_end(ed, "% after the rotation\n")
     wait_for(lambda: "after the rotation" in (source / "main.tex").read_text(encoding="utf-8"), "the save")
+    panel.get_by_role("button", name="Refresh").click()
+    expect(panel.locator("li.git-file").filter(has_text="main.tex")).to_have_count(1)
+    panel.get_by_label("Commit message").fill("After the rotation")  # kept while Stage all re-renders the panel
+    panel.get_by_role("button", name="Stage all").click()
+    expect(panel.get_by_text("Staged (1)")).to_be_visible()
+    panel.get_by_role("button", name="Commit").click()
+    expect(panel.get_by_text(re.compile("1 to push"))).to_be_visible()
     panel.get_by_role("button", name="Push").click()
     expect(panel.locator(".git-status")).to_contain_text("Could not push", timeout=30000)
     axe(ed, "hosted Git panel showing a refused push")
@@ -225,8 +243,7 @@ def run_hosted(browser, git, base, origin, data) -> None:
     ed.wait_for_function(LOADED, timeout=60000)
     ed.locator("#tab-git").click()
     panel.get_by_role("button", name="Push").click()
-    # The refused push already made the commit, so this one reports no new changes (and delivers that commit).
-    expect(panel.get_by_text(re.compile(r"^Pushed"))).to_be_visible(timeout=30000)
+    expect(panel.get_by_text("Pushed.", exact=True)).to_be_visible(timeout=30000)  # the commit the refused push kept
     assert "after the rotation" in show(bare, "main.tex")
     assert git.requests[-1][2] == "Basic " + base64.b64encode(f"ed:{ROTATED}".encode()).decode()
     ok("after the host rotated the token the push is refused; the new token from the Account page pushes")
@@ -248,8 +265,8 @@ def run_hosted(browser, git, base, origin, data) -> None:
 
     with sqlite3.connect(data / "host.db") as db:
         actions = [r[0] for r in db.execute("SELECT action FROM audit WHERE action LIKE 'git%' ORDER BY id")]
-    assert actions == ["git_token_set", "git_connected", "git_pull", "git_pull", "git_push", "git_push",
-                       "git_token_set", "git_push", "git_token_removed", "git_disconnected"], actions
+    assert actions == ["git_token_set", "git_connected", "git_pull", "git_pull", "git_commit", "git_push", "git_commit",
+                       "git_push", "git_token_set", "git_push", "git_token_removed", "git_disconnected"], actions
     ok("every Git step is in the audit log")
     for ctx in (actx, ectx):
         ctx.close()

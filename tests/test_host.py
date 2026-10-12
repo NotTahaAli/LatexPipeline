@@ -2401,6 +2401,14 @@ class GitSync(HostCase):
     def sync(self, client, op, **extra):
         return client.call("POST", f"/p/{self.pid}/api/git/remote?doc=Doc", {"op": op, **extra})
 
+    def commit(self, paths, message="mine", client=None):
+        client = client or self.editor
+        status, data, _ = client.call("POST", f"/p/{self.pid}/api/git", {"op": "stage", "paths": paths})
+        self.assertEqual(status, 200, data)
+        status, data, _ = client.call("POST", f"/p/{self.pid}/api/git", {"op": "commit", "message": message})
+        self.assertEqual(status, 200, data)
+        return data
+
     def connect(self, client=None):
         return self.sync(client or self.editor, "connect", url=self.URL, branch="main")
 
@@ -2431,7 +2439,8 @@ class GitSync(HostCase):
             self.assertEqual(client.call("GET", f"/p/{self.pid}/api/git/remote")[0], 200)
             self.assertEqual(self.connect(client)[0], 403, email)
         self.assertEqual(self.connect(self.client("out@x.org"))[0], 404)
-        self.assertEqual(self.editor.call("GET", f"/p/{self.pid}/api/git")[0], 404)  # the local panel: not hosted
+        self.assertEqual(self.editor.call("GET", f"/p/{self.pid}/api/git")[0], 409)  # not connected yet
+        self.assertEqual(self.editor.call("GET", f"/p/{self.pid}/api/git/branches")[0], 404)  # one branch hosted
         for url in ("http://git.example.org/a.git", "ssh://git.example.org/a.git", "file:///etc", "https://u:p@h.org/a",
                     "https://h.org/a?x=1", "https://h.org", "ext::sh -c touch% /tmp/x", "https://h.org/a b"):
             with self.subTest(url=url):
@@ -2483,10 +2492,15 @@ class GitSync(HostCase):
         self.pulled()
         (self.source / "main.tex").write_text("ONE\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
         self.upstream({"main.tex": "one\ntwo\nthree\nfour\nFIVE\n"})
+        status, result, _ = self.sync(self.editor, "pull")  # an uncommitted change in the way: nothing happens
+        self.assertEqual((status, result["ok"], result["uncommitted"]), (200, False, ["main.tex"]), result)
+        self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\ntwo\nthree\nfour\nfive\n")
+        self.commit(["main.tex"])
         status, result, _ = self.sync(self.editor, "pull")
         self.assertEqual((status, result["ok"]), (200, True), result)
         self.assertEqual((self.source / "main.tex").read_text(encoding="utf-8"), "ONE\ntwo\nthree\nfour\nFIVE\n")
         (self.source / "main.tex").write_text("ONE\nmine\nthree\nfour\nFIVE\n", encoding="utf-8")
+        self.commit(["main.tex"])
         self.upstream({"main.tex": "ONE\ntheirs\nthree\nfour\nFIVE\n"})
         status, result, _ = self.sync(self.editor, "pull")
         self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
@@ -2497,6 +2511,7 @@ class GitSync(HostCase):
     def test_push_needs_the_persons_token_and_never_shows_it(self):
         self.pulled()
         (self.source / "ch2.tex").write_text("New chapter\n", encoding="utf-8")
+        self.commit(["ch2.tex"])
         self.assertEqual(self.sync(self.editor, "push")[0], 400)  # no token yet
         self.assertEqual(self.app.db.all("SELECT detail FROM audit WHERE action = 'git_push'")[-1]["detail"],
                          f"{self.pid} failed: 400")  # refused attempts are audited too
@@ -2511,6 +2526,7 @@ class GitSync(HostCase):
         self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
         self.upstream({"other.tex": "x\n"})
         (self.source / "ch2.tex").write_text("Changed again\n", encoding="utf-8")
+        self.commit(["ch2.tex"])
         status, data, _ = self.sync(self.editor, "push")
         self.assertEqual(status, 409, data)  # the repository moved on: pull first
         replies = json.dumps([self.editor.call("GET", f"/p/{self.pid}/api/git/remote")[1], data, result])
@@ -2521,18 +2537,64 @@ class GitSync(HostCase):
         self.assertIn("git_push", actions)
 
     def test_push_message_says_what_the_remote_received(self):
-        """A refused push leaves its snapshot commit here; the next push delivers it and must not say "no new
-        changes" just because that push itself committed nothing."""
+        """A refused push leaves its commit here; the next push delivers it and must not say "no new commits" just
+        because nothing was committed since. Uncommitted changes are never pushed, and the reply says so."""
         self.pulled()
         self.set_token()
         self.upstream({"other.tex": "x\n"})
         (self.source / "ch2.tex").write_text("Mine\n", encoding="utf-8")
+        self.commit(["ch2.tex"])
         self.assertEqual(self.sync(self.editor, "push")[0], 409)  # committed here, refused there
         self.assertEqual(self.sync(self.editor, "pull")[1]["ok"], True)
         status, result, _ = self.sync(self.editor, "push")
         self.assertEqual((status, result["message"]), (200, "Pushed."), result)
         self.assertIn("ch2.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
-        self.assertEqual(self.sync(self.editor, "push")[1]["message"], "Pushed (no new changes).")
+        self.assertEqual(self.sync(self.editor, "push")[1]["message"], "Pushed (no new commits).")
+        (self.source / "ch3.tex").write_text("Draft\n", encoding="utf-8")
+        self.assertEqual(self.sync(self.editor, "push")[1]["message"],
+                         "Pushed (no new commits). 1 uncommitted change(s) stay here.")
+        self.assertNotIn("ch3.tex", run_git(self.remote, "ls-tree", "--name-only", "main").stdout)
+
+    def test_staging_commit_and_history(self):
+        """One shared staging area: editors stage, unstage and commit as themselves; anyone in the project reads
+        status, diffs and the log. Virtual environments, caches and LaTeX build files never show up."""
+        self.pulled()
+        (self.source / "main.tex").write_text("one\nTWO\nthree\nfour\nfive\n", encoding="utf-8")
+        (self.source / "ch2.tex").write_text("New\n", encoding="utf-8")
+        for junk in (".venv/lib/x.py", ".latex-cache/a/b.log", ".vscode/settings.json", "__pycache__/m.pyc",
+                     "main.aux", "main.synctex.gz", ".DS_Store"):
+            (self.source / junk).parent.mkdir(parents=True, exist_ok=True)
+            (self.source / junk).write_text("x", encoding="utf-8")
+        viewer = self.client("vi@x.org")
+        status, info, _ = viewer.call("GET", f"/p/{self.pid}/api/git")
+        self.assertEqual(status, 200, info)
+        self.assertEqual(sorted(f["path"] for f in info["files"]), ["ch2.tex", "main.tex"])
+        self.assertEqual((info["branch"], info["upstream"], info["ahead"], info["behind"], info["root"]),
+                         ("main", "origin/main", 0, 0, ""))
+        diff = viewer.call("GET", f"/p/{self.pid}/api/git/diff?path=main.tex&staged=0")[1]
+        self.assertIn("+TWO", diff["diff"])
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/git/diff?path=..%2F..%2Fhost.db")[0], 400)
+        for body in ({"op": "stage", "paths": ["main.tex"]}, {"op": "commit", "message": "x"}):
+            self.assertEqual(viewer.call("POST", f"/p/{self.pid}/api/git", body)[0], 403)
+        self.assertEqual(self.client("out@x.org").call("GET", f"/p/{self.pid}/api/git")[0], 404)
+        for paths in (["--all"], [".venv/lib/x.py"], "main.tex", []):
+            with self.subTest(paths=paths):
+                status, data, _ = self.editor.call("POST", f"/p/{self.pid}/api/git", {"op": "stage", "paths": paths})
+                self.assertEqual(status, 400, data)
+        self.editor.call("POST", f"/p/{self.pid}/api/git", {"op": "stage", "paths": ["main.tex", "ch2.tex"]})
+        self.editor.call("POST", f"/p/{self.pid}/api/git", {"op": "unstage", "paths": ["ch2.tex"]})
+        info = viewer.call("GET", f"/p/{self.pid}/api/git")[1]
+        files = {f["path"]: (f["index"], f["worktree"]) for f in info["files"]}
+        self.assertEqual(files, {"main.tex": ("M", "."), "ch2.tex": ("?", "?")})
+        head = self.editor.call("POST", f"/p/{self.pid}/api/git", {"op": "commit", "message": "Second line"})[1]["head"]
+        commits = viewer.call("GET", f"/p/{self.pid}/api/git/log")[1]["commits"]
+        self.assertEqual((commits[0]["id"], commits[0]["subject"], commits[0]["author"]), (head, "Second line", "Ed"))
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/git")[1]["ahead"], 1)
+        shown = viewer.call("GET", f"/p/{self.pid}/api/git/show?id={head}")[1]
+        self.assertIn("+TWO", shown["diff"])
+        self.assertEqual(viewer.call("GET", f"/p/{self.pid}/api/git/show?id=HEAD")[0], 404)
+        audit = self.app.db.one("SELECT detail FROM audit WHERE action = 'git_commit'")
+        self.assertIn(head, audit["detail"])
 
     def test_repository_outside_the_project_and_removed_with_it(self):
         self.pulled()
