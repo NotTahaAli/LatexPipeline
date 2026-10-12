@@ -70,7 +70,7 @@ class Stub:
                     for chunk in payload:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:  # Windows reports ConnectionAbortedError
                     with stub.lock:
                         stub.dropped += 1
 
