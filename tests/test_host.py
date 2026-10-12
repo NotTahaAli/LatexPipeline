@@ -2371,6 +2371,8 @@ class GitSync(HostCase):
         self.project = self.app.db.one("SELECT * FROM projects WHERE id = ?", self.pid)
         self.source = self.app.project_source(self.project)
         mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker for Git")).start()
+        self.relayed = mock.patch.object(host.Handler, "relay").start()  # the gateway's answer ends the request
+        self.addCleanup(lambda: (time.sleep(0.3), self.relayed.assert_not_called()))
         self.addresses = ["8.8.8.8"]
         mock.patch.object(host_git, "resolve", side_effect=lambda h, p: list(self.addresses)).start()
         self.transfers = []
@@ -2679,6 +2681,10 @@ class TeamGateway(HostCase):
         self.user("out@x.org", "editor", self.other)
         self.pid = Workspaces.make_project(self, self.client("ed@x.org"), self.tenant, "Doc", "article")
         mock.patch.object(self.app.workers, "acquire", side_effect=AssertionError("no worker")).start()
+        # The gateway's answer must end the request: it was relayed to a worker as well (a second reply on the
+        # connection), which the raising acquire above only logged.
+        self.relayed = mock.patch.object(host.Handler, "relay").start()
+        self.addCleanup(lambda: (time.sleep(0.3), self.relayed.assert_not_called()))
 
     def test_people_are_the_workspace_members(self):
         status, data, _ = self.client("vi@x.org").call("GET", f"/p/{self.pid}/api/people")

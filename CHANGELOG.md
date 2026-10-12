@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- `tests/ui_e2e.py`: a browser check of every palette command, shortcut and More menu entry of the editor, its features one by one (sharing with a link per role in separate browsers included) and every page of the hosted gateway, failing on console errors, failed requests and axe-core violations.
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
 - Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
@@ -101,6 +102,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- Hosted gateway: `/p/<id>/api/people`, `/api/access/*` and `/api/git/remote` were answered by the gateway and then relayed to the project's worker as well (a second reply on the connection); the gateway's answer now ends the request.
+- Builds of documents with TikZ pictures: a figure-listing pass (any file of the document with a `tikzpicture` changed, even one the document does not read) deleted `main.synctex.gz` and replaced `main.log` when latexmk then had nothing to redo, so source and PDF no longer jumped to each other until Rebuild from scratch; the editor now says "the build is still running" instead of "No SyncTeX data yet" during a build.
+- Editor: the palette had two commands with the id `references` (duplicate element ids); Find references is now `findrefs`.
+- Editor: switching the key bindings quickly (Emacs, then Default before Emacs had loaded) could leave the earlier bindings on.
+- Editor: the PDF no longer follows the cursor once "Follow the cursor" is turned off during its pause.
+- Editor: edit links no longer ask for the owner-only share state on load (a 403 in every guest's console).
+- Editor: Escape closes the notification list when it is empty (the focus stays on the bell then), and the bell has its name before the review data has loaded (axe `button-name`).
+- Editor accessibility (axe): the Symbols panel's group titles are `h2` (heading order), the PDF viewer has `role="region"` for its label, the links in a toast ("Recover it", "Discard") have the toast's contrast, and overlapping comment highlights no longer stack their tints, with text under a highlight in the ink colour (syntax colours fell below 4.5:1).
+- `tests/review_e2e.py` removes the cache, history and outputs of its throwaway document.
 - Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
 - Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
 - Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).

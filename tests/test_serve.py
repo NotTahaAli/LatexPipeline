@@ -736,6 +736,22 @@ class GatewayQuota(GatewayMode):
         ran.assert_not_called()  # already over quota: no LaTeX run at all
         self.assertIn("quota", serve.STATE[name]["error"])
 
+class SynctexWhileBuilding(unittest.TestCase):
+    def test_missing_synctex_says_whether_a_build_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main.tex"
+            main.write_text("x", encoding="utf-8")
+            name = serve.build.doc_name(main)
+            self.addCleanup(serve.STATE.pop, name, None)
+            with mock.patch.object(serve, "synctex_file", return_value=Path(tmp) / "none.synctex.gz"):
+                serve.STATE[name] = {"status": "building"}
+                with self.assertRaisesRegex(serve.SynctexError, "still running"):
+                    serve.synctex(main, "view", "1:1:main.tex")
+                serve.STATE[name] = {"status": "ok"}
+                with self.assertRaisesRegex(serve.SynctexError, "Rebuild from scratch"):
+                    serve.synctex(main, "view", "1:1:main.tex")
+
+
 class TunnelParsing(unittest.TestCase):
     def test_urls_from_each_tools_output(self):
         samples = {

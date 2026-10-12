@@ -300,7 +300,7 @@ button.link:hover{text-decoration-color:currentColor}
 #logText{margin:0;padding:12px 16px;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word;color:var(--ink-2)}
 
 #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:44px;max-width:80vw;background:var(--ink);color:var(--paper);border-radius:8px;padding:9px 16px;box-shadow:var(--shadow);z-index:60}
-#toast a{color:inherit;font-weight:600}
+#toast a,#toast button.link{color:inherit;font-weight:600}
 
 dialog{border:1px solid var(--rule);border-radius:10px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow);padding:0;max-width:min(620px,94vw);width:620px}
 dialog::backdrop{background:var(--scrim)}
@@ -533,6 +533,10 @@ dialog::backdrop{background:var(--scrim)}
 /* Review: comments and suggestions (review.js) */
 .cm-cmt{background:color-mix(in srgb,var(--ochre) 18%,transparent);border-bottom:2px solid color-mix(in srgb,var(--ochre) 70%,transparent)}
 .cm-cmt.active{background:color-mix(in srgb,var(--ochre) 34%,transparent)}
+/* Overlapping comments do not stack their tints, and text under a tint is ink: syntax colours fall below 4.5:1 there. */
+.cm-cmt .cm-cmt{background:none}
+.cm-cmt .cm-cmt.active{background:color-mix(in srgb,var(--ochre) 20%,transparent)}
+.cm-cmt,.cm-cmt [class*=tok-]{color:var(--ink)}
 .cm-sug-del{text-decoration:line-through;text-decoration-color:var(--ox);text-decoration-thickness:2px;color:var(--ox);background:var(--ox-soft)}
 .cm-sug-ins{text-decoration:underline;text-decoration-color:var(--moss);text-decoration-thickness:2px;text-underline-offset:3px;color:var(--moss);background:var(--moss-soft)}
 .cm-sug-del.active,.cm-sug-ins.active{outline:1px solid currentColor;border-radius:2px}
@@ -723,7 +727,7 @@ html.zen .cm-content{max-width:46em;margin:0 auto}
 .nav-present{position:fixed;inset:0;z-index:1000;background:#000;display:grid;place-items:center;outline:none}
 .nav-present-n{position:fixed;right:14px;bottom:10px;color:#bbb;font:12px var(--mono)}
 .sym-groups{padding:0 10px 12px}
-.sym-group h3{margin:10px 0 6px}
+.sym-group h2{margin:10px 0 6px}
 .sym-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(36px,1fr));gap:4px}
 .sym{height:36px;border:1px solid var(--rule);border-radius:5px;background:var(--surface);font:18px var(--serif);color:var(--ink)}
 .sym:hover,.sym:focus-visible{border-color:var(--accent);background:var(--accent-soft)}

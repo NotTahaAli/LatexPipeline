@@ -803,6 +803,26 @@ class CleanCacheRetryTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
+class FigureListingKeepsOutputsTests(unittest.TestCase):
+    def test_a_picture_in_a_file_the_document_does_not_read_keeps_synctex_and_the_log(self):
+        # The figure listing runs as the main job; latexmk then had nothing to redo, and the editor lost
+        # SyncTeX ("No SyncTeX data yet") and the page count until Rebuild from scratch.
+        with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):
+            main = write_doc(root, "fig", "\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\nText.\n"
+                             "\\begin{tikzpicture}\\draw (0,0) -- (1,1);\\end{tikzpicture}\n\\end{document}\n")
+            report, _ = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            synctex = build.cache_dir_for(main) / "main.synctex.gz"
+            self.assertTrue(synctex.is_file())
+            (main.parent / "notes.tex").write_text("\\begin{tikzpicture}\\draw (0,0) circle (1);\\end{tikzpicture}\n",
+                                                   encoding="utf-8")
+            report, _ = build.build_document(main, shutil.which("latexmk"), live=False)
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertTrue(synctex.is_file(), "the figure listing removed the SyncTeX file")
+            self.assertEqual(report["pages"], 1)
+
+
+@unittest.skipUnless(shutil.which("latexmk") and shutil.which("pdflatex"), "needs latexmk and pdflatex")
 class TimeoutTests(unittest.TestCase):
     def test_looping_document_is_killed_and_reported(self):
         with fake_repo() as root, contextlib.redirect_stdout(io.StringIO()):

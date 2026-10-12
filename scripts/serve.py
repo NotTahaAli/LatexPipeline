@@ -2031,7 +2031,10 @@ def synctex(main_tex: Path, kind: str, spec: str, pdf: Path | None = None) -> di
     if pdf is None:
         pdf = build.cache_dir_for(main_tex) / f"{main_tex.stem}.pdf"
         if not synctex_file(main_tex).exists():
-            raise SynctexError("No SyncTeX data yet: use Rebuild from scratch.")
+            with LOCK:  # TeX removes the .synctex.gz while it writes a new one
+                building = STATE.get(build.doc_name(main_tex), {}).get("status") == "building"
+            raise SynctexError("The build is still running; try again when it ends." if building
+                               else "No SyncTeX data yet: use Rebuild from scratch.")
     argv = ["edit", "-o", f"{spec}:{pdf}"] if kind == "edit" else ["view", "-i", spec, "-o", str(pdf)]
     try:
         result = subprocess.run(

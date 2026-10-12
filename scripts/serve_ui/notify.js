@@ -32,6 +32,7 @@ export function notifySupport(ctx) {
   const seenKey = () => "seen:" + ctx.doc();
   const bell = el("button", { type: "button", className: "btn quiet icon bell", id: "bellBtn" }, ctx.icon("bell"), el("span", { className: "count" }));
   bell.setAttribute("aria-haspopup", "true"); bell.setAttribute("aria-expanded", "false"); bell.setAttribute("aria-controls", "bellList");
+  bell.title = "Notifications: mentions and replies"; bell.setAttribute("aria-label", bell.title);   // named before the review data arrives
   const list = el("div", { className: "menu bell-list", id: "bellList", hidden: true });
   list.setAttribute("role", "region"); list.setAttribute("aria-label", "Notifications");
   const wrap = el("div", { className: "menu-wrap" }, bell, list);
@@ -64,7 +65,8 @@ export function notifySupport(ctx) {
     update();
     list.querySelector("button")?.focus();
   };
-  list.addEventListener("keydown", (e) => { if (e.key === "Escape") { close(); bell.focus(); } });
+  // On the wrapper: with nothing listed the focus stays on the bell, and Escape must close the list from there too.
+  wrap.addEventListener("keydown", (e) => { if (e.key === "Escape" && !list.hidden) { close(); bell.focus(); } });
   document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(); });
 
   // ---- @mentions: completion in every comment box --------------------------------------------------------------

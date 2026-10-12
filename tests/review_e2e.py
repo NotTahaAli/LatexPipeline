@@ -327,7 +327,12 @@ def main() -> int:
         server.terminate()
         server.wait(30)
         tmp.cleanup()
-        shutil.rmtree(ROOT / ".latex-history" / doc, ignore_errors=True)
+        # Outside the repository its cache and history are keyed _x<hash>_2F<name> (build.cache_dir_for).
+        for base in (ROOT / ".latex-cache", ROOT / ".latex-history", ROOT / ".latex-cache" / "_review"):
+            for found in base.glob(f"_x*_2F{doc}"):
+                shutil.rmtree(found, ignore_errors=True)
+        for found in (ROOT / "out").glob(f"{doc}.*"):
+            found.unlink()
     print("review e2e ok")
     return 0
 
