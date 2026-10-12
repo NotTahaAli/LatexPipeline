@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- Integration tests that run the external tools for real when installed (`tests/test_integration_tools.py`: dvisvgm, qpdf, pdftoppm, mutool, latexdiff, texcount, chktex, tex-fmt, veraPDF) and the AI, Zotero, Crossref and LanguageTool HTTP code against loopback stub servers (`tests/test_integration_net.py`, `tests/netstubs.py`), with opt-in live checks (`LP_LIVE_NET=1`, `LANGUAGETOOL_URL`).
 - Editor: a Git tab for the local owner (status, per-file diff, stage and unstage, commit, pull by fast-forward or merge with conflicts listed and never resolved, push, branches, log) through your own `git` with no request-chosen options (`scripts/gitops.py`); pulls and switches into files open in co-editing are merged like any outside edit.
 - Hosted Git sync: editors connect a project to an https repository and pull or push from the Git tab, with each person's own token (Account > Git, new `host.db` migration); git runs in the gateway on a repository outside the project area, public hosts only (resolved and pinned), with size caps, timeouts and audit entries (`scripts/host_git.py`).
 - Hosted personal API tokens (Account > API tokens), one system for every use: hashed, shown once, with scopes (`projects`: `Authorization: Bearer` on the chosen projects' `/p/<project>/...` and `GET /api/token`; `compile`: the compile API), an optional expiry, revocable, ended by a password change (`scripts/host_tokens.py`).
@@ -101,6 +102,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Fixed
 
+- `--deps` now lists the `.bib` files BibTeX or biber read (from latexmk's `.fdb_latexmk`; the `.fls` recorder never sees them), and a `.bib` outside the document directory now counts for rebuild detection and `--changed-since`.
+- MCP `render_page` with mutool (no pdftoppm) made portrait pages taller than `size`; the longest side is now `size`, as with pdftoppm.
 - Comment and reply boxes with @-completion (suggestion card, Review panel) no longer point `aria-controls` at a people list that is not in the page yet (axe `aria-valid-attr-value`).
 - Browser checks: axe-core now also covers Account > API tokens (`host_e2e.py`), the suggestion card and the bell (`review_e2e.py`), and the snippets, figure, table and TikZ dialogs and the Git panel (`nav_e2e.py`).
 - Files of Debian's `/usr/share/texmf` and `TEXMFDIST` no longer count as a document's inputs outside its directory (`TEXMFDEBIAN` and `TEXMFDIST` added to the TeX tree variables).
