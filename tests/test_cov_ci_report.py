@@ -97,7 +97,7 @@ class Comment(Paths):
             return ""
 
         args = argparse.Namespace(diff_dir=None, print_only=False)
-        env = dict(self.ENV)
+        env = {**self.ENV, "GITHUB_EVENT_PATH": ""}  # CI sets its own event file
         if event is not None:
             path = self.out / "event.json"
             path.write_text(json.dumps(event), encoding="utf-8")
