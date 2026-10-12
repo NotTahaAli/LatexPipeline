@@ -2196,7 +2196,9 @@ class Mcp(HostCase):
         self.assertTrue((source / "refs.bib").is_file())
         self.assertTrue(self.tool(token, "new_document_from_template", name="X", workspace=self.other)["isError"])
         only = self.connect()[1]["access_token"]  # one project, not the workspace: no new projects there
-        self.assertTrue(self.tool(only, "new_document_from_template", name="Y", workspace=self.tenant)["isError"])
+        refused = self.tool(only, "new_document_from_template", name="Y", workspace=self.tenant)
+        self.assertIn("single projects", refused["content"][0]["text"])
+        self.assertEqual(self.tool(only, "list_projects")["structuredContent"]["workspaces"], [])
         viewer = self.connect(email="vi@x.org", tenants=[self.tenant], projects=[])[1]["access_token"]
         self.assertTrue(self.tool(viewer, "new_document_from_template", name="Z", workspace=self.tenant)["isError"])
         self.assertEqual(self.app.db.one("SELECT COUNT(*) AS n FROM projects")["n"], 3)

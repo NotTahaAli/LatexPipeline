@@ -4,6 +4,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP `outline` and `word_counts`: a heading wrapped in an environment (`\chapter*{\begin{center}Title\end{center}}`) no longer shows the environment's name in its title.
+- MCP `list_reviews` gives each comment's id, so `delete_comment` can be used.
+- MCP `write_file` no longer records the new, still empty file as a version before its content, so restoring a file's first version gives the written text, not an empty file.
+- MCP `list_versions`: a named version lists up to 100 of its files and now says how many it holds (`file_count`); the version always kept every file.
+- MCP `bib_import` skips entries whose DOI the project already has under another key, and lists them under `duplicates`.
+- Hosted MCP: `new_document_from_template` on a connection given single projects says that such a connection cannot create projects; `list_projects` explains that `workspaces` lists only workspaces given as a whole.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added

@@ -1287,9 +1287,9 @@ def brace_arg(text: str, start: int) -> tuple[str, int] | None:
 
 
 def clean_title(title: str) -> str:
-    title = re.sub(r"\\(?:label|footnote)\{[^{}]*\}", "", title)
+    title = re.sub(r"\\(?:label|footnote|begin|end)\{[^{}]*\}", "", title)  # \begin{center}: not title text
     title = re.sub(r"\\[A-Za-z]+\*?\s*", "", title)
-    return re.sub(r"[{}]", "", title).strip() or "(untitled)"
+    return re.sub(r"\s+", " ", re.sub(r"[{}]", "", title)).strip() or "(untitled)"
 
 
 def tex_candidate(root: Path, current_dir: str, arg: str) -> str | None:

@@ -98,7 +98,9 @@ def _tool(name: str, title: str, scope: str, description: str, props: dict | Non
 TOOLS = [
     _tool("list_projects", "List projects", "read",
           "List the LaTeX projects you can work on, with each one's `project` value (pass it to the other tools), "
-          "name, your access (read, write, review) and whether a PDF exists.", project=False),
+          "name, workspace, your access (read, write, review) and whether a PDF exists. Hosted, `workspaces` lists "
+          "only the workspaces this connection was given as a whole (new_document_from_template needs one); it is "
+          "empty when only single projects were.", project=False),
     _tool("search", "Search projects", "read",
           "Search the text files of every project for words; returns up to 20 files (id, title, url), best first. "
           "Read one with fetch(id).",
@@ -133,7 +135,8 @@ TOOLS = [
           "Problems found without building: unused or missing labels, missing figures, bibliography issues, overfull "
           "boxes from the last build's log."),
     _tool("list_reviews", "List comments and suggestions", "read",
-          "Open comment threads and suggested edits in the project, with the quoted text each one is attached to."),
+          "Open comment threads (with each comment's id) and suggested edits in the project, with the quoted text each "
+          "one is attached to."),
     _tool("render_page", "Render a PDF page", "read",
           "A page of the built PDF as a PNG image: by page number, or the page that shows a source line (path and "
           "line, using SyncTeX). chapter=true renders the last chapter preview (preview_chapter) instead.",
@@ -204,8 +207,8 @@ TOOLS = [
     _tool("delete_comment", "Delete your comment", "review",
           "Delete a comment this AI client wrote through this connection (hosted) or under this client's name "
           "(local); other people's comments cannot be deleted.",
-          {"thread": _s("string", "The thread id.", maxLength=40), "comment": _s("string", "The comment id.",
-                                                                                  maxLength=40)},
+          {"thread": _s("string", "The thread id.", maxLength=40),
+           "comment": _s("string", "The comment id (list_reviews).", maxLength=40)},
           ["thread", "comment"], read_only=False, destructive=True),
     _tool("withdraw_suggestion", "Withdraw your suggestion", "review",
           "Withdraw a suggestion this AI client made (hosted: through this connection; local: under this client's "
@@ -229,7 +232,8 @@ TOOLS = [
            "y": _s("number", "Points from the top edge.", minimum=0, maximum=20000)}, ["page", "x", "y"]),
     _tool("list_versions", "List versions", "read",
           "The version history of one file, or of the whole project: id, time, authors, kind (save, restore, "
-          "delete, rename, label) and names of named versions. Page with before=<smallest id seen>.",
+          "delete, rename, label) and names of named versions, with up to 100 of their files (file_count is how many "
+          "they hold). Page with before=<smallest id seen>.",
           {"path": _s("string", "Only this file (and named versions).", maxLength=240),
            "before": _s("integer", "Only versions older than this id.", minimum=1)}),
     _tool("version_diff", "Compare a version", "read",
@@ -274,7 +278,8 @@ TOOLS = [
           ["path", "key"], read_only=False, destructive=True),
     _tool("bib_import", "Import references", "write",
           "Add entries from pasted BibTeX, RIS (Mendeley, EndNote, publisher exports) or a DOI (looked up at "
-          "Crossref: only the DOI is sent) to a .bib file. Keys already in the project are skipped.",
+          "Crossref: only the DOI is sent) to a .bib file. Keys already in the project are skipped, and so are entries "
+          "whose DOI an entry of the project already has (listed under duplicates).",
           {"path": BIB, "source": _s("string", "BibTeX, RIS, or a DOI such as 10.1000/xyz.", maxLength=1000000)},
           ["path", "source"], read_only=False, idempotent=False),
     _tool("bib_lookup", "Fill in missing fields", "write",
@@ -683,7 +688,8 @@ class Doc:
 
     def save(self, path: str, text: str, current: dict | None) -> dict:
         self.s.check_writable(self.name, path)  # locked document, linked file
-        self.s.remember_disk(self.name, path)  # what is on disk now, if history lacks it
+        if current:  # a file write_file just made is empty on disk: no version of that
+            self.s.remember_disk(self.name, path)  # what is on disk now, if history lacks it
         written = self.s.write_text_file(self.root, path, text, current["version"] if current else None,
                                          current["eol"] if current else "\n")
         self.s.remember(self.name, path, text, [self.author])
@@ -810,7 +816,8 @@ class Doc:
     def t_list_reviews(self) -> dict:
         data = self.s.review_list(self.name, self.role, self.user, None)
         threads = [{"id": t["id"], "path": t["path"], "quote": t["anchor"]["quote"][:500], "resolved": t["resolved"],
-                    "comments": [{"name": c["name"], "text": c["text"], "time": c["time"]} for c in t["comments"]]}
+                    "comments": [{"id": c.get("id"), "name": c["name"], "text": c["text"], "time": c["time"]}
+                                 for c in t["comments"]]}
                    for t in data["threads"][:200]]
         suggestions = [{"id": x["id"], "path": x["path"], "quote": x["anchor"]["quote"][:2000],
                         "replacement": x["insert"][:2000], "name": x.get("name")} for x in data["suggestions"][:200]]
@@ -1067,8 +1074,12 @@ class Doc:
         self.need_rate("history-read")
         rows = self.s.history_list(self.name, self.role, path, before)["versions"][:100]
         keep = ("id", "time", "path", "kind", "authors", "label", "deleted")
-        return result({"versions": [{k: r.get(k) for k in keep} | ({"files": r["files"][:100]} if "files" in r
-                                                                    else {}) for r in rows]})
+        out = []
+        for r in rows:
+            out.append({k: r.get(k) for k in keep})
+            if "files" in r:  # a named version keeps every file; the answer lists the first 100
+                out[-1].update(files=r["files"][:100], file_count=len(r["files"]))
+        return result({"versions": out})
 
     def t_version_diff(self, id: int, path: str | None = None, against: str = "current") -> dict:  # noqa: A002
         self.need_rate("history-read")
@@ -1122,6 +1133,23 @@ class Doc:
                 except OSError:
                     continue
         return keys
+
+    def project_dois(self, path: str, text: str) -> dict:
+        """normalised DOI -> (key, .bib path) for every entry of the project with a DOI; `text` stands for path."""
+        found: dict[str, tuple[str, str]] = {}
+        sources = [(path, text)]
+        for rel, full in text_files(self.root):
+            if rel.endswith(".bib") and rel != path:
+                try:
+                    sources.append((rel, full.read_text("utf-8", "replace")))
+                except OSError:
+                    continue
+        for rel, body in sources:
+            for entry in self.s.bibfix.parse(body):
+                doi = doi_key(next((f.value for f in entry.fields if f.name.lower() == "doi"), None))
+                if doi:
+                    found.setdefault(doi, (entry.key, rel))
+        return found
 
     def parsed(self, bibtex: str, many: bool = True) -> list:
         entries = [e for e in self.s.bibfix.parse(bibtex) if e.kind.lower() not in ("comment", "string", "preamble")]
@@ -1193,9 +1221,15 @@ class Doc:
         found = self.s.bib_import({"doi": doi.group(1)} if doi else {"bibtex": source})
         if not found["entries"]:
             raise ToolError(found.get("error") or "Nothing to import.")
-        entries = []
+        entries, duplicates = [], []
         made = set(self.project_keys()) | {e.key for e in self.s.bibfix.parse(current["text"])}
+        dois = self.project_dois(path, current["text"])
         for item in found["entries"][:200]:
+            doi = next((v for k, v in (item.get("fields") or {}).items() if k.lower() == "doi"), None)
+            same = dois.get(doi_key(doi))
+            if same:  # the same work under another key: citing both would list it twice
+                duplicates.append({"doi": doi, "key": item.get("key"), "existing_key": same[0], "file": same[1]})
+                continue
             if not item.get("key"):  # a DOI record: name it like authorYEAR, unused in the project
                 fields = item.get("fields") or {}
                 first = (fields.get("author") or "").split(" and ")[0].split(",")[0].split()
@@ -1215,9 +1249,10 @@ class Doc:
         taken = set(self.project_keys()) | {e.key for e in self.s.bibfix.parse(current["text"])}
         text, added, skipped = self.append(current["text"], entries, taken)
         if not added:
-            return result({"added": [], "skipped": skipped, "note": "Every key is already in the project."})
+            return result({"added": [], "skipped": skipped, "duplicates": duplicates,
+                           "note": "Every entry is already in the project."})
         return result({**self.change(path, current, text, f"imported {len(added)} entries"), "added": added,
-                       "skipped": skipped, "warning": found.get("error")})
+                       "skipped": skipped, "duplicates": duplicates, "warning": found.get("error")})
 
     def t_bib_lookup(self, path: str, key: str, apply: bool = False) -> dict:
         current = self.bib_file(path)
@@ -1319,6 +1354,14 @@ class Doc:
         if not ok:
             raise ToolError(message)
         return result({"docx": str(self.s.build.docx_path_for(self.main)), "message": message})
+
+
+def doi_key(doi) -> str | None:
+    """A DOI as compared for duplicates: no resolver prefix or braces, lower case (DOIs ignore case)."""
+    if not isinstance(doi, str):
+        return None
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", doi.strip().strip("{}").strip(), flags=re.I)
+    return doi.lower() or None
 
 
 def from_utf16(text: str, units: int) -> int:

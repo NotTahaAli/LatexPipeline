@@ -218,6 +218,7 @@ class Tools(DocCase):
         self.assertEqual(refs["refs_to_unknown_labels"], ["sec:none"])
         outline = self.ok("outline", project="thesis")["structuredContent"]
         self.assertEqual([h["title"] for h in outline["headings"]], ["Intro", "One"])
+        self.assertEqual(serve.clean_title("\\begin{center}\\textbf{Some Title}\n\\end{center}"), "Some Title")
         self.assertGreater(outline["total_words"], 5)
         status = self.ok("build_status", project="thesis")["structuredContent"]
         self.assertEqual((status["status"], status["pdf"]), ("never built", False))
@@ -438,7 +439,9 @@ class Parity(DocCase):
                                                               "name": "Ada"})["item"]["comments"][-1]["id"]
         self.assertIn("Only comments this AI client wrote", self.error("delete_comment", project="thesis",
                                                                        thread=tid, comment=human))
-        mine = thread["comments"][0]["id"]
+        listed = self.ok("list_reviews", project="thesis")["structuredContent"]["threads"][0]["comments"]
+        mine = listed[0]["id"]  # list_reviews gives the comment ids delete_comment needs
+        self.assertEqual(mine, thread["comments"][0]["id"])
         self.ok("delete_comment", project="thesis", thread=tid, comment=mine)
         texts = [c["text"] for c in serve.review_store("thesis").load()["threads"][0]["comments"]]
         self.assertEqual(texts, ["Done.", "Mine"])
@@ -535,6 +538,12 @@ class Parity(DocCase):
                           source="https://doi.org/10.1000/xyz")["structuredContent"]
             self.assertEqual(out["added"], ["doe2021"])
             self.assertIn("10.1000/xyz", crossref.call_args[0][0])
+            (self.root / "other.bib").write_text("@article{mine, doi={https://doi.org/10.1000/XYZ}}\n", "utf-8")
+            (self.root / "refs.bib").write_text(BIB, "utf-8")
+            out = self.ok("bib_import", project="thesis", path="refs.bib", source="10.1000/xyz")["structuredContent"]
+            self.assertEqual(out["added"], [])  # the same DOI under another key, in another file
+            self.assertEqual([(d["existing_key"], d["file"]) for d in out["duplicates"]], [("mine", "other.bib")])
+            (self.root / "other.bib").unlink()
             (self.root / "refs.bib").write_text("@article{bare, title={Deep Things}, doi={10.1000/xyz}}\n", "utf-8")
             proposal = self.ok("bib_lookup", project="thesis", path="refs.bib", key="bare")["structuredContent"]
             self.assertIn("year", proposal["fields"])
@@ -599,8 +608,17 @@ class Parity(DocCase):
         self.assertEqual((self.root / "chapters/one.tex").read_text(), ONE)
         self.assertIn("configures the build", self.error("restore_version", project="thesis", id=label,
                                                          path="build.toml"))
-        names = [v["label"] for v in self.ok("list_versions", project="thesis")["structuredContent"]["versions"]]
-        self.assertIn("Before restore", names)
+        listed = self.ok("list_versions", project="thesis")["structuredContent"]["versions"]
+        self.assertIn("Before restore", [v["label"] for v in listed])
+        named = next(v for v in listed if v["label"] == "Before restore")
+        self.assertEqual(named["file_count"], len(named["files"]))
+        self.assertIn("main.tex", named["files"])
+        self.ok("write_file", project="thesis", path="new.tex", content="Written text\n")
+        made = self.ok("list_versions", project="thesis", path="new.tex")["structuredContent"]["versions"]
+        self.assertEqual([v["kind"] for v in made if v["path"] == "new.tex"], ["auto"])  # no empty version first
+        (self.root / "new.tex").write_text("changed\n", "utf-8")
+        self.ok("restore_version", project="thesis", id=made[0]["id"], path="new.tex")
+        self.assertEqual((self.root / "new.tex").read_text(), "Written text\n")
         with self.assertRaises(mcp_tools.ToolError):
             self.doc("view", "8;Vi").run("label_version", {"label": "x"})
 

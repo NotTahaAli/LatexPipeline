@@ -705,6 +705,9 @@ class Hosted:
         tid = args.get("workspace") or ""
         if "write" not in self.scopes:
             raise NeedScope("write")
+        if not json.loads(self.grant["tenants"]):  # a new project would fall outside a grant of single projects
+            raise mcp_tools.ToolError("This connection was given single projects, not a whole workspace, so it "
+                                      "cannot create projects. Reconnect and pick a workspace you edit to do that.")
         if tid not in json.loads(self.grant["tenants"]) or H.tenant_role(H.APP, self.user, tid) not in H.EDIT_ROLES:
             raise mcp_tools.ToolError("Give workspace: the id of a workspace you edit and connected as a whole "
                                       "(list_projects shows them under workspaces).")
