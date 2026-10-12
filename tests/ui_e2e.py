@@ -244,9 +244,10 @@ class Watch:
     def _failed(self, request):
         err = request.failure or ""
         # A long-poll cut by navigation, a superseded PDF load, a download handed to the browser, or the AI answer
-        # stream the editor stops reading after its "done" line is not a failure.
+        # stream the editor stops reading after its "done" line, or a live preview a newer keystroke superseded, is
+        # not a failure.
         if "ERR_ABORTED" in err and re.search(
-            r"/api/(events|poll|ws)|/ui/|/pdf/|\.pdf|zip|/api/ai\?.*stream=1", request.url
+            r"/api/(events|poll|ws|preview)|/ui/|/pdf/|\.pdf|zip|/api/ai\?.*stream=1", request.url
         ):
             return
         self.bad.append(f"request failed: {request.method} {request.url} {err}")
@@ -306,7 +307,10 @@ def hover_at(page, pos):
 
 
 def reset(page):
-    """Back to a known state: no dialog, menu, tooltip, side panel or drawer."""
+    """Back to a known state: no popup tab, dialog, menu, tooltip, side panel or drawer."""
+    for other in page.context.pages:
+        if other is not page:
+            other.close()  # an open popup (texdoc, PDF tab) makes set_input_files on this page hang
     page.evaluate("""() => { for (const d of document.querySelectorAll('dialog[open]')) d.close();
         document.activeElement?.blur?.(); }""")
     page.mouse.move(0, 0)
