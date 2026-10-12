@@ -79,7 +79,8 @@ class SuggestionReplies(Team):
         self.review("edit", {"op": "comment", "path": "main.tex", "anchor": ANCHOR, "text": "x"})
         status, data = self.as_("view", "GET", "/api/people?doc=demo")
         self.assertEqual(status, 200)
-        self.assertEqual(data["people"], ["Bea", "Ed", "Kim"])  # "Kim (unverified name)" without the mark
+        self.assertEqual(data["people"], ["Bea", "Kim"])  # "Kim (unverified name)" without the mark; no link names
+        self.assertEqual(self.as_("ed", "GET", "/api/people?doc=demo")[1]["people"], ["Bea", "Ed", "Kim"])
         self.assertEqual(self.as_("view", "GET", "/api/people?doc=second")[0], 403)
 
 
