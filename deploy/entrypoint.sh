@@ -18,7 +18,7 @@ fi
 if ! bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true 2>/dev/null; then
   echo "bubblewrap cannot start a sandbox in this container, so every build would fail. Run it with the security" >&2
   echo "options in deploy/compose.yaml (seccomp profile, systempaths=unconfined, apparmor); on Ubuntu 23.10 and" >&2
-  echo "later also see README 'Docker and Coolify' for the AppArmor user-namespace setting." >&2
+  echo "later also see docs/hosting/docker.md for the AppArmor user-namespace setting." >&2
   bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true || true
   exit 2
 fi

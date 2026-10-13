@@ -664,7 +664,7 @@ def grammar_findings(name: str, doc_dir: Path) -> list[Finding]:
                   "set GRAMMAR_PUBLIC_OK=1 to allow it in CI.")
             return []
         if mode == "off":
-            print(f"{name}: grammar is off (no LanguageTool server answered; see README).")
+            print(f"{name}: grammar is off (no LanguageTool server answered; see docs/guides/grammar.md).")
             return []
         if mode == "public":
             print(f"{name}: {grammar.PUBLIC_NOTICE}")
@@ -905,7 +905,7 @@ def main() -> int:
                       help="report overfull boxes wider than this many points (default 10)")
 
     lint.add_argument("--grammar", action="store_true",
-                      help="also check the prose with LanguageTool (see README; off by default)")
+                      help="also check the prose with LanguageTool (see docs/guides/grammar.md; off by default)")
 
     lint.add_argument("--bib-lookup", action="store_true",
                       help="suggest missing bib fields from Crossref (sends DOIs and titles; off by default)")

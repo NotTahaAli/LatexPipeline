@@ -6,7 +6,7 @@ workers always do). Then every TeX process runs under bubblewrap (Linux): no net
 other processes, the system and the TeX installation read-only, the document's directory
 read-only, only its build directory writable, /tmp private, a minimal environment and
 resource limits. If bubblewrap is missing or does not work, builds are refused, never run
-unsandboxed. See README, "Sandboxed builds".
+unsandboxed. See docs/explanation/sandbox.md.
 """
 
 from __future__ import annotations

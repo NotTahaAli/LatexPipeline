@@ -63,7 +63,7 @@ GLOBAL_INPUTS = (
     "scripts/ci_report.py",
     ".github/workflows/build-pdf.yml",
     ".github/texlive-packages.txt",
-    ".github/fonts/",  # CI installs these fonts before building (README, "GitHub Actions")
+    ".github/fonts/",  # CI installs these fonts before building (docs/guides/ci.md)
     ".github/hooks/",  # CI's pre-build and post-build hooks
 )
 
@@ -630,7 +630,7 @@ ENGINE_MAGIC = re.compile(r"^\s*%\s*!\s*TEX\s+(?:TS-)?PROGRAM\s*=\s*(\S+)", re.I
 CONFIG_KEYS = {"engine", "shell_escape", "latexmk_args", "externalize", "pdfa", "tagged", "lang", "timeout", "review",
                "draft", "strict", "anonymous", "output", "html",
                "grammar", "grammar_url", "disabled_rules"}  # the last three are read by grammar.py
-# An [[output]] table: an extra PDF of the same document, out/<name>-<output name>.pdf (README, "build.toml keys").
+# An [[output]] table: an extra PDF of the same document, out/<name>-<output name>.pdf (docs/reference/build-toml.md).
 OUTPUT_KEYS = {"name", "define", "engine", "review", "draft", "anonymous"}
 OUTPUT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{0,39}")
 DEFINE_NAME = re.compile(r"[A-Za-z]{1,40}")  # a macro name: \def\<name>{} can do nothing else
@@ -861,7 +861,7 @@ def document_metadata(settings: dict) -> str:
     )  # one -usepretex argument: no newlines
 
 
-# build.toml review = "show" | "clean" (README, "Review markup"): \lpadd{new}, \lpdel{old}, \lpedit{old}{new},
+# build.toml review = "show" | "clean" (docs/guides/review-markup.md): \lpadd{new}, \lpdel{old}, \lpedit{old}{new},
 # \lpnote{text} and the environments lpaddblock, lpdelblock and lpnoteblock, injected with -usepretex. The definitions
 # wait for \begin{document} (hook begindocument/before), and a name the document or a package already defined is
 # left alone: the document's own macro wins. "show" loads xcolor and ulem (normalem, unless the document loaded
@@ -1264,7 +1264,7 @@ def _build_document(
                 main_tex.name,
             ]
 
-        # Fixed dates in the PDF's metadata; \today follows the same epoch (README, "Reproducible PDFs").
+        # Fixed dates in the PDF's metadata; \today follows the same epoch (docs/guides/documents.md).
         epoch = {"SOURCE_DATE_EPOCH": source_date_epoch(main_tex), "FORCE_SOURCE_DATE": "1"}
 
         def run(command: list[str], phase: str = "latex") -> int:
@@ -2674,7 +2674,7 @@ def parse_args() -> argparse.Namespace:
         "--sandbox",
         action="store_true",
         help="Run LaTeX under bubblewrap (Linux): no network, writes only to the build directory "
-             "(sets LATEX_SANDBOX=bwrap; README, 'Sandboxed builds').",
+             "(sets LATEX_SANDBOX=bwrap; docs/explanation/sandbox.md).",
     )
 
     parser.add_argument(

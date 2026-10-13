@@ -5,7 +5,7 @@ Local MCP server for this repository's LaTeX documents, over stdio (JSON-RPC 2.0
     python scripts/mcp_server.py [DOC ...] [--source DIR] [--read-only] [--sandbox] [--allow-build-config]
 
 Any MCP client that starts local servers (Claude Desktop, Claude Code, Codex CLI, Cursor, VS Code, Windsurf,
-Gemini CLI) can use it with your own subscription; see README, "Use with AI clients (MCP)". The tools are those of
+Gemini CLI) can use it with your own subscription; see docs/guides/mcp.md. The tools are those of
 mcp_tools.py, run as the owner: like serve.py without sharing, builds use your normal local settings (build.toml,
 latexmkrc), so only point it at documents you trust, or pass --sandbox; the tools change those two files only
 with --allow-build-config. Changes go through the editor's save path

@@ -4,6 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation: the README is now a short front page (features, quick start, a demo GIF) and the rest moved to one-task pages under `docs/` (index `docs/README.md`), plus `CONTRIBUTING.md` and `SECURITY.md`. `docs/realtime.md` and `docs/benchmarks.md` moved to `docs/explanation/`.
+
 ## [0.4.1] - 2026-10-12
 
 ### Added

@@ -222,7 +222,7 @@ export function editTools({ S, V, L, AC }, ctx) {
       el("div", { className: "field" }, el("label", { htmlFor: "sWrapCol", textContent: "Rewrap width (Alt+Q)" }), col),
       check("wrap", "Soft wrap long lines"),
       check("relLines", "Relative line numbers (distance from the cursor's line)"),
-      check("mathPrefix", "Math shortcuts: in math, @ and a key types a symbol (@a \\alpha, @b \\beta, @8 \\infty; the README has the table)"),
+      check("mathPrefix", "Math shortcuts: in math, @ and a key types a symbol (@a \\alpha, @b \\beta, @8 \\infty; docs/reference/shortcuts.md has the table)"),
       check("unicodePaste", "Offer to turn pasted Unicode into LaTeX (quotes, dashes; accents for pdflatex; Greek in math)"),
       el("div", { className: "field" }, el("button", { type: "button", className: "btn ghost", textContent: "Edit snippets...", onclick: () => openSnippets() }))));
   }

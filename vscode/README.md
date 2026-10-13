@@ -6,4 +6,4 @@ Install: `npx @vscode/vsce package` in this folder makes `latex-pipeline-0.1.0.v
 
 Use: run "LaTeX Pipeline: Connect to an editor or hosted project" from the command palette and paste the address you would open in a browser (`http://localhost:8000/`, a share link with `?token=`, or `https://<server>/p/<project>/`). A hosted project asks for a personal API token (Account page, API tokens). The document appears as a folder in the Explorer. "Build", "Show the PDF", "Open a file" and "Disconnect" are in the command palette; the status bar shows the build state and opens the PDF (or the Problems panel after a failed build).
 
-See the main README, section "VS Code", for details.
+See [docs/guides/vscode.md](../docs/guides/vscode.md) for details.
