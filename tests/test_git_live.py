@@ -297,6 +297,12 @@ class HostedLive(test_host.HostCase):
     def actions(self):
         return [r["action"] for r in self.app.db.all("SELECT action FROM audit WHERE action LIKE 'git%' ORDER BY id")]
 
+    def commit_here(self, *paths):
+        """Stage and commit through the hosted Git panel: pull and push never commit on their own."""
+        for op in ({"op": "stage", "paths": list(paths)}, {"op": "commit", "message": "Edit " + " ".join(paths)}):
+            status, data, _ = self.editor.call("POST", f"/p/{self.pid}/api/git?doc=Doc", op)
+            self.assertEqual(status, 200, data)
+
     def pulled_once(self, files=None):
         commit(self.seed, files or {"main.tex": "one\ntwo\nthree\nfour\nfive\n"})
         (self.source / "main.tex").unlink()
@@ -325,6 +331,7 @@ class HostedLive(test_host.HostCase):
         self.assertEqual(sent - {None}, {self.header(self.TOKEN)})  # the header from http.extraHeader
 
         (self.source / "ch2.tex").write_text("New chapter\n", encoding="utf-8")
+        self.commit_here("ch2.tex")
         status, result, _ = self.sync("push")
         self.assertEqual((status, result["ok"]), (200, True), result)
         self.assertEqual(self.remote_file("ch2.tex"), "New chapter\n")
@@ -334,6 +341,7 @@ class HostedLive(test_host.HostCase):
 
         # Both sides change the same line: the merge is aborted, the file listed, the project left as it was.
         (self.source / "main.tex").write_text("one\nmine\nthree\nfour\nfive\n", encoding="utf-8")
+        self.commit_here("main.tex")
         commit(self.seed, {"main.tex": "one\ntheirs\nthree\nfour\nfive\n"})
         status, result, _ = self.sync("pull")
         self.assertEqual((status, result["ok"], result["conflicts"]), (200, False, ["main.tex"]))
@@ -345,8 +353,10 @@ class HostedLive(test_host.HostCase):
         self.assertEqual(status, 409, data)  # the repository moved on: pull first
         # The person makes them agree; the next pull merges.
         (self.source / "main.tex").write_text("one\ntheirs\nthree\nfour\nfive\n", encoding="utf-8")
+        self.commit_here("main.tex")
         self.assertEqual(self.sync("pull")[1]["ok"], True)
         (self.source / "ch2.tex").write_text("Edited after the merge\n", encoding="utf-8")
+        self.commit_here("ch2.tex")
         self.assertEqual(self.sync("push")[0], 200)
         self.assertEqual(self.remote_file("ch2.tex"), "Edited after the merge\n")
 
@@ -354,11 +364,12 @@ class HostedLive(test_host.HostCase):
         new = "ghp_RotatedTokenOfEd678"
         self.git.users["ed"] = new
         (self.source / "ch2.tex").write_text("After rotation\n", encoding="utf-8")
+        self.commit_here("ch2.tex")
         status, data, _ = self.sync("push")
         self.assertEqual(status, 502, data)
         self.set_token(new)
         status, result, _ = self.sync("push")
-        # the refused push already committed the change here; this one delivers it
+        # the commit the refused push could not deliver goes now
         self.assertEqual((status, result["ok"], result["message"]), (200, True, "Pushed."), result)
         self.assertEqual(self.remote_file("ch2.tex"), "After rotation\n")
         self.assertEqual(self.git.requests[-1][2], self.header(new))
@@ -374,8 +385,9 @@ class HostedLive(test_host.HostCase):
         self.assertFalse(gitdir.exists())
         self.assertIsNone(self.app.db.one("SELECT 1 FROM git_remotes WHERE project_id = ?", self.pid))
         self.assertEqual(self.actions(), ["git_connected", "git_pull", "git_token_set", "git_pull", "git_pull",
-                                          "git_push", "git_pull", "git_push", "git_pull", "git_push", "git_push",
-                                          "git_token_set", "git_push", "git_token_removed", "git_pull",
+                                          "git_commit", "git_push", "git_commit", "git_pull", "git_push",
+                                          "git_commit", "git_pull", "git_commit", "git_push", "git_commit",
+                                          "git_push", "git_token_set", "git_push", "git_token_removed", "git_pull",
                                           "git_disconnected"])
         details = [r["detail"].split(" ", 1)[1] for r in self.app.db.all(
             "SELECT detail FROM audit WHERE action IN ('git_pull', 'git_push') ORDER BY id")]
