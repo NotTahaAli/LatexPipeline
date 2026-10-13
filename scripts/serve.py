@@ -4516,6 +4516,16 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def discard_body(self) -> None:
+        """Read a refused request's body: closing with unread bytes resets the connection, and Windows then drops the
+        reply."""
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if 0 < size <= MAX_UPLOAD:
+                self.rfile.read(size)
+        except (ValueError, OSError):
+            pass
+
     def body(self) -> dict:
         try:
             size = int(self.headers.get("Content-Length", "0"))
@@ -4595,7 +4605,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.reply(401, b"Unauthorized: open the full share link you were sent.", "text/plain", gone)
                 return
-            check_permission(self.role, self.command, unquote(url.path), query, self.admin)
+            try:
+                check_permission(self.role, self.command, unquote(url.path), query, self.admin)
+            except ApiError:
+                self.discard_body()
+                raise
             method()
         except ApiError as exc:
             self.json({"error": str(exc), **exc.extra}, exc.status)

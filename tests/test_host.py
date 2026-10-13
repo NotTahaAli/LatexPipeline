@@ -37,7 +37,7 @@ def make_zip(entries: dict, symlink: str | None = None) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
         for name, text in entries.items():
-            archive.writestr(name, text)
+            archive.writestr(zipfile.ZipInfo(name), text)  # fixed date: the same entries give the same bytes
         if symlink:
             info = zipfile.ZipInfo(symlink)
             info.external_attr = (stat.S_IFLNK | 0o777) << 16

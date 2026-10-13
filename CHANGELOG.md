@@ -4,6 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Fixed
+
+- Editor on Windows: a request refused for its role (403) now reaches the client; the unread body made Windows reset the connection and drop the reply, which the hosted gateway passed on as a closed connection.
+
 ## [0.4.1] - 2026-10-12
 
 ### Added
