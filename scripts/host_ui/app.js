@@ -517,7 +517,7 @@ async function adminPage() {
   const providers = form([
     info.providers.length ? el("ul", { className: "list card" }, info.providers.map((p) => el("li", {}, el("span", { className: "grow who", textContent: p.label }),
       el("span", { className: "tag", textContent: p.id }))))
-      : el("p", { className: "card", textContent: "None configured. Sign-in providers are set in config.toml on the server (see the README)." }),
+      : el("p", { className: "card", textContent: "None configured. Sign-in providers are set in config.toml on the server (see docs/hosting/sign-in.md)." }),
     el("label", { className: "check" }, input("auto_link", "checkbox", { checked: s.auto_link }), "Link sign-in providers to existing accounts with the same confirmed email"),
   ], "Save", save((v, f) => ({ auto_link: f.auto_link.checked })));
   const quotaKeys = ["max_projects_per_tenant", "max_project_mb", "max_workers", "max_workers_per_tenant", "worker_idle_minutes", "build_timeout", "max_tenants"];

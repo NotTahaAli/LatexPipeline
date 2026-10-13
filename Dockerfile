@@ -1,4 +1,4 @@
-# Hosted editor (scripts/host.py) in one container. See README "Docker and Coolify" for the security options
+# Hosted editor (scripts/host.py) in one container. See docs/hosting/docker.md for the security options
 # the container needs (deploy/compose.yaml): builds run under bubblewrap inside it.
 FROM ubuntu:24.04
 

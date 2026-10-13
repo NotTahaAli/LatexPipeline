@@ -50,7 +50,7 @@ permissions:
 env:
   # TeX Live year for the tug.org install (texlive-cache, tagged-pdf, build on a cache hit), e.g. "2025";
   # empty means the latest. It is part of the cache key, so changing it installs that year once. The apt
-  # fallback on a cache miss is always Ubuntu's TeX Live. See README, "GitHub Actions".
+  # fallback on a cache miss is always Ubuntu's TeX Live. See docs/guides/ci.md.
   TEXLIVE_VERSION: ""
 
 jobs:
@@ -162,7 +162,7 @@ jobs:
 
       # TeX Live from the cache saved by the texlive-cache job (about 12 s). On a miss,
       # trimmed apt (about 70 s) so this run isn't held up; texlive-cache fills the cache meanwhile.
-      # Keep the apt list in step with README.md and .github/texlive-packages.txt.
+      # Keep the apt list in step with docs/getting-started/install.md and .github/texlive-packages.txt.
       - name: Restore TeX Live cache
         id: tl
         uses: actions/cache/restore@v6
@@ -213,7 +213,7 @@ jobs:
           key: latex-${{ github.run_id }}
           restore-keys: latex-
 
-      # Repository-owned extras (README, "GitHub Actions"): fonts in .github/fonts/ for XeLaTeX and LuaLaTeX,
+      # Repository-owned extras (docs/guides/ci.md): fonts in .github/fonts/ for XeLaTeX and LuaLaTeX,
       # and .github/hooks/pre-build and post-build, run here only (never by the editor or a shared link).
       - name: Extra fonts
         if: hashFiles('.github/fonts/**') != ''

@@ -29,7 +29,7 @@ class EscapeNameTests(unittest.TestCase):
         self.assertEqual(build.escape_name("é"), "_C3_A9")
 
     def test_reversible_with_documented_recipe(self):
-        # README: replace "_" with "%", then URL-decode.
+        # docs/guides/ci.md: replace "_" with "%", then URL-decode.
         original = "FP-123 Proposal/v1_2 (é).pdf"
         escaped = build.escape_name(original)
         self.assertNotIn("/", escaped)

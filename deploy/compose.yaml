@@ -20,7 +20,7 @@ services:
       - "8080"
     # Builds run under bubblewrap, which needs user namespaces and its own /proc inside the container:
     # Docker's default seccomp profile plus 7 namespace syscalls, the default masks of /proc lifted, no
-    # capabilities, no privilege gain. LP_APPARMOR: the AppArmor profile (README "Docker and Coolify").
+    # capabilities, no privilege gain. LP_APPARMOR: the AppArmor profile (docs/hosting/docker.md).
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

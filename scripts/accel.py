@@ -3,7 +3,7 @@ Build accelerators for large documents (imported by build.py, standard library o
 
 externalize: TikZ/pgfplots figures are compiled once, in parallel, and cached by
 content hash, so a build re-typesets only the text. The document is not edited:
-a small file is injected with latexmk's -usepretex. See README, "Large documents".
+a small file is injected with latexmk's -usepretex. See docs/guides/large-documents.md.
 """
 
 from __future__ import annotations

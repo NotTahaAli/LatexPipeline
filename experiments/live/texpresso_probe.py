@@ -1,6 +1,6 @@
 """
 Stage-2 experiment (not used by the pipeline): drive TeXpresso headless over its editor protocol and time how
-long it takes to settle after an edit. Findings and numbers: docs/realtime.md.
+long it takes to settle after an edit. Findings and numbers: docs/explanation/realtime.md.
 
     git clone https://github.com/let-def/texpresso && make -C texpresso all   # see its INSTALL.md
     python3 experiments/live/texpresso_probe.py texpresso/build/texpresso bench/sample-report \

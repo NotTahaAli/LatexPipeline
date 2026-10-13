@@ -91,3 +91,11 @@ All runs produced 303 pages and no `??` in the text. Plain latexmk and Overleaf-
 * Overleaf-equivalent is the command only; real Overleaf adds network, sandboxing and queue time.
 * Edits are one word or one coordinate inside a chapter; edits that move pagination or labels cost extra passes in every latexmk-based tool.
 * Raw per-run data and the harness scripts are not part of the repository.
+
+## PDF size
+
+`build-report.json` and the CI summary table list each PDF's size. A `qpdf --object-streams=generate` pass was measured and dropped: pdfTeX already writes object streams, and it saved 0.3% (`files/test`, 101 KB) to 0.9% (`bench/sample-report`, 1.6 MB).
+
+## Earlier build optimizations
+
+Measured on a busier machine (median of 3) before the figure-edit change: `--force` went from 87 s to 55 s (figures 35 s to 14 s), and a text edit in a file holding a figure from 23 s to 13 s; other text edits were unchanged.

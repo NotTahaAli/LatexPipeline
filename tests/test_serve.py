@@ -1618,7 +1618,8 @@ class SharedBuilds(SharedState):
         env = dict(serve.SHARE_ENV)
         self.assertFalse(pdflatex_reads(absolute, **env))
         self.assertTrue(pdflatex_reads("\\input{sub/x}", **env))
-        self.assertFalse(pdflatex_reads("\\input{sub/up}", **env))  # "..": blocked on purpose, see README
+        # "..": blocked on purpose, see docs/explanation/security.md
+        self.assertFalse(pdflatex_reads("\\input{sub/up}", **env))
         target = Path(tempfile.gettempdir()) / f"lp-pwned-{os.getpid()}"
         self.addCleanup(lambda: target.unlink(missing_ok=True))
         pdflatex_reads(f"\\immediate\\openout3={target.as_posix()}\\immediate\\write3{{x}}", **env)

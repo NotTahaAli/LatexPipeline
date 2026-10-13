@@ -2748,7 +2748,7 @@ def cmd_serve(data: Path, insecure: bool) -> int:
         if not sandbox_works():
             build.error("bubblewrap does not work here (`bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev "
                         f"true` failed: {SANDBOX_ERROR['text']}). Install it (apt install bubblewrap) and allow "
-                        "unprivileged user namespaces (in Docker: README \"Docker and Coolify\"). Refusing to serve.")
+                        "unprivileged user namespaces (in Docker: docs/hosting/docker.md). Refusing to serve.")
             return 2
     else:
         print("!" * 78 + "\nWARNING: --insecure-no-sandbox. LaTeX runs WITHOUT the bubblewrap sandbox: any user who "
